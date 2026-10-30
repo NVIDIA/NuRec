@@ -1,0 +1,25 @@
+Fix make___nv_bfloat161 so bf16 CUDA codegen compiles.
+
+Upstream (through v2026.12.2) gives it the wrong return type and constructor
+(__nv_bfloat16 instead of __nv_bfloat161), so nvcc fails on slang's bf16 output.
+Mirror the correct __half1 form above. Not yet filed upstream; drop once fixed.
+
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes prelude/slang-cuda-prelude.h of Slang v2026.4.
+
+diff --git a/prelude/slang-cuda-prelude.h b/prelude/slang-cuda-prelude.h
+--- a/prelude/slang-cuda-prelude.h
++++ b/prelude/slang-cuda-prelude.h
+@@ -752,9 +752,10 @@ SLANG_FORCE_INLINE SLANG_CUDA_CALL __half1 make___half1(__half x)
+ #if SLANG_CUDA_ENABLE_BF16
+ SLANG_MAKE_VECTOR_FROM_SCALAR(__nv_bfloat16)
+ #if !SLANG_CUDA_RTC
+-SLANG_FORCE_INLINE SLANG_CUDA_CALL __nv_bfloat16 make___nv_bfloat161(__nv_bfloat16 x)
++// Local fix: mirror the correct __half1 form (upstream had __nv_bfloat16 here).
++SLANG_FORCE_INLINE SLANG_CUDA_CALL __nv_bfloat161 make___nv_bfloat161(__nv_bfloat16 x)
+ {
+-    return __nv_bfloat16{x};
++    return __nv_bfloat161{x};
+ }
+ #endif
+ #endif

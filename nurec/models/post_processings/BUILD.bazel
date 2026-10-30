@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+package(default_visibility = [
+    "//:core_package_group",
+])
+
+# Constants shared by the post-processing models
+py_library(
+    name = "def_constants",
+    srcs = ["constants.py"],
+)
+
+# Generate compile-time constants for the PPISP Slang module
+py_binary(
+    name = "gen_constants",
+    srcs = ["constants.py"],
+    main = "constants.py",
+)
+
+# Generate compile-time constants file for PPISP Slang compilation
+genrule(
+    name = "constants_txt",
+    outs = ["constants.txt"],
+    cmd = "$(location :gen_constants) > $@",
+    tools = [":gen_constants"],
+)
+
+py_library(
+    name = "pylib_bilateral_grid",
+    srcs = ["__init__.py"],
+    deps = [
+        "//nurec/models/post_processings/bilateral_grid:pylib",
+        "//nurec/models/post_processings/bilateral_grid/cuda:pylib_cc",
+    ],
+)
+
+py_library(
+    name = "pylib_ppisp_legacy",
+    srcs = ["__init__.py"],
+    deps = [
+        "//nurec/models/post_processings/ppisp_legacy:pylib",
+    ],
+)

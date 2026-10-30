@@ -1,0 +1,149 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# TODO: Seperate ncore files into their own self-contained py_library
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "base.py",
+        "labels_utils.py",
+        "ncore.py",
+        "registry.py",
+        "summary.py",
+        "track_split.py",
+        "utils.py",
+        "vehicle_light.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        "//nurec/utils:pylib_ncore_types",
+        "//nurec/utils:pylib_renamed_keys",
+        pip_requirement("scipy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("opencv-python"),
+        pip_requirement("imageio"),
+        pip_requirement("imageio-ffmpeg"),
+        pip_requirement("setuptools"),
+        pip_requirement("einops"),
+        pip_requirement("tqdm"),
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        pip_requirement("lietorch"),
+        pip_requirement("pillow"),
+        pip_requirement("pandas"),
+        pip_requirement("universal-pathlib"),
+        pip_requirement("dataclasses-json"),
+        pip_requirement("simplejpeg"),
+        pip_requirement("cuml-cu12"),
+        ":pylib_tracks",
+        "//nurec/config:pylib",
+        "//nurec/datasets/samplers:pylib",
+        "//nurec/libs/ray_utils:pylib_cc",
+        "//nurec/libs/vren:pylib",
+        "//nurec/libs/vren:pylib_cc",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_morph",
+        "//nurec/utils:pylib_ncore_utils",
+        "//nurec/visualdebugger:pylib",
+    ],
+)
+
+pytest_test(
+    name = "summary_test",
+    size = "small",
+    srcs = ["summary_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/utils:pylib_types",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "utils_test",
+    srcs = ["utils_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_tracks",
+    srcs = [
+        "track_split.py",
+        "tracks.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//nurec/benchmark:__subpackages__",
+    ],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("dataclasses-json"),
+        "//nurec/libs/vren:pylib_cc",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_fields",
+        "//nurec/visualdebugger:pylib",
+    ],
+)
+
+pytest_test(
+    name = "tracks_test",
+    srcs = ["tracks_test.py"],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        ":pylib",
+        "//nurec/models:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_tests",
+    ],
+)
+
+pytest_test(
+    name = "tracks_coalesce_test",
+    srcs = ["tracks_coalesce_test.py"],
+    deps = [
+        ":pylib_tracks",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "ncore_test",
+    srcs = ["ncore_test.py"],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("torch"),
+        ":pylib",
+        "//nurec/datasets/samplers:pylib",
+    ],
+)
+
+pytest_test(
+    name = "vehicle_light_test",
+    srcs = ["vehicle_light_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("opencv-python"),
+    ],
+)

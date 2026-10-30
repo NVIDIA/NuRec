@@ -1,0 +1,115 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Lidar-free NuRec team.
+# Six-camera Car2Sim preset initialized and supervised without production lidar.
+
+defaults:
+  # Base recipe and production features.
+  - /apps/AV/_base_3dgut_dynamic_road_semantic.yaml
+  - /apps/prod/options/artifact: default
+  - /apps/prod/options/harmonizer/3dgut: disabled
+  - /apps/prod/options/mesh: disabled
+  - /apps/prod/options/ground: disabled
+
+  # Sensors, sampling, calibration, and cuboid tracks.
+  - /apps/prod/options/subsampling/3dgut: batch_sampler_4
+  - /apps/prod/Hyperion-8.1/options/sensors: hyperion8.1_6cam_1lidar
+  - /apps/prod/Hyperion-8.1/options/validation: default
+  - /apps/prod/options/calib: disabled
+  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "30000"
+  - /apps/prod/Hyperion-8.1/options/lidar_input: virtual_no_training_rays
+  - /apps/prod/Hyperion-8.1/options/cuboid_track_label_sources: autolabel
+  - /apps/prod/Hyperion-8.1/options/cuboid_track_filter: camera_visible_min_distance_10m
+  - /apps/prod/Hyperion-8.1/options/visible_track_split: pedestrians_5s
+  - /apps/prod/Hyperion-8.1/options/static_rigid_track_generation: traffic_light_fused_004
+
+  # Layer initialization and temporal appearance.
+  - /apps/prod/Hyperion-8.1/options/background_init: accumulated_point_cloud_fused_004_650000
+  - /apps/prod/Hyperion-8.1/options/background_ignore_classes: road_traffic_light
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_init: camera_tracks_300000_step_5
+  - /apps/prod/Hyperion-8.1/options/dynamic_deformables_init: camera_tracks_300000_step_5
+  - /apps/prod/Hyperion-8.1/options/dynamic_deformables_model: interpolated_table_10hz
+  - /apps/prod/Hyperion-8.1/options/road_init: camera_ground_mesh_fused_004
+  - /apps/prod/Hyperion-8.1/options/road_optimizer: geometry_lrs_position_1e-6_density_1e-2_scale_1e-3_rotation_1e-4
+  - /apps/prod/Hyperion-8.1/options/static_rigids_layer: camera_tracks_150000
+  - /apps/prod/Hyperion-8.1/options/traffic_light_layer: camera_tracks_step_time
+  - /model/gaussians/models@model.layers.vehicle_lights: vehicle_light_rigid_gaussians
+  - /model/gaussians/extra_signal@model.layers.vehicle_lights.extra_signal:
+      [semantic_logits]
+  - /model/gaussians/initialization@model.layers.vehicle_lights.initialization: camera_vehicle_light_tracks
+  - /model/tracks_calib@model.layers.vehicle_lights.tracks_calib: skip
+  - /model/gaussians/models@model.layers.static_vehicle_lights: vehicle_light_rigid_gaussians
+  - /model/gaussians/extra_signal@model.layers.static_vehicle_lights.extra_signal:
+      [semantic_logits]
+  - /model/gaussians/initialization@model.layers.static_vehicle_lights.initialization: camera_vehicle_light_tracks
+  - /model/tracks_calib@model.layers.static_vehicle_lights.tracks_calib: skip
+  - /apps/prod/options/temporal_appearance@model.layers.dynamic_rigids: fourier_features_dim_20
+  - /apps/prod/options/temporal_appearance@model.layers.background: fourier_features_dim_5
+
+  # Training strategy and optimizers.
+  - /apps/AV/module_mixins/_mcmc_mixin.yaml
+  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "2300000"
+  - /apps/prod/Hyperion-8.1/options/mcmc_excluded_layers: road
+  - /apps/prod/Hyperion-8.1/options/mcmc_layer_policy: lidarfree_vehicle_lights_interpolated_deformables
+  - /apps/prod/Hyperion-8.1/options/gaussian_optimizer: selective_adam
+  - /apps/prod/options/construction_barriers: random_cuboids
+
+  # Losses and rendering.
+  - /apps/prod/Hyperion-8.1/options/lidar_loss_weight: "0"
+  - /apps/prod/Hyperion-8.1/options/gaussian_flatten_loss: weight_0_ratio_threshold_5
+  - /apps/prod/Hyperion-8.1/options/distance_loss: log_l1_weight_0
+  - /apps/prod/Hyperion-8.1/options/node_semantic_loss: exclude_road_all_layers
+  - /apps/prod/Hyperion-8.1/options/background_in_track_loss: person_vehicle_traffic_light_bce_1e-1
+  - /apps/prod/Hyperion-8.1/options/renderer_culling: lidar_unlimited_camera_1000m
+
+  # Checkpointing and runtime behavior.
+  - /apps/prod/Hyperion-8.1/options/checkpoint_interval: end_of_training
+  - /apps/prod/Hyperion-8.1/options/runtime_gc: usage_75e-2_every_100_steps
+  # Camera-side active tile masking only: skip camera tiles whose pixels are all
+  # RayFlags.INVALID. This preset has no production lidar, so the lidar-overlap strategy
+  # would have nothing to crop; camera_invalid_only changes no supervision terms.
+  - /apps/prod/Hyperion-8.1/options/active_tile_mask: camera_invalid_only
+
+  # Config-group overrides inherited from the base recipe.
+  - override /model/gaussians/strategy@model.strategy: mcmc
+  - override /model/post_processing@model.post_processing.b: ppisp
+  - override /model/post_processing@model.post_processing.c: null
+  - override /logger: dummy
+
+  - _self_
+
+dataset:
+  # Camera depth and normal losses are disabled in this preset. Keep auxiliary
+  # data available to initialization and validation, but do not decode and
+  # transform their labels for random training batches.
+  load_aux_depth_in_train: false
+  load_aux_normal_in_train: false
+
+checkpoint:
+  artifact:
+    firing_patterns:
+      # `lidar_virtual` is a synthetic stream, not a unit: its points sit at the origin, so
+      # every direction comes back non-finite and there is no firing pattern to measure.
+      enabled: false
+
+model:
+  layers:
+    vehicle_lights:
+      motion_source_layer: dynamic_rigids
+      tracks:
+        label_classes: ${model.layers.dynamic_rigids.tracks.label_classes}
+        is_dynamic: true
+      initialization:
+        camera_ids: ${dataset.camera_ids}
+        num_point_cloud_points_in_layer: 15000
+
+    static_vehicle_lights:
+      motion_source_layer: static_rigids
+      tracks:
+        label_classes: ${model.layers.static_rigids.tracks.label_classes}
+        is_dynamic: false
+      initialization:
+        camera_ids: ${dataset.camera_ids}
+        num_point_cloud_points_in_layer: 5000

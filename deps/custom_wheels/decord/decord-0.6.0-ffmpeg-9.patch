@@ -1,0 +1,188 @@
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes cmake/util/FindFFmpeg.cmake, src/audio/audio_reader.cc and other decord sources of decord 0.6.0 (NVIDIA fork).
+
+diff --git a/cmake/util/FindFFmpeg.cmake b/cmake/util/FindFFmpeg.cmake
+index 88249f9..f6a9948 100644
+--- a/cmake/util/FindFFmpeg.cmake
++++ b/cmake/util/FindFFmpeg.cmake
+@@ -30,25 +30,17 @@ if (FFMPEG_DIR)
+       ${FFMPEG_DIR}/lib/libswresample.dylib
+     )
+   elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+-    if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+-      set(FFMPEG_LIBRARIES
+-        ${FFMPEG_DIR}/libavformat.so
+-        ${FFMPEG_DIR}/libavfilter.so
+-        ${FFMPEG_DIR}/libavcodec.so
+-        ${FFMPEG_DIR}/libavutil.so
+-        ${FFMPEG_DIR}/libavdevice.so.58
+-        ${FFMPEG_DIR}/libswresample.so
+-      )
+-    else()
+-      set(FFMPEG_LIBRARIES
+-        ${FFMPEG_DIR}/lib/libavformat.so
+-        ${FFMPEG_DIR}/lib/libavfilter.so
+-        ${FFMPEG_DIR}/lib/libavcodec.so
+-        ${FFMPEG_DIR}/lib/libavutil.so
+-        ${FFMPEG_DIR}/lib/libavdevice.so
+-        ${FFMPEG_DIR}/lib/libswresample.so
+-      )
+-    endif()
++    # One layout for both architectures. The aarch64 branch this replaces expected the
++    # shared objects directly under FFMPEG_DIR and named libavdevice by its ffmpeg 4
++    # soname, which only suited the apt packages; FFMPEG_DIR is a prefix we build.
++    set(FFMPEG_LIBRARIES
++      ${FFMPEG_DIR}/lib/libavformat.so
++      ${FFMPEG_DIR}/lib/libavfilter.so
++      ${FFMPEG_DIR}/lib/libavcodec.so
++      ${FFMPEG_DIR}/lib/libavutil.so
++      ${FFMPEG_DIR}/lib/libavdevice.so
++      ${FFMPEG_DIR}/lib/libswresample.so
++    )
+   else()
+     set(FFMPEG_LIBRARIES
+       ${FFMPEG_DIR}/lib/libavformat.lib
+diff --git a/src/audio/audio_reader.cc b/src/audio/audio_reader.cc
+index ee1d87e..1946edf 100644
+--- a/src/audio/audio_reader.cc
++++ b/src/audio/audio_reader.cc
+@@ -128,7 +128,7 @@ namespace decord {
+                 pCodecParameters = tempCodecParameters;
+                 originalSampleRate = tempCodecParameters->sample_rate;
+                 if (targetSampleRate == -1) targetSampleRate = originalSampleRate;
+-                numChannels = tempCodecParameters->channels;
++                numChannels = tempCodecParameters->ch_layout.nb_channels;
+                 break;
+             }
+         }
+@@ -148,7 +148,6 @@ namespace decord {
+         if (codecOpenRet < 0) {
+             char errstr[200];
+             av_strerror(codecOpenRet, errstr, 200);
+-            avcodec_close(pCodecContext);
+             avcodec_free_context(&pCodecContext);
+             avformat_close_input(&pFormatContext);
+             LOG(FATAL) << "ERROR open codec through avcodec_open2: " << errstr;
+@@ -209,7 +208,6 @@ namespace decord {
+         DrainDecoder(pCodecContext, pFrame);
+         // clean up
+         av_frame_free(&pFrame);
+-        avcodec_close(pCodecContext);
+         swr_close(swr);
+         swr_free(&swr);
+         avcodec_free_context(&pCodecContext);
+@@ -227,7 +225,7 @@ namespace decord {
+         // allocate resample buffer
+         float** outBuffer;
+         int outLinesize = 0;
+-        int outNumChannels = av_get_channel_layout_nb_channels(mono ? AV_CH_LAYOUT_MONO : pFrame->channel_layout);
++        int outNumChannels = mono ? 1 : pFrame->ch_layout.nb_channels;
+         numChannels = outNumChannels;
+         int outNumSamples = av_rescale_rnd(pFrame->nb_samples,
+                                            this->targetSampleRate, pFrame->sample_rate, AV_ROUND_UP);
+@@ -276,11 +274,21 @@ namespace decord {
+         if (!this->swr) {
+             LOG(FATAL) << "ERROR Failed to allocate resample context";
+         }
+-        if (pCodecContext->channel_layout == 0) {
+-            pCodecContext->channel_layout = av_get_default_channel_layout( pCodecContext->channels );
++        if (!av_channel_layout_check(&pCodecContext->ch_layout)) {
++            av_channel_layout_default(&pCodecContext->ch_layout,
++                                      pCodecContext->ch_layout.nb_channels);
+         }
+-        av_opt_set_channel_layout(this->swr, "in_channel_layout",  pCodecContext->channel_layout, 0);
+-        av_opt_set_channel_layout(this->swr, "out_channel_layout", mono ? AV_CH_LAYOUT_MONO : pCodecContext->channel_layout,  0);
++        AVChannelLayout out_ch_layout;
++        if (mono) {
++            av_channel_layout_from_mask(&out_ch_layout, AV_CH_LAYOUT_MONO);
++        } else {
++            av_channel_layout_copy(&out_ch_layout, &pCodecContext->ch_layout);
++        }
++        av_opt_set_chlayout(this->swr, "in_chlayout",  &pCodecContext->ch_layout, 0);
++        av_opt_set_chlayout(this->swr, "out_chlayout", &out_ch_layout, 0);
++        // av_opt_set_chlayout copies the layout, and a custom order carries a heap
++        // allocation, so release our copy once the resampler has taken it.
++        av_channel_layout_uninit(&out_ch_layout);
+         av_opt_set_int(this->swr, "in_sample_rate",     pCodecContext->sample_rate,                0);
+         av_opt_set_int(this->swr, "out_sample_rate",    this->targetSampleRate,                0);
+         av_opt_set_sample_fmt(this->swr, "in_sample_fmt",  pCodecContext->sample_fmt, 0);
+diff --git a/src/video/ffmpeg/ffmpeg_common.h b/src/video/ffmpeg/ffmpeg_common.h
+index b0b973f..f0f7316 100644
+--- a/src/video/ffmpeg/ffmpeg_common.h
++++ b/src/video/ffmpeg/ffmpeg_common.h
+@@ -21,6 +21,7 @@
+ extern "C" {
+ #endif
+ #include <libavcodec/avcodec.h>
++#include <libavcodec/bsf.h>
+ #include <libavformat/avformat.h>
+ #include <libavformat/avio.h>
+ #include <libavfilter/avfilter.h>
+diff --git a/src/video/ffmpeg/filter_graph.cc b/src/video/ffmpeg/filter_graph.cc
+index 1913c9c..c74c83c 100644
+--- a/src/video/ffmpeg/filter_graph.cc
++++ b/src/video/ffmpeg/filter_graph.cc
+@@ -6,6 +6,13 @@
+ 
+ #include "filter_graph.h"
+ 
++#include <string>
++
++// av_get_pix_fmt_name lives in pixdesc.h.
++extern "C" {
++#include <libavutil/pixdesc.h>
++}
++
+ #include <dmlc/logging.h>
+ 
+ namespace decord {
+@@ -65,12 +72,18 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
+     /* buffer video sink: to terminate the filter chain. */
+ 	// buffersink_params = av_buffersink_params_alloc();
+ 	// buffersink_params->pixel_fmts = pix_fmts;
+-	CHECK_GE(avfilter_graph_create_filter(&buffersink_ctx_, buffersink, "out",
+-		NULL, NULL, filter_graph_.get()), 0) << "Cannot create buffer sink";
+-	// av_free(buffersink_params);
+-    // LOG(INFO) << "create filter sink";
+-    // CHECK_GE(av_opt_set_bin(buffersink_ctx_, "pix_fmts", (uint8_t *)&pix_fmts, sizeof(AV_PIX_FMT_RGB24), AV_OPT_SEARCH_CHILDREN), 0) << "Set bin error";
+-    CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN), 0) << "Set output pixel format error.";
++	// Allocate and initialise the sink in separate steps: ffmpeg rejects option changes
++	// once a filter is initialised, and avfilter_graph_create_filter does both at once.
++	// The option itself was renamed pix_fmts -> pixel_formats and takes format names.
++	buffersink_ctx_ = avfilter_graph_alloc_filter(filter_graph_.get(), buffersink, "out");
++	CHECK(buffersink_ctx_) << "Cannot create buffer sink";
++	std::string pix_fmt_names;
++	for (const enum AVPixelFormat *fmt = pix_fmts; *fmt != AV_PIX_FMT_NONE; ++fmt) {
++		if (!pix_fmt_names.empty()) pix_fmt_names += "|";
++		pix_fmt_names += av_get_pix_fmt_name(*fmt);
++	}
++	CHECK_GE(av_opt_set(buffersink_ctx_, "pixel_formats", pix_fmt_names.c_str(), AV_OPT_SEARCH_CHILDREN), 0) << "Set output pixel format error.";
++	CHECK_GE(avfilter_init_dict(buffersink_ctx_, NULL), 0) << "Cannot init buffer sink";
+ 
+     // LOG(INFO) << "create filter set opt";
+     /* Endpoints for the filter graph. */
+diff --git a/src/video/video_reader.cc b/src/video/video_reader.cc
+index af4858d..dc2c3ac 100644
+--- a/src/video/video_reader.cc
++++ b/src/video/video_reader.cc
+@@ -145,7 +145,7 @@ VideoReader::~VideoReader(){
+ 
+ void VideoReader::SetVideoStream(int stream_nb) {
+     if (!fmt_ctx_) return;
+-    AVCodec *dec;
++    const AVCodec *dec;
+     int st_nb = av_find_best_stream(fmt_ctx_.get(), AVMEDIA_TYPE_VIDEO, stream_nb, -1, &dec, 0);
+     // LOG(INFO) << "find best stream: " << st_nb;
+     CHECK_GE(st_nb, 0) << "ERROR cannot find video stream with wanted index: " << stream_nb;
+@@ -554,7 +554,10 @@ double VideoReader::GetRotation() const {
+     if (rotate && *rotate->value && strcmp(rotate->value, "0"))
+         theta = atof(rotate->value);
+ 
+-    uint8_t* displaymatrix = av_stream_get_side_data(active_st, AV_PKT_DATA_DISPLAYMATRIX, NULL);
++    const AVPacketSideData *side_data = av_packet_side_data_get(
++        active_st->codecpar->coded_side_data, active_st->codecpar->nb_coded_side_data,
++        AV_PKT_DATA_DISPLAYMATRIX);
++    const uint8_t* displaymatrix = side_data ? side_data->data : nullptr;
+     if (displaymatrix && !theta)
+         theta = -av_display_rotation_get((int32_t*) displaymatrix);
+ 

@@ -1,0 +1,894 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+This module defines the dependencies and extensions for the nurec project.
+"""
+
+module(
+    name = "nurec",
+    repo_name = "nurec_repo",
+)
+
+## platforms
+bazel_dep(name = "platforms", version = "1.1.0")
+
+## aspect_rules_lint
+bazel_dep(name = "aspect_rules_lint", version = "2.9.0")
+
+## buildifier_prebuilt
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.4")
+
+## aspect_rules_js
+bazel_dep(name = "aspect_rules_js", version = "3.4.1")
+
+## tar.bzl
+bazel_dep(name = "tar.bzl", version = "0.10.4")
+
+## Transitive dependency of aspect_rules_lint, we need a minimum of version
+## 0.5.4 for Bazel 9 compatibility. Remove this pin once aspect_rules_lint
+## raises its pin.
+bazel_dep(name = "rules_buf", version = "0.5.4")
+
+## rules_pkg
+bazel_dep(name = "rules_pkg", version = "1.3.0")
+
+## rules_cc
+bazel_dep(name = "rules_cc", version = "0.2.22")
+
+## rules_shell
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+## bazel skylib
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+
+## rules_uv
+bazel_dep(name = "rules_uv", version = "0.89.2")
+single_version_override(
+    module_name = "rules_uv",
+    patch_strip = 1,
+    patches = ["//bazel/rules_uv:rules_uv.patch"],
+    version = "0.89.2",
+)
+
+## rules_python
+bazel_dep(name = "rules_python", version = "2.3.2")
+single_version_override(
+    module_name = "rules_python",
+    patch_strip = 1,
+    patches = ["//bazel/rules_python:rules_python.patch"],
+    version = "2.3.2",
+)
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    configure_coverage_tool = True,
+    is_default = True,
+    python_version = "3.13",
+)
+
+# rules_python 2.3.2's bundled python-build-standalone catalog doesn't include the
+# 3.13.15 "20260807" release (it tops out at 3.13.13), so we register its download
+# URL + sha256 explicitly here
+# (the standard single_version_override mechanism for a build not in the catalog). The
+# 3.11.14 toolchain was in-catalog, which is why it needed no urls override. The urls
+# entry is the release-relative path resolved against the default base_url.
+python.single_version_override(
+    python_version = "3.13.15",
+    sha256 = {
+        "aarch64-unknown-linux-gnu": "68159637492dcf3501c0967b69e07665c3dda070fb42231737055f72963f66fc",
+        "x86_64-unknown-linux-gnu": "7253808c3413d9ebd03e76b3853c895b9287f12e0750a30fce1cbf430e516113",
+    },
+    strip_prefix = "python",
+    urls = ["20260807/cpython-{python_version}+20260807-{platform}-{build}.tar.gz"],
+)
+use_repo(python, "python_3_13", "python_versions")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+
+# Pin which hub the unified @pypi resolves packages from (gsplat consumes
+# torch through @pypi); without it the alphabetically-first hub wins.
+pip.default(default_hub = "nurec_pip_deps")
+pip.whl_mods(
+    additive_build_content = """
+# Make torch headers / libraries available to C++ rules
+
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+
+cc_library(
+    # Internal target, do not use directly. Use //deps/torch:torch_headers instead,
+    # which adds the CUDA header deps that torch headers transitively require
+    # but cannot be declared here because @cuda is not visible inside pip-generated repos.
+    name = 'torch_header_no_cuda_deps',
+    includes = [
+        'site-packages/torch/include',
+        'site-packages/torch/include/torch/csrc/api/include',
+    ],
+    hdrs = glob(['site-packages/torch/include/**/*.h']) + glob(['site-packages/torch/include/**/*.hpp']) + glob(['site-packages/torch/include/**/*.cuh']),
+)
+
+# ------------------------
+
+cc_import(
+    name = "libtorch_python",
+    shared_library = "site-packages/torch/lib/libtorch_python.so",
+)
+
+# ------------------------
+
+cc_import(
+    name = "libc10",
+    shared_library = "site-packages/torch/lib/libc10.so",
+)
+
+# ------------------------
+
+cc_import(
+    name = "libc10_cuda",
+    shared_library = "site-packages/torch/lib/libc10_cuda.so",
+)
+
+# ------------------------
+
+cc_import(
+    name = "libtorch",
+    shared_library = "site-packages/torch/lib/libtorch.so",
+)
+
+# ------------------------
+
+cc_import(
+    name = "libtorch_cpu",
+    shared_library = "site-packages/torch/lib/libtorch_cpu.so",
+)
+
+# ------------------------
+
+cc_import(
+    name = "libtorch_cuda",
+    shared_library = "site-packages/torch/lib/libtorch_cuda.so",
+)
+""",
+    hub_name = "whl_mods_hub",
+    whl_name = "torch",
+)
+pip.whl_mods(
+    additive_build_content = """
+# Make tcnn headers / libraries available to C++ rules
+
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+
+cc_library(
+    name = 'tinycudann_headers',
+    includes = [
+        'site-packages/tinycudann/rtc/include'
+    ],
+    hdrs = glob(['site-packages/tinycudann/rtc/include/**/*']),
+)
+
+# ------------------------
+""" +
+                             "\n".join(["""
+cc_import(
+    name = "lib_tinycudann_{0}_{1}",
+    shared_library = "site-packages/tinycudann_bindings/_{0}_C.cpython-313-{1}-linux-gnu.so",
+)""".format(GPU_ARCH, CPU_ARCH) for GPU_ARCH in [
+                                 70,
+                                 75,
+                                 80,
+                                 86,
+                                 89,
+                                 90,
+                                 100,
+                                 120,
+                             ] for CPU_ARCH in [
+                                 "x86_64",
+                                 "aarch64",
+                             ]]),
+    hub_name = "whl_mods_hub",
+    whl_name = "tinycudann",
+)
+pip.whl_mods(
+    additive_build_content = """
+# Make numpy headers available to C++ rules
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = 'numpy_headers',
+    includes = [
+        'site-packages/numpy/core/include',
+    ],
+    hdrs = glob(['site-packages/numpy/core/include/**/*.h']),
+)
+""",
+    hub_name = "whl_mods_hub",
+    whl_name = "numpy",
+)
+
+# Patch triton to enhance libcuda.so detection and apply an arch cap for SM
+# versions not supported by CUDA 12.8.
+[
+    pip.override(
+        file = "triton-3.6.0-cp313-cp313-manylinux_2_27_%s.manylinux_2_28_%s.whl" % (CPU_ARCH, CPU_ARCH),
+        patch_strip = 1,
+        patches = [
+            "deps/triton/triton.patch",
+        ],
+    )
+    for CPU_ARCH in [
+        "x86_64",
+        "aarch64",
+    ]
+]
+
+# Patch slangtorch to prefer the Bazel-pinned slangc from runfiles (so runtime
+# JIT matches the build-time slang), falling back to the bundled binary.
+pip.override(
+    file = "slangtorch-1.3.18-py3-none-any.whl",
+    patch_strip = 1,
+    patches = [
+        "deps/slangtorch/slangtorch.patch",
+    ],
+)
+
+# Patch mmengine to add force=True to Adafactor registration to avoid duplicate
+# registration conflict with transformers
+pip.override(
+    file = "mmengine-0.10.5-py3-none-any.whl",
+    patch_strip = 1,
+    patches = [
+        "deps/mmengine/mmengine.patch",
+    ],
+)
+
+# Patch zarr 2.18.2 for compatibility with numcodecs>=0.16, which renamed two
+# functions that zarr imports (cbuffer_sizes and cbuffer_metainfo) to private names.
+pip.override(
+    file = "zarr-2.18.2-py3-none-any.whl",
+    patch_strip = 1,
+    patches = [
+        "deps/zarr/zarr.patch",
+    ],
+)
+use_repo(pip, "whl_mods_hub")
+
+EXTRA_HUB_ALIASES = {
+    "torch": [
+        "torch_header_no_cuda_deps",
+        "libtorch_python",
+        "libc10",
+        "libc10_cuda",
+        "libtorch",
+        "libtorch_cpu",
+        "libtorch_cuda",
+    ],
+    "tinycudann": ["tinycudann_headers"] + ["lib_tinycudann_%s_%s" % (GPU_ARCH, CPU_ARCH) for GPU_ARCH in [
+        70,
+        75,
+        80,
+        86,
+        89,
+        90,
+        100,
+        120,
+    ] for CPU_ARCH in [
+        "x86_64",
+        "aarch64",
+    ]],
+    "numpy": [
+        "numpy_headers",
+    ],
+}
+
+WHL_MODIFICATIONS = {
+    "@whl_mods_hub//:torch.json": "torch",
+    "@whl_mods_hub//:tinycudann.json": "tinycudann",
+    "@whl_mods_hub//:numpy.json": "numpy",
+}
+
+pip.parse(
+    timeout = 3000,
+    enable_implicit_namespace_pkgs = True,
+    # Stop the tensorrt-cu12 sdist's setup.py "pip-inside-pip hack" from running a
+    # nested, unscoped `pip install` that silently redirects to pypi.nvidia.com and
+    # pollutes the hermetic Python toolchain.
+    # With this set, setup.py declares tensorrt-cu12-libs/-bindings as normal
+    # install_requires instead.
+    environment = {"NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP": "1"},
+    extra_hub_aliases = EXTRA_HUB_ALIASES,
+    hub_name = "nurec_pip_deps",
+    python_version = "3.13",
+    requirements_by_platform = {
+        "//deps/python:requirements_3_13_x86_64.txt": "linux_x86_64",
+    },
+    whl_modifications = WHL_MODIFICATIONS,
+)
+pip.parse(
+    timeout = 3000,
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "nurec_pip_deps_docs",
+    python_version = "3.13",
+    requirements_lock = "//deps/python:requirements_3_13_docs.txt",
+)
+pip.parse(
+    timeout = 3000,
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "nurec_pip_deps_mypy",
+    python_version = "3.13",
+    requirements_lock = "@nurec_repo//bazel/typing:mypy_version.txt",
+)
+use_repo(pip, "nurec_pip_deps", "nurec_pip_deps_docs", "nurec_pip_deps_mypy")
+
+## rules_py
+bazel_dep(name = "aspect_rules_py", version = "1.12.1")
+single_version_override(
+    module_name = "aspect_rules_py",
+    patch_strip = 1,
+    patches = ["//bazel/aspect_rules_py:aspect_rules_py.patch"],
+    version = "1.12.1",
+)
+
+## rules_cuda
+# Currently on a mainline commit ahead of the 0.3.0 release. That latest
+# release does not support aarch64 yet.
+bazel_dep(name = "rules_cuda")
+archive_override(
+    module_name = "rules_cuda",
+    patch_strip = 1,
+    patches = ["//bazel/cuda:rules_cuda.patch"],
+    sha256 = "897c49b775086d24197104034f052c2b8670835d47cfbcc0148423dee567c5ce",
+    strip_prefix = "rules_cuda-b283e98359bed46b1178892183b65b860a4a547a",
+    urls = ["https://github.com/bazel-contrib/rules_cuda/archive/b283e98359bed46b1178892183b65b860a4a547a.tar.gz"],
+)
+
+cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
+
+# Hermetic 12.8.0 toolkit
+cuda.redist_json(
+    name = "rules_cuda_redist_json",
+    platforms = [
+        "linux-sbsa",
+        "linux-x86_64",
+    ],
+    sha256 = "daa0d766b36feaa933592162c27be5fb63b68fc547ca6886c160a35d96ee8891",
+    version = "12.8.0",
+)
+cuda.toolkit(name = "cuda")
+use_repo(cuda, "cuda")
+
+# CUDA compat (forward-compatibility) driver libraries, fetched as a raw apt
+# .deb and extracted in bazel/cuda_compat.
+# CUDA 12.8.0's redistributable JSON (what rules_cuda draws the rest of the
+# toolkit from) has no datacenter cuda_compat archive. But when upgrading to
+# a newer CUDA release it should be possible to revisit this implementation
+# and move away from the .deb.
+cuda_compat_deb = use_repo_rule("//bazel/cuda_compat:defs.bzl", "cuda_compat_deb")
+
+cuda_compat_deb(
+    name = "cuda_compat",
+    cuda_version = "12-8",
+    sha256_sbsa = "56a1ee17f857059acc1c52955f747391304db37158b6bcfed72c11d6ce777f0c",
+    sha256_x86_64 = "e980bf55b8d1f6390f07968df46644c971a52f4e4129067d33d1445fac716893",
+    version = "570.211.01-0ubuntu1",
+)
+
+## rules_oci
+bazel_dep(name = "rules_oci", version = "2.3.0")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "nurec_run_image_oci",
+    # Multi-arch base, the digest used here is a manifest index digest.
+    digest = "sha256:98cf839d18758e70ad2a65ba94879873a09626a06d66c737c64885e5567b3029",
+    image = "nurec/base:run-v16",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64",
+    ],
+)
+
+# We use only "nurec_run_image_oci" in BUILD files, the arch-specific
+# variants are direct dependencies that Bazel warns about if we don't import explicitly.
+use_repo(oci, "nurec_run_image_oci", "nurec_run_image_oci_linux_amd64", "nurec_run_image_oci_linux_arm64")
+
+## toolchains_llvm
+bazel_dep(name = "toolchains_llvm", version = "1.9.0")
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    llvm_version = "16.0.4",
+)
+use_repo(llvm, "llvm_toolchain")
+
+## npm / pnpm
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    npmrc = "//deps/npm:.npmrc",
+    pnpm_lock = "//deps/npm:pnpm-lock.yaml",
+)
+use_repo(npm, "npm")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+
+# Allows developers to use the matching pnpm version, for example:
+# bazel run -- @pnpm --dir /home/runner/work/rules_js/rules_js install
+use_repo(pnpm, "pnpm")
+
+## rules_multitool
+bazel_dep(name = "rules_multitool", version = "1.11.1")
+
+# rules_uv already registers its lockfile with multitool; we only need the repo for generate_lock.
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+use_repo(multitool, "multitool")
+
+# rules_multirun
+bazel_dep(name = "rules_multirun", version = "0.14.0")
+
+## pigz
+bazel_dep(name = "pigz", version = "2.8.bcr.1")
+
+## ninja
+bazel_dep(name = "ninja", version = "1.12.1.bcr.2")
+
+# ----------------------------------------------------------------------------------
+
+## external repositories
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# mypy_integration
+http_archive(
+    name = "mypy_integration",
+    patch_args = ["-p1"],
+    patches = [
+        "@nurec_repo//:bazel/typing/mypy.patch",
+    ],
+    sha256 = "7bb11a48aa12b0f0d951831d960232607dcbae4fab1ceca9ebd1feec75caada5",
+    strip_prefix = "bazel-mypy-integration-39321959f1ea5a1b54af2a9a6e3072d58923adeb",
+    urls = ["https://github.com/bazel-contrib/bazel-mypy-integration/archive/39321959f1ea5a1b54af2a9a6e3072d58923adeb.tar.gz"],
+)
+
+# mmseg
+http_archive(
+    name = "mmseg_repo",
+    build_file = "//deps/mmseg_repo:mmseg_repo.BUILD",
+    patch_args = ["-p1"],
+    patches = ["//deps/mmseg_repo:mmseg_gpu_io.patch"],
+    sha256 = "a98f50ba2c45cca225d79221242ea898629949478026db1a458f7dedddf45992",
+    strip_prefix = "mmseginference-8748ac0938a6471547f57c379bd7564f09723614-8748ac0938a6471547f57c379bd7564f09723614",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mmseg_repo/archive.tar.gz"],
+)
+
+# PAI -> NCore V4 converter. The nvidia-ncore wheel packages only ncore/, so build the tools/
+# sources from the repo at the same revision as the wheel pin. Replace with a plain wheel
+# dependency once the converter ships in nvidia-ncore. Patched locally to decode camera video in
+# presentation order (deps/ncore_pai_converter).
+http_archive(
+    name = "ncore_pai_converter",
+    build_file_content = """
+load("@rules_python//python:defs.bzl", "py_library")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+
+py_library(
+    name = "pai_converter",
+    srcs = glob([
+        "tools/debug.py",
+        "tools/data_converter/cli.py",
+        "tools/data_converter/pai/*.py",
+        "tools/data_converter/pai/pai_remote/*.py",
+    ]),
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        pip_requirement("click"),
+        # tools/data_converter/cli.py imports tools.debug at module scope, which needs debugpy.
+        pip_requirement("debugpy"),
+        pip_requirement("DracoPy"),
+        pip_requirement("imageio"),
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("pandas"),
+        pip_requirement("pillow"),
+        pip_requirement("pyarrow"),
+        pip_requirement("PyNvVideoCodec"),
+        pip_requirement("remotezip"),
+        pip_requirement("requests"),
+        pip_requirement("rich"),
+        pip_requirement("scipy"),
+        pip_requirement("tqdm"),
+        pip_requirement("universal-pathlib"),
+    ],
+)
+""",
+    patch_args = ["-p1"],
+    # Drop ncore's nested BUILD files; they would make tools/ sub-packages the glob cannot reach.
+    patch_cmds = ["find tools -name 'BUILD.bazel' -delete"],
+    patches = ["//deps/ncore_pai_converter:simpledecoder_order.patch"],
+    sha256 = "b70f00d77ed2088ea6be50d3eb35ad4f66e40c2476260daebaabd8000418dec8",
+    strip_prefix = "ncore-cbd8c16f3487186e8848e707eece0045ece3a058",
+    urls = ["https://github.com/NVIDIA/ncore/archive/cbd8c16f3487186e8848e707eece0045ece3a058.tar.gz"],
+)
+
+# gsplat, a Bazel module forwarding to its own CMake build; rules_foreign_cc
+# and the cmake/ninja/CUDA toolchains arrive transitively from its MODULE.bazel.
+# --config=local_gsplat overrides it with the deps/gsplat checkout.
+bazel_dep(name = "gsplat", version = "0.0.0")
+archive_override(
+    module_name = "gsplat",
+    sha256 = "33c7030b63ac07486baba62c46b234027dfe330608e9f261eed49eed16581c9f",
+    strip_prefix = "gsplat-b0cedf8dc9d17fa3386e866dd72bfd308a919327-b0cedf8dc9d17fa3386e866dd72bfd308a919327",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/gsplat/archive.tar.gz"],
+)
+
+# cosmos-predict1
+http_archive(
+    name = "cosmos_predict1",
+    build_file = "//deps/cosmos_predict1:cosmos_predict1.BUILD",
+    sha256 = "d8cdd8f3c034f9f664f79d555b4b3fa59fbfd910d6682ce17d34213de2efb031",
+    strip_prefix = "cosmos-predict1-2b446ebb36a7d19f22d293e0619be89ec2fbeb32",
+    urls = ["https://github.com/nvidia-cosmos/cosmos-predict1/archive/2b446ebb36a7d19f22d293e0619be89ec2fbeb32.tar.gz"],
+)
+
+# Harmonizer source for checkpoint-backed temporal inference.
+http_archive(
+    name = "harmonizer",
+    build_file = "//deps/harmonizer:harmonizer.BUILD",
+    patch_args = ["-p1"],
+    patches = [
+        "//deps/harmonizer:explicit_cosmos_path.patch",
+        "//deps/harmonizer:current_frame_decode.patch",
+    ],
+    sha256 = "ee96f3a2ddb1043d6e1d9d8f6785e8d9c93354ea173b3d0a96407f534aad39aa",
+    strip_prefix = "harmonizer-281af3eff3e81047de15d877332b5493ea5027bd",
+    urls = ["https://github.com/NVIDIA/harmonizer/archive/281af3eff3e81047de15d877332b5493ea5027bd.tar.gz"],
+)
+
+# eigen / numpyeigen
+http_archive(
+    name = "numpyeigen",
+    build_file = "//deps/numpyeigen:numpyeigen.BUILD",
+    sha256 = "1b77ab89d90d407f1c2af035df4a5b708e1ddac91882d488e59d82dc0da8ef60",
+    strip_prefix = "numpyeigen",
+    # source-repo: https://github.com/fwilliams/numpyeigen, commit e2ac640
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/repo-numpyeigen-e2ac640.tar.gz"],
+)
+
+http_archive(
+    name = "numpyeigen_pybind11",
+    build_file = "//deps/numpyeigen_pybind11:numpyeigen_pybind11.BUILD",
+    sha256 = "5a13e0e17621622e61f4ce706167b80d4844b31dfd01aa7ab5c9d1ae99d540a9",
+    strip_prefix = "pybind11",
+    # source-repo: https://github.com/fwilliams/pybind11, commit c230777e
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/repo-pybind11-c230777e.tar.gz"],
+)
+
+http_archive(
+    name = "eigen",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# TODO(janickm): Replace this with a better version, like from TensorFlow.
+# See https://github.com/tensorflow/tensorflow/tree/master/third_party/eigen3
+cc_library(
+    name = 'eigen',
+    includes = ['.'],
+    hdrs = glob(['Eigen/**']),
+    visibility = ['@numpyeigen//:__pkg__'],
+)
+""",
+    sha256 = "685adf14bd8e9c015b78097c1dc22f2f01343756f196acdc76a678e1ae352e11",
+    strip_prefix = "eigen-3.3.7",
+    urls = [
+        "https://gitlab.com/libeigen/eigen/-/archive/3.3.7/eigen-3.3.7.tar.bz2",
+    ],
+)
+
+# slang. A custom build (v2026.4 + PR #11040 + prelude bf16 fix): the only slang
+# that both compiles collector (broken on 2026.9+) and supports bf16 torch-binding.
+http_archive(
+    name = "slang_x86_64",
+    build_file = "//deps/slang:slang.BUILD",
+    sha256 = "d0a0540d24d7d2b3ef13d5a9ddb0397c7d1e882cefd13b43c70591d4d6a4071f",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/slang-2026.4-pr11040-linux-x86_64.tar.gz"],
+)
+
+http_archive(
+    name = "slang_aarch64",
+    build_file = "//deps/slang:slang.BUILD",
+    sha256 = "d29268d1f62b3677c2b86729ab2baa43c07ec57ac16c5ec7eaa389ac3ff91082",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/slang-2026.4-pr11040-linux-aarch64.tar.gz"],
+)
+
+# ----------------------------------------------------------------------------------
+
+## Pretrained model checkpoints
+
+http_file(
+    name = "sam2_egomask_weights",
+    downloaded_file_path = "sam2_hiera_l_avfinetuned_v1.pt",
+    sha256 = "db7f399a50c61212d2be4a261787f08c5e806b646d58b644675565f5ec81273c",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/sam2_hiera_l_avfinetuned_v1.pt"],
+)
+
+http_file(
+    name = "mask2former_weights",
+    downloaded_file_path = "mask2former_dinov2_nv_private12k_backboneTTA_76000.pth",
+    sha256 = "cfff9fef4f0b1597f467621abb0d1f280372000c18cd1b105dae3d1e825f6a0e",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_nv_private12k_backboneTTA_76000.pth"],
+)
+
+# Mask2Former TensorRT engines: one http_file per engine (not a single tarball) so
+# no archive approaches the ~5GB generic-package size limit and each engine is an
+# independent entry. Selected per (GPU, arch) in apps/av/aux_gen/estimators.py.
+# Build-time downloads baked into the nurec_tools image runfiles at <repo>/file/<engine>;
+# nothing is fetched from the registry at runtime.
+http_file(
+    name = "trt_engine_a40_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.6.A40.x86_64.fp16.dynamic.engine",
+    sha256 = "ef5066e725bdc2af512e6b44e77256d0eb27c6774b99e44072c9970f2e408ee8",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.6.A40.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_l40_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.x86_64.fp16.dynamic.engine",
+    sha256 = "494300de098d4d54f787451a2028bb4b4f06d3a1572dd845ac2aa8f962044ace",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_l40_aarch64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.aarch64.fp16.dynamic.engine",
+    sha256 = "3de7e235185ab8aa31b320926df272b6392fcc76fa7fb426586265b3dd524dd4",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.aarch64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_a100_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.0.A100.x86_64.fp16.dynamic.engine",
+    sha256 = "4febc0d327bd6452732f5e84f98e184e72280b4b27521360a63d54506ad53e65",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.0.A100.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_a6000_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.6.A6000.x86_64.fp16.dynamic.engine",
+    sha256 = "6bec613f26c2c3bf82ea318961d173cf9f45e7b8dd782382ddda0ba7326d80b4",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.6.A6000.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_ampereplus_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.ampereplus.x86_64.fp16.dynamic.engine",
+    sha256 = "258a2f07b5f05dced3fea7e7056a5c9ea9bc0f5edbe961bc6c92ec2c278581c4",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.ampereplus.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_ampereplus_aarch64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.ampereplus.aarch64.fp16.dynamic.engine",
+    sha256 = "c1a561f8f2aa21c3e51115a0335e67caac3954a05031379ec14f03b363de0410",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.ampereplus.aarch64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_5880_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.5880.x86_64.fp16.dynamic.engine",
+    sha256 = "5bca903a894ce6eca596ca6accb206bd7bacf4ee3e36b5cc5b77c34966c79f75",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.5880.x86_64.fp16.dynamic.engine"],
+)
+
+http_file(
+    name = "trt_engine_l4_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L4.x86_64.fp16.dynamic.engine",
+    sha256 = "fd3478eec3573010e264d6aa25ab6264df3d728ec36c5630bd63bf1fd124d6a7",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L4.x86_64.fp16.dynamic.engine"],
+)
+
+# big-lama inpainting weights for SimpleLama (nurec/models/background.py).
+# Fetched at build time to avoid the runtime download from GitHub, which
+# is the default path in the wheel.
+http_file(
+    name = "lama_model",
+    downloaded_file_path = "big-lama.pt",
+    sha256 = "7ba7aa7ac37a4d41fdbbeba3a2af7ead18058552997e3a3cd1a3b2210c9e6b4c",
+    urls = ["https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"],
+)
+
+# NVIDIA car models for demonstration purposes
+http_archive(
+    name = "nv_assets",
+    sha256 = "c7d738e6c9a16640db39c9a63783bc62fee75a6860d5d5a2b160c74324981a40",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/nv_assets.tar.gz"],
+)
+
+# ----------------------------------------------------------------------------------
+
+## unit test data
+
+http_archive(
+    name = "test_data_ncore_v4",
+    sha256 = "71c49736acb441b5d9210172f5035171cdba99b819a2d25dcca8e047376a45c3",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/test_data_ncore_v4.tar.gz"],
+)
+
+http_archive(
+    name = "test_data_prober_generated",
+    sha256 = "41c9ad7b66f2e8ee7da8ad1e5da7ed65af920bd1dc5e4fcc9976e0074de346c5",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/test_data_prober_generated.tar.gz"],
+)
+
+http_archive(
+    name = "test_config_25_05",
+    sha256 = "b434cc6451795eaf95a02c643c24431ee44486d7ef1ebd4e6ded619e0e311c39",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/test_config_25_05.tar.gz"],
+)
+
+# ------------------------------------------------------------------------------
+
+## Tracy profiler
+
+# Tracy default variant (CPU-only, no GPU profiling, no CUPTI dependency)
+http_archive(
+    name = "tracy",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = 'tracy',
+    srcs = ['public/TracyClient.cpp'],
+    hdrs = glob([
+        'public/tracy/*.h',
+        'public/tracy/*.hpp',
+        'public/common/*.h',
+        'public/common/*.hpp',
+        'public/client/*.h',
+        'public/client/*.hpp',
+        'public/libbacktrace/*.h',
+        'public/libbacktrace/*.hpp',
+    ]),
+    textual_hdrs = glob([
+        'public/common/*.cpp',
+        'public/client/*.cpp',
+        'public/libbacktrace/*.cpp',
+    ]),  # These are included by TracyClient.cpp
+    includes = ['public'],
+    defines = [
+        'TRACY_ENABLE',
+        'TRACY_NO_GPU=1',  # Explicitly disable GPU features
+        # Note: No TRACY_HAS_GPU for CPU-only build
+    ],
+    copts = [
+        '-include', 'cstring',  # Workaround for missing include in Tracy 0.12.2
+        '-Wno-unused-variable',  # Suppress unused variable warnings in Tracy 0.12.2
+        '-Wno-unused-result',    # Suppress unused result warnings in Tracy 0.12.2
+        '-Wno-unused-function',  # Suppress unused function warnings in Tracy 0.12.2
+    ],
+    linkopts = [
+        '-lpthread',
+        '-ldl',
+    ],
+    visibility = ['//visibility:public'],
+    alwayslink = True,  # Force all symbols to be linked
+    # Note: No CUPTI dependency for CPU-only build
+)
+
+cc_library(
+    name = 'tracy_headers',
+    hdrs = glob([
+        'public/tracy/*.h',
+        'public/tracy/*.hpp',
+        'public/common/*.h',
+        'public/common/*.hpp',
+        'public/client/*.h',
+        'public/client/*.hpp',
+        'public/libbacktrace/*.h',
+        'public/libbacktrace/*.hpp',
+    ]),
+    includes = ['public'],
+    visibility = ['//visibility:public'],
+)
+""",
+    patch_args = ["-p1"],
+    patches = ["//bazel/tracy:tracy.patch"],
+    sha256 = "09617765ba5ff1aa6da128d9ba3c608166c5ef05ac28e2bb77f791269d444952",
+    strip_prefix = "tracy-0.12.2",
+    urls = ["https://github.com/wolfpld/tracy/archive/refs/tags/v0.12.2.tar.gz"],
+)
+
+# Tracy GPU variant (full GPU profiling with CUPTI dependency)
+http_archive(
+    name = "tracy_gpu",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = 'tracy',
+    srcs = ['public/TracyClient.cpp'],
+    hdrs = glob([
+        'public/tracy/*.h',
+        'public/tracy/*.hpp',
+        'public/common/*.h',
+        'public/common/*.hpp',
+        'public/client/*.h',
+        'public/client/*.hpp',
+        'public/libbacktrace/*.h',
+        'public/libbacktrace/*.hpp',
+    ]),
+    textual_hdrs = glob([
+        'public/common/*.cpp',
+        'public/client/*.cpp',
+        'public/libbacktrace/*.cpp',
+    ]),  # These are included by TracyClient.cpp
+    includes = ['public'],
+    defines = [
+        'TRACY_ENABLE',
+        'TRACY_HAS_GPU',  # Enable GPU profiling features
+    ],
+    copts = [
+        '-include', 'cstring',  # Workaround for missing include in Tracy 0.12.2
+        '-Wno-unused-variable',  # Suppress unused variable warnings in Tracy 0.12.2
+        '-Wno-unused-result',    # Suppress unused result warnings in Tracy 0.12.2
+        '-Wno-unused-function',  # Suppress unused function warnings in Tracy 0.12.2
+    ],
+    linkopts = [
+        '-lpthread',
+        '-ldl',
+    ],
+    visibility = ['//visibility:public'],
+    alwayslink = True,  # Force all symbols to be linked
+    deps = [
+        '@cuda//:cupti',  # CUPTI dependency for GPU profiling
+    ],
+)
+
+cc_library(
+    name = 'tracy_headers',
+    hdrs = glob([
+        'public/tracy/*.h',
+        'public/tracy/*.hpp',
+        'public/common/*.h',
+        'public/common/*.hpp',
+        'public/client/*.h',
+        'public/client/*.hpp',
+        'public/libbacktrace/*.h',
+        'public/libbacktrace/*.hpp',
+    ]),
+    includes = ['public'],
+    visibility = ['//visibility:public'],
+)
+""",
+    patch_args = ["-p1"],
+    patches = ["//bazel/tracy:tracy.patch"],
+    sha256 = "09617765ba5ff1aa6da128d9ba3c608166c5ef05ac28e2bb77f791269d444952",
+    strip_prefix = "tracy-0.12.2",
+    urls = ["https://github.com/wolfpld/tracy/archive/refs/tags/v0.12.2.tar.gz"],
+)
+
+# ----------------------------------------------------------------------------------
+
+## local configuration
+
+# GPU info detection from local system
+gpu_info = use_repo_rule("//bazel/gpu_info:gpu_info.bzl", "gpu_info")
+
+gpu_info(name = "gpu_info")
+
+# ----------------------------------------------------------------------------------
+
+## hedron_compile_commands
+# helly25 fork adopted for Bazel 9 compatibility, move back to hedronvision if
+# this project becomes active again.
+bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+archive_override(
+    module_name = "hedron_compile_commands",
+    sha256 = "d32bc62018856ea8299ab43cc06e511c2e09e422d45be843d34c122c1180b802",
+    strip_prefix = "bazel-compile-commands-extractor-85d83bc1ee3ab8034d9c40f6900a0753688068b6",
+    urls = ["https://github.com/helly25/bazel-compile-commands-extractor/archive/85d83bc1ee3ab8034d9c40f6900a0753688068b6.tar.gz"],
+)
+
+# ----------------------------------------------------------------------------------

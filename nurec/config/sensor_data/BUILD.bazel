@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# HESAI Pandar128/AT128 lidar calibration data (manufacturer datasheet values,
+# https://www.hesaitech.com), loaded via NuRec's OmegaConf `load_json` resolver by
+# any config that references it under sensor/lidar_model.yaml.
+filegroup(
+    name = "sensor_data",
+    srcs = [
+        "hesai_at128.json",
+        "hesai_pandar128.json",
+    ],
+    visibility = ["//visibility:public"],
+)

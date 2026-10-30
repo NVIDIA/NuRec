@@ -1,0 +1,15 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Sipeng Zhang
+
+defaults:
+  - /apps/AV/_base_3dgut_dynamic.yaml
+  - /model/gaussians/extra_signal@model.layers.background.extra_signal: [semantic_logits]
+  - /model/gaussians/extra_signal@model.layers.road.extra_signal: [semantic_logits]
+  - /model/gaussians/extra_signal@model.layers.dynamic_deformables.extra_signal: [semantic_logits]
+  - /model/gaussians/extra_signal@model.layers.dynamic_rigids.extra_signal: [semantic_logits]
+  - override /model: gaussians/composite/dynamic_gaussians_road
+  - override /model/background: sky_env_map # These configs are geared towards novel view synthesis where the environment map can provide better results than an MLP
+  - override /loss: gaussians_av_road_semantic

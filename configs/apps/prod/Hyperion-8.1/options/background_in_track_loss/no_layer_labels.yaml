@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Apply the background-in-track loss without restricting it to semantic labels.
+
+loss:
+  background_in_track_gaussian:
+    layer_labels_to_use: {}

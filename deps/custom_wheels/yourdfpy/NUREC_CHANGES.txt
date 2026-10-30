@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+yourdfpy 0.0.58+nre1 - statement of changes
+
+This wheel is built from yourdfpy 0.0.58 (https://github.com/clemense/yourdfpy, MIT), with its
+packaging metadata modified by NVIDIA CORPORATION & AFFILIATES, 2026. No source file is changed.
+
+Changes:
+- setup.cfg: the trimesh[easy] requirement is replaced by trimesh.
+- Version set to the local version 0.0.58+nre1.

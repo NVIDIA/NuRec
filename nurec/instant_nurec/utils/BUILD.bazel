@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//nurec/instant_nurec:__subpackages__",
+]
+
+py_library(
+    name = "pylib_trajectory",
+    srcs = ["trajectory.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/utils:pylib_geometry",
+        "//nurec/utils:pylib_types",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_motion",
+    srcs = ["motion.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        # Type-check-time only: motion.py guards `from nurec.datasets.tracks import CuboidTracks`
+        # behind `if TYPE_CHECKING`, but mypy still resolves it. Without this dep edge, narrow
+        # mypy_test targets (e.g. blocks_test_mypy) raise [import-untyped].
+        "//nurec/datasets:pylib_tracks",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_cubemap",
+    srcs = ["cubemap.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/libs/vren:pylib",
+        "//nurec/models:pylib_background_sampling",
+        "//nurec/utils:pylib_profiling",
+        pip_requirement("torch"),
+        pip_requirement("einops"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "pylib_covariance",
+    srcs = ["covariance.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/utils:pylib_geometry",
+        pip_requirement("torch"),
+        pip_requirement("torch_scatter"),
+    ],
+)
+
+pytest_test(
+    name = "covariance_test",
+    srcs = ["covariance_test.py"],
+    deps = [
+        ":pylib_covariance",
+        "//nurec/utils:pylib_geometry",
+    ],
+)
+
+pytest_test(
+    name = "cubemap_test",
+    srcs = ["cubemap_test.py"],
+    deps = [
+        ":pylib_cubemap",
+        "//nurec/models:pylib_background_sampling",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "optim.py",
+        "sensor.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        ":pylib_cubemap",
+        ":pylib_motion",
+        ":pylib_trajectory",
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+    ],
+)
+
+# Shared helpers for the instant_nurec predict (//nurec/instant_nurec:run) entrypoint and the train/val/test/trainval/
+# predict entrypoint in a separate downstream training package.
+py_library(
+    name = "pylib_run_helpers",
+    srcs = ["run_helpers.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/utils:pylib_misc",
+        pip_requirement("torch"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+pytest_test(
+    name = "run_helpers_test",
+    srcs = ["run_helpers_test.py"],
+    deps = [
+        ":pylib_run_helpers",
+        "//nurec/instant_nurec/config:pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "sensor_test",
+    srcs = ["sensor_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)

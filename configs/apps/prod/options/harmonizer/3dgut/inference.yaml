@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - override /harmonizer: harmonizer
+
+harmonizer:
+  inference:
+    # Enable the inference-time diffusion harmonizer call to improve image quality after rendering
+    enabled: true

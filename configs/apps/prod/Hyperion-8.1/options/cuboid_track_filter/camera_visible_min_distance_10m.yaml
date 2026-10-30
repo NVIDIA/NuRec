@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Retain camera-visible cuboid tracks at least 10 meters long.
+
+dataset:
+  cuboid_tracks_params:
+    track_min_distance_m: 10.0
+    camera_visibility: true

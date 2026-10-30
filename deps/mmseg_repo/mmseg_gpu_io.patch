@@ -1,0 +1,295 @@
+diff --git a/mmseg/trt/mask2former_inferencer.py b/mmseg/trt/mask2former_inferencer.py
+index be8429d..3402d87 100644
+--- a/mmseg/trt/mask2former_inferencer.py
++++ b/mmseg/trt/mask2former_inferencer.py
+@@ -0,0 +1,4 @@
++# Modified by NVIDIA CORPORATION & AFFILIATES, 2026.
++# Changes: added a TensorRT GPU-resident I/O inference path.
++# Upstream project: https://github.com/open-mmlab/mmsegmentation
++# Licensed under the Apache License, Version 2.0.
+@@ -19,2 +23,3 @@
+ import numpy as np
+ import tensorrt as trt
++import torch
+@@ -132,1 +137,74 @@ class Mask2formerInferencer(TRTInferencer):
++    def infer_device(
++        self,
++        imgs: torch.Tensor,
++        stream: torch.cuda.Stream,
++    ) -> List[torch.Tensor]:
++        """Enqueue inference with CUDA-resident input and output buffers.
++
++        Args:
++            imgs: Contiguous CUDA tensor with shape
++                ``[max_batch_size, C, H, W]``, dtype and device matching the
++                engine input binding, and BGR channel order.
++            stream: CUDA stream on the engine input device. The caller owns
++                the stream and its synchronization.
++
++        Returns:
++            CUDA tensors that alias the TensorRT output bindings. They remain
++            valid only until the next inference overwrites those bindings, so
++            pipelined callers must copy them to request-owned tensors on
++            ``stream`` before enqueueing another inference.
++
++        Raises:
++            ValueError: If the input device, dtype, shape, or layout does not
++                match the fixed TensorRT binding.
++            RuntimeError: If TensorRT fails to enqueue inference.
++        """
++        engine_input = self.inputs[0]
++        expected_shape = (self.max_batch_size, *self._input_shape)
++        if imgs.device != engine_input.device.device:
++            raise ValueError(
++                f'input device {imgs.device} does not match engine device '
++                f'{engine_input.device.device}')
++        if imgs.dtype != engine_input.device.dtype:
++            raise ValueError(
++                f'input dtype {imgs.dtype} does not match engine dtype '
++                f'{engine_input.device.dtype}')
++        if tuple(imgs.shape) != expected_shape:
++            raise ValueError(
++                f'input shape {tuple(imgs.shape)} does not match engine shape '
++                f'{expected_shape}')
++        if not imgs.is_contiguous():
++            raise ValueError('infer_device expects a contiguous input tensor')
++
++        with torch.cuda.stream(stream):
++            if self.execute_v3:
++                if not self.context.set_tensor_address(
++                        engine_input.name, imgs.data_ptr()):
++                    raise RuntimeError(
++                        'TensorRT failed to bind Mask2Former device input')
++                enqueue_succeeded = self.context.execute_async_v3(
++                    stream_handle=stream.cuda_stream)
++                if not self.context.set_tensor_address(
++                        engine_input.name, engine_input.device_ptr):
++                    raise RuntimeError(
++                        'TensorRT failed to restore Mask2Former input binding')
++            else:
++                bindings = list(self.bindings)
++                try:
++                    input_binding_index = bindings.index(
++                        engine_input.device_ptr)
++                except ValueError as error:
++                    raise RuntimeError(
++                        'TensorRT Mask2Former input binding is missing') from error
++                bindings[input_binding_index] = imgs.data_ptr()
++                enqueue_succeeded = self.context.execute_async(
++                    batch_size=self.max_batch_size,
++                    bindings=bindings,
++                    stream_handle=stream.cuda_stream)
++            if not enqueue_succeeded:
++                raise RuntimeError('TensorRT failed to enqueue Mask2Former inference')
++            imgs.record_stream(stream)
++
++        return [out.device for out in self.outputs]
++
+     def __del__(self) -> None:
+         """Clear things up on object deletion."""
+         # Clear session and buffer
+diff --git a/mmseg/apis/__init__.py b/mmseg/apis/__init__.py
+index 1e41f8d..e5c3f0f 100644
+--- a/mmseg/apis/__init__.py
++++ b/mmseg/apis/__init__.py
+@@ -0,0 +1,4 @@
++# Modified by NVIDIA CORPORATION & AFFILIATES, 2026.
++# Changes: added a TensorRT GPU-resident I/O inference path.
++# Upstream project: https://github.com/open-mmlab/mmsegmentation
++# Licensed under the Apache License, Version 2.0.
+@@ -1,2 +5,4 @@
+ # Copyright (c) OpenMMLab. All rights reserved.
+-from .inference import inference_model, init_model, show_result_pyplot
++from .inference import (get_model_device_input_spec, inference_model,
++                        inference_model_device, init_model,
++                        show_result_pyplot)
+@@ -4,5 +10,7 @@
+ __all__ = [
+     'init_model',
+     'inference_model',
++    'get_model_device_input_spec',
++    'inference_model_device',
+     'show_result_pyplot',
+ ]
+diff --git a/mmseg/apis/inference.py b/mmseg/apis/inference.py
+index f278f7f..14ecf69 100644
+--- a/mmseg/apis/inference.py
++++ b/mmseg/apis/inference.py
+@@ -0,0 +1,4 @@
++# Modified by NVIDIA CORPORATION & AFFILIATES, 2026.
++# Changes: added a TensorRT GPU-resident I/O inference path.
++# Upstream project: https://github.com/open-mmlab/mmsegmentation
++# Licensed under the Apache License, Version 2.0.
+@@ -239,3 +243,172 @@
++def get_model_device_input_spec(
++        model: Union[BaseSegmentor, Mask2formerInferencer],
++        resolution: tuple) -> tuple:
++    """Return the CUDA input shape, dtype, and device for a model.
++
++    Args:
++        model: Initialized PyTorch segmentor or TensorRT inferencer.
++        resolution: Raw input resolution as ``(width, height)``.
++
++    Returns:
++        ``(shape, dtype, device)`` for a contiguous BGR input tensor.
++
++    Raises:
++        TypeError: If ``model`` is not a supported segmentor.
++        RuntimeError: If a PyTorch model has no parameters.
++    """
++    if isinstance(model, Mask2formerInferencer):
++        input_tensor = model.inputs[0].device
++        shape = (model.max_batch_size, *model._input_shape)
++        return tuple(int(value) for value in shape), input_tensor.dtype, input_tensor.device
++    if isinstance(model, BaseSegmentor):
++        try:
++            device = next(model.parameters()).device
++        except StopIteration as error:
++            raise RuntimeError('device inference model has no parameters') from error
++        width, height = (int(value) for value in resolution)
++        return (1, 3, height, width), torch.uint8, device
++    raise TypeError(
++        'device inference expects BaseSegmentor or Mask2formerInferencer, '
++        f'got {type(model)}')
++
++
++def inference_model_device(
++        model: Union[BaseSegmentor, Mask2formerInferencer],
++        img: torch.Tensor,
++        stream: torch.cuda.Stream) -> SegDataSample:
++    """Run segmentation from a CUDA-resident BGR image.
++
++    TensorRT inference binds the supplied image directly. PyTorch inference
++    implements the supported test-pipeline transforms with torch operations.
++
++    Args:
++        model: Initialized PyTorch segmentor or TensorRT inferencer.
++        img: Contiguous CUDA BGR tensor shaped ``[1, 3, H, W]``. TensorRT
++            requires its fixed binding dtype; PyTorch requires ``uint8``
++            values in ``[0, 255]``.
++        stream: CUDA stream owning preprocessing and model inference.
++
++    Returns:
++        A CUDA ``SegDataSample`` containing ``seg_logits.data`` as
++        ``[C, H, W]``, ``pred_sem_seg.data`` as ``[1, H, W]``, and optional
++        backbone features with the configured model shape and dtype.
++        TensorRT fields alias engine bindings and remain valid only until the
++        next inference.
++
++    Raises:
++        TypeError: If ``model`` is not a supported segmentor.
++        ValueError: If input, stream, device, or configured transforms are
++            incompatible with device inference.
++        RuntimeError: If inference returns incomplete outputs.
++    """
++    if img.device.type != 'cuda':
++        raise ValueError(f'device inference expects CUDA input, got {img.device}')
++    if img.ndim != 4 or tuple(img.shape[:2]) != (1, 3):
++        raise ValueError(
++            f'device inference expects [1, 3, H, W] input, got {tuple(img.shape)}')
++    if not img.is_contiguous():
++        raise ValueError('device inference expects contiguous input')
++    if stream.device != img.device:
++        raise ValueError(
++            f'device inference stream is on {stream.device}, input is on {img.device}')
++
++    height, width = (int(value) for value in img.shape[-2:])
++    expected_shape, expected_dtype, expected_device = \
++        get_model_device_input_spec(model, (width, height))
++    if tuple(img.shape) != expected_shape:
++        raise ValueError(
++            f'device inference input shape {tuple(img.shape)} does not match '
++            f'{expected_shape}')
++    if img.dtype != expected_dtype:
++        raise ValueError(
++            f'device inference input dtype {img.dtype} does not match '
++            f'{expected_dtype}')
++    if img.device != expected_device:
++        raise ValueError(
++            f'device inference input is on {img.device}, expected {expected_device}')
++
++    if isinstance(model, Mask2formerInferencer):
++        raw_outputs = model.infer_device(img, stream)
++        if len(raw_outputs) < 2:
++            raise RuntimeError(
++                f'TensorRT returned {len(raw_outputs)} outputs, expected at least 2')
++        prediction = SegDataSample()
++        prediction.seg_logits = PixelData(
++            data=raw_outputs[0].reshape(
++                len(model.dataset_meta['classes']), height, width))
++        prediction.pred_sem_seg = PixelData(
++            data=raw_outputs[1].reshape(1, height, width))
++        if len(raw_outputs) >= 3 and raw_outputs[2].numel():
++            prediction.backbone_feats = PixelData(
++                data=raw_outputs[2].reshape(
++                    tuple(model.cfg.trt_settings.backbone_feats_shape)))
++        return prediction
++
++    supported_transforms = {
++        'LoadAnnotations',
++        'LoadImageFromFile',
++        'LoadImageFromNDArray',
++        'PackSegInputs',
++        'Resize',
++    }
++    unsupported_transforms = [
++        transform.get('type') for transform in model.cfg.test_pipeline
++        if transform.get('type') not in supported_transforms
++    ]
++    if unsupported_transforms:
++        raise ValueError(
++            'CUDA-resident inference does not support test-pipeline transforms '
++            f'{unsupported_transforms}')
++    resize_transforms = [
++        transform for transform in model.cfg.test_pipeline
++        if transform.get('type') == 'Resize'
++    ]
++    if len(resize_transforms) > 1:
++        raise ValueError(
++            'CUDA-resident inference supports at most one Resize transform')
++
++    resized_height, resized_width = height, width
++    if resize_transforms:
++        resize = resize_transforms[0]
++        if 'scale' not in resize:
++            raise ValueError(
++                'CUDA-resident Resize requires an explicit (width, height) scale')
++        target_width, target_height = (int(value) for value in resize['scale'])
++        if resize.get('keep_ratio', False):
++            scale = min(target_width / width, target_height / height)
++            resized_height = int(height * scale + 0.5)
++            resized_width = int(width * scale + 0.5)
++        else:
++            resized_height, resized_width = target_height, target_width
++
++    with torch.no_grad(), torch.cuda.stream(stream):
++        model_input = img.to(dtype=torch.float32)
++        if (resized_height, resized_width) != (height, width):
++            model_input = torch.nn.functional.interpolate(
++                model_input,
++                size=(resized_height, resized_width),
++                mode='bilinear',
++                align_corners=False).round_()
++        data_sample = SegDataSample(
++            metainfo={
++                'ori_shape': (height, width),
++                'img_shape': (resized_height, resized_width),
++                'pad_shape': (resized_height, resized_width),
++                'scale_factor': (resized_width / width,
++                                 resized_height / height),
++                'padding_size': [0, 0, 0, 0],
++                'flip': False,
++            })
++        predictions = model.test_step({
++            'inputs': [model_input[0]],
++            'data_samples': [data_sample],
++        })
++    if len(predictions) != 1:
++        raise RuntimeError(
++            f'device inference returned {len(predictions)} predictions, expected 1')
++    return predictions[0]
++
++
+ def show_result_pyplot(
+     model: Union[BaseSegmentor, Mask2formerInferencer],
+     img: Union[str, np.ndarray],

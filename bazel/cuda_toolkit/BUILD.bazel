@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load(":defs.bzl", "cuda_toolkit_tree")
+
+# The compiler and the runtime core: nvcc and what code compiled at runtime
+# links against.
+_CORE = [
+    "@cuda//:cccl_all_files",
+    "@cuda//:cudart_all_files",
+    "@cuda//:nvcc_all_files",
+    "@cuda//:nvrtc_all_files",
+    "@cuda//:nvtx_all_files",
+]
+
+# Math components.
+_MATH = [
+    "@cuda//:cublas_all_files",
+    "@cuda//:cufft_all_files",
+    "@cuda//:curand_all_files",
+    "@cuda//:cusolver_all_files",
+    "@cuda//:cusparse_all_files",
+]
+
+# CMake resolves a toolkit out of one directory, so give gsplat's CMake build a
+# merged one holding the components it needs. Only ever a build input, never
+# runfiles.
+cuda_toolkit_tree(
+    name = "gsplat_build",
+    visibility = ["@gsplat//bazel:__pkg__"],
+    deps = _CORE + _MATH,
+)
+
+# Materialized in the runfiles of the targets that compile CUDA at runtime, with
+# CUDA_HOME pointing at it from the rules_python bootstrap. Torch headers
+# include cublas_v2.h and friends, so code compiled at runtime needs the math
+# headers, but the associated libraries are not needed for this use case: torch
+# and its dependencies load them from the nvidia-*-cu12 wheels.
+cuda_toolkit_tree(
+    name = "runtime",
+    header_only_deps = _MATH,
+    visibility = [
+        "//nurec/harmonizer:__pkg__",  # Transformer Engine
+        "//nurec/libs/slang_utils:__pkg__",  # Slangtorch JIT
+        "//nurec/models:__pkg__",  # tinycudann
+        "//nurec/utils/io/export/ppisp_export:__pkg__",  # Torch cpp_extension
+    ],
+    deps = _CORE,
+)

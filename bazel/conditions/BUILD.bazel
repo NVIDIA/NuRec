@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Config setting for enabling Mamba dependencies
+config_setting(
+    name = "mamba",
+    flag_values = {"//bazel/flags:mamba": "True"},
+    visibility = [
+        "//nurec/instant_nurec:__subpackages__",
+    ],
+)
+
+# Config setting for building all tools
+# Triggered when every individual tool flag is enabled
+config_setting(
+    name = "all_tools",
+    flag_values = {
+        "//bazel/flags:ncore_aux_data": "True",
+        "//bazel/flags:mask_annotator": "True",
+    },
+    visibility = [
+        "//apps:__pkg__",
+        "//deps/docker:__pkg__",
+    ],
+)
+
+# Individual tool conditions
+config_setting(
+    name = "ncore_aux_data",
+    flag_values = {"//bazel/flags:ncore_aux_data": "True"},
+    visibility = [
+        "//apps:__pkg__",
+        "//deps/docker:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "mask_annotator",
+    flag_values = {"//bazel/flags:mask_annotator": "True"},
+    visibility = [
+        "//apps:__pkg__",
+        "//deps/docker:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "coverage_mode",
+    define_values = {"cuda_coverage_dev": "true"},
+    visibility = ["//visibility:public"],
+)

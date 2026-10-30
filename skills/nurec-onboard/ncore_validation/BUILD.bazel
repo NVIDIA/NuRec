@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//skills/nurec-onboard:__subpackages__"])
+
+py_library(
+    name = "utils",
+    srcs = [
+        "__init__.py",
+        "utils.py",
+    ],
+    imports = [".."],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "validate_lib",
+    srcs = [
+        "validate.py",
+        "validate_cameras.py",
+        "validate_cross_sensor.py",
+        "validate_cuboids.py",
+        "validate_helpers.py",
+        "validate_lidar.py",
+        "validate_nurec.py",
+        "validate_poses.py",
+        "validate_structure.py",
+    ],
+    imports = [".."],
+    deps = [
+        ":utils",
+        "//skills/nurec-onboard/validators",
+        pip_requirement("click"),
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("pyyaml"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_binary(
+    name = "validate",
+    srcs = ["validate.py"],
+    main = "validate.py",
+    deps = [
+        ":validate_lib",
+    ],
+)
+
+py_binary(
+    name = "eval",
+    srcs = ["eval.py"],
+    main = "eval.py",
+    deps = [
+        ":utils",
+        ":validate_lib",
+        pip_requirement("click"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("scipy"),
+    ],
+)
+
+pytest_test(
+    name = "validate_test",
+    srcs = ["validate_test.py"],
+    deps = [
+        ":validate_lib",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("pyyaml"),
+        pip_requirement("scipy"),
+    ],
+)

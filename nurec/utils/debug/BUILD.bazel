@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", requirement_3_11 = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+SRCS = [
+    "__init__.py",
+    "remote_debug.py",
+]
+
+py_library(
+    name = "pylib",
+    srcs = SRCS,
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //apps/av/aux_gen:ncore_aux_data
+        "//apps/av/aux_gen:__pkg__",
+    ],
+    deps = [
+        requirement_3_11("debugpy"),
+        "//nurec/utils:pylib_misc",
+    ],
+)
+
+py_library(
+    name = "pylib_aux",
+    srcs = SRCS,
+    deps = [
+        requirement_3_11("debugpy"),
+    ],
+)
+
+mypy_test(
+    name = "pylib_mypy",
+    timeout = "long",
+    deps = [
+        ":pylib",
+    ],
+)

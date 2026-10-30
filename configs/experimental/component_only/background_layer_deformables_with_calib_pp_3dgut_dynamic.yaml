@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Example app: component-only 'background_layer_deformables_with_calib_pp' on top of the
+# /apps/AV/NV/3dgut_dynamic preset. See configs/component_only/background_layer_deformables_with_calib_pp.yaml.
+
+defaults:
+  - /apps/AV/NV/3dgut_dynamic
+  - /component_only: background_layer_deformables_with_calib_pp
+  - _self_
+
+system:
+  test:
+    val_render_selected_nodes: {}

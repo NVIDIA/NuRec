@@ -1,0 +1,27 @@
+--- a/src/pix2pix_turbo_harmonizer.py
++++ b/src/pix2pix_turbo_harmonizer.py
+@@ -0,0 +1,5 @@
++# Modified by NVIDIA CORPORATION & AFFILIATES, 2026.
++# Changes: explicit Cosmos checkpoint path handling; added a current-frame-only
++#          decode path (forward_current_only).
++# Original source: https://github.com/NVIDIA/harmonizer @ 281af3ef
++# Licensed under the Apache License, Version 2.0.
+@@ -371,3 +376,18 @@ class Pix2Pix_Turbo(torch.nn.Module):
+         torch.cuda.synchronize()
+         # print(f"----Total time: {time.time() - start_time:.4f} seconds")
+         return output_image
++
++    def forward_current_only(self, x, timesteps=None):
++        """Return only temporal slot zero, the current-frame Harmonizer output."""
++        assert len(x.shape) == 5, f"expected 5D input (B,C,V,H,W); got {x.shape}"
++
++        unet_input = self.vae_encode(x)
++        sigma_B_T = self.timesteps.to(dtype=unet_input.dtype) / 1000
++        z_denoised = self.unet.denoise(
++            xt_B_C_T_H_W=unet_input, sigma=sigma_B_T, condition=self.condition
++        ).x0
++        # Slot zero is the current frame. The tokenizer decoder is causal, so
++        # its slot-zero output cannot depend on later conditioning slots.
++        output_image = self.vae_decode(z_denoised[:, :, :1, :, :])
++
++        return output_image

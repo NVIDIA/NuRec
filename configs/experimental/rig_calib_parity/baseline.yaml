@@ -1,0 +1,67 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Reproduces the reference baseline used by the original rig-calibration study.
+# Supply dataset.path and out_dir at runtime.
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_lidarfree
+  - override /logger: tensorboard
+  - _self_
+
+seed: 42
+mode: trainval
+force_validate: true
+
+logger:
+  run_id: 01_clean_port_no_calib
+
+dataset:
+  camera_ids:
+    - camera_front_wide_120fov
+    - camera_cross_left_120fov
+    - camera_cross_right_120fov
+    - camera_front_tele_30fov
+  samplers:
+    batch_sampler:
+      camera_pixel_sampler:
+        subsample: 4
+  cuboid_tracks_params:
+    track_label_sources: [AUTOLABEL]
+  val_camera_ids: [camera_front_wide_120fov]
+  n_val_image_subsample: 4
+
+trainer:
+  max_epochs: 1
+  val_check_interval: null
+  log_every_n_steps: 50
+
+checkpoint:
+  every_n_train_steps: null
+  save_top_k: 0
+  fp16: true
+  strip_optimizer: true
+
+model:
+  renderer:
+    outputs:
+      camera:
+        enable_ray_gradients: true
+      lidar:
+        enable_ray_gradients: false
+  calib:
+    name: skip-calib
+    camera:
+      enabled: false
+    lidar:
+      enabled: false
+
+system:
+  record_quality_metrics:
+    psnr_interval: 50
+  test:
+    separate_val_dir_per_step: true
+    save_results: false
+    save_inputs: false
+    save_videos: false
+    save_extra_signals: false

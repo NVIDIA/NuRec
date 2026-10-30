@@ -1,0 +1,653 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+
+package nurec.grpc.protos.sensorsim;
+
+import "nurec/grpc/protos/common.proto";
+import "nurec/grpc/protos/ipc.proto";
+
+////////////////////////////////////////////////////////////////////////////////
+// Sensor simulator <-> Runtime
+////////////////////////////////////////////////////////////////////////////////
+
+message HarmonizerSessionId {
+    string session_id = 1;
+}
+
+service SensorsimService {
+    rpc render_rgb (RGBRenderRequest) returns (RGBRenderReturn) {
+        option deprecated = true;
+    }
+    rpc render_camera (CameraRenderRequest) returns (CameraRenderReturn);
+    rpc batch_render_rgb (BatchRGBRenderRequest) returns (BatchRGBRenderReturn) {
+        option deprecated = true;
+    }
+    rpc batch_render_camera (BatchCameraRenderRequest) returns (BatchCameraRenderReturn);
+    rpc render_lidar (LidarRenderRequest) returns (LidarRenderReturn);
+    // Open a temporal-harmonizer session holding the frame history for ONE coherent render
+    // sequence (a single trajectory). Use one session per sequence — reusing it across separate
+    // or interleaved sequences corrupts the temporal conditioning. Send the session's frames in
+    // trajectory order, one at a time (await each render before sending the next); concurrent or
+    // out-of-order requests build the history wrongly and are not rejected. Returns
+    // FAILED_PRECONDITION unless the server runs --enable-harmonizer-temporal.
+    rpc create_harmonizer_session (nurec.grpc.protos.common.Empty) returns (HarmonizerSessionId);
+    rpc end_harmonizer_session (HarmonizerSessionId) returns (nurec.grpc.protos.common.Empty);
+    rpc get_version (nurec.grpc.protos.common.Empty) returns (nurec.grpc.protos.common.VersionId);
+    rpc get_available_scenes (nurec.grpc.protos.common.Empty) returns (nurec.grpc.protos.common.AvailableScenesReturn);
+    rpc get_loaded_scenes (nurec.grpc.protos.common.Empty) returns (LoadedScenesReturn);
+    rpc get_available_cameras (AvailableCamerasRequest) returns (AvailableCamerasReturn);
+    rpc shut_down (nurec.grpc.protos.common.Empty) returns (nurec.grpc.protos.common.Empty);
+    rpc get_available_trajectories (AvailableTrajectoriesRequest) returns (AvailableTrajectoriesReturn);
+    rpc get_available_ego_masks (nurec.grpc.protos.common.Empty) returns (AvailableEgoMasksReturn);
+    rpc get_external_asset_objects (ExternalAssetObjectsRequest) returns (ExternalAssetObjectsReturn);
+    rpc edit_assets (EditAssetsRequest) returns (EditAssetsResponse);
+    rpc restore_model_parameters (RestoreModelParametersRequest) returns (nurec.grpc.protos.common.Empty);
+    rpc get_dynamic_objects (AvailableDynamicObjectsRequest) returns (AvailableDynamicObjectsReturn);
+    rpc get_server_config (nurec.grpc.protos.common.Empty) returns (ServerConfig);
+
+    // CUDA IPC session lifecycle. After open_ipc_session, render_rgb may be called
+    // with use_cuda_ipc=true to deliver the payload into one of the server-owned,
+    // pre-allocated buffers exported as cudaIpcMemHandle_t bytes in the open response.
+    rpc open_ipc_session  (nurec.grpc.protos.ipc.OpenIpcSessionRequest)  returns (nurec.grpc.protos.ipc.OpenIpcSessionResponse);
+    rpc close_ipc_session (nurec.grpc.protos.ipc.CloseIpcSessionRequest) returns (nurec.grpc.protos.ipc.CloseIpcSessionResponse);
+}
+
+message LoadedSceneEntry {
+    string scene_id = 1; // Scene ID for this group of cached instances.
+    uint64 loaded_instance_count = 2; // Cached instances for this scene: active + reusable.
+    uint64 reusable_instance_count = 3; // Spare instances for this scene available for checkout without loading.
+}
+
+message LoadedScenesReturn {
+    repeated LoadedSceneEntry scenes = 1; // Per-scene counts, sorted by scene_id.
+    uint64 loaded_instance_capacity = 2; // Global cached-instance capacity from BackendCache.maxsize.
+}
+
+message EgoMaskId {
+    string camera_logical_id = 1; // camera_front_wide_120fov, etc
+    string rig_config_id = 2; // hyperion 8.0, 8.1, etc
+}
+
+message AvailableEgoMasksReturn {
+    message EgoMaskMetadata {
+        EgoMaskId ego_mask_id = 1;
+        // future: extra metadata like nominal camera_to_rig pose
+    }
+
+    repeated EgoMaskMetadata ego_mask_metadata = 1;
+}
+
+enum ShutterType {
+    UNKNOWN = 0; // Unknown shutter type
+    ROLLING_TOP_TO_BOTTOM = 1; // Rolling shutter from top to bottom of the imager
+    ROLLING_LEFT_TO_RIGHT = 2; // Rolling shutter from left to right of the imager
+    ROLLING_BOTTOM_TO_TOP = 3; // Rolling shutter from bottom to top of the imager
+    ROLLING_RIGHT_TO_LEFT = 4; // Rolling shutter from right to left of the imager
+    GLOBAL = 5; //Instantaneous global shutter (no rolling shutter)
+}
+
+message LinearCde {
+    double linear_c = 1;
+    double linear_d = 2;
+    double linear_e = 3;
+}
+
+message FthetaCameraParam {
+    enum PolynomialType {
+        UNKNOWN = 0; // Unknown polynomial type
+        PIXELDIST_TO_ANGLE = 1; // Polynomial mapping pixeldistances-to-angles (also known as "backward" polynomial)
+        ANGLE_TO_PIXELDIST = 2; // Polynomial mapping angles-to-pixeldistances (also known as "forward" polynomial)
+    }
+
+    double principal_point_x = 1;
+    double principal_point_y = 2;
+
+    PolynomialType reference_poly = 3;
+
+    repeated double pixeldist_to_angle_poly = 4;
+
+    repeated double angle_to_pixeldist_poly = 5;
+
+    double max_angle = 6;
+
+    LinearCde linear_cde = 7;
+}
+
+// OpenCV pinhole camera model parameters
+message OpenCVPinholeCameraParam {
+    // Principal point coordinates (cx, cy) in pixels
+    double principal_point_x = 1;
+    double principal_point_y = 2;
+
+    // Focal lengths (fx, fy) in pixels
+    double focal_length_x = 3;
+    double focal_length_y = 4;
+
+    // Radial distortion coefficients [k1, k2, k3, k4, k5, k6]
+    repeated double radial_coeffs = 5;
+
+    // Tangential distortion coefficients [p1, p2]
+    repeated double tangential_coeffs = 6;
+
+    // Thin prism distortion coefficients [s1, s2, s3, s4]
+    repeated double thin_prism_coeffs = 7;
+}
+
+message OpenCVFisheyeCameraParam {
+   double principal_point_x = 1;
+
+   double principal_point_y = 2;
+
+   double focal_length_x = 3;
+
+   double focal_length_y = 4;
+
+   repeated double radial_coeffs = 5;
+
+   double max_angle = 6;
+}
+
+message BivariateWindshieldModelParameters {
+    enum ReferencePolynomial {
+        FORWARD = 0;
+        BACKWARD = 1;
+    }
+
+    ReferencePolynomial reference_poly = 1;
+
+    repeated double horizontal_poly = 2;
+
+    repeated double vertical_poly = 3;
+
+    repeated double horizontal_poly_inverse = 4;
+
+    repeated double vertical_poly_inverse = 5;
+}
+
+message CameraSpec {
+
+    string temporary_camera_spec = 1 [deprecated = true];
+
+    oneof camera_param {
+
+        FthetaCameraParam ftheta_param = 2;
+
+        OpenCVPinholeCameraParam opencv_pinhole_param = 3;
+
+        OpenCVFisheyeCameraParam opencv_fisheye_param = 4;
+    }
+    // these two are for book-keeping by the user
+    string logical_id = 5;
+    // DEPRECATED: This field is no longer used in alpasim runtime code and
+    // NuRec no longer supports multiple trajectories
+    uint32 trajectory_idx = 6 [deprecated = true];
+
+    uint32 resolution_h = 7;
+    uint32 resolution_w = 8;
+    ShutterType shutter_type = 9;
+
+    oneof external_distortion {
+        BivariateWindshieldModelParameters bivariate_windshield_model_param = 10;
+    }
+}
+
+message PosePair {
+    // represents poses at start and end of the frame
+    // TODO: replace with common.Trajectory (more general)
+    nurec.grpc.protos.common.Pose start_pose = 1;
+    nurec.grpc.protos.common.Pose end_pose = 2;
+}
+
+// Per-frame aspect state for one actor, fully resolved by the SENDER (an external
+// animator process). The renderer performs NO animation or
+// semantic evaluation: it shows exactly the named aspects and hides every other
+// baked cluster of that actor's asset edit. Aspect keys are the baked artifact's
+// cluster names (see the embedded asset-edits manifest), e.g. "appearancemode:alternate",
+// "appearancemode:shared:AssemblyL/part_2", "panelstate:on".
+message AspectState {
+    // The FULL set of visible aspects for THIS request's frame (stateless: the
+    // sender resends the complete set every request; an empty list explicitly HIDES
+    // every baked cluster this frame — zero opacity, nothing renders black).
+    repeated string aspects = 1;
+
+    // Optional per-aspect intensity for continuous fades, evaluated by the sender.
+    message AspectGain {
+        string aspect = 1;
+        // Scales the cluster's baked alphas (0..1). `optional` so an unset gain is
+        // distinguishable from 0.0: without presence, an entry added only to carry
+        // cold_rgb would arrive as 0.0 and hide the cluster entirely. Absent = 1.0.
+        optional float gain = 2;
+        // Color at gain 0 (element blends toward its baked color); empty = alpha-only.
+        repeated float cold_rgb = 3;
+    }
+    repeated AspectGain gains = 2;
+}
+
+message DynamicObject {
+    string track_id = 1;
+    PosePair pose_pair = 2;
+    // Presence of this field (even with empty aspects) means the sender drives this
+    // actor's aspects FOR THIS REQUEST ONLY; absence renders the actor's
+    // scheduled/baked state for this frame. The renderer keeps no aspect state
+    // between requests — senders must send the full set every frame.
+    //
+    // COMPATIBILITY: a server predating this field drops it as an unknown field and
+    // returns success having applied no edit. Check get_server_config for the key
+    // "asset_edits.aspect_state" (value "stateless-v1") before relying on it. A server
+    // that DOES support it validates addressing and fails the RPC with INVALID_ARGUMENT
+    // on an unknown track id or an aspect string the scene has no baked cluster for,
+    // so silence from a supporting server means the edit was applied.
+    optional AspectState aspect_state = 3;
+}
+
+enum ImageFormat {
+    UNDEFINED = 0;
+    PNG = 1;
+    JPEG = 2;
+    // AlpaSim currently only supports PNG and JPEG.
+    JPEG2000 = 3;
+    RGB_UINT8_PLANAR = 4;
+    AVC = 5;
+    AV1 = 6;
+
+}
+
+// Which image product to render and return. COLOR is the zero/default value, so a
+// default-constructed CameraRenderProduct is a legal (and natural) request.
+enum CameraRenderProduct {
+    CAMERA_RENDER_PRODUCT_COLOR = 0;
+    CAMERA_RENDER_PRODUCT_DISTANCE_COLORIZED = 1;   // metric ray distance (||point - camera|| in meters), turbo colormap
+    CAMERA_RENDER_PRODUCT_SEMANTICS_COLORIZED = 2;  // semantic class colors
+}
+
+// Source of tracks for overlaying bounding boxes on output camera images
+// UNSPECIFIED = no bbox overlay (default)
+// MODEL = Learned/calibrated tracks in the checkpoint.
+// ARTIFACT = sequence_tracks.json in the USDZ.
+enum OverlayBoundingBoxSource {
+    OVERLAY_BOUNDING_BOX_SOURCE_UNSPECIFIED = 0;
+    OVERLAY_BOUNDING_BOX_SOURCE_MODEL = 1;
+    OVERLAY_BOUNDING_BOX_SOURCE_ARTIFACT = 2;
+}
+
+// RGB color for bounding box wireframe edges. Unset = server default (0, 255, 0).
+// Each channel is 0-255; values outside this range are rejected with INVALID_ARGUMENT.
+message BboxColor {
+    uint32 r = 1;
+    uint32 g = 2;
+    uint32 b = 3;
+}
+
+message RGBRenderRequest {
+    // DEPRECATED - use CameraRenderRequest
+    option deprecated = true;
+
+    string scene_id = 1;
+
+    uint32 resolution_h = 2;
+    uint32 resolution_w = 3;
+
+    CameraSpec camera_intrinsics = 4;
+
+    fixed64 frame_start_us = 5;
+    fixed64 frame_end_us = 6;
+
+    PosePair sensor_pose = 7;
+
+    repeated DynamicObject dynamic_objects = 8;
+
+    ImageFormat image_format = 9;
+    float image_quality = 10;
+
+    bool insert_ego_mask = 11;
+    // if `insert_ego_mask` is true, `ego_mask_id` has to correspond to one of the ego masks in the AvailableEgoMasksReturn
+    EgoMaskId ego_mask_id = 12;
+
+    // 13..19 are intentionally left unused — `harmonizer_session_id` was given a
+    // gap to leave room for related fields (e.g. per-request harmonizer overrides).
+    // Mark them reserved so a future contributor can't accidentally collide.
+    reserved 13 to 19;
+
+    // On a server with temporal Harmonizer enabled, this field is required when apply_harmonizer
+    // is true; the render uses the session's HarmonizerState. When apply_harmonizer is false or
+    // unset, supplying this field resets that session's history so a later opt-in starts a fresh
+    // coherent sequence rather than conditioning on stale frames. If the server is non-temporal,
+    // this field is silently ignored.
+    // The id must identify a single coherent render sequence (see create_harmonizer_session).
+    optional string harmonizer_session_id = 20;
+
+    // Request Harmonizer postprocessing for this render. Unset or false leaves the color output
+    // unharmonized. On a temporal server, apply_harmonizer=true requires harmonizer_session_id. When
+    // apply_harmonizer is false or unset, a supplied ID resets that session; without an ID, no
+    // temporal session state changes. If apply_harmonizer is true and the server was not started
+    // with a Harmonizer mode enabled, the request fails with FAILED_PRECONDITION.
+    optional bool apply_harmonizer = 21;
+
+    // CUDA IPC delivery: when true, the server renders into one of the buffers
+    // exported by open_ipc_session for `ipc_session_id` and returns its id in
+    // RGBRenderReturn.buffer_id, leaving `image_bytes` empty. `released_buffer_id`,
+    // if set, tells the server the client is done reading that buffer (from a
+    // previous response) and it may be reused — omitted on the first request of a
+    // session.
+    bool            use_cuda_ipc       = 22;
+    string          ipc_session_id     = 23;
+    optional uint32 released_buffer_id = 24;
+}
+
+message CameraRenderRequest {
+    string scene_id = 1;
+
+    uint32 resolution_h = 2;
+    uint32 resolution_w = 3;
+
+    CameraSpec camera_intrinsics = 4;
+
+    fixed64 frame_start_us = 5;
+    fixed64 frame_end_us = 6;
+
+    PosePair sensor_pose = 7;
+
+    repeated DynamicObject dynamic_objects = 8;
+
+    ImageFormat image_format = 9;
+    float image_quality = 10;
+
+    bool insert_ego_mask = 11;
+    // if `insert_ego_mask` is true, `ego_mask_id` has to correspond to one of the ego masks in the AvailableEgoMasksReturn
+    EgoMaskId ego_mask_id = 12;
+
+    // Image products to render. Empty list defaults to a single COLOR output. Entries must be
+    // unique; the server returns one CameraRenderOutput per requested product in the same order.
+    repeated CameraRenderProduct render_products = 13;
+    // Draw 3D cuboid wireframes on every requested output (color, distance, semantics);
+    // selects the source of tracks. Set to UNSPECIFIED to disable.
+    OverlayBoundingBoxSource overlay_bounding_boxes = 14;
+    // Upper bound of the distance colormap (meters). Unset = server default (80 m).
+    optional float distance_colormap_vmax_m = 15;
+    // RGB color for bounding box wireframe edges. Unset = server default (0, 255, 0).
+    optional BboxColor bbox_color = 16;
+
+    // On a server with temporal Harmonizer enabled, this field is required when a colour request
+    // sets apply_harmonizer true; the render uses the session's HarmonizerState. When
+    // apply_harmonizer is false or unset, supplying this field resets that session's history so a
+    // later opt-in starts a fresh coherent sequence rather than conditioning on stale frames. If
+    // the server is non-temporal, this field is silently ignored.
+    // The id must identify a single coherent render sequence (see create_harmonizer_session).
+    // Only meaningful for the CAMERA_RENDER_PRODUCT_COLOR product.
+    optional string harmonizer_session_id = 17;
+
+    // Request Harmonizer postprocessing for this render. Unset or false leaves the color output
+    // unharmonized. On a temporal server, apply_harmonizer=true requires harmonizer_session_id. When
+    // apply_harmonizer is false or unset, a supplied ID resets that session; without an ID, no
+    // temporal session state changes. If apply_harmonizer is true and the server was not started
+    // with a Harmonizer mode enabled, the request fails with FAILED_PRECONDITION.
+    // Only meaningful for CAMERA_RENDER_PRODUCT_COLOR.
+    optional bool apply_harmonizer = 18;
+
+    // CUDA IPC delivery: when true, the server renders the CAMERA_RENDER_PRODUCT_COLOR product
+    // into one of the buffers exported by open_ipc_session for `ipc_session_id` and returns its
+    // id in the response's CameraRenderOutput.buffer_id, leaving `image_bytes` empty. Only a
+    // single CAMERA_RENDER_PRODUCT_COLOR render_products entry (or an empty render_products
+    // list, which defaults to COLOR) is supported with use_cuda_ipc=true -- any other product
+    // combination, or overlay_bounding_boxes set, aborts INVALID_ARGUMENT, since the IPC path
+    // never materializes a host-visible image for a bbox overlay or a second, differently-typed
+    // product buffer. `released_buffer_id`, if set, tells the server the client is done reading
+    // that buffer (from a previous response) and it may be reused — omitted on the first
+    // request of a session.
+    bool            use_cuda_ipc       = 19;
+    string          ipc_session_id     = 20;
+    optional uint32 released_buffer_id = 21;
+}
+
+message AvailableCamerasRequest {
+    string scene_id = 1;
+}
+
+message AvailableCamerasReturn {
+    message AvailableCamera {
+        CameraSpec intrinsics = 1;
+        nurec.grpc.protos.common.Pose rig_to_camera = 2; // should be camera_to_rig -> silently breaks things, deprecate and create duplicate? or just fix and let people know
+
+        string logical_id = 3;
+        // DEPRECATED: This field is no longer used in alpasim runtime code and
+        // NuRec no longer supports multiple trajectories
+        uint32 trajectory_idx = 4 [deprecated = true];
+    }
+
+    repeated AvailableCamera available_cameras = 1;
+}
+
+message AvailableTrajectoriesRequest {
+    string scene_id = 1;
+}
+
+message AvailableTrajectoriesReturn {
+    message AvailableTrajectory {
+        uint32 trajectory_idx = 1;
+        nurec.grpc.protos.common.Trajectory trajectory = 2;
+    }
+
+    repeated AvailableTrajectory available_trajectories = 1;
+}
+
+message ExternalAssetObjectsRequest {
+    string scene_id = 1;
+}
+
+message ExternalAssetObjectsReturn {
+    repeated string track_ids = 1;
+}
+
+// Per-class metadata when render_product is CAMERA_RENDER_PRODUCT_SEMANTICS_COLORIZED (index, name, display color 0-255)
+message SemanticsClassEntry {
+    int32 class_index = 1;
+    string class_name = 2;
+    uint32 color_r = 3;
+    uint32 color_g = 4;
+    uint32 color_b = 5;
+}
+
+message CameraRenderOutput {
+    bytes image_bytes = 1;
+    uint32 image_height = 2;
+    uint32 image_width = 3;
+    // Which product this buffer carries. Matches the corresponding entry in the
+    // request's render_products list (or COLOR for an empty request list).
+    CameraRenderProduct render_product = 4;
+    repeated SemanticsClassEntry semantics_class_mapping = 5;  // when output is semantics
+    optional float distance_colormap_vmax_m = 6; // when output is distance
+
+    // For CUDA IPC (request.use_cuda_ipc=true): format is the literal string
+    // "rgb_uint8_planar" and buffer_id is the server-selected buffer that now holds the
+    // rendered frame; image_bytes is left empty. Unset for the normal encoded-bytes path.
+    string format    = 7;
+    uint32 buffer_id = 8;
+}
+
+message CameraRenderReturn {
+    repeated CameraRenderOutput camera_render_outputs = 1;
+}
+
+message RGBRenderReturn {
+    option deprecated = true;
+    bytes image_bytes = 1;
+
+    string format    = 2;  // e.g. "rgb_uint8_planar"
+    // For CUDA IPC (use_cuda_ipc=true), the server-selected buffer id that now
+    // holds the rendered frame.
+    uint32 buffer_id = 3;
+}
+
+message BatchCameraRenderRequest {
+    repeated BatchCameraRenderRequestItem items = 1;
+}
+
+message BatchCameraRenderRequestItem {
+    string camera_name = 1;           // Identifier to match response
+    CameraRenderRequest request = 2;
+}
+
+// Batch camera render response
+message BatchCameraRenderReturn {
+    repeated BatchCameraRenderReturnItem items = 1;
+}
+
+message BatchCameraRenderReturnItem {
+    string camera_name = 1;           // Matches request camera_name
+    CameraRenderReturn result = 2;    
+    bool success = 3;                 
+    string error_message = 4;         
+}
+
+// Batch render request - multiple cameras in one call
+message BatchRGBRenderRequest {
+    // DEPRECATED - use BatchCameraRenderRequest
+    option deprecated = true;
+    repeated BatchRGBRenderRequestItem items = 1;
+}
+
+message BatchRGBRenderRequestItem {
+    string camera_name = 1;           // Identifier to match response
+    RGBRenderRequest request = 2;     // Full render request for this camera
+}
+
+// Batch render response
+message BatchRGBRenderReturn {
+    // DEPRECATED - use BatchCameraRenderReturn
+    option deprecated = true;
+    repeated BatchRGBRenderReturnItem items = 1;
+}
+
+message BatchRGBRenderReturnItem {
+    string camera_name = 1;           // Matches request camera_name
+    RGBRenderReturn result = 2;       // Rendered image bytes
+    bool success = 3;                 // True if render succeeded
+    string error_message = 4;         // Populated if success=false
+}
+
+enum LidarDeviceType {
+    PANDAR128 = 0;
+    AT128 = 1;
+}
+
+message LidarSpec {
+    //Currently, support the lidar model [PANDAR128, AT128]
+    //TODO: Add lidar parameteriazation
+    LidarDeviceType lidar_type = 2;
+}
+
+// Neighbour source for the floating-point ("flying pixel") filter (enable_distance_filter).
+enum LidarFloatingFilterSource {
+    // Structured 2D range-view grid. Requires a structured lidar model (the default path).
+    LIDAR_FLOATING_FILTER_SOURCE_RANGEVIEW = 0;
+    // Sensor-agnostic: bin sensor-frame elevation into rows, sort azimuth within a row,
+    // gradient along azimuth. Works for model-free / unstructured lidar.
+    LIDAR_FLOATING_FILTER_SOURCE_ANGLE = 1;
+}
+
+message LidarRenderFilter {
+    // Raydrop probability threshold [0-1]. Rays with raydrop > threshold are dropped.
+    // Default: use artifact config value (typically 0.5 for validation)
+    optional float raydrop_threshold = 1;
+
+    // Opacity threshold [0-1]. Rays with opacity <= threshold are dropped.
+    // Set to 0.0 to disable (matching validation behavior).
+    // Default: use artifact config value (0.8)
+    optional float opacity_threshold = 2;
+
+    // Enable distance-based edge filtering to remove floating points.
+    // Default: use artifact config value
+    optional bool enable_distance_filter = 3;
+
+    // Distance filter threshold [0-1]. Higher = fewer points filtered.
+    // Default: use artifact config value (0.02)
+    optional float distance_filter_threshold = 4;
+
+    // Neighbour source for the floating-point filter (gated by enable_distance_filter).
+    // Default: RANGEVIEW (use artifact config value). Use ANGLE for model-free lidar.
+    optional LidarFloatingFilterSource neighbor_source = 5;
+
+    // Angle source only: elevation row (scanline) spacing in degrees. Unset = auto-estimate
+    // from the frame (set explicitly for dense/continuous sensors, ~FOV_el / n_beams).
+    optional float elevation_resolution_deg = 6;
+
+    // Angle source only: max azimuth gap (deg) for two rays to count as neighbours (skips
+    // scan holes / seam). Unset = auto (3x the native azimuth spacing).
+    optional float azimuth_max_gap_deg = 7;
+}
+
+message LidarRenderReturn {
+    // The xyz of the lidar points in the end-of-spin lidar space
+    // [x1, y1, z1, x2, y2, z2, .....]
+    repeated float point_xyzs = 1;
+    // The intensity of the points
+    // range [0, 1]
+    repeated float point_intensities = 2;
+
+    uint32 num_points=3;
+    bytes point_xyzs_buffer = 4;
+    bytes point_intensities_buffer=5;
+}
+
+message LidarRenderRequest {
+
+    string scene_id = 1;
+
+    LidarSpec lidar_config = 2;
+
+    fixed64 frame_start_us = 3;
+    fixed64 frame_end_us = 4;
+
+    PosePair sensor_pose = 5;
+
+    repeated DynamicObject dynamic_objects = 6;
+
+    // Optional render filter. If not provided, uses artifact defaults.
+    LidarRenderFilter render_filter = 7;
+
+    // Which lidar of the artifact to render. May be omitted when the artifact
+    // has exactly one lidar; required on multi-lidar artifacts.
+    string lidar_id = 8;
+}
+
+message DynamicObjectTrack {
+    string id = 1;
+    string semantic_class = 2;
+    nurec.grpc.protos.common.Trajectory trajectory = 3;
+    nurec.grpc.protos.common.AABB object_size = 4;
+    string asset_id = 5;
+}
+
+message AvailableDynamicObjectsRequest {
+    string scene_id = 1;
+}
+
+message AvailableDynamicObjectsReturn {
+    repeated DynamicObjectTrack dynamic_objects = 1;
+}
+
+message ReplaceAssetAction {
+    string original_id = 1;
+    string replacement_id = 2;
+    nurec.grpc.protos.common.AABB object_size = 3;
+}
+
+message EditAssetsRequest {
+    string scene_id = 1;
+    repeated ReplaceAssetAction replace = 2;
+    repeated DynamicObjectTrack insert = 3;
+}
+
+message EditAssetsResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message RestoreModelParametersRequest {
+    string scene_id = 1;
+}
+
+message ServerConfig {
+    map<string, string> server_config = 1;
+}

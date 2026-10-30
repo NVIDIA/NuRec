@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - override /harmonizer: harmonizer
+
+harmonizer:
+  training:
+    enabled: true
+
+  inference:
+    enabled: false

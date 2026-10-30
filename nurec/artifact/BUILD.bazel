@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "artifact.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//nurec/benchmark:__pkg__",
+    ],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("pyyaml"),
+    ],
+)
+
+pytest_test(
+    name = "artifact_test",
+    size = "small",
+    srcs = [
+        "artifact_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_binary(
+    name = "info",
+    srcs = ["info.py"],
+    main = "info.py",
+    deps = [":pylib"],
+)
+
+py_wheel(
+    name = "wheel",
+    distribution = "nurec_artifact",
+    entry_points = {
+        "console_scripts": [
+            "usdz-info = nurec.artifact.info:main",
+        ],
+    },
+    homepage = "https://github.com/NVIDIA/NuRec",
+    platform = "any",
+    requires = [
+        "numpy",
+        "PyYAML",
+    ],
+    version = "0.2.1",
+    deps = [
+        ":info",
+        ":pylib",
+    ],
+)

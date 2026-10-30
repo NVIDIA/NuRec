@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - /instant_nurec/apps/options: _long_primitive_merge
+  - sensors@dataset.predict: h81_3cam_960
+
+out_dir: /instant_nurec_debug/long_primitive_merge_3cam

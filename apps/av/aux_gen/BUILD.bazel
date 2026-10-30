@@ -1,0 +1,329 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+
+# nurec:allow-direct-py-test - worker_spawn_test must run as an import-safe main so multiprocessing
+# `spawn` does not recursively start the repository's pytest launcher.
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+# ----------------------------------------------------------------------------------
+
+# Mask2Former TensorRT engines, one http_file per engine (see MODULE.bazel). Grouped
+# here so consumers reference a single target; each lands in runfiles at
+# trt_engine_<key>/file/<engine> (searched by find_network_file_path in estimators.py).
+filegroup(
+    name = "mask2former_trt_engines",
+    srcs = [
+        "@trt_engine_5880_x86_64//file",
+        "@trt_engine_a100_x86_64//file",
+        "@trt_engine_a40_x86_64//file",
+        "@trt_engine_a6000_x86_64//file",
+        "@trt_engine_ampereplus_aarch64//file",
+        "@trt_engine_ampereplus_x86_64//file",
+        "@trt_engine_l40_aarch64//file",
+        "@trt_engine_l40_x86_64//file",
+        "@trt_engine_l4_x86_64//file",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+################################################################
+# Deps list
+################################################################
+
+NCORE_AUX_DATA_DEPS = [
+    ":pylib_depth_estimator",
+    pip_requirement("torch"),
+    pip_requirement("nvidia-ncore"),
+    pip_requirement("click"),
+    pip_requirement("tqdm"),
+    pip_requirement("numpy"),
+    pip_requirement("zarr"),
+    pip_requirement("torchvision"),
+    pip_requirement("dataclasses_json"),
+    pip_requirement("point-cloud-utils"),
+    pip_requirement("universal-pathlib"),
+    pip_requirement("s3fs"),
+    pip_requirement("setuptools"),
+    pip_requirement("pillow"),
+    ":pylib_device_frame",
+    ":pylib_segmentation_device_pipeline",
+    ":pylib_estimators_aux",
+    ":pylib_device_frame_service",
+    ":pylib_shared_segmentation",
+    ":pylib_utils_aux",
+    "//nurec/ncore_backends:pylib",
+    "//nurec/utils:pylib_cli",
+    "//nurec/utils:pylib_ncore_types",
+    "//nurec/utils:pylib_files",
+    "//nurec/utils:pylib_ncore_utils",
+    "//nurec/utils:pylib_types",
+    "//nurec/utils/debug:pylib",
+]
+
+NCORE_AUX_DATA_DATA = [
+    "//:notices_file",
+]
+
+################################################################
+# Python libs
+################################################################
+
+py_library(
+    name = "pylib_trt_engine_selection",
+    srcs = ["trt_engine_selection.py"],
+)
+
+py_library(
+    name = "pylib_depth_estimator",
+    srcs = ["depth_estimator.py"],
+    visibility = [],
+    deps = [
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_device_frame",
+    srcs = ["device_frame.py"],
+    visibility = [],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_segmentation_device_pipeline",
+    srcs = ["segmentation_device_pipeline.py"],
+    visibility = [],
+    deps = [
+        ":pylib_device_frame",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_segmentation_presentation",
+    srcs = ["segmentation_presentation.py"],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+    ],
+)
+
+py_library(
+    name = "pylib_estimators_aux",
+    srcs = [
+        "estimators.py",
+    ],
+    data = [
+        ":mask2former_trt_engines",
+        "@mask2former_weights//file",
+        "@sam2_egomask_weights//file",
+    ],
+    deps = [
+        ":pylib_device_frame",
+        ":pylib_segmentation_device_pipeline",
+        ":pylib_segmentation_presentation",
+        ":pylib_trt_engine_selection",
+        ":pylib_utils_aux",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("point-cloud-utils"),
+        pip_requirement("sam2"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+        pip_requirement("torchvision"),
+        "//nurec/libs/vren:pylib",
+        "//nurec/utils:pylib_geometry",
+        "//nurec/utils:pylib_ncore_utils",
+        "@mmseg_repo//:pylib_aux",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_library(
+    name = "pylib_device_frame_service",
+    srcs = ["device_frame_service.py"],
+    deps = [
+        ":pylib_device_frame",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_shared_segmentation",
+    srcs = ["shared_segmentation.py"],
+    visibility = [],
+    deps = [
+        ":pylib_device_frame_service",
+        ":pylib_segmentation_device_pipeline",
+        ":pylib_segmentation_presentation",
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+    ],
+)
+
+py_library(
+    name = "pylib_utils_aux",
+    srcs = [
+        "utils.py",
+    ],
+    deps = [
+        pip_requirement("matplotlib"),
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "ncore_aux_data.py",
+    ],
+    visibility = [
+        "//apps:__pkg__",
+    ],
+    deps = NCORE_AUX_DATA_DEPS + ["//apps/av:pylib"],
+)
+
+################################################################
+# PyBinary rules
+################################################################
+
+py_binary(
+    name = "ncore_aux_data",
+    srcs = [
+        "ncore_aux_data_main.py",
+    ],
+    data = NCORE_AUX_DATA_DATA,
+    main = "ncore_aux_data_main.py",
+    visibility = [],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "ncore_aux_data_test",
+    srcs = ["ncore_aux_data_test.py"],
+    data = ["@test_data_ncore_v4//:ncore_clipgt_1sec"],
+    tags = ["exclusive"],
+    deps = [
+        ":pylib",
+        ":pylib_depth_estimator",
+        ":pylib_device_frame",
+        ":pylib_device_frame_service",
+        ":pylib_estimators_aux",
+        ":pylib_segmentation_device_pipeline",
+        ":pylib_segmentation_presentation",
+        pip_requirement("click"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+        "@mmseg_repo//:pylib_aux",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_library(
+    name = "worker_spawn_test_support",
+    testonly = True,
+    srcs = ["worker_spawn_test_support.py"],
+    visibility = [],
+    deps = [":pylib"],
+)
+
+py_test(
+    name = "worker_spawn_test",
+    timeout = "moderate",
+    srcs = ["worker_spawn_test.py"],
+    data = [
+        "@test_data_ncore_v4//:ncore_clipgt_1sec",
+    ],
+    main = "worker_spawn_test.py",
+    deps = [
+        ":pylib",
+        ":worker_spawn_test_support",
+        "//nurec/ncore_backends:pylib",
+        pip_requirement("universal-pathlib"),
+        "@rules_python//python/runfiles",
+    ],
+)
+
+mypy_test(
+    name = "worker_spawn_test_mypy",
+    deps = [
+        ":worker_spawn_test",
+    ],
+)
+
+pytest_test(
+    name = "device_frame_service_test",
+    srcs = ["device_frame_service_test.py"],
+    tags = ["exclusive"],
+    deps = [
+        ":pylib_device_frame",
+        ":pylib_device_frame_service",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "aux_gen_test",
+    timeout = "long",
+    srcs = [
+        "aux_gen_test.py",
+    ],
+    data = [
+        ":ncore_aux_data",
+        "@test_data_ncore_v4//:ncore_1sec",
+    ],
+    tags = ["exclusive"],
+    deps = [
+        ":ncore_aux_data",
+        ":pylib_utils_aux",
+        "//nurec/utils:pylib_ncore_utils",
+        pip_requirement("pytest-grpc"),
+        pip_requirement("grpcio"),  # required by pytest-grpc
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        "@rules_python//python/runfiles",
+    ],
+)
+
+pytest_test(
+    name = "trt_engine_selection_test",
+    srcs = ["trt_engine_selection_test.py"],
+    deps = [":pylib_trt_engine_selection"],
+)
+
+pytest_test(
+    name = "trt_torch_comparison_test",
+    timeout = "long",
+    srcs = [
+        "trt_torch_comparison_test.py",
+    ],
+    data = [
+        ":mask2former_trt_engines",
+        "@mask2former_weights//file",
+        "@test_data_ncore_v4//:ncore_1sec",
+    ],
+    tags = ["manual"],
+    deps = [
+        ":ncore_aux_data",
+        "//nurec/utils:pylib_ncore_utils",
+        pip_requirement("click"),
+        pip_requirement("grpcio"),  # required by pytest-grpc
+        pip_requirement("numpy"),
+        pip_requirement("pytest-grpc"),
+        "@rules_python//python/runfiles",
+    ],
+)

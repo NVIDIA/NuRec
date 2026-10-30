@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@rules_uv//uv:pip.bzl", "pip_compile")
+
+exports_files(
+    [
+        "requirements_3_13_overrides.in",
+        "requirements_3_13_x86_64.in",
+        "requirements_3_13_x86_64.txt",
+    ],
+    visibility = [],
+)
+
+# Copy gsplat's generated requirements beside requirements_3_13_common.in so its
+# `-r gsplat_requirements.in` line resolves during pip compile (no cross-repo path).
+copy_file(
+    name = "gsplat_requirements",
+    src = "@gsplat//bazel:pip_requirements",
+    out = "gsplat_requirements.in",
+)
+
+# Check that our compiled pip requirements are up-to-date
+pip_compile(
+    name = "requirements_3_13_x86_64",
+    size = "medium",
+    args = [
+        "--native-tls",
+        "--no-config",
+        "--generate-hashes",
+        "--emit-index-url",
+        "--emit-find-links",
+        "--index-strategy",
+        "unsafe-best-match",
+    ],
+    data = [
+        ":gsplat_requirements",
+        ":requirements_3_13_common.in",
+        ":requirements_3_13_transitive_deps_constraints.in",
+    ],
+    py3_runtime = "@python_3_13//:py3_runtime",
+    python_platform = "x86_64-manylinux_2_31",
+    requirements_in = "requirements_3_13_x86_64.in",
+    requirements_overrides = "requirements_3_13_overrides.in",
+    requirements_txt = "requirements_3_13_x86_64.txt",
+    target_compatible_with = ["@platforms//cpu:x86_64"],
+    visibility = [],
+)
+
+# Separate sets of requirements specific to docs builds.
+# Uses requirements_3_13_x86_64.txt as constraint to enforce matching package
+# versions, since we bring packages from both sets of requirements under the
+# same venv when building documentation.
+pip_compile(
+    name = "requirements_3_13_docs",
+    args = [
+        "--native-tls",
+        "--no-config",
+        "--generate-hashes",
+        "--emit-index-url",
+        "--emit-find-links",
+        "--index-strategy",
+        "unsafe-best-match",
+    ],
+    data = [":requirements_3_13_x86_64.txt"],
+    py3_runtime = "@python_3_13//:py3_runtime",
+    python_platform = "x86_64-manylinux_2_31",
+    requirements_in = "requirements_3_13_docs.in",
+    requirements_txt = "requirements_3_13_docs.txt",
+    visibility = [],
+)

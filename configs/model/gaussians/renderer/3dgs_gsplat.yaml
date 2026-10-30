@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GSplat Renderer Configuration (classic 3DGS formulation)
+#
+# Self-contained: does not inherit from any legacy renderer config so that their deprecation
+# can land without dragging this file along.
+
+name: 3dgs-gsplat
+
+# Conservative camera sizing per device/mode:
+#   3*pinhole + 2*fisheye + FTheta + transformed-K variants.
+# Conservative LiDAR geometry sizing per device/mode: 3*distinct geometries.
+# Each distinct LiDAR geometry/device/mode/tiling combination uses one frame
+# context entry. Count normal and inference separately when both are used.
+# Override any capacity with model.renderer.<setting>=<entries>.
+max_camera_tensor_cache_entries: 4096
+max_lidar_geometry_cache_entries: 1024
+max_lidar_frame_context_cache_entries: 1024
+
+# Output dtype of the Slang collector's SH coefficients into gsplat.
+sh_features_dtype: fp16
+
+# Rasterization mode for gsplat
+# Options: "classic" (standard 3DGS) or "antialiased" (Mip-Splatting)
+rasterize_mode: classic
+
+# 3dgs-gsplat does not support ray input, this must be False.
+use_rays: False
+
+# Unstructured lidar render requires the 3DGUT ray path; not supported here.
+lidar_unstructured: False
+
+# Logging level: [0=FATAL, 1=ERROR, 2=WARNING, 3=INFO, 4=DEBUG]
+log_level: 3
+
+# Note: GSplat uses PyTorch autograd for differentiation
+# No need for separate forward/backward pipeline configuration
+
+# option for future MGPU support (local preparation before global rendering)
+prepare_before_render: false
+
+# Selects the eval3d batch policy passed to gsplat.rasterization():
+# - mixed_batch:    serial fwd, parallel bwd (default)
+# - parallel_batch: not supported in 3dgs-gsplat
+renderer_config: mixed_batch
+
+culling:
+  near_clip_distance: 0.2
+  far_clip_distance_camera: 3.402823466e+38 # max float
+  far_clip_distance_lidar: 3.402823466e+38 # max float
+  # near_far_z_culling : for backward compatibility
+  near_far_z_culling: false
+
+antialiasing:
+  lidar_divergence: 0.002 # FIXME: move this to the sensor model
+
+profiling:
+  frequency: 0
+
+outputs:  # Per-sensor rendering output channels configuration
+  lidar:
+    enable_features: false              # Basic radiance features (RGB) - disabled for LiDAR as intensity is sensor-specific
+    enable_extended_features: true      # Additional computed features beyond radiance (e.g., semantic features)
+    enable_sensor_features: true        # Sensor-specific extended features (e.g., LiDAR intensity, reflectance)
+    enable_normals: false               # Surface normal computation - disabled for performance optimization
+    enable_ray_gradients: false         # Ray gradient computation for backpropagation - expensive, only enable when training calibration
+  camera:
+    enable_features: true               # Basic radiance features (RGB) - enabled for cameras as they capture visible light
+    enable_extended_features: true      # Additional computed features beyond radiance (e.g., depth, semantic labels)
+    enable_sensor_features: true        # Sensor-specific extended features (camera-specific processing)
+    enable_normals: false               # Surface normal computation - disabled for performance, enable for normal maps
+    enable_ray_gradients: false         # Ray gradient computation - enable only when training view-dependent calibration parameters
+  scene:
+    enable_cumulated_weights: false     # Enable per-element cumulated weights output
+    enable_visibility: false            # Enable per-element visibility mask output (GUT renderer only)

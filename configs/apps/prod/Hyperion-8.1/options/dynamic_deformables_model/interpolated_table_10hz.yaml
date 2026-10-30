@@ -1,0 +1,12 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use 10 Hz interpolated deformation tables with stable per-actor Gaussian rows.
+
+defaults:
+  # A table represents one continuous trajectory per source track. Splitting a
+  # visible track would instead initialize independent tables at the boundary.
+  - override /apps/prod/Hyperion-8.1/options/visible_track_split: disabled
+  - override /model/gaussians/models@model.layers.dynamic_deformables: interpolated_table_deformable_gaussians
+  - _self_

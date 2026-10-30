@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+opencv-python 4.10.0.84+nre5 - statement of changes (Apache License 2.0, section 4(b))
+
+This wheel is built from the opencv-python 4.10.0.84 sdist from PyPI
+(sha256 72d234e4582e9658ffea8e9cae5b63d488ad06994ef12d81dc303b17472f3526); OpenCV itself is
+licensed under the Apache License 2.0 and opencv-python's packaging under the MIT license. The
+upstream license files are retained. The files below were modified by NVIDIA CORPORATION &
+AFFILIATES, 2026. This file is the statement of changes; the modified files themselves carry no
+in-file notice.
+
+Source changes (opencv-4.10-ffmpeg-8.patch):
+- opencv/modules/videoio/src/cap_ffmpeg_impl.hpp: FFmpeg 8/9 compatibility. av_packet_side_data_get
+  replaces av_stream_get_side_data; avcodec_close is skipped for libavcodec >= 62; the removed
+  AVCodec supported_framerates array is read through avcodec_get_supported_config for
+  libavcodec >= 63.
+- opencv/modules/videoio/src/cap_ffmpeg_hw.hpp: the removed AVCodec pix_fmts array is read through
+  avcodec_get_supported_config for libavcodec >= 63.
+- cv2/version.py (opencv-python packaging, MIT): opencv_version stamped with the +nre5 local
+  version at build time.
+
+Build differences that are not source changes: the wheel is compiled against a shared LGPL
+FFmpeg 9.0.1 bundled by auditwheel (the upstream PyPI wheel bundles FFmpeg 5.1.x).

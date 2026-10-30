@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+# Formatting (Python with Ruff)
+alias(
+    name = "format",
+    actual = "//bazel/format:format",
+)
+
+alias(
+    name = "format.check",
+    actual = "//bazel/format:format.check",
+)

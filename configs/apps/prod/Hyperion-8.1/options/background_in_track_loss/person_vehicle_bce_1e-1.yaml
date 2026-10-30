@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Penalize background Gaussians inside person and vehicle tracks with weight 1e-1.
+
+loss:
+  background_in_track_gaussian:
+    fn: bce_with_logits
+    reduce:
+      name: mean
+    lambda_: 0.1
+    layer_names:
+      - background
+    layer_labels_to_use:
+      background: ["person", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"]

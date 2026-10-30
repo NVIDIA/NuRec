@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Limit MCMC growth to 2,000,000 Gaussians.
+
+model:
+  strategy:
+    add:
+      max_n_gaussians: 2_000_000

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+# NPM / PNPM package management
+npm_link_all_packages(name = "node_modules")
+
+py_binary(
+    name = "update_lock",
+    srcs = ["update_lock.py"],
+    args = ["$(rlocationpath @pnpm//:pnpm)"],
+    data = ["@pnpm"],
+    main = "update_lock.py",
+    deps = ["@rules_python//python/runfiles"],
+)
+
+pytest_test(
+    name = "check_lock_test",
+    srcs = ["check_lock_test.py"],
+    data = [
+        "package.json",
+        "pnpm-lock.yaml",
+    ],
+    deps = [pip_requirement("pyyaml")],
+)

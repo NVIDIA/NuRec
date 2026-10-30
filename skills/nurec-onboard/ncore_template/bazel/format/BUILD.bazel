@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@aspect_rules_lint//format:defs.bzl", "format_multirun")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# Wrapper that runs `ruff check --select I` (import sorting) + `ruff format`.
+# Pure `ruff format` does not sort imports or flag unused imports; the wrapper
+# closes that gap. See `ruff_isort.sh` for the upstream NCore reference.
+sh_binary(
+    name = "ruff-isort",
+    srcs = ["ruff_isort.sh"],
+    data = ["@multitool//tools/ruff"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+format_multirun(
+    name = "format",
+    python = ":ruff-isort",
+    starlark = "@buildifier_prebuilt//:buildifier",
+    starlark_check_args = [
+        "--mode=diff",
+        "--lint=warn",
+    ],
+    starlark_fix_args = [
+        "--lint=fix",
+    ],
+    visibility = ["//:__pkg__"],
+)

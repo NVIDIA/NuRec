@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "cuda_losses_function.py",
+    ],
+    deps = [
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/utils:pylib_cuda_rng",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)

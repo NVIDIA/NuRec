@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use camera-DCP autolabels for cuboid tracks.
+
+dataset:
+  cuboid_tracks_params:
+    track_label_sources:
+      - AUTOLABEL@camera-DCP

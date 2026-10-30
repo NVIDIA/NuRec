@@ -1,0 +1,20 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+checkpoint:
+  artifact:
+    enabled: true
+    compression:
+      enabled: false
+      level: 9
+      opacity_threshold: 0.005
+      exclude: []
+    checkpoint:
+      enabled: true
+    parsed_config:
+      enabled: true
+    rig_trajectories:
+      enabled: true
+    sequence_tracks:
+      enabled: true

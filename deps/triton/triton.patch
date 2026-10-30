@@ -1,0 +1,36 @@
+--- a/triton/backends/nvidia/compiler.py
++++ b/triton/backends/nvidia/compiler.py
+@@ -113,2 +113,6 @@
+ def sm_arch_from_capability(capability: int):
++    # NuRec: TRITON_OVERRIDE_SM_ARCH forces the literal sm_NNN string handed to
++    # nvrtc/ptxas.
++    if (override := os.environ.get("TRITON_OVERRIDE_SM_ARCH")):
++        return override
+     # TODO: Handle non-"a" sms
+@@ -451,2 +455,7 @@
+-        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
+-        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
++        # NuRec: when TRITON_OVERRIDE_SM_ARCH is set, route make_ptx/make_cubin
++        # through `capability` (parsed from options.arch, which honours
++        # TRITON_OVERRIDE_ARCH) instead of the raw self.target.arch, so the
++        # `.target sm_{capability}` directive emitted in PTX agrees with the cap.
++        arch = capability if os.environ.get("TRITON_OVERRIDE_SM_ARCH") else self.target.arch
++        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, arch)
++        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, arch)
+
+--- a/triton/backends/nvidia/driver.py
++++ b/triton/backends/nvidia/driver.py
+@@ -31,6 +31,12 @@ def libcuda_dirs():
+     env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
+     if env_ld_library_path and not dirs:
+         dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
++    env_ld_preload = os.getenv("LD_PRELOAD")
++    if env_ld_preload and not dirs:
++        preload_dirs = [Path(lib_path).parent for lib_path in env_ld_preload.split(":") if Path(lib_path).name.startswith("libcuda.so")]
++        if len(preload_dirs) > 0:
++            dirs = preload_dirs
++
+     msg = 'libcuda.so cannot found!\n'
+     if locs:
+         msg += 'Possible files are located at %s.' % str(locs)
+

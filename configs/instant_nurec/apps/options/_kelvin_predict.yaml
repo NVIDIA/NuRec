@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Dev variant — inherits from `_instant_nurec_predict_prod`. Layer experimental tweaks here.
+defaults:
+  # Relative include of the sibling prod YAML — avoids double-adding to the
+  # `instant_nurec/apps/options` group, which would happen with `/instant_nurec/apps/options: _instant_nurec_predict_prod`.
+  - _instant_nurec_predict_prod
+  - _self_
+
+# Distinct output directory keeps dev runs out of the prod prefix.
+out_dir: /instant_nurec_debug/kelvin_predict

@@ -1,0 +1,8 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize the background from an instant_nurec-predicted point cloud.
+
+defaults:
+  - override /model/gaussians/initialization@model.layers.background.initialization: instant_nurec_ply

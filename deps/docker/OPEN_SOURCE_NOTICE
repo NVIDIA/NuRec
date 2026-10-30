@@ -1,0 +1,15 @@
+This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia
+
+The attribution and license texts of the open source in this image are under /licenses;
+/licenses/THIRD-PARTY.txt lists where each part is.
+
+The source code of the Python wheels that NVIDIA builds or modifies for this distribution, with
+NVIDIA's changes to them, is in the nurec-dev-deps-enterprise container image of the same release
+tag on NGC, under /licenses/sources. /licenses/sources/README.md in that image lists each wheel
+with its upstream source and license.
+
+The Ubuntu packages of the run base image that the nurec-dev-deps-enterprise image carries under
+/opt/nvidia/nurec-build-deps are the ones in the nurec-enterprise image of the same release tag,
+and are archived with it at the URL above.
+
+For further inquiries or assistance, contact us at oss-requests@nvidia.com

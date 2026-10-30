@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("//bazel/pytest:defs.bzl", "pytest_test")
+load(":defs.bzl", "cuda_compat_tar")
+
+# Libraries shipped by the cuda-compat .deb, at their default location.
+cuda_compat_tar(
+    name = "compat_tar",
+    deb = "@cuda_compat//:deb",
+    prefix = "usr/local/cuda/compat",
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+    visibility = [
+        "//:__pkg__",
+        "//apps:__pkg__",
+        "//nurec/instant_nurec:__pkg__",
+    ],
+)
+
+pytest_test(
+    name = "compat_tar_test",
+    size = "small",
+    srcs = ["compat_tar_test.py"],
+    data = [":compat_tar"],
+    mypy = False,
+)

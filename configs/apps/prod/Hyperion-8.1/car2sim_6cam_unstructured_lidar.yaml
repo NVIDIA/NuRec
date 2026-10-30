@@ -1,0 +1,45 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: janickm
+#
+# car2sim_lidar + the model-free unstructured LiDAR path. The production-style
+# reference for unstructured reconstruction, and the B arm of the structured-vs-
+# unstructured A/B (A arm: car2sim_lidar).
+#
+# See nurec/datasets/README.md#model-free-unstructured-lidar for what the fields below mean; the field
+# docstrings live on nurec/config/dataset.py. This file only records the choices.
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_lidar
+  - _self_
+
+dataset:
+  lidar_ray_mode: unstructured
+  use_real_lidar_rays: true
+  # Genuinely model-free ray-drop supervision; requires use_real_lidar_rays=true.
+  lidar_unstructured_raydrop_virtual_rays: aggregate_lattice
+
+model:
+  renderer:
+    # Must pair with dataset.lidar_ray_mode=unstructured (enforced by NuRecConfig).
+    lidar_unstructured: true
+    # NOTE: car2sim_lidar selects active_tile_mask=camera_invalid_only, which is
+    # inherited here deliberately. That strategy masks CAMERA tiles only and
+    # leaves lidar rendering untouched, so it is compatible with (and inert for)
+    # the unstructured path, and keeping it makes this the single-variable B arm
+    # against car2sim_lidar. valid_camera_lidar_overlap would NOT be compatible:
+    # its lidar half needs a structured (n_rows, n_columns) sensor model to build
+    # the cam->lidar tile mapping, which the model-free path does not have --
+    # NuRecConfig rejects that combination.
+
+system:
+  test:
+    lidar:
+      # car2sim_lidar enables floating_point_filter, a distance-discontinuity filter.
+      # The default neighbor_source="rangeview" is defined on the 2D range-view grid,
+      # which the (N, 1) return list has no equivalent of; NuRecConfig rejects that
+      # pairing. Left disabled here; to run it on unstructured lidar set
+      # neighbor_source="angle" (sensor-agnostic, works from ray directions).
+      floating_point_filter:
+        enabled: false

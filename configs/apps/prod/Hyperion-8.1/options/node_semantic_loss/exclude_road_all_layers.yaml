@@ -1,0 +1,14 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Exclude road semantics from every Gaussian layer supervised by the node-semantic loss.
+
+loss:
+  node_semantic_gaussians:
+    layer_labels_to_exclude:
+      background: [road]
+      dynamic_rigids: [road]
+      dynamic_deformables: [road]
+      static_rigids: [road]
+      traffic_light: [road]

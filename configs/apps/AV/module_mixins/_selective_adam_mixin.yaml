@@ -1,0 +1,41 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Umar Javed
+# Every Gaussian-layer optimizer is SelectiveAdam, but visibility masking is toggled
+# per-group at runtime via the model.gaussian_*_selective flags:
+#   - gaussian_selective          — positions / rotations / features   (default: masked)
+#   - gaussian_density_selective  — densities                          (default: dense)
+#   - gaussian_scale_selective    — scales                             (default: dense)
+# Density and scale update densely by default so node_semantic, out_of_bound, and
+# visibility-filtered regularizers reach invisible Gaussians globally. Flip either
+# density or scale to selective by setting the corresponding flag (at launch, via
+# hydra override, or at runtime through self.config mutation).
+#
+# Density/scale regularization is visibility-filtered to prevent draining rarely-visible layers.
+
+model:
+  gaussian_optimizer_name: selective_adam
+  gaussian_density_optimizer_name: selective_adam
+  gaussian_scale_optimizer_name: selective_adam
+
+  # Flags — can be flipped mid-run without swapping optimizers.
+  gaussian_selective: true
+  gaussian_density_selective: false
+  gaussian_scale_selective: false
+
+  # Use non-occlusion-aware visibility for SelectiveAdam (simpler, slightly better empirically)
+  selective_adam_occlusion_aware: false
+
+  renderer:
+    outputs:
+      scene:
+        enable_visibility: true
+        enable_cumulated_weights: true
+
+loss:
+  gaussian_scale:
+    visibility_filter: true
+  gaussian_density:
+    visibility_filter: true

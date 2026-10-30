@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - ../ncore@_here_
+
+ncore_json_base_path: /instant_nurec_debug/data/celsius2_l3_55k_720p/
+ncore_json_list_path: /instant_nurec_debug/data/celsius2_l3_55k_720p/all.lst
+
+# Keep supervision aligned with the context cameras and add a moving-left Gen3C view for testing.
+supervision_camera_ids: "${add:${.context_camera_ids},[{ncore_path: gen3c/0.zarr.itar,camera_id: camera_front_wide_120fov,unique_sensor_idx: 0}]}"

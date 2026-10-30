@@ -1,0 +1,28 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Add a static traffic-light layer with camera-track initialization and step-function time embedding.
+
+defaults:
+  - /model/gaussians/models@model.layers.traffic_light: rigid_gaussians
+  - /model/gaussians/extra_signal@model.layers.traffic_light.extra_signal: [semantic_logits]
+  - /model/gaussians/initialization@model.layers.traffic_light.initialization: camera_dynamic_tracks
+  - /model/input_embedding@model.layers.traffic_light.time_embed: individual_step_time_gaussian
+  - /model/tracks_calib@model.layers.traffic_light.tracks_calib: skip
+  - _self_
+
+model:
+  layers:
+    traffic_light:
+      class_labels: ["traffic light"]
+      is_static: true
+      fourier_features_dim: 5
+      tracks:
+        label_classes:
+          - "generated traffic light"
+      initialization:
+        keep_all_track_poses: true
+        symmetric_axis: null
+        camera_ids: ${dataset.camera_ids}
+        step_frame: 5

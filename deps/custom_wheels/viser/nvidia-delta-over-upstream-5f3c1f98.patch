@@ -1,0 +1,164 @@
+diff --git a/.gitignore b/.gitignore
+index 35074b16..e522ef56 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,3 +17,4 @@ htmlcov
+ build
+ src/viser/client/build
+ src/viser/client/.nodeenv
++dist/
+\ No newline at end of file
+diff --git a/NRE_BUILD.md b/NRE_BUILD.md
+new file mode 100644
+index 00000000..1673af42
+--- /dev/null
++++ b/NRE_BUILD.md
+@@ -0,0 +1,33 @@
++# Build for NRE
++
++This package contains a dependency of `plyfile` which is GPL-licensed. Hence we have this clone to remove that dependency.
++
++## Build instructions
++
++```bash
++# Create a new conda environment
++conda create -n viser-build python=3.10
++conda activate viser-build
++
++# (Optionally) Append an additional identifier to the version number
++sed -i 's/__version__ = "\(.*\)"/__version__ = "\1+nre5"/' src/viser/__init__.py
++# Need to install (in editable mode) before running `sync_client_server.py`
++pip install -e ".[dev]"
++python sync_client_server.py
++
++# Follow the procedure documented in .github/publish.yml
++pip install build twine
++# Build client files.
++python -c "import viser; viser.ViserServer()"
++# This should delete everything in src/viser/client except for the
++# build folder + original source files. We don't want to package
++# .nodeenv, node_modules, etc in the release.
++rm -rf src/viser/client/.nodeenv
++rm -rf src/viser/client/node_modules
++
++# Build the package
++python -m build
++
++# Upload to Gitlab (NRE)
++twine upload --username $PYPI_USERNAME --password $PYPI_PASSWORD --repository-url <NVIDIA-internal-package-registry-url> dist/* --verbose --skip-existing
++```
+diff --git a/pyproject.toml b/pyproject.toml
+index e35a49b7..7c7355dc 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -47,7 +47,6 @@ dependencies = [
+     "nodeenv>=1.8.0",
+     "psutil>=5.9.5",
+     "yourdfpy>=0.0.53",
+-    "plyfile>=1.0.2"
+ ]
+ 
+ [project.optional-dependencies]
+@@ -64,7 +63,6 @@ examples = [
+     "plotly>=5.21.0",
+     "robot_descriptions>=1.10.0",
+     "gdown>=4.6.6",
+-    "plyfile",
+     "opencv-python",
+     "pyliblzfse>=0.4.1; platform_system!='Windows'",
+ ]
+diff --git a/src/viser/client/src/MessageHandler.tsx b/src/viser/client/src/MessageHandler.tsx
+index cb4ab738..66fa2686 100644
+--- a/src/viser/client/src/MessageHandler.tsx
++++ b/src/viser/client/src/MessageHandler.tsx
+@@ -14,7 +14,7 @@ import {
+   isSceneNodeMessage,
+ } from "./WebsocketMessages";
+ import { isTexture } from "./WebsocketFunctions";
+-import { useFrame } from "@react-three/fiber";
++import { useFrame, useThree } from "@react-three/fiber";
+ import { Button, Progress } from "@mantine/core";
+ import { IconCheck, IconDownload } from "@tabler/icons-react";
+ import { computeT_threeworld_world } from "./WorldTransformUtils";
+@@ -570,6 +570,7 @@ export function FrameSynchronizedMessageHandler() {
+   const viewerMutable = viewer.mutable.current;
+   const messageQueue = viewerMutable.messageQueue;
+   const splatContext = React.useContext(GaussianSplatsContext)!;
++  const gl = useThree((state) => state.gl);
+ 
+   useFrame(
+     () => {
+@@ -631,21 +632,35 @@ export function FrameSynchronizedMessageHandler() {
+             true,
+           );
+ 
+-        // Note: We don't need to add the camera to the scene for rendering
+-        // The renderer.render() function uses the camera directly
+-        // Create a new renderer
+-        const renderer = new THREE.WebGLRenderer({
+-          antialias: true,
+-          alpha: true,
+-        });
+-        renderer.setSize(targetWidth, targetHeight);
+-        renderer.setClearColor(
+-          0xffffff,
++        // Save current renderer state.
++        const originalSize = gl.getSize(new THREE.Vector2());
++        const originalClearColor = gl.getClearColor(new THREE.Color());
++        const originalClearAlpha = gl.getClearAlpha();
++
++        // Configure for capture.
++        gl.setSize(targetWidth, targetHeight);
++        gl.setClearColor(0xffffff);
++        gl.setClearAlpha(
+           viewerMutable.getRenderRequest!.format == "image/png" ? 0.0 : 1.0,
+-        ); // Set clear color to transparent
++        );
+ 
+         // Render the scene.
+-        renderer.render(viewerMutable.scene!, camera);
++        gl.render(viewerMutable.scene!, camera);
++
++        // Temporary canvas for saving the rendered image. This is needed to
++        // prevent flickers: we need context from the original canvas for
++        // rendering, but we want to revert the renderer state immediately.
++        const canvas = gl.domElement;
++        const bufferCanvas = document.createElement("canvas");
++        bufferCanvas.width = targetWidth;
++        bufferCanvas.height = targetHeight;
++        const ctx = bufferCanvas.getContext("2d")!;
++        ctx.drawImage(canvas, 0, 0, targetWidth, targetHeight);
++
++        // Restore the original renderer state.
++        gl.setSize(originalSize.x, originalSize.y);
++        gl.setClearColor(originalClearColor);
++        gl.setClearAlpha(originalClearAlpha);
+ 
+         // Restore splatting indices.
+         if (sortedIndicesOrig !== null && splatMeshProps !== null) {
+@@ -653,11 +668,9 @@ export function FrameSynchronizedMessageHandler() {
+           splatMeshProps.sortedIndexAttribute.needsUpdate = true;
+         }
+ 
+-        // Get the rendered image.
++        // Get the rendered image from our temp canvas.
+         viewerMutable.getRenderRequestState = "in_progress";
+-        renderer.domElement.toBlob(async (blob) => {
+-          renderer.dispose();
+-          renderer.forceContextLoss();
++        bufferCanvas.toBlob(async (blob) => {
+ 
+           viewerMutable.sendMessage({
+             type: "GetRenderResponseMessage",
+diff --git a/src/viser/infra/_infra.py b/src/viser/infra/_infra.py
+index b2a861ba..c45b7bc8 100644
+--- a/src/viser/infra/_infra.py
++++ b/src/viser/infra/_infra.py
+@@ -537,6 +537,7 @@ class WebsockServer(WebsockMessageHandler):
+                         ws_handler,
+                         host,
+                         port_attempt,
++                        max_size=1024 * 1024 * 50,  # 50MB
+                         # Compression can be too slow for our use cases.
+                         compression=None,
+                         process_request=(

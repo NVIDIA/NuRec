@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Bazel module for the NCore V4 conversion template.
+"""
+
+module(
+    name = "ncore_template",
+    repo_name = "ncore_template_repo",
+)
+
+bazel_dep(name = "aspect_rules_lint", version = "2.9.0")
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.4")
+bazel_dep(name = "rules_python", version = "2.3.2")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "rules_uv", version = "0.89.2")
+bazel_dep(name = "rules_multitool", version = "1.11.1")
+
+# Transitive dependency of aspect_rules_lint, we need a minimum of version
+# 0.5.4 for Bazel 9 compatibility. Remove this pin once aspect_rules_lint
+# raises its pin.
+bazel_dep(name = "rules_buf", version = "0.5.4")
+
+# Python 3.13 toolchain
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.13",
+)
+use_repo(python, "python_3_13", "python_versions")
+
+# Pip dependencies (nvidia-ncore from PyPI, plus click, numpy, scipy, universal-pathlib).
+#
+# `experimental_index_url` resolves wheels through Bazel's own downloader
+# instead of shelling out to `pip wheel` at fetch time. Downloader fetches are
+# content-addressed into `--repository_cache` (pinned in `.bazelrc`), so a
+# workspace materialized from this template at a new path -- which gets a fresh
+# output base, and therefore refetches every external repo -- still builds from
+# the pre-populated cache with no network access. `pip wheel` downloads bypass
+# that cache, so without this the first build in a new workdir must reach PyPI.
+#
+# Index mode maps each requirement to a wheel URL by hash: every pin in
+# `requirements_3_13.txt` must keep its `--hash=sha256:` entries. A package is
+# looked up on the first index that lists it, and PyPI lists torch without the
+# CPU-only builds, so torch is pinned to PyTorch's index; otherwise its hashes
+# don't match and it falls back to `pip wheel`.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    experimental_index_url = "https://pypi.org/simple",
+    experimental_index_url_overrides = {"torch": "https://download.pytorch.org/whl/cpu"},
+    hub_name = "ncore_template_pip_deps",
+    python_version = "3.13",
+    requirements_lock = "//deps/pip:requirements_3_13.txt",
+)
+
+# Patch zarr 2.18.2 for compatibility with numcodecs>=0.16, which renamed two
+# functions that zarr imports (cbuffer_sizes and cbuffer_metainfo) to private names.
+pip.override(
+    file = "zarr-2.18.2-py3-none-any.whl",
+    patch_strip = 1,
+    patches = [
+        "deps/zarr/zarr.patch",
+    ],
+)
+use_repo(pip, "ncore_template_pip_deps")
+
+# Format (Ruff)
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+use_repo(multitool, "multitool")

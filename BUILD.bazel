@@ -1,0 +1,402 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@aspect_rules_py//py:defs.bzl", "py_image_layer")
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_pkg//:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/rules_oci:default_layer_groups.bzl", "default_layer_groups")
+
+# Formatting target aliases for convenience
+alias(
+    name = "format",
+    actual = "//bazel/format:format",
+)
+
+alias(
+    name = "format.check",
+    actual = "//bazel/format:custom_check",
+)
+
+# Linter configuration files visible to //bazel/format/ targets.
+exports_files(
+    [".shellcheckrc"],
+    visibility = [
+        "//bazel/format:__pkg__",
+    ],
+)
+
+exports_files(
+    [
+        ".bazelrc",
+        "MODULE.bazel",
+        "uv.lock",
+    ],
+    visibility = [],
+)
+
+# Generated files: the third-party notices tooling regenerates them and tests that they are current.
+exports_files(
+    [
+        "THIRD_PARTY_NOTICES.md",
+        "third_party_licenses",
+    ],
+    visibility = [],
+)
+
+# The canonical license texts that THIRD_PARTY_NOTICES.md links to, fetched by the
+# third-party notices tooling.
+filegroup(
+    name = "third_party_licenses_generic",
+    srcs = glob(["third_party_licenses/generic/*.txt"]),
+    visibility = [],
+)
+
+################################################################
+# NuRec py_binary
+################################################################
+
+## Main NuRec run entrypoint
+RUN_DEPS = [
+    pip_requirement("click"),
+    pip_requirement("click-default-group"),
+    "//nurec:pylib",
+    "//nurec/benchmark:pylib",
+    "//nurec/compression:pylib_cli",
+    "//nurec/config:pylib_version",
+    "//nurec/metrics:pylib_compute",
+    "//nurec/run:pylib",
+    "//nurec/utils/edit:pylib",
+    "//nurec/utils:pylib_ffmpeg_config",
+    "//nurec/utils/io/export:pylib",
+    "//nurec/utils/upgrade/cli:pylib",
+    "//nurec/grpc:pylib",
+    "//nurec/grpc:pylib_multiproc",
+    "//apps/viewer:pylib",
+    "//nurec/render/novel_trajectory:pylib",
+]
+
+## Tracy default dependencies (CPU-only) - use standard deps but replace core library
+RUN_DEPS_TRACY = [
+    dep if dep != "//nurec:pylib" else "//nurec:pylib_tracy"
+    for dep in RUN_DEPS
+]
+
+## Tracy GPU dependencies - use standard deps but replace core library
+RUN_DEPS_TRACY_GPU = [
+    dep if dep != "//nurec:pylib" else "//nurec:pylib_tracy_gpu"
+    for dep in RUN_DEPS
+]
+
+# Data dependencies of the 'run' target
+RUN_DATA = [
+    ":notices_file",
+    "//configs",
+    # Runnable losses example shipped with the public image.
+    "//nurec/libs/losses/examples",
+    # sensor/lidar_model.yaml's load_json resolver reads these at runtime.
+    "//nurec/config/sensor_data",
+    # The AV benchmark spec and its resolved preset, so the chain is driveable from the image.
+    "//workflows/av_benchmark:specs",
+    "//workflows/av_benchmark:configs",
+]
+
+filegroup(
+    name = "notices_file",
+    srcs = ["NOTICES"],
+    visibility = [
+        "//apps:__pkg__",
+        "//apps/av/aux_gen:__pkg__",
+    ],
+)
+
+RUN_SRCS = [
+    "run.py",
+]
+
+py_library(
+    name = "pylib",
+    srcs = RUN_SRCS,
+    data = RUN_DATA,
+    visibility = [],
+    deps = RUN_DEPS,
+)
+
+py_binary(
+    name = "run",
+    srcs = RUN_SRCS,
+    main = "run.py",
+    visibility = [
+        # Add visibility for the AV Benchmark workflow
+        "//workflows/av_benchmark:__pkg__",
+    ],
+    deps = [":pylib"],
+)
+
+################################################################
+# Tracy Profiling Targets
+################################################################
+
+# NuRec with Tracy CPU-only profiling
+py_binary(
+    name = "run_with_tracy",
+    srcs = RUN_SRCS,
+    data = RUN_DATA,
+    env = {
+        "TRACY_ENABLE": "1",
+        "TRACY_NO_BROADCAST": "1",  # Disable LAN discovery
+        "TRACY_NO_CALLSTACK": "1",  # Reduce overhead
+        "TRACY_NO_EXIT": "0",  # Allow ordinary CLI shutdown without a connected profiler.
+        "TRACY_NO_GPU": "1",  # Disable GPU profiling overhead at runtime
+        "TRACY_NO_SAMPLING": "1",  # Reduce overhead
+        "TRACY_NO_SYSTEM_TRACING": "1",  # Reduce noise
+    },
+    main = "run.py",
+    deps = RUN_DEPS_TRACY,
+)
+
+# NuRec with Tracy CPU + GPU profiling (higher overhead)
+py_binary(
+    name = "run_with_tracy_gpu",
+    srcs = RUN_SRCS,
+    data = RUN_DATA,
+    env = {
+        "TRACY_ENABLE": "1",
+        "TRACY_NO_GPU": "0",  # Enable GPU profiling even if inherited from a CPU launch.
+        "TRACY_NO_BROADCAST": "1",  # Disable LAN discovery
+        "TRACY_NO_CALLSTACK": "1",  # Reduce overhead
+        "TRACY_NO_EXIT": "0",  # Allow ordinary CLI shutdown without a connected profiler.
+        "TRACY_NO_SAMPLING": "1",  # Reduce overhead
+        "TRACY_NO_SYSTEM_TRACING": "1",  # Reduce noise
+    },
+    main = "run.py",
+    deps = RUN_DEPS_TRACY_GPU,
+)
+
+mypy_test(
+    name = "run_mypy",
+    timeout = "long",
+    deps = [
+        ":pylib",
+    ],
+)
+
+################################################################
+# Common image rules
+################################################################
+
+# Layer for HOME directory writable by all users
+# (ex. to receive default cache folder for various Python dependencies, though
+# this won't be persisted in our typical container invocations).
+pkg_tar(
+    name = "home_dir_tar",
+    compressor = "@pigz//:pigz",
+    empty_dirs = ["/home"],
+    extension = "tar.gz",
+    mode = "0777",
+    tags = [
+        "manual",
+    ],
+    visibility = [],
+)
+
+# Open-source attribution, shipped at /licenses in every published image.
+pkg_files(
+    name = "image_licenses_files",
+    srcs = [
+        "NOTICES",
+        "THIRD_PARTY_NOTICES.md",
+        "deps/docker/THIRD-PARTY.txt",
+    ] + glob(["third_party_licenses/**"]),
+    prefix = "licenses",
+    renames = {
+        "deps/docker/THIRD-PARTY.txt": "THIRD-PARTY.txt",
+    },
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+pkg_tar(
+    name = "image_licenses_tar",
+    srcs = [
+        "deps/docker/OPEN_SOURCE_NOTICE",
+        ":image_licenses_files",
+    ],
+    compressor = "@pigz//:pigz",
+    compressor_args = "-n",
+    extension = "tar.gz",
+    mode = "0644",
+    tags = [
+        "manual",
+    ],
+    visibility = [
+        "//apps:__pkg__",
+    ],
+)
+
+################################################################
+# Regular Image Rules
+################################################################
+
+# OCI image for 'run'
+py_image_layer(
+    name = "run_image_layer",
+    binary = "run",
+    compressor = "@pigz//:pigz",
+    compressor_args = "-n",
+    layer_groups = default_layer_groups(),
+    root = "/app/",
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+oci_image(
+    name = "run_image_oci",
+    base = "@nurec_run_image_oci",
+    entrypoint = ["/app/run"],
+    env = {
+        "HOME": "/home",
+        "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
+        "USER": "nurec",
+    },
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+    tars = [
+        "//bazel/cuda_compat:compat_tar",  # put first: rarely changes
+        ":image_licenses_tar",
+        ":run_image_layer",
+        ":home_dir_tar",
+        "//bazel/version:version_file_yaml_tar",  # put last in the list of tar files to make this the last / often changing layer
+    ],
+    workdir = "/app/run.runfiles/_main",
+)
+
+# Build the image and load it into a local runtime:
+# $ bazel run //:load_run_image_oci
+# $ docker run -it --rm --gpus all ghcr.io/nvidia/nurec/nurec_run:latest
+#
+# Note: this target assigns the ':latest' tag for the local machine's native architecture.
+# This differs from registry contents pushed by CI, for which ':latest' is always the
+# x86_64 image.
+oci_load(
+    name = "load_run_image_oci",
+    image = ":run_image_oci",
+    repo_tags = ["ghcr.io/nvidia/nurec/nurec_run:latest"],
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+# Push the image to the registry:
+# $ bazel run //:push_run_image_oci [-- --tag ${TAG}]
+# Note: Don't push the 'latest' tag from local builds, we reserve this to images generated by post-merge pipelines in CI.
+#       A custom tag can be specific on the above command if needed.
+oci_push(
+    name = "push_run_image_oci",
+    image = ":run_image_oci",
+    repository = "ghcr.io/nvidia/nurec/nurec_run",  # this can be overriden by providing --repository
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+# MPS-bootstrapping variant of the run image: identical layers, but the entrypoint starts the
+# NVIDIA MPS control daemon before chaining to /app/run (runtime args pass through unchanged).
+# MPS must be up before any CUDA context exists — CUDA initializes at Python import time, so the
+# daemon cannot be started from inside the server; the entrypoint is the earliest in-container
+# hook. Intended for multi-process serving (`serve-grpc --multiproc-workers N --require-mps`) on
+# a container that owns the whole GPU; harmless for single-process workloads.
+pkg_tar(
+    name = "mps_entrypoint_tar",
+    srcs = ["mps_entrypoint.sh"],
+    mode = "0755",
+    package_dir = "/app",
+    tags = [
+        "manual",
+    ],
+)
+
+oci_image(
+    name = "mps_run_image_oci",
+    base = ":run_image_oci",
+    entrypoint = [
+        "/app/mps_entrypoint.sh",
+        "/app/run",
+    ],
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+    tars = [":mps_entrypoint_tar"],
+)
+
+# Build the image and load it into a local runtime:
+# $ bazel run //:load_mps_run_image_oci
+# $ docker run -it --rm --gpus all --init ghcr.io/nvidia/nurec/nurec_run_mps:latest serve-grpc ...
+oci_load(
+    name = "load_mps_run_image_oci",
+    image = ":mps_run_image_oci",
+    repo_tags = ["ghcr.io/nvidia/nurec/nurec_run_mps:latest"],
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+# Push the image to the registry:
+# $ bazel run //:push_mps_run_image_oci [-- --tag ${TAG}]
+# Note: Don't push the 'latest' tag from local builds, we reserve this to images generated by post-merge pipelines in CI.
+#       A custom tag can be specific on the above command if needed.
+oci_push(
+    name = "push_mps_run_image_oci",
+    image = ":mps_run_image_oci",
+    repository = "ghcr.io/nvidia/nurec/nurec_run_mps",  # this can be overriden by providing --repository
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+################################################################
+# Package Groups
+################################################################
+
+# Use package groups to manage code visibility [https://bazel.build/concepts/visibility] and prevent
+# unnecessary dependencies between targets
+package_group(
+    name = "core_package_group",
+    packages = [
+        "//apps/...",  # public applications depend on regular nurec components
+        "//nurec/...",  # all regular nurec-code packages
+    ],
+)
+
+package_group(
+    name = "aux_package_group",
+    packages = [
+        # packages used for aux-data generation
+        "//apps/av/aux_gen/...",
+    ],
+)
+
+package_group(
+    name = "asset_harvester_package_group",
+    packages = [],
+)
+
+package_group(
+    name = "mypy_typing_group",
+    packages = [
+        # Packages needed for using mypy with identifiers from
+        # repositories we build ourselves.
+        "//bazel/typing/...",
+    ],
+)

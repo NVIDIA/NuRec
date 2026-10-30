@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    # Broader visibility so others could take this
+    "//:core_package_group",
+]
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "dataset.py",
+        "export_paths.py",
+        "instant_nurec.py",
+        "models.py",
+        "predict.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("pydantic"),
+        pip_requirement("omegaconf"),
+        pip_requirement("numpy"),
+        # Do not replace these leaf config dependencies with
+        # //nurec/config:pylib; that target imports this instant_nurec schema.
+        "//nurec/config:pylib_base_schema",
+        "//nurec/config:pylib_leaf_schemas",
+        "//nurec/config:pylib_trainer_config",
+        "//nurec/config:pylib_version",
+        "//nurec/utils:pylib_misc",
+    ],
+)
+
+# Keep Hydra composition and model-registry downloads out of schema-only consumers.
+py_library(
+    name = "pylib_parse",
+    srcs = ["parse.py"],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        ":pylib",
+        "//nurec:pylib_reporoot",
+        "//nurec/config:pylib_resolvers",
+        "//nurec/utils:pylib_model_registry",
+        "//nurec/utils/upgrade:pylib",
+        pip_requirement("hydra-core"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "export_paths_test",
+    srcs = ["export_paths_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "instant_nurec_config_test",
+    srcs = ["instant_nurec_config_test.py"],
+    deps = [
+        ":pylib_parse",
+        "//nurec/utils:pylib_model_registry",
+    ],
+)

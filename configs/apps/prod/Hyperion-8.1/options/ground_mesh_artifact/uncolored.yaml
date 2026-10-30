@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Skip coloring the ground mesh artifact at checkpoint time. Use when the
+# road Gaussians already own the ground color and the mesh-derived road
+# geometry is preserved during training.
+
+checkpoint:
+  artifact:
+    mesh:
+      ground:
+        colored: false

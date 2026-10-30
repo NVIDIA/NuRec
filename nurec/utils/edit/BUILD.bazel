@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Three libraries along the dependency steps the sources already have, so a test of a
+# dataclass and yaml.safe_load does not build the gsplat CUDA extension:
+#
+#   :pylib_schema   authoring schema only            -> stdlib + pyyaml
+#   :pylib_simready SimReady/USD reading             -> + numpy, usd-core
+#   :pylib          the bake, the checkpoint splice  -> + torch, the model graph, click
+#
+# Anything added here belongs in the narrowest library that can hold it
+# (ply_gaussians.py sits in :pylib because it reuses the model graph's PLYGaussianLoader).
+py_library(
+    name = "pylib_schema",
+    srcs = [
+        "__init__.py",
+        "asset_edits_schema.py",
+    ],
+    deps = [
+        "//nurec/utils:pylib_renamed_keys",
+        pip_requirement("pyyaml"),
+    ],
+)
+
+py_library(
+    name = "pylib_simready",
+    srcs = [
+        "simready_gaussians.py",
+        "variant_animation.py",
+    ],
+    deps = [
+        ":pylib_schema",
+        pip_requirement("numpy"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "asset_edits.py",
+        "asset_edits_cli.py",
+        "layer_append.py",
+        "ply_gaussians.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //:run
+        "//:__pkg__",
+    ],
+    deps = [
+        ":pylib_schema",
+        ":pylib_simready",
+        "//nurec/artifact:pylib",
+        "//nurec/asset_edits:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/models:pylib",  # nurec.models.composite.LayerTrackIds in asset_edits.py
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/render:pylib",
+        "//nurec/utils:pylib_geometry",  # se3_matrix_to_tquat in asset_edits.py
+        "//nurec/utils:pylib_types",  # TrackFlags / FrameConversion / RigTrajectories
+        pip_requirement("click"),
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "variant_animation_test",
+    size = "small",
+    srcs = ["variant_animation_test.py"],
+    deps = [
+        ":pylib_simready",
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "asset_edits_schema_test",
+    size = "small",
+    srcs = ["asset_edits_schema_test.py"],
+    deps = [
+        ":pylib_schema",
+        pip_requirement("pyyaml"),
+    ],
+)
+
+pytest_test(
+    name = "asset_edits_test",
+    size = "medium",  # ~18s of torch/gaussians imports before the first test runs
+    srcs = ["asset_edits_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_simready",  # SimReadyAsset/SimReadyGaussians fakes
+        "//nurec/datasets:pylib",  # CuboidTracks
+        "//nurec/models:pylib",  # LayerTrackIds
+        "//nurec/models/gaussians:pylib",  # RigidGaussianModel
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/utils:pylib_types",  # FrameConversion / TrackFlags
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "asset_edits_cli_test",
+    size = "medium",  # ~18s of torch/gaussians imports before the first test runs
+    srcs = ["asset_edits_cli_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/asset_edits:pylib",
+        pip_requirement("click"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "ply_gaussians_test",
+    size = "medium",  # ~18s of torch/gaussians imports before the first test runs
+    srcs = ["ply_gaussians_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_simready",
+        "//nurec/models/gaussians:pylib",  # write_ply_3dgs fixtures
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "simready_gaussians_test",
+    size = "small",
+    srcs = ["simready_gaussians_test.py"],
+    deps = [
+        ":pylib_simready",
+        pip_requirement("numpy"),
+        pip_requirement("usd-core"),
+    ],
+)

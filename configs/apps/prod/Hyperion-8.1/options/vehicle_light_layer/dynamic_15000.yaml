@@ -1,0 +1,46 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Dynamic vehicle lights, initialized when SAM3 aux masks are available.
+#
+# The layer follows the production dynamic-rigid tracks. Static vehicle lights
+# intentionally remain out of this option because lidar Car2Sim has no
+# static-rigids owner/track-generation path.
+
+defaults:
+  - /model/gaussians/models@model.layers.vehicle_lights: vehicle_light_rigid_gaussians
+  - /model/gaussians/initialization@model.layers.vehicle_lights.initialization: camera_vehicle_light_tracks
+  - /model/tracks_calib@model.layers.vehicle_lights.tracks_calib: skip
+  - _self_
+
+model:
+  strategy:
+    add:
+      fixed_count_layer_ids: [vehicle_lights]
+    relocate:
+      same_track_layer_ids: [vehicle_lights]
+      min_gaussians_per_track:
+        vehicle_lights: 16
+    perturb:
+      noise_lr:
+        layers:
+          vehicle_lights: 100.0
+      max_position_offset_m:
+        vehicle_lights: 0.02
+
+  layers:
+    vehicle_lights:
+      # Lamps are a camera-supervised appearance overlay on the already-rendered
+      # dynamic-rigid vehicle surface. Rendering them into lidar creates a
+      # competing second surface and regressed depth/chamfer in the two-clip A/B.
+      render_in_lidar: false
+      # Match the owner in both camera-only and intensity/raydrop presets.
+      extra_signal: ${model.layers.dynamic_rigids.extra_signal}
+      motion_source_layer: dynamic_rigids
+      tracks:
+        label_classes: ${model.layers.dynamic_rigids.tracks.label_classes}
+        is_dynamic: true
+      initialization:
+        camera_ids: ${dataset.camera_ids}
+        num_point_cloud_points_in_layer: 15000

@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: random
+
+num_points: 100_000
+scale_factor: 0.01
+default_density: ${eval:'0.5 if ("${model.strategy.name}"=="mcmc") else 0.01'}

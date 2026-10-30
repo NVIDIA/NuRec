@@ -1,0 +1,12 @@
+diff --git a/zarr/util.py b/zarr/util.py
+--- a/zarr/util.py
++++ b/zarr/util.py
+@@ -30,7 +30,7 @@
+ )
+ from numcodecs.ndarray_like import NDArrayLike
+ from numcodecs.registry import codec_registry
+-from numcodecs.blosc import cbuffer_sizes, cbuffer_metainfo
++from numcodecs.blosc import _cbuffer_sizes as cbuffer_sizes, _cbuffer_metainfo as cbuffer_metainfo
+ from zarr.types import DIMENSION_SEPARATOR
+ 
+ KeyType = TypeVar("KeyType")

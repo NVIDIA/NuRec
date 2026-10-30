@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_uv//uv:pip.bzl", "pip_compile")
+
+package(default_visibility = ["//visibility:public"])
+
+pip_compile(
+    name = "requirements",
+    size = "medium",
+    args = [
+        "--generate-hashes",
+        "--emit-index-url",
+        # The PyTorch CPU index also hosts older copies of PyPI packages; take
+        # the best version across both indexes instead of the first index's.
+        "--index-strategy=unsafe-best-match",
+    ],
+    py3_runtime = "@python_3_13//:py3_runtime",
+    requirements_in = "requirements_3_13.in",
+    requirements_txt = "requirements_3_13.txt",
+)

@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@aspect_rules_py//py:defs.bzl", "py_image_layer")
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+load("//bazel/rules_oci:default_layer_groups.bzl", "default_layer_groups")
+
+py_library(
+    # Tiny stand-alone target containing the instant_nurec supervision-pack dataclasses
+    name = "pylib_supervision_pack",
+    srcs = ["supervision_pack.py"],
+    visibility = [
+        "//nurec/instant_nurec:__subpackages__",
+        "//nurec/libs/losses:__subpackages__",
+    ],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+# Inference-only instant_nurec predict CLI/binary, and the source of the deployed `nurec_instant_nurec_run`
+# container image (all real callers of this image only ever invoke predict mode). The full
+# train/val/test/trainval/predict CLI used for training runs lives in a separate downstream
+# training package.
+py_library(
+    name = "pylib",
+    srcs = ["run.py"],
+    visibility = [],
+    deps = [
+        pip_requirement("click"),
+        pip_requirement("click-default-group"),
+        pip_requirement("pytorch_lightning"),
+        "//apps/viewer:pylib",
+        "//nurec/config:pylib",
+        "//nurec/config:pylib_parse",
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/instant_nurec/config:pylib_parse",
+        "//nurec/instant_nurec/systems:pylib",
+        "//nurec/instant_nurec/utils:pylib_run_helpers",
+        "//nurec/utils:pylib_callbacks",
+    ],
+)
+
+py_binary(
+    name = "run",
+    srcs = ["run.py"],
+    data = ["//configs"],
+    main = "run.py",
+    visibility = [],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "optimized_python_test",
+    srcs = ["optimized_python_test.py"],
+    data = [
+        "//nurec/instant_nurec/models:optimized_python_sources",
+        "//nurec/instant_nurec/models/blocks:optimized_python_sources",
+        "//nurec/instant_nurec/primitives:optimized_python_sources",
+        "//nurec/instant_nurec/systems:optimized_python_sources",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+mypy_test(
+    name = "run_mypy",
+    timeout = "long",
+    deps = [
+        ":pylib",
+    ],
+)
+
+################################################################
+# Common image rules
+################################################################
+
+# Layer for HOME directory writable by all users
+# (ex. to receive default cache folder for various Python dependencies, though
+# this won't be persisted in our typical container invocations).
+pkg_tar(
+    name = "home_dir_tar",
+    compressor = "@pigz//:pigz",
+    empty_dirs = ["/home"],
+    extension = "tar.gz",
+    mode = "0777",
+    tags = [
+        "manual",
+    ],
+)
+
+################################################################
+# Normal container rules
+################################################################
+
+# OCI image for the public 'nurec_instant_nurec_run' composition.
+py_image_layer(
+    name = "instant_nurec_run_image_layer",
+    binary = ":run",
+    compressor = "@pigz//:pigz",
+    compressor_args = "-n",
+    layer_groups = default_layer_groups(),
+    root = "/app/",
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+oci_image(
+    name = "instant_nurec_run_image_oci",
+    base = "@nurec_run_image_oci",
+    entrypoint = ["/app/nurec/instant_nurec/run"],
+    env = {
+        "HOME": "/home",
+        "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
+        "USER": "nurec",
+    },
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+    tars = [
+        "//bazel/cuda_compat:compat_tar",  # put first: rarely changes
+        ":instant_nurec_run_image_layer",
+        ":home_dir_tar",
+        "//bazel/version:version_file_yaml_tar",
+    ],
+    workdir = "/app/nurec/instant_nurec/run.runfiles/_main",
+)
+
+# Build the image and load it into a local runtime:
+# $ bazel run //nurec/instant_nurec:load_instant_nurec_run_image_oci
+# $ docker run -it --rm --gpus all ghcr.io/nvidia/nurec/nurec_instant_nurec_run:latest
+#
+# Note: this target assigns the ':latest' tag for the local machine's native architecture.
+# This differs from registry contents pushed by CI, for which ':latest' is always the
+# x86_64 image.
+oci_load(
+    name = "load_instant_nurec_run_image_oci",
+    image = ":instant_nurec_run_image_oci",
+    repo_tags = ["ghcr.io/nvidia/nurec/nurec_instant_nurec_run:latest"],
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)
+
+# Push the image to the registry:
+# $ bazel run //nurec/instant_nurec:push_instant_nurec_run_image_oci [-- --tag ${TAG}]
+# Note: Don't push the 'latest' tag from local builds, we reserve this to images generated by post-merge pipelines in CI.
+#       A custom tag can be specific on the above command if needed.
+oci_push(
+    name = "push_instant_nurec_run_image_oci",
+    image = ":instant_nurec_run_image_oci",
+    repository = "ghcr.io/nvidia/nurec/nurec_instant_nurec_run",  # this can be overriden by providing --repository
+    tags = [
+        "manual",
+        "no-remote-cache",
+    ],
+)

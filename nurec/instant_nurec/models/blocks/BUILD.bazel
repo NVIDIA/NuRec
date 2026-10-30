@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//nurec/instant_nurec:__subpackages__",
+]
+
+filegroup(
+    name = "optimized_python_sources",
+    srcs = [
+        "dpt.py",
+        "embeds.py",
+        "layers.py",
+    ],
+    visibility = ["//nurec/instant_nurec:__pkg__"],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "aa_vit.py",
+        "attention.py",
+        "dav3.py",
+        "dpt.py",
+        "embeds.py",
+        "layers.py",
+        "mamba_scan.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("einops"),
+        "//nurec/instant_nurec/utils:pylib",
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/utils:pylib_geometry",
+    ] + select({
+        # mamba_ssm/causal_conv1d are loaded very slowly, so we make them optional.
+        "//bazel/conditions:mamba": [
+            pip_requirement("mamba_ssm"),
+            pip_requirement("causal_conv1d"),
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+pytest_test(
+    name = "blocks_test",
+    srcs = ["blocks_test.py"],
+    target_compatible_with = ["@platforms//cpu:x86_64"],
+    deps = [
+        ":pylib",
+    ] + select({
+        "//bazel/conditions:mamba": [
+            pip_requirement("mamba_ssm"),
+            pip_requirement("causal_conv1d"),
+        ],
+        "//conditions:default": [],
+    }),
+)

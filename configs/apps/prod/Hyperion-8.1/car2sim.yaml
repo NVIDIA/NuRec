@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Default Car2Sim preset. Keep the selected camera-count config explicit.
+
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_6cam
+  - _self_

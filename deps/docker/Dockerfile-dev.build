@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE=pass-dev-deps-image-through-the-base-image-build-arg.invalid/nurec-dev-deps
+FROM ${BASE_IMAGE}
+
+# TARGETARCH is auto-populated by BuildKit (amd64 on x86_64 hosts, arm64 on aarch64).
+ARG TARGETARCH
+
+LABEL maintainer="Janick Martinez Esturo <janickm@nvidia.com>"
+
+# Needed for string substitution
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN \
+    # Add additional system libraries
+    apt-get update -qq --fix-missing && \
+    apt-get -y install --no-install-recommends \
+        gcc g++ gcc-11 g++-11 lcov libglib2.0-0 libopenblas-dev libgl1 clang ccache curl file \
+        git git-lfs unzip zip wget xz-utils jq sudo pandoc jupyter-nbconvert python3-pip \
+        patchelf docker.io docker-buildx \
+    && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN \
+    # Add python -> python3 symlink (required for bazel-build image entrypoints)
+    ln -s /usr/bin/python3 /usr/bin/python
+
+ARG BAZELISK_VERSION=v1.20.0
+RUN \
+    # Install bazelisk
+    wget https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH} -O /usr/local/bin/bazelisk && \
+    chmod +x /usr/local/bin/bazelisk
+
+# Create foreign docker group to allow access to host's /var/run/docker.sock.
+RUN \
+    groupadd --gid 141 docker141
+
+# Run as developer (make sure sudo can be run without password)
+# Use a pinned UID/GID of 1000 to ensure consistent ownership of volume or bind-mount
+# data across container images. Ubuntu 24.04 ships a default `ubuntu` user at 1000,
+# remove it first.
+# The GID-999 group is used as second option for Docker socket access, looked up by GID.
+RUN \
+    userdel -r ubuntu 2>/dev/null || true && \
+    groupdel ubuntu 2>/dev/null || true && \
+    groupadd --gid 1000 developer && \
+    useradd --uid 1000 --gid 1000 --create-home --groups sudo,docker,docker141 developer && \
+    echo "developer:developer" | chpasswd && \
+    echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+    usermod -aG "$(getent group 999 | cut -d: -f1)" developer
+USER developer
+
+# Set required driver capabilities ('compute' for cuda, 'graphics' for optix, 'utility' for nvidia-smi)
+ENV NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility,video
+
+# Make all devices visible by default
+ENV NVIDIA_VISIBLE_DEVICES=all

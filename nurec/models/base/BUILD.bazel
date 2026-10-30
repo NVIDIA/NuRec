@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "base.py",
+    ],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        "//nurec:pylib",
+        "//nurec/utils:pylib_misc",
+        "//nurec/utils:pylib_optim",
+        "//nurec/utils:pylib_types",
+    ],
+)
+
+pytest_test(
+    name = "base_test",
+    srcs = ["base_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)

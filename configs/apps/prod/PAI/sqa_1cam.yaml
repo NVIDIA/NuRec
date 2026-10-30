@@ -1,0 +1,18 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Camera-focused SQA preset for sequences converted from PhysicalAI-AV. Same lineage as
+# sqa_lidar_1cam, minus lidar rendering, lidar validation and the lidar attribute losses.
+#
+# Lidar is still loaded: background and road initialization come from the lidar rig trajectory,
+# and dynamic-rigids init asserts a lidar id is present, so a lidar-free variant would be a
+# different reconstruction rather than a smaller one.
+
+defaults:
+  - /apps/prod/Hyperion-8.1/sqa_default
+  - _self_
+
+dataset:
+  lidar_ids:
+    - lidar_top_360fov

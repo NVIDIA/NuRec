@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+pytest_test(
+    name = "config_test",
+    srcs = ["config_test.py"],
+    deps = [
+        ":pylib_config",
+        pip_requirement("torch"),
+    ],
+)
+
+# Config (and loss return types) only; no nurec/utils so nurec/config can depend on this without a cycle.
+py_library(
+    name = "pylib_config",
+    srcs = ["config.py"],
+    deps = [
+        "//nurec/config:pylib_base_schema",
+        pip_requirement("omegaconf"),
+        pip_requirement("pydantic"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_component_only_normalization",
+    srcs = ["component_only_normalization.py"],
+    deps = [
+        ":pylib_config",
+        "//nurec/libs/losses/models:pylib_camera_loss_masks",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "component_only_normalization_test",
+    srcs = ["component_only_normalization_test.py"],
+    deps = [
+        ":pylib_component_only_normalization",
+        ":pylib_config",
+        "//nurec/libs/losses/models:pylib_camera_loss_masks",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "loss_aggregator.py",
+    ],
+    deps = [
+        ":pylib_config",
+        "//nurec/datasets:pylib",
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/libs/losses/models:pylib",
+        "//nurec/libs/slang_gaussians:pylib",
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib",
+    ],
+)

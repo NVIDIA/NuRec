@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Filegroup for extensions slang file to be reused by other packages
+filegroup(
+    name = "extensions_slang",
+    srcs = ["extensions.slang"],
+    visibility = ["//visibility:public"],
+)
+
+# Filegroup for constants slang file to be reused by other packages
+filegroup(
+    name = "constants_slang",
+    srcs = ["constants.slang"],
+    visibility = ["//visibility:public"],
+)
+
+# Ninja runtime dependency for slangtorch
+genrule(
+    name = "ninja_runtime",
+    srcs = ["@ninja"],
+    outs = ["ninja"],
+    cmd = "cp $< $@",
+    executable = True,
+)
+
+# All runtime tools required for slangtorch JIT shader compilation.
+# Add to data deps of any py_library that compiles .slang files at runtime.
+# slangc_runfiles matches the build-time slang pin and ships its co-located libs
+# so $ORIGIN/../lib resolves in containers, on both arches.
+filegroup(
+    name = "slangtorch_jit",
+    srcs = [
+        ":ninja_runtime",
+        "//bazel/cuda_toolkit:runtime",
+        "//deps/slang:slangc_runfiles",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "pylib_utils",
+    srcs = ["utils.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@rules_python//python/runfiles",
+    ],
+)
+
+filegroup(
+    name = "cuda_slang",
+    srcs = ["cuda.slang"],
+    visibility = ["//visibility:public"],
+)

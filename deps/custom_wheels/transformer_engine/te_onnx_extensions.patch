@@ -1,0 +1,11 @@
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes transformer_engine/pytorch/te_onnx_extensions.py of TransformerEngine 1.11.
+
+--- a/transformer_engine/pytorch/te_onnx_extensions.py
++++ b/transformer_engine/pytorch/te_onnx_extensions.py
+@@ -27 +27 @@
+-from torch.onnx import symbolic_helper, register_custom_op_symbolic, _type_utils
++from torch.onnx import symbolic_helper, register_custom_op_symbolic
+@@ -31 +31 @@
+-from torch.onnx._internal import jit_utils
++from torch.onnx._internal.torchscript_exporter import _type_utils, jit_utils

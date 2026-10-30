@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Static-path PPISP SPG sidecar triple (CUDA shader source +
+# Lua launcher + USDA Shader-prim template). Loaded at runtime by
+# nurec/utils/io/export/ppisp_export/usd_writer.py via
+# Path(__file__).parent / "spg_sidecars". Data only -- no Python
+# files in this sub-package.
+#
+# Basenames keep the ``ppisp_`` prefix because they ship inside
+# the published USDZ archive where the parent directory context is
+# lost; the prefix keeps the assets self-documenting to downstream
+# consumers (Omniverse, external renderers).
+filegroup(
+    name = "data",
+    srcs = [
+        "ppisp_usd_spg.cu",
+        "ppisp_usd_spg.cu.lua",
+        "ppisp_usd_spg.usda",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+)
+
+pytest_test(
+    name = "static_schema_test",
+    size = "small",
+    srcs = [
+        "static_schema_test.py",
+    ],
+    data = [
+        ":data",
+    ],
+    deps = [
+        pip_requirement("usd-core"),
+    ],
+)

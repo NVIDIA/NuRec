@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Weight the lidar loss by 3e-2.
+
+loss:
+  lidar:
+    lambda_: 0.03

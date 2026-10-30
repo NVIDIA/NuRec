@@ -1,0 +1,59 @@
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes imaginaire/auxiliary/text_encoder.py of the cosmos-predict2 1.0.9 wheel.
+
+--- a/imaginaire/auxiliary/text_encoder.py
++++ b/imaginaire/auxiliary/text_encoder.py
+@@ -27,12 +27,8 @@
+ from transformers import T5EncoderModel, T5TokenizerFast
+ from typing_extensions import Self, override
+ 
+-from imaginaire.configs.reason1.model_config_qwen import QwenModelConfig, QwenVisionConfig
+ from imaginaire.constants import COSMOS_REASON1_PRIVATE_CHECKPOINT, T5_MODEL_DIR, TEXT_ENCODER_CLASS, TextEncoderClass
+-from imaginaire.lazy_config import LazyCall as L
+ from imaginaire.lazy_config import instantiate as lazy_instantiate
+-from imaginaire.models.vlm_qwen import build_tokenizer
+-from imaginaire.models.vlm_qwen_omni import QwenVLBaseModel
+ from imaginaire.utils import log
+ 
+ transformers.utils.logging.set_verbosity_error()
+@@ -114,25 +110,7 @@
+     embedding_concat_strategy: str = str(EmbeddingConcatStrategy.FULL_CONCAT)
+     n_layers_per_group: int = 5
+     ckpt_path: str = COSMOS_REASON1_PRIVATE_CHECKPOINT
+-    model_config: QwenVLBaseModel = L(QwenVLBaseModel)(  # noqa: RUF009
+-        model_config=L(QwenModelConfig)(
+-            tokenizer_type="Qwen/Qwen2.5-VL-7B-Instruct",
+-            name_or_path="Qwen/Qwen2.5-VL-7B-Instruct",
+-            hidden_size=3584,
+-            intermediate_size=18944,
+-            max_window_layers=28,
+-            num_attention_heads=28,
+-            num_hidden_layers=28,
+-            num_key_value_heads=4,
+-            tie_word_embeddings=False,
+-            vocab_size=152064,
+-            vision_config=L(QwenVisionConfig)(out_hidden_size=3584),
+-            output_hidden_states=True,
+-        ),
+-        tokenizer=L(build_tokenizer)(
+-            tokenizer_type="Qwen/Qwen2.5-VL-7B-Instruct",
+-        ),
+-    )
++    model_config: Any = None
+ 
+ 
+ class CosmosReason1TextEncoder(CosmosTextEncoderBase):
+@@ -141,10 +119,12 @@
+     ):
+         super().__init__()
+         self.config = config
++        if self.config.model_config is None:
++            raise RuntimeError("CosmosReason1TextEncoder is disabled in this inference-only probe.")
+ 
+         log.info("Instantiating text encoder model...")
+         with torch.device("meta"):
+-            self.model: QwenVLBaseModel = lazy_instantiate(self.config.model_config)
++            self.model = lazy_instantiate(self.config.model_config)
+         self.model.to_empty(device=device)
+         with torch.no_grad():
+             self.model.init_weights()

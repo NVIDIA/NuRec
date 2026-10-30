@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Shellcheck configuration for shell scripts in this repo.
+#
+# A subset of the shellcheck rules overlap with rules in the SonarQube
+# scans that gate every release; enforcing them at lint time catches
+# the violation before it reaches the release-gate pass.  Per-finding
+# suppression goes inline in the script via `# shellcheck disable=SCnnnn`.
+#
+# All scripts in this repo are bash, including those meant to be
+# `source`-d (no shebang).  Without this directive shellcheck would default to
+# POSIX `sh` on such files and flag bash-specific syntax as false positives.
+shell=bash
+
+# Resolve `source "$(dirname "$0")/utils.sh"`-style relative imports so
+# shellcheck actually follows them and cross-validates symbols (SC1091
+# would otherwise fire).  SCRIPTDIR is shellcheck's special token for
+# the directory of each script being linted.
+external-sources=true
+source-path=SCRIPTDIR
+
+# Opt-in rules that match release-gate Sonar scan rules:
+#   require-double-brackets (SC2292) -- prefer [[ ... ]] over [ ... ]
+#   in bash conditionals.  [[ ]] is safer than [ ]: no globbing or
+#   word-splitting on the right-hand side, supports pattern matching
+#   (=~, == with globs), no surprise word-splitting on unquoted vars.
+enable=require-double-brackets

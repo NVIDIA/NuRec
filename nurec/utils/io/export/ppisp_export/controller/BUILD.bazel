@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# PPISP controller export path: per-camera controller
+# CNN/MLP authored as a USD Shader prim plus the automatic-parameter
+# variant of the PPISP SPG shader that reads the controller output
+# at runtime. spg-runtime exports use this path by default when the
+# loaded PPISP module was trained with controllers.
+#
+# Sidecar basenames keep the ``ppisp_`` prefix: they ship inside
+# the published USDZ archive where the parent directory context is
+# lost, so the names must stay self-documenting to downstream
+# consumers (Omniverse, external renderers).
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "weights.py",
+        "writer.py",
+    ],
+    data = [
+        # CUDA controller templates plus the automatic-parameter PPISP shader.
+        # writer.py turns the controller templates into per-camera generated
+        # CUDA sidecars with embedded weights.
+        "ppisp_controller.cu",
+        "ppisp_controller.cu.lua",
+        "ppisp_usd_spg_auto.cu",
+        "ppisp_usd_spg_auto.cu.lua",
+        "ppisp_usd_spg_auto.usda",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+    deps = [
+        "//nurec/utils:pylib_types",  # for NamedSerialized
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "weights_test",
+    size = "small",
+    srcs = [
+        "weights_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "weights_real_ppisp_test",
+    size = "small",
+    srcs = [
+        "weights_real_ppisp_test.py",
+    ],
+    mypy = False,
+    tags = [
+        "manual",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "shader_contract_test",
+    size = "small",
+    srcs = [
+        "shader_contract_test.py",
+    ],
+    data = [
+        "//nurec/utils/io/export/ppisp_export/spg_sidecars:data",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "writer_test",
+    size = "small",
+    srcs = [
+        "writer_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/utils/io/export/ppisp_export:pylib",
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)

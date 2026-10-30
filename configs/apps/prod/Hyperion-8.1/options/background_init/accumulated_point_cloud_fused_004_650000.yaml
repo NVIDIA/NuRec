@@ -1,0 +1,19 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize 650,000 background points from the fused camera point cloud.
+
+defaults:
+  - override /model/gaussians/initialization@model.layers.background.initialization: accumulated_point_cloud
+  - _self_
+
+model:
+  layers:
+    background:
+      initialization:
+        num_point_cloud_points: 650_000
+        num_near_points: 100_000
+        num_far_points: 100_000
+        point_cloud_path: ${dirname:${dataset.path}}/fusion/fused_004.ply
+        non_dynamic_points_only: true

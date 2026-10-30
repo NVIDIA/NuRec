@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+semantic_logits:
+  # Number of semantic classes (output dimensions)
+  n_signal_dim: 20
+  sensor_type: camera
+  activation: none

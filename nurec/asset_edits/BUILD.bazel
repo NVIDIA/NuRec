@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Package charter: the RENDER-TIME half of the asset-edits feature only — the
+# manifest/schedule data model and the per-frame override executor. Its dependency
+# closure is deliberately stdlib + torch + the model layer's torch-only hook
+# contract (:pylib_edit_hook), which is what lets serve.py and
+# GaussiansComposite reach it without inheriting the bake tooling's USD + Click
+# graph. Authoring, SimReady import and the bake live in //nurec/utils/edit. Do not
+# add a module here that needs anything heavier.
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "runtime.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/models/gaussians:pylib_edit_hook",
+        "//nurec/utils:pylib_renamed_keys",
+        pip_requirement("torch"),
+    ],
+)
+
+# The producer half of the row-remap contract lives in GaussiansComposite, so this test
+# needs the model graph. Kept as its own target so :runtime_test stays torch-only.
+pytest_test(
+    name = "collect_integration_test",
+    size = "medium",  # ~16s of torch/gaussians imports before the first test runs
+    srcs = ["collect_integration_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/models:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_edit_hook",  # CollectedLayerLayout imported directly
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "runtime_test",
+    size = "small",
+    srcs = ["runtime_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/models/gaussians:pylib_edit_hook",
+        pip_requirement("torch"),
+    ],
+)

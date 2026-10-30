@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Example app: component-only 'deformables_with_calib' on top of the
+# /apps/prod/Hyperion-8.1/car2sim_lidar preset. See configs/component_only/deformables_with_calib.yaml.
+
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_lidar
+  - /component_only: deformables_with_calib
+  - _self_
+
+system:
+  test:
+    val_render_selected_nodes: {}

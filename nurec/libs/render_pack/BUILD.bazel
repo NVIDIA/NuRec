@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Fused render-output post-processing kernel: (H,W,3) f32 in [0,1] -> (3,H,W) u8
+# in [0,255]. Replaces the PyTorch chain of (* 255 / clamp / cast / permute /
+# contiguous) with a single CUDA pass that writes directly into a caller-owned
+# destination buffer, eliminating 5 kernel launches and a D2D copy per frame.
+# Shared by serve-grpc's zero-copy delivery transports (e.g. CUDA IPC).
+cuda_library(
+    name = "render_pack_cuda",
+    srcs = ["render_pack.cu"],
+    hdrs = ["render_pack.h"],
+)
+
+# Standalone binding for the render-pack kernel — no transport-specific host
+# libraries, so its correctness is testable in the default GPU CI.
+cc_binary(
+    name = "_render_pack.so",
+    srcs = ["render_pack_binding.cpp"],
+    linkshared = True,
+    deps = [
+        ":render_pack_cuda",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_cuda//cuda:runtime",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# testonly package for the pytest target below — the only consumer of __init__.py/
+# _render_pack.so; there is no non-test Python entry point for this package (see
+# __init__.py), so unlike cuda_ipc_transport there is no separate public :pylib.
+py_library(
+    name = "testlib",
+    testonly = True,
+    srcs = ["__init__.py"],
+    data = [":_render_pack.so"],
+)
+
+pytest_test(
+    name = "render_pack_test",
+    srcs = ["render_pack_test.py"],
+    tags = ["gpu"],
+    deps = [
+        ":testlib",
+        pip_requirement("torch"),
+    ],
+)

@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Offline SH-match optimization: DC warm-start + multi-view Adam
+# loop used by the sh-optimized PPISP integration mode. Never
+# executed at runtime in the spg-runtime path.
+TEST_ENV = {
+    # These tests intentionally operate on tiny tensors.  Prevent BLAS/OpenMP
+    # thread-pool overhead from dominating each scalar-sized operation.
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+}
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "dc_warmstart.py",
+        "node_iteration.py",
+        "optimization.py",
+        "renderer_callable.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+    deps = [
+        "//nurec/models/gaussians:pylib",
+        "//nurec/utils/io/export:pylib_radiance_scaling",
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+        pip_requirement("torchmetrics"),
+    ],
+)
+
+pytest_test(
+    name = "dc_warmstart_test",
+    # Torch/PPISP import and initialization alone can exceed the 60 s
+    # small-test budget on the aarch64 CI workers.  Keep the hermetic
+    # warm-start coverage, but give the test its appropriate budget.
+    size = "medium",
+    srcs = [
+        "dc_warmstart_test.py",
+    ],
+    env = TEST_ENV,
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "optimization_infra_test",
+    size = "medium",
+    srcs = [
+        "optimization_infra_test.py",
+    ],
+    env = TEST_ENV,
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "optimization_loop_test",
+    size = "medium",
+    srcs = [
+        "optimization_loop_test.py",
+    ],
+    env = TEST_ENV,
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "renderer_callable_test",
+    size = "medium",
+    srcs = [
+        "renderer_callable_test.py",
+    ],
+    env = TEST_ENV,
+    deps = [
+        ":pylib",
+        "//nurec/utils:pylib_types",  # for DataAndRenderingBatch
+        pip_requirement("torch"),
+    ],
+)

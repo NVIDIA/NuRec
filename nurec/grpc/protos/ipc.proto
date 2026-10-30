@@ -1,0 +1,40 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+
+package nurec.grpc.protos.ipc;
+
+////////////////////////////////////////////////////////////////////////////////
+// CUDA IPC session control plane
+//
+// For a client co-located with the server on the same node: the server allocates
+// and owns a small pool of GPU frame buffers, exports each as a cudaIpcMemHandle_t,
+// and the client opens them read-only via cudaIpcOpenMemHandle.
+// render_rgb stays a blocking RPC; the server picks which pooled buffer to render
+// into, and the client tells the server (via released_buffer_id on the next
+// request) once it is done reading a given buffer.
+////////////////////////////////////////////////////////////////////////////////
+
+message OpenIpcSessionRequest {
+    uint32 requested_width        = 1;
+    uint32 requested_height       = 2;
+    uint32 requested_buffer_count = 3;  // e.g. 2; server rejects requests above its configured max
+}
+
+message OpenIpcSessionResponse {
+    string session_id                   = 1;
+    repeated bytes cuda_ipc_mem_handles = 2;  // one cudaIpcMemHandle_t (64 raw bytes) per buffer
+    uint64 buffer_size                  = 3;  // bytes per buffer: actual_width * actual_height * 3 (uint8 planar)
+    bytes device_uuid                   = 4;  // server's CUDA device UUID (cudaDeviceProp::uuid), sanity-checked before open
+    uint32 actual_width                 = 5;
+    uint32 actual_height                = 6;
+}
+
+message CloseIpcSessionRequest {
+    string session_id = 1;
+}
+
+message CloseIpcSessionResponse {
+    bool   success       = 1;
+    string error_message = 2;
+}

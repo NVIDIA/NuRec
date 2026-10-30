@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: rig-calib
+start_global_step: 250
+skip_first_pose_delta: true
+enable_torch_compile: false
+
+rig_trajectory:
+  enabled: true
+  spline_degree: 3
+  knot_spacing_seconds: 0.10
+  max_translation_m: 0.25
+  max_rotation_degrees: 3.0
+  curvature_l1_weight: 0.0001
+  curvature_translation_normalization_m_s2: 2.0
+  curvature_rotation_normalization_degrees_s2: 20.0
+
+camera_extrinsics:
+  enabled: true
+  gauge: mean-zero-per-trajectory
+  max_translation_m: 0.10
+  max_rotation_degrees: 3.0
+
+lidar:
+  enabled: false
+camera:
+  enabled: true
+
+optimizer:
+  name: fused_adam
+  args:
+    lr: 0.0001
+    eps: 1.e-15
+    betas: [0.9, 0.99]
+    weight_decay: 0.0
+scheduler:
+  name: SequentialLR
+  interval: step
+  milestones:
+    - ${...start_global_step}
+    - ${add:${...start_global_step},500}
+
+  schedulers:
+    - name: ConstantLR
+      args:
+        factor: 0.0
+        total_iters: ${.....start_global_step}
+    - name: LinearLR
+      interval: step
+      args:
+        start_factor: 0.01
+        end_factor: 1.0
+        total_iters: 500
+    - name: StepFunCosineAnnealingLR
+      interval: step
+      args:
+        T_max: ${sub:${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}},${add:${.....start_global_step},500}}
+        min_factor: 0.0333
+        update_every_n_steps: ${trainer.annealing_update_every_n_steps}

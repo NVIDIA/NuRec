@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "pylib",
+    srcs = ["__init__.py"],
+    visibility = ["//apps/av:__subpackages__"],
+    deps = ["//apps:pylib"],
+)

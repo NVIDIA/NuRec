@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Skeleton custom NuRec config authored by run-nurec, mounted at launch.
+#
+# Every FILL IN marker takes a value resolved from the validated NCore shard
+# before launch. The placeholder each one replaces overrides the inherited
+# default and then cannot be used -- a string where NuRec wants an integer, a
+# sensor name no shard carries -- so a missed substitution fails when NuRec
+# reaches the value rather than running on a plausible default.
+#
+# Fields absent here stay at their inherited defaults. See SKILL.md
+# "Select or create app config" for how each block is decided and what
+# justifies adding a field beyond this skeleton.
+
+# @package _global_
+defaults:
+  # Base model. FILL IN: keep one. Pick by the dynamic-vs-static decision in
+  # SKILL.md; a static config against a shard with dynamic cuboids fails fast.
+  - /apps/AV/_base_3dgut_dynamic.yaml      # OR /apps/AV/_base_3dgut_static.yaml
+  # NuRec's SQA option blocks (verbatim names; see configs/apps/prod/options/).
+  - /apps/prod/options/artifact: default     # keep checkpoint, parsed_config, rig_trajectories, sequence_tracks
+  - /apps/prod/options/harmonizer/3dgut: disabled # skip diffusion image-quality refiner (training + inference)
+  - /apps/prod/options/mesh: disabled        # skip generic mesh extraction
+
+dataset:
+  # Pin the shard's actual sensors.
+  camera_ids: [<cam0>, <cam1>]     # FILL IN: every camera ID the shard carries
+  lidar_ids:  [<selected_lidar>]   # FILL IN: the single deliberately chosen LiDAR ID
+  # The inherited defaults derive train_camera_ids and val_camera_ids from
+  # camera_ids by interpolation, but pin
+  # generate_static_rigid_cuboid_tracks.visibility_check_camera_ids to a literal
+  # camera_front_wide_120fov, inert only while that block stays disabled. Repin
+  # it to ${dataset.camera_ids} when enabling the block, so the visibility list
+  # cannot drift from the selected cameras.
+  # Full image resolution, and all three subsampling factors must agree. The
+  # pixel sampler already inherits 1, but `/dataset: ncore` pins the two fields
+  # below to 4, so leaving them out trains and validates at quarter resolution.
+  n_val_image_subsample: 1
+  n_train_sequential_image_subsample: 1
+  samplers:
+    batch_sampler:
+      camera_pixel_sampler:
+        subsample: 1
+  val_camera_frame_step: 1
+  cuboid_tracks_params:
+    # Accept any LabelSource the converter wrote. Pin to a specific list only if
+    # the diagnosis identifies a track-source mismatch.
+    track_label_sources: null
+
+# Match validation MP4 playback speed to the effective input camera cadence
+# after val_camera_frame_step, and enable the two quality metrics the run
+# record requires that the inherited defaults leave off.
+system:
+  test:
+    video_fps: <val_video_fps>  # FILL IN: round(input_camera_fps_hz / val_camera_frame_step)
+    metrics:
+      ssim:
+        enabled: true
+      lpips:
+        enabled: true
+
+# Pin label_classes to the shard's class_id vocabulary. The
+# dynamic_gaussians defaults carry one vocabulary (lowercase 'car' / 'truck'),
+# so a shard using different or dataset-prefixed class IDs has its cuboids
+# dropped from every layer, which NuRec does not report. The value replaces
+# the inherited list rather than extending it, so paste the full bundled
+# default list ahead of the shard's additions. Drop the block only when every
+# observed class_id is already in the bundled defaults.
+model:
+  layers:
+    dynamic_rigids:
+      tracks:
+        # FILL IN: the bundled default list verbatim, then the shard's class IDs
+        label_classes: [<bundled defaults>, <shard-specific additions>]
+    dynamic_deformables:
+      tracks:
+        # FILL IN: the bundled default list verbatim, then the shard's class IDs
+        label_classes: [<bundled defaults>, <shard-specific additions>]

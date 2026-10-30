@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+# The elevation-aware unicycle-calibration module approximates cars with fixed-frame yaw, pitch, and height.
+
+name: elevation-aware-unicycle-tracks-calib
+start_global_step: 500
+
+fix_first_pose: true
+fix_last_pose: true
+
+pitch_slope_clamp_rad: 1.2
+
+short_gap_fusion:
+  enabled: true
+  min_gap_us: 10000
+
+optimizer:
+  name: fused_adam
+  args:
+    lr: 1.0e-3
+    eps: 1.e-8
+    betas: [0.9, 0.99]
+scheduler:
+  name: SequentialLR
+  interval: step
+  milestones:
+    - ${...start_global_step}
+    - ${add:${...start_global_step},${system.warmup_steps}}
+
+  schedulers:
+    - name: ConstantLR
+      args:
+        factor: 0.0
+        total_iters: ${.....start_global_step}
+    - name: LinearLR
+      interval: step
+      args:
+        start_factor: 0.01
+        end_factor: 1.0
+        total_iters: ${system.warmup_steps}
+    - name: StepFunCosineAnnealingLR
+      interval: step
+      args:
+        T_max: ${sub:${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}},${add:${.....start_global_step},${system.warmup_steps}}}
+        min_factor: 0.0333
+        update_every_n_steps: ${trainer.annealing_update_every_n_steps}
+
+# Local axes of the cuboid tracks that define how the tracks should be interpreted in the unicycle model.
+# (Note that this should correspond to the track poses in the dataset)
+cuboid_tracks:
+  # Local up direction of the local frame of the cuboid tracks.
+  up_axis: [0.0, 0.0, 1.0]
+  # Local forward direction of the local frame of the cuboid tracks.
+  forward_axis: [1.0, 0.0, 0.0]

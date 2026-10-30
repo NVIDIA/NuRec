@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+cosmos-predict2 1.0.9+nre2 - statement of changes (Apache License 2.0, section 4(b))
+
+This wheel is derived from the upstream cosmos-predict2 1.0.9 wheel published on PyPI
+(https://pypi.org/project/cosmos-predict2/1.0.9/), licensed under the Apache License,
+Version 2.0. It has been modified by NVIDIA CORPORATION & AFFILIATES, 2026. The upstream
+LICENSE is retained unchanged in this dist-info directory.
+
+Changes relative to upstream 1.0.9:
+
+1. cosmos_predict2-1.0.9.dist-info/METADATA (now cosmos_predict2-1.0.9+nre2.dist-info)
+   - Version: 1.0.9 -> 1.0.9+nre2.
+   - All Requires-Dist "==x.y.z" pins removed (requirements left unpinned); packages not
+     needed for inference (better-profanity, ipdb, mediapy, modelscope, nltk, peft, pynvml,
+     qwen-vl-utils[decord], retinaface-py, webdataset) moved to a new "full" extra.
+     Patch: relax_runtime_dependencies.patch
+2. imaginaire/auxiliary/text_encoder.py
+   - Removed the Reason1/Qwen imports and the default QwenVLBaseModel config; model_config
+     defaults to None and CosmosReason1TextEncoder raises when used. Patch:
+     lazy_reason1_text_encoder.patch
+3. imaginaire/lazy_config/lazy.py
+   - The "add" OmegaConf resolver is registered only if not already registered. Patch:
+     imaginaire_omegaconf_resolver.patch
+
+The modified source files carry no in-file notice; this file is the statement of changes
+(NVIDIA CORPORATION & AFFILIATES, 2026). The two source patches additionally open with a
+plain-text modification notice; relax_runtime_dependencies.patch (METADATA only) has none.
+The patches are maintained with the NuRec wheel build sources.

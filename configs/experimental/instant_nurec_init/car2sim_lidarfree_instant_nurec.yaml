@@ -1,0 +1,30 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# instant_nurec-init variant of the lidarfree config.
+#   - Background gaussians are seeded from the instant_nurec (kelvin) PLY output.
+#   - Road gaussians keep the parent's camera-derived ground-mesh init
+#     (`camera_ground_mesh_road`, Lucrezia/MR3387, lidarfree-specific). This
+#     mirrors the lidar instant_nurec-default pattern in
+#     `configs/apps/prod/Hyperion-8.1/car2sim_6cam.yaml`, which keeps the
+#     parent's `lidar_ground_mesh_road` for road and only instant_nurec-initializes
+#     background.
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_lidarfree
+  - override /model/gaussians/initialization@model.layers.background.initialization: instant_nurec_ply
+
+model:
+  layers:
+    background:
+      initialization:
+        num_point_cloud_points: 850000
+    dynamic_rigids:
+      initialization:
+        camera_ids: []
+    dynamic_deformables:
+      initialization:
+        camera_ids: []
+    static_rigids:
+      initialization:
+        camera_ids: []

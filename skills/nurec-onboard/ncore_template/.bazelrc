@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Default compilation mode
+build --compilation_mode=opt
+
+# Opt out of `aspect_rules_lint` 2.x anonymous telemetry (and any other tool
+# that honors the cross-vendor `DO_NOT_TRACK` convention). Set on all three
+# of repo / action / test env so the var is visible to module-extension
+# evaluation, build actions, and test actions; `bazel run` inherits the
+# operator's shell env separately (set in `run.sh`).
+common --repo_env=DO_NOT_TRACK=1
+common --action_env=DO_NOT_TRACK=1
+test --test_env=DO_NOT_TRACK=1
+
+# Error (instead of only warning, the default) when a direct dependency
+# resolves to a version different from the declared one.
+common --check_direct_dependencies=error
+
+# Don't generate missing `__init__.py` files in Python runfiles; packages
+# declare their own, as in the enclosing repository.
+build --incompatible_default_to_explicit_init_py
+
+# Show outputs of failing tests by default
+test --test_output=errors
+
+# Local action cache, shared by every converter workspace materialized from
+# this template. Bazel supports sharing a `--disk_cache` directory across
+# workspaces (entries are salt-differentiated to prevent cross-workspace
+# collisions).
+#
+# When detaching this converter: the namespace `nurec-onboard` is a label, not
+# a contract. Optionally rename it to your project name so the on-disk cache
+# directory is self-describing (e.g. `disk-cache/<your-project>`); leaving the
+# original label in place also works.
+build --disk_cache=~/.cache/bazel/disk-cache/nurec-onboard
+
+# Pin Bazel's HTTP repository cache to a stable per-user path. Content-
+# addressable (keyed on URL+sha256), so a wheel already downloaded by any
+# Bazel workspace pointing at the same path is reused without a network
+# round-trip. Per Bazel's docs
+# (https://bazel.build/run/build#the-repository-cache) the repository
+# cache "is shared between all workspaces and installed versions of bazel".
+# Sharing it between this template and the workdirs materialized from it is
+# what lets `warm_bazel_cache` (in NuRec Onboard's `run.sh`) pre-populate the
+# cache before the agent runs `bazel run` in the materialized converter
+# workdir.
+#
+# Per-operator override: drop `build --repository_cache=<your/path>` into
+# `.bazelrc.user` (imported below); Bazel's last-flag-wins makes it win.
+#
+# When detaching this converter: keep this line. The pin works standalone --
+# first `bazel run` populates the cache, subsequent runs reuse. Change the
+# path here only if your org pins a different machine-wide Bazel cache
+# convention.
+build --repository_cache=~/.cache/bazel/repository-cache
+
+# Re-enable HTTP Basic auth for HTTPS proxy tunneling, which Java disables by
+# default (`jdk.http.auth.tunneling.disabledSchemes=Basic`). Behind a forward
+# proxy that requires credentials, Bazel's JVM HTTP client cannot authenticate,
+# so PyPI fetches (such as the `pip.parse` simple-API metadata fetch after
+# adding a dependency) fail with HTTP 407. Inert when no proxy is configured.
+#
+# When detaching this converter: keep this line if your hosts sit behind a
+# proxy that requires credentials.
+startup --host_jvm_args=-Djdk.http.auth.tunneling.disabledSchemes=
+
+# Load user overrides if present.
+try-import %workspace%/.bazelrc.user

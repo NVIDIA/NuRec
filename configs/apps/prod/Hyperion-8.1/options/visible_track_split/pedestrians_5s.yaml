@@ -1,0 +1,18 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Split long pedestrian-family tracks into at most five-second visible segments.
+
+dataset:
+  cuboid_tracks_params:
+    visible_track_split:
+      enabled: true
+      max_visible_duration_s: 5.0
+      target_label_classes:
+        - Pedestrian
+        - Pedestrian with Object
+        - pedestrian
+        - person
+        - person_group
+        - stroller

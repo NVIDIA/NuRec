@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "base.py",
+        "fixed.py",
+        "holdout.py",
+        "image_crop.py",
+        "lidar_crop.py",
+        "semantic.py",
+        "timestamp.py",
+        "uniform.py",
+        "weighted.py",
+    ],
+    deps = [
+        "//nurec/harmonizer:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_misc",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "holdout_test",
+    srcs = ["holdout_test.py"],
+    deps = [
+        "//nurec/datasets:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "fixed_test",
+    srcs = ["fixed_test.py"],
+    deps = [
+        "//nurec/datasets:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "uniform_test",
+    srcs = ["uniform_test.py"],
+    deps = [
+        "//nurec/datasets:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+    ],
+)

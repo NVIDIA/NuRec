@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Generate static traffic-light cuboid tracks from the fused point cloud.
+
+dataset:
+  generate_static_rigid_cuboid_tracks:
+    enabled: true
+    visibility_check_camera_ids: ${dataset.camera_ids}
+    rigid_classes:
+      - "traffic light"
+    point_cloud_path: ${dirname:${dataset.path}}/fusion/fused_004.ply

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//deps/numpyeigen:npe_add_module.bzl", "npe_codegen_function", "npe_codegen_module")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# The vendored DownloadProject copy is listed in the third-party notices; the notices tooling
+# checks that it is still here.
+exports_files(
+    [
+        "cmake/DownloadProject.CMakeLists.cmake.in",
+        "cmake/DownloadProject.cmake",
+    ],
+    visibility = [],
+)
+
+npe_codegen_function(
+    name = "ray_utils_codegen_function",
+    src = ":ray_utils.cpp",
+    out = ":ray_utils_function.cpp",
+)
+
+npe_codegen_module(
+    name = "ray_utils_codegen_module",
+    src = ":ray_utils.cpp",
+    out = ":ray_utils_module.cpp",
+    module = "libray_utils_cc",
+)
+
+cc_binary(
+    name = "ray_utils_cc",
+    srcs = [
+        ":ray_utils_function.cpp",
+        ":ray_utils_module.cpp",
+    ],
+    linkshared = True,
+    deps = [
+        "@numpyeigen//:npe",
+    ],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [
+        ":ray_utils_cc",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//bazel/docs:__pkg__",
+    ],
+)

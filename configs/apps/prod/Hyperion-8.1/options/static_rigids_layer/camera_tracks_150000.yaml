@@ -1,0 +1,25 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Add a static-rigids layer initialized with 150,000 camera-track points.
+
+defaults:
+  - /model/gaussians/models@model.layers.static_rigids: rigid_gaussians
+  - /model/tracks_calib@model.layers.static_rigids.tracks_calib: static
+  - /model/gaussians/extra_signal@model.layers.static_rigids.extra_signal: [semantic_logits]
+  - /model/gaussians/initialization@model.layers.static_rigids.initialization: camera_dynamic_tracks
+  - /apps/prod/options/temporal_appearance@model.layers.static_rigids: fourier_features_dim_20
+  - _self_
+
+model:
+  layers:
+    static_rigids:
+      tracks:
+        label_classes: ${model.layers.dynamic_rigids.tracks.label_classes}
+        is_dynamic: false
+      initialization:
+        num_point_cloud_points_in_layer: 150_000
+        camera_ids: ${dataset.camera_ids}
+        step_frame: 5
+        symmetric_axis: "Y"

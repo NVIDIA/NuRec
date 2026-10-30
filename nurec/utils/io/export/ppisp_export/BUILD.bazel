@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Top-level PPISP USD-export sub-package. Owns the writer used by
+# the default spg-runtime mode (usd_writer.py), the export-time
+# integration shims that gaussian_usd_asset.py calls into
+# (export_integration.py), and the per-camera/frame ID resolver
+# (reference_selection.py). The three sub-packages (sh_match/,
+# controller/, spg_sidecars/) are stand-alone Bazel targets and
+# are not aggregated into this pylib -- callers depend on the one
+# they need.
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "export_integration.py",
+        "reference_selection.py",
+        "spg_files.py",
+        "usd_writer.py",
+    ],
+    data = [
+        # usd_writer.py loads the sidecar triple from sibling
+        # spg_sidecars/ at runtime via Path(__file__).parent.
+        "//nurec/utils/io/export/ppisp_export/spg_sidecars:data",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+    deps = [
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/io/export/ppisp_export/controller:pylib",
+        "//nurec/utils/io/export/ppisp_export/sh_match:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+py_library(
+    name = "spg_cuda_runtime_lib",
+    srcs = [
+        "spg_cuda_controller_runtime.py",
+        "spg_cuda_ppisp_runtime.py",
+    ],
+    data = [
+        "//bazel/cuda_toolkit:runtime",
+        "//nurec/libs/slang_utils:slangtorch_jit",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/libs/slang_utils:pylib_utils",
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "usd_writer_test",
+    size = "small",
+    srcs = [
+        "usd_writer_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "reference_selection_test",
+    size = "small",
+    srcs = [
+        "reference_selection_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "export_integration_test",
+    size = "small",
+    srcs = [
+        "export_integration_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "spg_equivalence_test",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "spg_equivalence_test.py",
+    ],
+    mypy = False,
+    tags = ["manual"],
+    deps = [
+        ":pylib",
+        ":spg_cuda_runtime_lib",
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "spg_cuda_runtime_test",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "spg_cuda_runtime_test.py",
+    ],
+    mypy = False,
+    deps = [
+        ":pylib",
+        ":spg_cuda_runtime_lib",
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "spg_performance_test",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "spg_cuda_runtime_test.py",
+    ],
+    args = [
+        "-k",
+        "performance_sweep",
+    ],
+    env = {
+        "NUREC_RUN_PPISP_EXPORTED_CUDA_PERF": "1",
+    },
+    mypy = False,
+    tags = ["manual"],
+    deps = [
+        ":pylib",
+        ":spg_cuda_runtime_lib",
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+    ],
+)

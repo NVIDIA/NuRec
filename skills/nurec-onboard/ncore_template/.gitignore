@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Bazel
+bazel-*
+.bazelrc.user
+
+# Python
+__pycache__/
+
+# Ruff cache
+.ruff_cache/

@@ -1,0 +1,1028 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+cc_binary(
+    name = "tcnn_allocator_cc",
+    srcs = ["tcnn_allocator_bindings.cpp"],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions and to build correct torch-extension bindings
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libtcnn_allocator_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        "//deps/torch:torch_headers",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_cuda//cuda:runtime",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_tcnn_allocator",
+    srcs = ["tcnn_allocator.py"],
+    data = [":tcnn_allocator_cc"],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_packed_ops",
+    srcs = ["packed_ops.py"],
+    deps = [
+        pip_requirement("torch"),
+        "//nurec/libs/packed_ops:pylib_cc",
+    ],
+)
+
+py_library(
+    name = "pylib_prober",
+    srcs = ["prober.py"],
+    deps = [
+        ":pylib_tests",
+        "//nurec/config:pylib",
+        "@rules_python//python/runfiles",
+        pip_requirement("torch"),
+        pip_requirement("hydra-core"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+py_library(
+    name = "pylib_selective_adam_visibility",
+    srcs = ["selective_adam_visibility.py"],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "selective_adam_visibility_test",
+    srcs = ["selective_adam_visibility_test.py"],
+    deps = [
+        ":pylib_selective_adam_visibility",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_types",
+    srcs = [
+        "batch.py",
+        "types.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for aux_gen ncore_aux_data
+        "//apps/av/aux_gen:__pkg__",
+    ],
+    deps = [
+        ":pylib_fields",
+        ":pylib_geometry",
+        ":pylib_misc",
+        ":pylib_prober",
+        ":pylib_renamed_keys",
+        ":pylib_selective_adam_visibility",
+        ":pylib_torch_compile",
+        "//nurec/libs/geometry/kernels:pylib",
+        "//nurec/libs/sensors:pylib_slang",
+        "//nurec/utils/sensors:pylib",
+        "//nurec/utils/sensors:pylib_ncore_sensors_converters",
+        "//nurec/visualdebugger:pylib",
+        pip_requirement("dataclasses-json"),
+        pip_requirement("numpy"),
+        pip_requirement("opencv-python"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+        pip_requirement("usd-core"),
+        pip_requirement("lietorch"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "types_test",
+    timeout = "long",
+    srcs = ["types_test.py"],
+    data = glob(["testdata/**"]) + [
+        "@test_data_ncore_v4//:ncore_1sec",
+    ],
+    deps = [
+        ":pylib_tests",
+        ":pylib_types",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib",
+        pip_requirement("lietorch"),
+        pip_requirement("hydra-core"),
+        pip_requirement("numpy"),
+        pip_requirement("parameterized"),
+        pip_requirement("nvidia-ncore"),
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_library(
+    name = "pylib_metrics",
+    srcs = ["metrics.py"],
+    visibility = [
+        "//nurec/utils/io/export:__pkg__",
+    ],
+    deps = [
+        ":pylib_trainer",
+        ":pylib_types",
+        "//nurec:pylib",
+        "//nurec/config:pylib_version",
+        pip_requirement("torch"),
+        pip_requirement("pydantic"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pyarrow"),
+        pip_requirement("pyyaml"),
+    ],
+)
+
+pytest_test(
+    name = "metrics_test",
+    srcs = ["metrics_test.py"],
+    deps = [
+        ":pylib_metrics",
+        pip_requirement("pyarrow"),
+        pip_requirement("pyyaml"),  # test reads metrics.yaml back
+        pip_requirement("torch"),  # test monkeypatches torch.cuda.is_available
+    ],
+)
+
+py_library(
+    name = "pylib_fields",
+    srcs = ["fields.py"],
+    deps = [
+        pip_requirement("dataclasses-json"),
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_lidar_pattern_recovery",
+    srcs = ["lidar_pattern_recovery.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_renamed_keys",
+    srcs = ["renamed_keys.py"],
+)
+
+pytest_test(
+    name = "renamed_keys_test",
+    size = "small",
+    srcs = ["renamed_keys_test.py"],
+    deps = [":pylib_renamed_keys"],
+)
+
+py_library(
+    name = "pylib_legacy_pickle",
+    srcs = ["legacy_pickle.py"],
+    visibility = ["//nurec:__pkg__"],
+    deps = [pip_requirement("torch")],
+)
+
+pytest_test(
+    name = "legacy_pickle_test",
+    size = "small",
+    srcs = ["legacy_pickle_test.py"],
+    deps = [
+        ":pylib_legacy_pickle",
+        ":pylib_renamed_keys",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_misc",
+    srcs = ["misc.py"],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+py_library(
+    name = "pylib_cached_device_tensor",
+    srcs = ["cached_device_tensor.py"],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "cached_device_tensor_test",
+    srcs = ["cached_device_tensor_test.py"],
+    deps = [
+        ":pylib_cached_device_tensor",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_cuda_rng",
+    srcs = ["cuda_rng.py"],
+    deps = [
+        ":pylib_renamed_keys",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_morton",
+    srcs = ["morton.py"],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_training_rng",
+    srcs = ["training_rng.py"],
+    deps = [
+        ":pylib_cuda_rng",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "morton_test",
+    srcs = ["morton_test.py"],
+    deps = [
+        ":pylib_morton",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "cuda_rng_checkpoint_test",
+    size = "small",
+    srcs = ["cuda_rng_checkpoint_test.py"],
+    deps = [
+        ":pylib_cuda_rng",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "cuda_rng_test",
+    srcs = ["cuda_rng_test.py"],
+    deps = [
+        ":pylib_cuda_rng",
+        ":pylib_misc",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "fused_parameter_gather_test",
+    timeout = "moderate",
+    srcs = ["fused_parameter_gather_test.py"],
+    tags = ["multi-gpu"],
+    deps = [
+        ":pylib_misc",
+        ":pylib_optim",
+        ":pylib_profiling",
+        ":pylib_selective_adam_visibility",
+        "//nurec/libs/gaussian_collective_payload_ops:pylib_cc",
+        "//nurec/models/gaussians:pylib_fused_parameter_gather",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "fused_payload_field_major_test",
+    srcs = ["fused_payload_field_major_test.py"],
+    deps = [
+        ":pylib_profiling",
+        "//nurec/libs/gaussian_collective_payload_ops:pylib_cc",
+        "//nurec/models/gaussians:pylib_fused_parameter_gather",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "cli_test",
+    srcs = ["cli_test.py"],
+    deps = [
+        ":pylib_cli",
+    ],
+)
+
+py_library(
+    name = "pylib_morph",
+    srcs = ["morph.py"],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_ncore_types",
+    srcs = ["ncore_types.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":pylib_misc",
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "pylib_ncore_utils",
+    srcs = ["ncore_utils.py"],
+    visibility = [
+        "//:aux_package_group",
+        "//:core_package_group",
+        "//nurec/benchmark:__subpackages__",
+    ],
+    deps = [
+        ":pylib_morph",
+        ":pylib_types",
+        "//nurec/ncore_backends:pylib",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("torch"),
+        pip_requirement("torchvision"),
+        pip_requirement("tqdm"),
+        pip_requirement("universal-pathlib"),
+        pip_requirement("zarr"),
+    ],
+)
+
+pytest_test(
+    name = "ncore_utils_test",
+    size = "small",
+    srcs = ["ncore_utils_test.py"],
+    deps = [
+        ":pylib_ncore_utils",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_tests",
+    srcs = [
+        "tests.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_colored_exceptions",
+    srcs = [
+        "colored_exceptions.py",
+    ],
+    deps = [],
+)
+
+py_library(
+    name = "pylib_knn",
+    srcs = [
+        "knn.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("torch"),
+        "//nurec/libs/pytorch3d_knn:pylib_cc",
+    ],
+)
+
+py_library(
+    name = "pylib_cuboid",
+    srcs = ["cuboid.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "cuboid_test",
+    srcs = ["cuboid_test.py"],
+    deps = [
+        ":pylib_cuboid",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_geometry",
+    srcs = [
+        "geometry.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for aux_gen estimators
+        "//apps/av/aux_gen:__pkg__",
+    ],
+    deps = [
+        ":pylib_knn",
+        ":pylib_profiling",
+        pip_requirement("torch"),
+        pip_requirement("lietorch"),
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "pylib_component_only_mask",
+    srcs = [
+        "component_only_mask.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("torch"),
+        "//nurec/config:pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_component_only_supervision",
+    srcs = ["component_only_supervision.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        ":pylib_component_only_mask",
+        ":pylib_types",
+        "//nurec/datasets/samplers:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "component_only_supervision_test",
+    srcs = ["component_only_supervision_test.py"],
+    deps = [
+        ":pylib_component_only_supervision",
+        ":pylib_types",
+        # mypy follows sampler TYPE_CHECKING imports into nurec.datasets.ncore.
+        "//nurec/datasets:pylib",
+        "//nurec/datasets/samplers:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "component_only_mask_test",
+    srcs = ["component_only_mask_test.py"],
+    deps = [
+        ":pylib_component_only_mask",
+    ],
+)
+
+py_library(
+    name = "pylib_cudaeventtimer",
+    srcs = ["cudaeventtimer.py"],
+    deps = [pip_requirement("torch")],
+)
+
+pytest_test(
+    name = "cudaeventtimer_test",
+    size = "small",
+    srcs = ["cudaeventtimer_test.py"],
+    deps = [
+        ":pylib_cudaeventtimer",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_profiling",
+    srcs = [
+        "profiling.py",
+    ],
+    deps = [
+        pip_requirement("torch"),
+        ":pylib_trainer",
+        "//nurec/config:pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_cli",
+    srcs = [
+        "cli.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for aux_gen (ScopedTimer CLI options)
+        "//apps/av/aux_gen:__pkg__",
+    ],
+    deps = [
+        ":pylib_profiling",
+        "//nurec/config:pylib",
+        pip_requirement("click"),
+    ],
+)
+
+py_library(
+    name = "pylib_model_registry",
+    srcs = ["model_registry.py"],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //apps/av/avmask_annotator
+        "//apps/av/avmask_annotator:__pkg__",
+    ],
+    deps = [
+        ":pylib_misc",
+        pip_requirement("huggingface-hub"),
+        pip_requirement("requests"),
+        pip_requirement("tqdm"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "lidar_firing_lattice.py",
+        "lidar_model.py",
+        "lidar_post_processing.py",
+        "log.py",
+        "media_log.py",
+        "model_registry.py",
+        "unstructured_lidar.py",
+        "visualize.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//nurec/benchmark:__subpackages__",
+    ],
+    deps = [
+        ":pylib_cached_device_tensor",
+        ":pylib_colored_exceptions",
+        ":pylib_cuboid",
+        ":pylib_cuda_rng",
+        ":pylib_geometry",
+        ":pylib_knn",
+        ":pylib_lpips_network",
+        ":pylib_metrics",
+        ":pylib_misc",
+        ":pylib_packed_ops",
+        ":pylib_profiling",
+        ":pylib_types",
+        "//nurec:pylib",
+        "//nurec/config:pylib",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils/upgrade:pylib",
+        "//nurec/visualdebugger:pylib",
+        pip_requirement("dataclasses-json"),
+        pip_requirement("torch"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("matplotlib"),
+        pip_requirement("einops"),
+        pip_requirement("flow_vis"),
+        pip_requirement("imageio"),
+        pip_requirement("scipy"),
+        pip_requirement("lietorch"),
+        pip_requirement("hydra-core"),
+        pip_requirement("shortuuid"),
+        pip_requirement("tensorboardx"),
+        pip_requirement("pydantic"),
+        pip_requirement("pillow"),
+        pip_requirement("pytorch-lightning"),
+        pip_requirement("pyyaml"),
+        pip_requirement("huggingface-hub"),
+        pip_requirement("requests"),
+        pip_requirement("tqdm"),
+        pip_requirement("tinycudann"),
+        "//nurec/libs/packed_ops:pylib_cc",
+        "//nurec/libs/pytorch3d_knn:pylib_cc",
+        "//nurec/libs/vren:pylib",
+        "//nurec/libs/vren:pylib_cc",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+    ],
+)
+
+pytest_test(
+    name = "visualize_test",
+    size = "small",
+    srcs = ["visualize_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("matplotlib"),
+    ],
+)
+
+pytest_test(
+    name = "geometry_test",
+    srcs = ["geometry_test.py"],
+    deps = [
+        ":pylib_geometry",
+        ":pylib_prober",
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "lidar_post_processing_test",
+    srcs = ["lidar_post_processing_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "unstructured_lidar_test",
+    srcs = ["unstructured_lidar_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "lidar_firing_lattice_test",
+    srcs = ["lidar_firing_lattice_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_optim",
+    srcs = [
+        "optim.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        pip_requirement("apex"),
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+        pip_requirement("lietorch"),
+        "//nurec/config:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/utils:pylib_trainer",
+    ],
+)
+
+pytest_test(
+    name = "optim_test",
+    srcs = ["optim_test.py"],
+    deps = [
+        ":pylib_optim",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_callbacks",
+    srcs = ["callbacks.py"],
+    deps = [
+        ":pylib",
+        ":pylib_types",
+        "//nurec/config:pylib",
+        "//nurec/systems:pylib",
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+pytest_test(
+    name = "callbacks_test",
+    srcs = ["callbacks_test.py"],
+    deps = [
+        ":pylib_callbacks",
+        "//nurec/systems:pylib",
+        pip_requirement("torch"),
+        pip_requirement("tensorboardx"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+py_library(
+    name = "pylib_files",
+    srcs = [
+        "files.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//apps/av/aux_gen:__pkg__",
+    ],
+    deps = [
+        pip_requirement("universal-pathlib"),
+    ],
+)
+
+pytest_test(
+    name = "model_registry_test",
+    srcs = ["model_registry_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_custom_metrics",
+    srcs = ["custom_metrics.py"],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("torchmetrics"),
+    ],
+)
+
+pytest_test(
+    name = "prober_test",
+    srcs = ["prober_test.py"],
+    deps = [
+        ":pylib_prober",
+        ":pylib_tests",
+        # nurec is needed to allow debugpy to work
+        "//nurec:pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "scopedtimer_test",
+    srcs = ["scopedtimer_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/config:pylib_scopedtimer",
+    ],
+)
+
+pytest_test(
+    name = "misc_test",
+    srcs = ["misc_test.py"],
+    deps = [
+        ":pylib_misc",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_trainer",
+    srcs = ["trainer.py"],
+    deps = [
+        "//nurec/config:pylib_scopedtimer",
+        "//nurec/config:pylib_trainer_config",
+        pip_requirement("torch"),
+        pip_requirement("pytorch-lightning"),
+    ],
+)
+
+py_library(
+    name = "pylib_schedulers",
+    srcs = ["schedulers.py"],
+    deps = [
+        ":pylib_trainer",
+        "//nurec/config:pylib_trainer_config",
+        pip_requirement("omegaconf"),
+    ],
+)
+
+py_library(
+    name = "pylib_lpips_network",
+    srcs = [
+        "lpips_network.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("torchvision"),
+        pip_requirement("lpips"),
+    ],
+)
+
+# Tracy default variant (CPU-only)
+py_library(
+    name = "pylib_misc_tracy",
+    srcs = [
+        "__init__.py",
+        "geometry.py",
+        "knn.py",
+        "lidar_model.py",
+        "log.py",
+        "media_log.py",
+        "misc.py",
+        "model_registry.py",
+        "profiling.py",
+        "trainer.py",
+        "visualize.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + ["//:__pkg__"],
+    deps = [
+        ":pylib_metrics",
+        ":pylib_packed_ops",
+        ":pylib_types",
+        "//nurec:pylib",
+        "//nurec/config:pylib",
+        "//nurec/libs/tracy_utils:pylib",  # Default Tracy (CPU-only)
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils/upgrade:pylib",
+        "//nurec/visualdebugger:pylib",
+        pip_requirement("dataclasses-json"),
+        pip_requirement("torch"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("lietorch"),
+        pip_requirement("hydra-core"),
+        pip_requirement("huggingface-hub"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+# Tracy GPU variant
+py_library(
+    name = "pylib_misc_tracy_gpu",
+    srcs = [
+        "__init__.py",
+        "geometry.py",
+        "knn.py",
+        "lidar_model.py",
+        "log.py",
+        "media_log.py",
+        "misc.py",
+        "model_registry.py",
+        "profiling.py",
+        "trainer.py",
+        "visualize.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + ["//:__pkg__"],
+    deps = [
+        ":pylib_metrics",
+        ":pylib_packed_ops",
+        ":pylib_types",
+        "//nurec:pylib",
+        "//nurec/config:pylib",
+        "//nurec/libs/tracy_utils:pylib_gpu",  # GPU Tracy
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils/upgrade:pylib",
+        "//nurec/visualdebugger:pylib",
+        pip_requirement("dataclasses-json"),
+        pip_requirement("torch"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("lietorch"),
+        pip_requirement("hydra-core"),
+        pip_requirement("huggingface-hub"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pytorch_lightning"),
+    ],
+)
+
+py_binary(
+    name = "ffmpeg_wrap",
+    srcs = [
+        "ffmpeg_wrap.py",
+    ],
+    main = "ffmpeg_wrap.py",
+    deps = [
+        ":pylib_ffmpeg_config",
+        pip_requirement("imageio-ffmpeg"),
+        pip_requirement("setuptools"),
+    ],
+)
+
+py_library(
+    name = "pylib_ffmpeg_config",
+    srcs = ["ffmpeg_config.py"],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+        "//apps:__pkg__",
+    ],
+    deps = [
+        pip_requirement("imageio-ffmpeg"),
+    ],
+)
+
+py_library(
+    name = "pylib_tile_mask",
+    srcs = [
+        "tile_mask.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        ":pylib_geometry",
+        ":pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "ffmpeg_config_test",
+    srcs = ["ffmpeg_config_test.py"],
+    deps = [
+        ":pylib_ffmpeg_config",
+    ],
+)
+
+pytest_test(
+    name = "video_codec_test",
+    srcs = ["video_codec_test.py"],
+    deps = [
+        pip_requirement("imageio-ffmpeg"),
+    ],
+)
+
+# Stdlib-only MPS detection helper. Consumed by nurec.grpc.multiproc_serve's preflight (`mps_active` /
+# `mps_preflight`) when serving with --multiproc-workers, not by run.py. Must have no torch / CUDA-touching
+# deps so it can run before any CUDA-initializing import.
+py_library(
+    name = "pylib_mps_prelaunch",
+    srcs = ["mps_prelaunch.py"],
+    deps = [],
+)
+
+pytest_test(
+    name = "mps_prelaunch_test",
+    srcs = ["mps_prelaunch_test.py"],
+    deps = [
+        ":pylib_mps_prelaunch",
+    ],
+)
+
+pytest_test(
+    name = "tile_mask_test",
+    srcs = ["tile_mask_test.py"],
+    deps = [
+        ":pylib_tile_mask",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_torch_compile",
+    srcs = [
+        "torch_compile.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_lidar_object_init_points",
+    srcs = ["lidar_object_init_points.py"],
+    visibility = [
+        "//:core_package_group",
+    ],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+pytest_test(
+    name = "lidar_object_init_points_test",
+    size = "small",
+    srcs = ["lidar_object_init_points_test.py"],
+    deps = [
+        ":pylib_lidar_object_init_points",
+        ":pylib_ncore_utils",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+    ],
+)

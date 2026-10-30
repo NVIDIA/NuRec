@@ -1,0 +1,12 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep visible-track splitting disabled.
+
+dataset:
+  cuboid_tracks_params:
+    visible_track_split:
+      enabled: false
+      max_visible_duration_s: 10.0
+      target_label_classes: null

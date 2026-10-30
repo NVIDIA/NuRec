@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+imageio-ffmpeg 0.6.0+nre6 - statement of changes
+
+This wheel is built from imageio-ffmpeg (https://github.com/imageio/imageio-ffmpeg, BSD 2-Clause) at
+tag v0.6.0. It bundles an LGPL-2.1-or-later FFmpeg 9.0.1 executable and SVT-AV1 2.3.0; their
+source tarballs ship inside the wheel under imageio_ffmpeg/binaries/. The files below were modified
+by NVIDIA CORPORATION & AFFILIATES, 2026.
+
+Changes applied by the NuRec build:
+- imageio_ffmpeg/binaries/: the upstream FFmpeg executable is replaced by the NVIDIA build named
+  ffmpeg-linux-<arch>-v9.0.1, with LICENSE.ffmpeg-LGPL, BUILD-INFO.txt, the FFmpeg and SVT-AV1
+  source tarballs and a CycloneDX record of the FFmpeg component.
+- imageio_ffmpeg/_definitions.py: __version__ = "0.6.0+nre6"; the per-platform executable names
+  point at v9.0.1.
+- imageio_ffmpeg/__init__.py: imports the codec helpers from the added _video_codec.py
+  (ensure_nvenc_available, get_codec_config, is_nvenc_available, pick_codec).
+- imageio_ffmpeg/_video_codec.py and py.typed: added.

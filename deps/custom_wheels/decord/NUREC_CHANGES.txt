@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+decord 0.6.0+nre4 - statement of changes (Apache License 2.0, section 4(b))
+
+This wheel is built from decord v0.6.0 (https://github.com/dmlc/decord, Apache License 2.0)
+via an NVIDIA fork at commit
+3bb314828c626d7c33e4f84a85772593fce7ea40. The upstream LICENSE is retained in this dist-info
+directory. The files below were modified by NVIDIA CORPORATION & AFFILIATES, 2026. This file is
+the statement of changes; the modified files themselves carry no in-file notice.
+
+Fork commits over upstream v0.6.0 (cmake/util/FindFFmpeg.cmake only, an aarch64 library layout
+that the patch below then replaces; the net change to that file is a comment).
+
+Changes applied by the NuRec build (decord-0.6.0-ffmpeg-9.patch):
+- cmake/util/FindFFmpeg.cmake: one Linux FFMPEG_LIBRARIES layout for all architectures.
+- src/video/ffmpeg/ffmpeg_common.h: restored #include <libavcodec/bsf.h>.
+- src/video/ffmpeg/filter_graph.cc: buffer sink created with avfilter_graph_alloc_filter and the
+  pixel_formats option (FFmpeg 7+); added pixdesc.h include.
+- src/video/video_reader.cc: const AVCodec*, av_packet_side_data_get (FFmpeg 7+).
+- src/audio/audio_reader.cc: AVChannelLayout API in place of channels/channel_layout; removed
+  avcodec_close (FFmpeg 7+).
+- python/decord/_ffi/libinfo.py: __version__ stamped with the +nre4 local version at build time.
+
+Build differences that are not source changes: the native library is compiled against a shared
+LGPL FFmpeg 9.0.1 built with --disable-gpl --disable-nonfree and bundled into decord.libs/ by
+auditwheel (the upstream PyPI wheel bundles FFmpeg 4.1.6 with libx264); the LGPL notice
+decord.libs/LICENSE.ffmpeg-LGPL is added.

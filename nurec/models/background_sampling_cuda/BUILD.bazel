@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+cuda_library(
+    name = "background_sampling_cuda",
+    srcs = ["background_sampling_cuda.cu"],
+    hdrs = ["utils.h"],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions.
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+    ],
+    deps = [
+        "//deps/torch:torch_headers",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+cc_binary(
+    name = "background_sampling_cuda_cc",
+    srcs = ["binding.cpp"],
+    copts = [
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libbackground_sampling_cuda_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":background_sampling_cuda",
+        "//deps/torch:torch_headers",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = ["__init__.py"],
+    data = [":background_sampling_cuda_cc"],
+    deps = [pip_requirement("torch")],
+)

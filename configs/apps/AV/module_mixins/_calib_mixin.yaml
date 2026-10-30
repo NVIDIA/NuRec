@@ -1,0 +1,21 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Haithem Turki
+
+model:
+  renderer:
+    # enable ray gradients backpropagation for both lidar and camera
+    outputs:
+      lidar:
+        enable_ray_gradients: true
+      camera:
+        enable_ray_gradients: true
+
+  calib:
+    name: free-pose-calib
+    lidar:
+      enabled: true
+    camera:
+      enabled: true

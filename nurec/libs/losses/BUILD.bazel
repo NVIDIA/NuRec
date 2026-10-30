@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//bazel/docs:__pkg__",
+    ],
+    deps = [
+        "//nurec/libs/losses/functional:pylib",
+        "//nurec/libs/losses/models:pylib",
+        "//nurec/libs/losses/orchestration:pylib",
+    ],
+)

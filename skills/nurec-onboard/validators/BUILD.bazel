@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//skills/nurec-onboard:__subpackages__"])
+
+# Shared YAML-schema and workflow-summary validators consumed by workflow
+# SKILLs (`nurec-onboard/steps/build-ncore-converter`, `nurec-onboard/steps/validate-ncore-data`,
+# `nurec-onboard`, `nurec-onboard/steps/run-nurec`) and exercised by the
+# `*_test.py` unit tests below. Modules import as packages rooted at
+# `skills/nurec-onboard` (`from validators._validation_base import ...`).
+py_library(
+    name = "validators",
+    srcs = [
+        "__init__.py",
+        "_validation_base.py",
+        "audit_dataset_validator.py",
+        "build_ncore_converter_validator.py",
+        "nurec_onboard_validator.py",
+        "run_nurec_validator.py",
+        "validate_ncore_data_validator.py",
+    ],
+    data = ["//skills/nurec-onboard:nurec-onboard/SKILL.md"],
+    imports = [".."],
+    deps = [
+        "//skills/nurec-onboard/lib:parse_input",
+        pip_requirement("pyyaml"),
+    ],
+)
+
+py_binary(
+    name = "audit_dataset_validator",
+    srcs = ["audit_dataset_validator.py"],
+    main = "audit_dataset_validator.py",
+    deps = [
+        ":validators",
+        "//skills/nurec-onboard/lib:parse_input",
+    ],
+)
+
+py_binary(
+    name = "build_ncore_converter_validator",
+    srcs = ["build_ncore_converter_validator.py"],
+    main = "build_ncore_converter_validator.py",
+    deps = [
+        ":validators",
+        pip_requirement("numpy"),
+        # `ncore.data.v4` is lazy-imported by the `--store` path only;
+        # declare it here so `bazel run -- ... --store <p>` resolves it.
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_binary(
+    name = "validate_ncore_data_validator",
+    srcs = ["validate_ncore_data_validator.py"],
+    main = "validate_ncore_data_validator.py",
+    deps = [":validators"],
+)
+
+py_binary(
+    name = "run_nurec_validator",
+    srcs = ["run_nurec_validator.py"],
+    main = "run_nurec_validator.py",
+    deps = [":validators"],
+)
+
+py_binary(
+    name = "nurec_onboard_validator",
+    srcs = ["nurec_onboard_validator.py"],
+    main = "nurec_onboard_validator.py",
+    deps = [":validators"],
+)
+
+# Shared test-side base class (`ValidatorTestCase`) carrying the
+# diagnostic-list assertion mixins used across every test file.
+py_library(
+    name = "validator_test_helpers",
+    testonly = True,
+    srcs = [
+        "__init__.py",
+        "validator_test_helpers.py",
+    ],
+    imports = [".."],
+)
+
+# One test target per file; `_validation_base.py` is tested by
+# `validation_base_test.py`, so the list holds test filenames, not modules.
+[
+    pytest_test(
+        name = src[:-len(".py")],
+        srcs = [src],
+        data = [
+            "//skills/nurec-onboard:examples/input-pandaset.yaml",
+            "//skills/nurec-onboard:examples/input-waymo.yaml",
+            "//skills/nurec-onboard:nurec-onboard/steps/audit-dataset/input-skeleton.yaml",
+            "//skills/nurec-onboard:nurec-onboard/steps/run-nurec/SKILL.md",
+            "//skills/nurec-onboard:nurec-onboard/steps/run-nurec/config-skeleton.yaml",
+        ],
+        deps = [
+            ":validator_test_helpers",
+            ":validators",
+        ],
+    )
+    for src in [
+        "audit_dataset_validator_test.py",
+        "build_ncore_converter_validator_test.py",
+        "nurec_onboard_validator_test.py",
+        "run_nurec_validator_test.py",
+        "validate_ncore_data_validator_test.py",
+        "validation_base_test.py",
+    ]
+]

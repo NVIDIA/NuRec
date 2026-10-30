@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# NCore V4 conversion template dependencies, from PyPI except for torch.
+# To regenerate the lock file: bazel run //deps/pip:requirements
+
+# nvidia-ncore imports torch, but converters only run it on the CPU. The CPU
+# build skips the multi-GB CUDA wheels that every converter workdir would
+# otherwise install.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+click
+nvidia-ncore==19.8.0
+numpy
+pyyaml
+scipy
+torch==2.11.0+cpu
+universal-pathlib
+
+# Match the root workspace: zarr 2.18.2 is patched in MODULE.bazel for
+# numcodecs>=0.16, which renamed two functions zarr imports. nvidia-ncore
+# needs zarr 2.x.
+numcodecs>=0.16
+zarr==2.18.2

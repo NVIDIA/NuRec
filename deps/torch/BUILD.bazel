@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+cc_library(
+    name = "torch_headers",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@nurec_pip_deps//torch:torch_header_no_cuda_deps",
+        # Torch headers include these. They belong on the pip target above, but
+        # @cuda is not visible inside pip-generated repos.
+        "@cuda//:cublas_headers",
+        "@cuda//:cusolver_headers",
+        "@cuda//:cusparse_headers",
+    ],
+)

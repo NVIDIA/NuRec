@@ -1,0 +1,18 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configure log-L1 predicted-depth supervision with zero training weight.
+
+loss:
+  distance:
+    fn: log_l1
+    reduce:
+      name: mean
+    lambda_: 0.0
+    min_distance: 0.01
+    max_distance: 50.0
+    allow_missing_supervision: true
+    normalize_by_opacity: false
+    mask_semantic_classes: ["~sky", "road"]
+    semantic_lambdas: [1.0, 2.0]

@@ -1,0 +1,89 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Static construction-barrier layer, enabled by the production lidar-free preset.
+defaults:
+  - /model/gaussians/models@model.layers.barriers: sh_gaussians
+  - /model/gaussians/extra_signal@model.layers.barriers.extra_signal: [semantic_logits]
+  - /model/gaussians/initialization@model.layers.barriers.initialization: construction_barriers
+  - _self_
+
+dataset:
+  cuboid_tracks_params:
+    excluded_class_names: [cone, pole, barrier]
+
+model:
+  layers:
+    barriers:
+      name: construction-barriers-gaussians
+      fourier_features_dim: 1
+      cuboid_perturbation_scale: 1.3
+      scale_pos_lr_by_scene_extent: false
+      # OmegaConf replaces lists atomically. Keep the native SH optimizers,
+      # changing only position LR to 0.00016 * 10, with no scene-scale factor.
+      optimizers:
+        - name: ${model.gaussian_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            positions:
+              args:
+                lr: 0.0016
+          scheduler:
+            name: ExponentialLR
+            interval: step
+            args:
+              gamma: ${calc_exp_lr_decay_rate:0.01,${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}}
+        - name: ${model.gaussian_density_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            densities:
+              args:
+                lr: 0.05
+        - name: ${model.gaussian_scale_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            scales:
+              args:
+                lr: 0.005
+        - name: ${model.gaussian_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            features_albedo:
+              args:
+                lr: 0.0025
+            features_specular:
+              args:
+                lr: ${div:0.0025,20}
+            rotations:
+              args:
+                lr: 0.001
+            extra_signal:
+              args:
+                lr: 0.01
+            camera_extra_signal:
+              args:
+                lr: 0.01
+            lidar_extra_signal:
+              args:
+                lr: 0.01
+  strategy:
+    cuboid_grouped_layer_ids: [barriers]
+    independent_layer_max_n_gaussians:
+      barriers: 256000
+    perturb:
+      noise_lr:
+        layers:
+          barriers: 500.0

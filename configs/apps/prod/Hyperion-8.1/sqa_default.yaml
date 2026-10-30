@@ -1,0 +1,33 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# One-camera SQA preset derived from the default Car2Sim preset.
+
+defaults:
+  - car2sim
+
+  # SQA deviations from Car2Sim.
+  - override /apps/prod/options/ground: disabled
+  - override /apps/prod/Hyperion-8.1/options/sensors: hyperion8.1_1cam_1lidar
+  - override /apps/prod/Hyperion-8.1/options/visible_track_split: disabled
+  - override /apps/prod/Hyperion-8.1/options/background_init: lidar_rig_trajectory
+  - override /apps/prod/Hyperion-8.1/options/road_init: lidar_rig_trajectory
+  - override /apps/prod/options/temporal_appearance@model.layers.dynamic_rigids: fourier_features_dim_20_albedo_lr_2.5e-3
+  - override /apps/prod/Hyperion-8.1/options/gaussian_optimizer: fused_adam
+  - override /apps/prod/Hyperion-8.1/options/background_in_track_loss: no_layer_labels
+  - override /apps/prod/Hyperion-8.1/options/runtime_gc: usage_unlimited_every_10000_steps
+  # The car2sim_6cam ancestor crops lidar supervision to the valid-camera overlap and
+  # compensates the lidar loss weight for the 1/n_valid_lidar normalization shift that
+  # crop causes. SQA is single-camera: cropping to one camera's field of view would drop
+  # most of the lidar supervision, so opt out of the mask entirely — and with no crop the
+  # compensation no longer applies, so restore the uncompensated lidar weight.
+  # NOTE: camera_invalid_only was tried here (review thread 9ddda065) and regressed the
+  # sqa_lite PSNR gate by ~3 dB (19.02 vs the 22.00 threshold). On this dataset the
+  # training flags mark more pixels INVALID than the eval ego mask excludes, so masked
+  # tiles are skipped during training (never supervised -> holes in the artifact) yet
+  # still scored by the eval. SQA stays opted out until the flags-INVALID region and the
+  # eval ego mask agree.
+  - override /apps/prod/Hyperion-8.1/options/active_tile_mask: disabled
+  - override /apps/prod/Hyperion-8.1/options/lidar_loss_weight: "5e-3"
+  - _self_

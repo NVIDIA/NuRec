@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps_docs//:requirements.bzl", requirement_docs = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "sphinx_wrapper",
+    srcs = ["sphinx_wrapper.py"],
+    main = "sphinx_wrapper.py",
+    visibility = [],
+    deps = [
+        requirement_docs("sphinx"),
+        requirement_docs("sphinx_rtd_theme"),
+        requirement_docs("autodoc-pydantic"),
+        "@nurec_repo//apps/viewer:pylib",
+        "@nurec_repo//nurec/datamodules:pylib",
+        "@nurec_repo//nurec/datasets:pylib",
+        "@nurec_repo//nurec/datasets/samplers:pylib",
+        "@nurec_repo//nurec/grpc:pylib",
+        "@nurec_repo//nurec/libs/losses:pylib",
+        "@nurec_repo//nurec/libs/packed_ops:pylib_cc",
+        "@nurec_repo//nurec/libs/pytorch3d_knn:pylib_cc",
+        "@nurec_repo//nurec/libs/ray_utils:pylib_cc",
+        "@nurec_repo//nurec/libs/tracy_utils:pylib",
+        "@nurec_repo//nurec/models:pylib",
+        "@nurec_repo//nurec/systems:pylib",
+    ],
+)

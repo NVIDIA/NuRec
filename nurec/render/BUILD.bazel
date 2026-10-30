@@ -1,0 +1,124 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "actors.py",
+        "bbox_overlay.py",
+        "lidar_firing_pattern.py",
+        "render.py",
+        "scene.py",
+        "track_labels.py",
+        "utils.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //:run
+        "//:__pkg__",
+        "//nurec/instant_nurec:__pkg__",
+    ],
+    deps = [
+        "//nurec:pylib",
+        "//nurec/artifact:pylib",
+        "//nurec/compression:pylib_usdz",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/libs/sensors:camera_kernels",
+        "//nurec/libs/vren:pylib",
+        "//nurec/libs/vren:pylib_cc",
+        "//nurec/models:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/systems:pylib",
+        "//nurec/utils:pylib",
+        pip_requirement("einops"),
+        pip_requirement("lietorch"),
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pillow"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "actors_test",
+    size = "medium",
+    srcs = [
+        "actors_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "bbox_overlay_test",
+    size = "small",
+    srcs = [
+        "bbox_overlay_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "lidar_firing_pattern_test",
+    size = "small",
+    srcs = [
+        "lidar_firing_pattern_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "render_test",
+    size = "small",
+    srcs = [
+        "render_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "track_labels_test",
+    size = "medium",
+    srcs = [
+        "track_labels_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/utils:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)

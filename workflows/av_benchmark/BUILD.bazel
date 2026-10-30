@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+filegroup(
+    name = "specs",
+    srcs = glob(["specs/*.yaml"]),
+    visibility = [
+        "//:core_package_group",
+        # Add visibility for the released images
+        "//:__pkg__",
+    ],
+)
+
+# The benchmark's training preset, resolved. Declared here rather than reached through //:run:
+# this is the workflow's own config now, and the point of it is that the chain does not need the
+# internal tree to run.
+filegroup(
+    name = "configs",
+    srcs = glob(["configs/**/*.yaml"]),
+    visibility = [
+        "//:core_package_group",
+        # Add visibility for the released images
+        "//:__pkg__",
+    ],
+)
+
+# The published-row mapping. Kept separate from ':pylib' so nurec_tools does not pull in the
+# chain runner and its runfiles dependency.
+py_library(
+    name = "row_lib",
+    srcs = ["benchmark_row.py"],
+    visibility = ["//apps:__pkg__"],
+    deps = [
+        pip_requirement("click"),
+        pip_requirement("pyyaml"),
+    ],
+)
+
+pytest_test(
+    name = "benchmark_row_test",
+    srcs = ["benchmark_row_test.py"],
+    deps = [":row_lib"],
+)
+
+py_library(
+    name = "reference_map_lib",
+    srcs = ["reference_map.py"],
+    visibility = ["//apps:__pkg__"],
+    deps = [
+        pip_requirement("click"),
+        pip_requirement("huggingface-hub"),
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "reference_map_test",
+    srcs = ["reference_map_test.py"],
+    deps = [":reference_map_lib"],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "run.py",
+    ],
+    visibility = [
+        "//:core_package_group",
+    ],
+    deps = [
+        "@rules_python//python/runfiles",
+        pip_requirement("pyyaml"),
+    ],
+)
+
+# The chain runs the released binaries, so it needs them plus its training preset in the
+# runfiles. The clip is passed with --clip-root.
+py_binary(
+    name = "run",
+    srcs = ["run.py"],
+    data = [
+        "//:run",
+        "//apps:nurec_tools",
+    ] + glob(["specs/*.yaml"]) + glob(["configs/**/*.yaml"]),
+    main = "run.py",
+    # Not built by wildcard patterns: it pulls in the full release binaries, and the benchmark job
+    # names the target explicitly.
+    tags = ["manual"],
+    visibility = [
+        "//:core_package_group",
+    ],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "run_test",
+    srcs = ["run_test.py"],
+    data = glob(["specs/*.yaml"]) + glob(["configs/**/*.yaml"]),
+    deps = [":pylib"],
+)

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: lidar-ground-mesh-road
+
+num_random_points: 0
+default_density: 0.99
+default_scale: [0.1, 0.1, 0.001]
+scale_multiplier: 1.0
+step_frame: 1
+
+# Ground mesh reconstruction parameters (same defaults as GroundMeshConfig)
+min_ray_length: 0.1
+voxel_size: 0.1
+smoothing_passes: 10
+ground_compat_max_distance: 0.5
+ground_compat_max_angle_deg: 60.0
+num_plane_hypotheses: 100
+plane_max_distance: 0.3
+plane_max_angle_deg: 30
+plane_min_eval_points: 1000
+plane_max_eval_points: 10000
+plane_min_inliers: 1000
+enable_plane_extension: false
+min_points_per_voxel: 1
+# Grid is the default road-init topology because it is fast, local to occupied BEV cells, and
+# avoids Delaunay's long convex-hull bridges. Set `mesh_topology: delaunay` to opt back into the
+# legacy compatibility path for workflows that prefer fully filled convex-hull geometry.
+mesh_topology: grid
+smoothing_method: neighbor_average
+height_statistic: mean
+color_statistic: mean
+# camera-rgb preserves legacy coloring. camera-rgb-frame-valid-pixels excludes
+# frame-masked RGB while retaining LiDAR road geometry, and fills missing colors
+# from valid road observations.
+color_type: camera-rgb
+outlier_height_threshold: null
+outlier_neighbor_radius: 1
+outlier_min_neighbors: 4
+max_triangle_edge_length: null
+max_triangle_normal_angle_deg: null
+z_offset: 0.0 # Ground height in ego/rig space (same semantics as checkpoint.artifact.mesh.ground.z_offset)
+
+extend_to_cuboids:
+  enabled: false          # Extend the ground mesh to cuboid tracks to cover areas with no nearby LiDAR points
+  base_margin: 0.5        # Margin in meters added around each cuboid's base rectangle before sampling points
+  exclude_points_radius: 1.0  # 2D radius in meters; cuboid ground points near a scanned point are excluded
+  exclude_points_knns: 1  # Nearest scanned ground point neighbours queried per cuboid ground point
+  cuboid_point_merge_cell_size: 0.5  # XY grid cell size in meters used to merge cuboid ground samples

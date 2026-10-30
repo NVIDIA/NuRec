@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize the road from 400,000 sampled points.
+
+model:
+  layers:
+    road:
+      initialization:
+        num_point_cloud_points: 400_000

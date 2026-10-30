@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Version constraints on transitive dependencies.
+#
+# An entry here says "ship package P at minimum version V" without declaring that
+# anything depends on P. uv applies these additively to whatever the resolve already
+# pulls in, so a constraint whose package is no longer required simply stops appearing
+# in the generated lock.
+#
+# That is the difference from requirements_3_13_common.in, where a floor and a real
+# dependency are written identically, so a floor there outlives what motivated it.
+# Packages the tree imports directly belong in that file, with their version.
+#
+# Record where every entry came from, so a later reader can judge it. An entry can be
+# retired once the resolve forces the version anyway, or once the package has left the
+# lock.
+
+aiohttp>=3.14.3  # CVE-2026-50269: CRLF injection via improper validation in payload.py
+anyio>=4.14.2  # GHSA-82r6-8w77-94w6 (Critical), via httpx
+cbor2>=5.9.0  # CWE-674 / CVE-2026-26209; restricts a transitive NCore dependency
+fonttools>=4.63.0  # CVE-2025-66034 (High, 8.6), found by the Black Duck dependency scan
+idna>=3.7  # was idna==3.7, relaxed by the pin-to-minimum batch in d0baf05e3f
+python-dateutil>=2.9.0.post0  # upgraded in 00567f9e56

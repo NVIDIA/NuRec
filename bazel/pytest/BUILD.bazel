@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+exports_files(["pytest_main.py"])
+
+# GPU selection plugin - automatically included in pytest_test targets
+py_library(
+    name = "gpu_selection_plugin",
+    srcs = ["gpu_selection_plugin.py"],
+    visibility = ["//visibility:public"],
+)

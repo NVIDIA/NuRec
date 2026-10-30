@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+cuda_library(
+    name = "gaussian_collective_payload_ops_cuda",
+    srcs = [
+        "gradient_pack.cu",
+        "payload_pack.cu",
+        "payload_unpack.cu",
+    ],
+    hdrs = ["gaussian_collective_payload_ops.h"],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions.
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+    ],
+    deps = ["//deps/torch:torch_headers"],
+)
+
+cc_binary(
+    name = "gaussian_collective_payload_ops_cc",
+    srcs = ["binding.cpp"],
+    copts = [
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libgaussian_collective_payload_ops_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":gaussian_collective_payload_ops_cuda",
+        "//deps/torch:torch_headers",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [":gaussian_collective_payload_ops_cc"],
+    deps = [pip_requirement("torch")],
+)
+
+py_library(
+    name = "cross_stream_test_utils",
+    srcs = ["cross_stream_test_utils.py"],
+    deps = [pip_requirement("torch")],
+)
+
+pytest_test(
+    name = "gradient_pack_test",
+    srcs = ["gradient_pack_test.py"],
+    deps = [
+        ":cross_stream_test_utils",
+        ":pylib_cc",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "payload_pack_test",
+    srcs = ["payload_pack_test.py"],
+    deps = [
+        ":cross_stream_test_utils",
+        ":pylib_cc",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "payload_unpack_test",
+    srcs = ["payload_unpack_test.py"],
+    deps = [
+        ":cross_stream_test_utils",
+        ":pylib_cc",
+        pip_requirement("torch"),
+    ],
+)

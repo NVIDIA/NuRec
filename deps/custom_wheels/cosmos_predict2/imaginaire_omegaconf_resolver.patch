@@ -1,0 +1,14 @@
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes imaginaire/lazy_config/lazy.py of the cosmos-predict2 1.0.9 wheel.
+
+--- a/imaginaire/lazy_config/lazy.py
++++ b/imaginaire/lazy_config/lazy.py
+@@ -70,1 +70,7 @@
+-OmegaConf.register_new_resolver("add", lambda *vals: sum(vals))
++# NuRec registers a two-argument ``add`` resolver before importing this wheel.
++# Harmonizer does not resolve ``${add:...}``, so retain the existing global
++# resolver rather than replace NuRec's configuration behavior. If a future
++# upstream path needs the variadic form below, OmegaConf will fail during
++# resolution instead of silently changing the process-wide resolver.
++if not OmegaConf.has_resolver("add"):
++    OmegaConf.register_new_resolver("add", lambda *vals: sum(vals))

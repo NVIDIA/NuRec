@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+causal-conv1d 1.5.2+git9332030pt2.11.0cu128sm80to120ptx100 - statement of changes
+
+This wheel is built from causal-conv1d (https://github.com/Dao-AILab/causal-conv1d, BSD 3-Clause)
+at commit 933203064542689e7827bb98c90227f096e8a845. The file below was modified by NVIDIA
+CORPORATION & AFFILIATES, 2026.
+
+Changes applied by the NuRec build:
+- setup.py: lines 176-196, the hard-coded -gencode list of CUDA architectures, removed so the
+  architectures come from the build environment.
+The local version comes from CAUSAL_CONV1D_LOCAL_VERSION at build time.

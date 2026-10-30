@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib_camera_loss_masks",
+    srcs = ["camera_loss_masks.py"],
+    deps = [
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "camera_loss_masks_test",
+    srcs = ["camera_loss_masks_test.py"],
+    deps = [
+        ":pylib_camera_loss_masks",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "base_losses.py",
+        "loss_fns.py",
+        "losses_module.py",
+        "primitive_losses.py",
+        "registry.py",
+        "render_losses.py",
+        "utils.py",
+    ],
+    deps = [
+        ":pylib_camera_loss_masks",
+        "//nurec/datasets:pylib",
+        "//nurec/instant_nurec:pylib_supervision_pack",
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/libs/losses/functional:pylib",
+        "//nurec/libs/losses/models/lambda_schedulers:pylib",
+        "//nurec/libs/losses/models/reduce_functions:pylib",
+        "//nurec/libs/slang_gaussians:pylib",
+        "//nurec/models:pylib",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/utils:pylib",
+        pip_requirement("einops"),
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "utils_only",
+    srcs = ["utils.py"],
+    deps = [
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/libs/losses/functional:pylib",
+        "//nurec/models:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/utils:pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+# ``loss_fns`` + ``registry`` without ``__init__.py`` so tests can import ``loss_fns.ssim``
+# without pulling ``ModuleLosses`` and its heavy model/rendering deps.
+py_library(
+    name = "loss_fns_only",
+    testonly = True,
+    srcs = [
+        "loss_fns.py",
+        "registry.py",
+    ],
+    deps = [
+        ":utils_only",
+        "//nurec/models:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/utils:pylib_lpips_network",
+        "//nurec/utils:pylib_packed_ops",
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "loss_fns_test",
+    srcs = ["loss_fns_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "loss_fns_gsplat_parity_test",
+    srcs = ["loss_fns_gsplat_parity_test.py"],
+    deps = [
+        ":loss_fns_only",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "utils_test",
+    srcs = ["utils_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "render_losses_test",
+    srcs = ["render_losses_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "unicycle_pose_loss_test",
+    srcs = ["unicycle_pose_loss_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/datasets:pylib_tracks",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "losses_module_test",
+    size = "large",
+    srcs = ["losses_module_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/config:pylib",
+        "//nurec/libs/losses/orchestration:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+    ],
+)

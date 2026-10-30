@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//nurec/instant_nurec:__subpackages__",
+]
+
+py_library(
+    name = "pylib_primitive_merge",
+    srcs = [
+        "__init__.py",
+        "primitive_merge.py",
+    ],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/instant_nurec/utils:pylib_covariance",
+        "//nurec/instant_nurec/utils:pylib_cubemap",
+        "//nurec/instant_nurec/utils:pylib_trajectory",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_ncore_types",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+        pip_requirement("torch_scatter"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "export_ply.py",
+        "export_usdz.py",
+        "prediction_runner.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + ["//nurec/run:__pkg__"],
+    deps = [
+        ":pylib_primitive_merge",
+        "//apps/av/road_mesh:pylib",
+        "//nurec/datasets:pylib_tracks",
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/instant_nurec/utils:pylib_trajectory",
+        "//nurec/models:pylib_utils",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_ncore_utils",
+        "//nurec/utils:pylib_types",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+        pip_requirement("tqdm"),
+    ],
+)
+
+pytest_test(
+    name = "prediction_runner_test",
+    srcs = ["prediction_runner_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/instant_nurec/systems:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "primitive_merge_test",
+    srcs = ["primitive_merge_test.py"],
+    deps = [
+        ":pylib_primitive_merge",
+        "//nurec/instant_nurec/utils:pylib",
+        "//nurec/utils:pylib",
+    ],
+)
+
+pytest_test(
+    name = "export_ply_test",
+    srcs = ["export_ply_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/instant_nurec/utils:pylib",
+    ],
+)

@@ -1,0 +1,14 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Render the road and background layers separately at validation time, in
+# addition to the full composite render.
+
+system:
+  test:
+    val_render_selected_nodes:
+      road_only:
+        - road
+      background_only:
+        - background

@@ -1,0 +1,24 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Current clean-port implementation, otherwise identical to the parity baseline.
+defaults:
+  - baseline
+  - override /model/calib: rig_calib
+  - _self_
+
+logger:
+  run_id: 02_clean_port_rig_calib
+
+model:
+  calib:
+    name: rig-calib
+    camera:
+      enabled: true
+    lidar:
+      enabled: false
+    rig_trajectory:
+      enabled: true
+    camera_extrinsics:
+      enabled: true

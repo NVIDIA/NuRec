@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Import all architecture-specific dependencies for x86_64
+
+-r requirements_3_13_common.in
+
+# Workaround for a uv resolver quirk: under this project's index set, triton
+# 3.3.0 wheels are rejected as platform-incompatible during preference-mode
+# resolution (uv pip compile --output-file=<existing>) in requirements
+# _test target runs, even though their manylinux_2_27/2_28 tags should
+# satisfy --python-platform=manylinux_2_31. --find-links exposes the same
+# wheels (same URL, same hashes) through a flat listing, which uv's resolver
+# accepts. The root cause hasn't been isolated.
+--find-links https://pypi.org/simple/triton/
+# Work around a stale hash in the TensorRT 10.13.0.35 x86_64 stub sdist by
+# exposing the actual NVIDIA wheel directly during uv resolution.
+--find-links https://pypi.nvidia.com/tensorrt-cu12-libs/
+
+# x86_64 build of poisson-recon
+poisson-recon @ file:///opt/nvidia/nurec-build-deps/wheelhouse/poisson_recon-13.74.1-py3-none-manylinux2014_x86_64.whl#sha256=623e70c0b1a33531c02bdd8e63bcac3bf211c4765d60b3ff32cd0a9c61dd83ed
+
+# x86_64 build of usd-core wheel (>=26.3 for UsdVol ParticleField schema API)
+usd-core==26.3 --hash=sha256:7d59943477483dc950e36a0453d451b8818c6e4898b095cb35bdab86375b7f0c
+

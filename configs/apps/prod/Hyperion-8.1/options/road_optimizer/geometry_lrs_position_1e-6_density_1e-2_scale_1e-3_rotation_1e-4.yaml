@@ -1,0 +1,69 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Road optimizer with lidar-free geometry learning rates.
+#
+# The full optimizer list is one atomic option because OmegaConf replaces
+# optimizer lists instead of merging individual parameter entries.
+
+model:
+  layers:
+    road:
+      optimizers:
+        - name: ${model.gaussian_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            positions:
+              args:
+                lr: 0.000001
+          scheduler:
+            name: ExponentialLR
+            interval: step
+            args:
+              gamma: ${calc_exp_lr_decay_rate:0.01,${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}}
+        - name: ${model.gaussian_density_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            densities:
+              args:
+                lr: 0.01
+        - name: ${model.gaussian_scale_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            scales:
+              args:
+                lr: 0.001
+        - name: ${model.gaussian_optimizer_name}
+          args:
+            lr: 0.01
+            eps: 1.e-15
+            betas: [0.9, 0.99]
+          params:
+            features_albedo:
+              args:
+                lr: 0.0025
+            features_specular:
+              args:
+                lr: ${div:0.0025,20}
+            rotations:
+              args:
+                lr: 0.0001
+            extra_signal:
+              args:
+                lr: 0.01
+            camera_extra_signal:
+              args:
+                lr: 0.01
+            lidar_extra_signal:
+              args:
+                lr: 0.01

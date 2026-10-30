@@ -1,0 +1,24 @@
+Third-party software in the NuRec container images
+===================================================
+
+The NuRec images are built on the NVIDIA Ubuntu base image
+nvcr.io/nvidia/base/ubuntu:noble-20260911. Its source code is published at
+https://catalog.ngc.nvidia.com/orgs/nvidia/base/resources/ubuntu-sources
+
+Attribution for the open-source software in these images is provided as follows.
+
+NuRec
+  /licenses/NOTICES
+
+Python packages, the Python runtime and source built into NuRec
+  /licenses/THIRD_PARTY_NOTICES.md lists each component with its version, license and
+  copyright, and links to its license text in /licenses/third_party_licenses/.
+
+Ubuntu packages (the base image and the packages installed on top of it)
+  Run `dpkg -l` to list the installed packages. The copyright and license of each
+  package are in /usr/share/doc/<package>/copyright.
+
+NVIDIA software
+  /usr/local/cuda/compat holds the CUDA forward compatibility libraries (cuda-compat 12-8,
+  570.211.01). They are NVIDIA proprietary software, governed by the NVIDIA CUDA Toolkit
+  End User License Agreement: https://docs.nvidia.com/cuda/eula/

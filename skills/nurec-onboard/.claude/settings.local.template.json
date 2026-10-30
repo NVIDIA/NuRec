@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Monitor",
+      "Read",
+      "Shell",
+      "SubAgent",
+      "Task",
+      "Write"
+    ]
+  },
+  "sandbox": {
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": true,
+    "enabled": true,
+    "excludedCommands": [
+      "docker *"
+    ],
+    "failIfUnavailable": true,
+    "filesystem": {
+      "allowWrite": []
+    },
+    "network": {
+      "allowedDomains": [
+        "bcr.bazel.build",
+        "download-r2.pytorch.org",
+        "download.pytorch.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "objects.githubusercontent.com",
+        "pypi.org",
+        "release-assets.githubusercontent.com",
+        "releases.bazel.build"
+      ]
+    }
+  }
+}

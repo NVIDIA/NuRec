@@ -1,0 +1,23 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Allocate 60% of the sampling probability to the four fisheye cameras and 40% to
+# the six perspective cameras.
+# A weighted sensor pick needs a frame sampler that honours the sensor it is handed.
+# Timestamp frame sampler works and is pinned here.
+# Timestamp also keeps the camera and lidar frames on the same moment.
+
+dataset:
+  samplers:
+    batch_sampler:
+      camera_sensor_sampler:
+        name: weighted
+        sample_all_sensors: false
+        per_camera_probabilities: [0.0666, 0.0666, 0.0667, 0.0667, 0.0667, 0.0667, 0.15, 0.15, 0.15, 0.15]
+      camera_frame_sampler:
+        name: timestamp
+      lidar_sensor_sampler:
+        name: uniform
+      lidar_frame_sampler:
+        name: timestamp

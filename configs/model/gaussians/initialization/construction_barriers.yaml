@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: construction-barriers
+# Read static detections directly from the dataset's merged NCore cuboid stream.
+points_per_cuboid: 256
+seed: 1043
+default_scale: 0.03
+default_density: 0.5
+scale_multiplier: 1.0

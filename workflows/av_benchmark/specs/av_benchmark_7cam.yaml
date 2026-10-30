@@ -1,0 +1,329 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Seven-camera PhysicalAI-AV chain. The defaults here are the benchmark's: a full clip, the
+# preset's own training budget, and every metric the chain can produce. CI narrows the two
+# expensive vars with --set rather than keeping a second spec, so there is one definition and CI
+# cannot drift from what the benchmark publishes.
+name: av_benchmark_7cam
+
+# CONFIG and CONFIG_DIR default to the resolved preset checked in beside this spec, so the chain
+# runs without the internal tree. That file is the internal preset as Hydra composed it, captured
+# from a run of this spec, so the benchmark it defines is unchanged. `--set CONFIG=...` still
+# overrides, which is how a run against a different preset is requested.
+vars:
+  CONFIG: workflows/av_benchmark/configs/av_benchmark_lidar_7cam.yaml
+  CONFIG_DIR: workflows/av_benchmark/configs
+  CLIP_ID: 004c2001-5fc3-43b1-a4d8-bfb0bbb9fdc6
+  LIDAR: lidar_top_360fov
+  DURATION_SEC: "20"
+  # The preset's own budget. Below ~20000 steps densify_20000_to_35000 never fires and
+  # dynamic_rigids_fourier_freeze (10000) never releases, so a shorter run -- as CI uses --
+  # exercises the chain at the initial gaussian budget rather than reconstructing.
+  TRAIN_SAMPLES: "30000"
+  # Object-level image quality: per-instance crops of tracked actors, scored separately
+  # from whole-frame metrics. Surfaced as vars because the defaults decide which actors qualify.
+  OBJ_MIN_BBOX: "50"        # pixels; smaller instances are dropped
+  OBJ_CROP_PADDING: "0.0"   # ratio of bbox size added around each crop
+  OBJ_BATCH_SIZE: "32"      # feature-extraction batch
+  # Trained and validated camera set, as a Hydra list; the default is the preset's own. Dropping
+  # camera_rear_tele_30fov gives the six cameras the published NuRec dataset uses. convert and aux
+  # prepare all seven either way. It must include RENDER_CAMERA, which render reads from the model.
+  CAMERAS: "[camera_front_wide_120fov,camera_front_tele_30fov,camera_cross_right_120fov,camera_cross_left_120fov,camera_rear_left_70fov,camera_rear_right_70fov,camera_rear_tele_30fov]"
+  # Ground mesh (mesh_ground.ply/.usd) in the exported USDZ, as the published NuRec dataset ships it.
+  GROUND_MESH: "false"
+  RUN_ID: av_benchmark  # pinned, else a random shortuuid validate cannot predict
+  RENDER_CAMERA: camera_front_wide_120fov  # one camera is enough to cover the stages
+  # A USDZ of the same clip carrying map.xodr and pose_record.json (local path or hf://), read
+  # by inject_reference_map. Empty skips it with a warning.
+  REFERENCE_USDZ: ""
+
+# The public runner validates and collects this named subset, plus explicitly named report outputs
+# from enabled optional tasks. Task-local `produces` remains the sole authority for paths, so
+# packaging does not duplicate the workflow's output layout.
+report_outputs:
+  - PARSED_CONFIG
+  - SCENE_PACKAGE
+  - GAUSSIAN_PLY_DIR
+  - RENDER_METRICS
+  - RGB_METRICS_YAML
+  - RGB_METRICS_CSV
+  - RGB_METRICS_PARQUET
+  - OBJECT_METRICS_DIR
+  - GAUSSIAN_STATISTICS
+  - VALIDATION_METRICS
+  - BENCHMARK_ROW
+
+tasks:
+  # No phase: acquisition, not reconstruction. HF_TOKEN comes from the environment.
+  - name: download
+    optional: true
+    binary: nurec_tools
+    args:
+      - pai-clip-dl
+      - download
+      - $CLIP_ID
+      - --output-dir=$WORK/clip_hf
+    produces:
+      CLIP_ROOT: $WORK/clip_hf
+
+  - name: convert
+    phase: input_preparation
+    binary: nurec_tools
+    args:
+      - pai-convert
+      - --root-dir=$CLIP_ROOT
+      - --output-dir=$WORK/converted
+      - --no-radars
+      - --camera-id=camera_front_wide_120fov
+      - --camera-id=camera_front_tele_30fov
+      - --camera-id=camera_cross_right_120fov
+      - --camera-id=camera_cross_left_120fov
+      - --camera-id=camera_rear_left_70fov
+      - --camera-id=camera_rear_right_70fov
+      - --camera-id=camera_rear_tele_30fov
+      - --lidar-id=$LIDAR
+      - pai-v4
+      - --clip-id=$CLIP_ID
+      - --duration-sec=$DURATION_SEC
+    produces:
+      SEQUENCE_DIR: $WORK/converted/pai_$CLIP_ID
+      SEQUENCE_JSON: $WORK/converted/pai_$CLIP_ID/pai_$CLIP_ID.json
+
+  - name: aux
+    phase: input_preparation
+    binary: nurec_tools
+    args:
+      - ncore-aux-data
+      - --dataset-path=$SEQUENCE_JSON
+      - --output-dir=$SEQUENCE_DIR
+      - --camera-id=camera_front_wide_120fov
+      - --camera-id=camera_front_tele_30fov
+      - --camera-id=camera_cross_right_120fov
+      - --camera-id=camera_cross_left_120fov
+      - --camera-id=camera_rear_left_70fov
+      - --camera-id=camera_rear_right_70fov
+      - --camera-id=camera_rear_tele_30fov
+      - --lidar-id=$LIDAR
+      - --store-meta
+
+  - name: train
+    phase: training_and_optimization
+    binary: nurec
+    args:
+      - main
+      - --config-name=$CONFIG
+      - dataset.path=$SEQUENCE_JSON
+      - out_dir=$WORK/train
+      - mode=train
+      - logger.name=dummy
+      - logger.run_id=$RUN_ID
+      - dataset.n_samples_per_epoch=$TRAIN_SAMPLES
+      - dataset.camera_ids=$CAMERAS
+      - dataset.train_camera_ids=$CAMERAS
+      - dataset.val_camera_ids=$CAMERAS
+    produces:
+      CHECKPOINT: $WORK/train/$RUN_ID/checkpoints/last.ckpt
+      # Resolved training config, so export reloads exactly what trained.
+      PARSED_CONFIG: $WORK/train/$RUN_ID/config/parsed.yaml
+      # What render reads; the export task below is the packaged deliverable.
+      ARTIFACT: $WORK/train/$RUN_ID/artifacts/last.usdz
+
+  # Before validate: a validation failure must not cost the scene package.
+  - name: export
+    phase: export_and_packaging
+    binary: nurec
+    args:
+      - export-usdz-artifact
+      - --config-name=$PARSED_CONFIG
+      - --output-dir=$WORK/export
+      - checkpoint.artifact.mesh.ground.enabled=$GROUND_MESH
+    produces:
+      SCENE_PACKAGE: $WORK/export/last.usdz
+
+  - name: export_plys
+    phase: export_and_packaging
+    binary: nurec
+    args:
+      - export-gaussian-plys
+      - --config-name=$PARSED_CONFIG
+      - --checkpoint-name=last.ckpt
+      - --output-dir=$WORK/gaussian_plys
+      - --format=_3DGRT
+      - --percentage-gaussians=100
+    produces:
+      GAUSSIAN_PLY_DIR: $WORK/gaussian_plys
+
+  # Below here: measurement, not reconstruction, so no phase.
+  - name: benchmark_gt
+    binary: nurec
+    args:
+      - export-ncore-benchmark-gt
+      - --dataset-path=$SEQUENCE_JSON
+      - --output-dir=$WORK/metrics_gt
+      - --frame-step-camera=1  # every frame; the fixture is short
+      - --frame-name-width=20  # match render's stems so metrics pair by filename
+    produces:
+      METRICS_GT_DIR: $WORK/metrics_gt
+
+  # image-scale=1.0 keeps render and GT one resolution, so metrics need no conform pass.
+  - name: render
+    binary: nurec
+    args:
+      - render
+      - --artifact-path=$ARTIFACT
+      - --output-dir=$WORK/renders
+      - --renderer=default
+      - --image-format=png
+      - --camera-id=$RENDER_CAMERA
+      - --image-scale=1.0
+      - --replicate-training-views
+      - --calib-source=training-sensor-poses-calib
+      - --frame-step=1
+      - --frame-naming=frame-end-timestamp
+      - --output-type=color
+      # Object-level image quality reads a video rather than an image sequence. This writes
+      # one per camera beside the frames, where eval-rendering-metrics looks for it.
+      - --export-video
+    produces:
+      RENDER_DIR: $WORK/renders/color
+      RENDER_METRICS: $WORK/renders/metrics.yaml
+
+  # Dedicated RGB path; validate scores RGB too, but is the only LiDAR path.
+  # Whole-frame image quality. eval-rendering-metrics takes one of two exclusive paths --
+  # `if not object_level_metrics:` guards the image-level pass entirely -- so the object-level
+  # flags cannot be added here: they would replace these metrics rather than add to them.
+  # SSIM and LPIPS have no other producer in the chain (validate emits neither), so a single
+  # combined invocation silently drops two of the published metrics. Hence two tasks.
+  - name: render_metrics
+    binary: nurec
+    args:
+      - eval-rendering-metrics
+      - --render-dir=$RENDER_DIR
+      - --gt-dir=$METRICS_GT_DIR
+      - --output-dir=$WORK/metrics/rgb
+      - --rendered-image-extension=png
+      - --metrics=psnr
+      - --metrics=ssim
+      - --metrics=lpips
+      - --lpips-net-type=alex
+      - --visualize
+      - --visualization-multiplier=5
+      - --save-yaml
+      - --save-csv
+      - --save-parquet
+    produces:
+      RGB_METRICS_YAML: $WORK/metrics/rgb/rendering_metrics.yaml
+      RGB_METRICS_CSV: $WORK/metrics/rgb/rendering_metrics.csv
+      RGB_METRICS_PARQUET: $WORK/metrics/rgb/rendering_metrics.parquet
+
+  # Object-level image quality: per-instance crops of tracked actors, scored separately
+  # from whole frames. --dataset-path is read only under --object-level-metrics, so the two
+  # travel together; the shard it names carries the tracked-actor boxes.
+  - name: render_metrics_objects
+    binary: nurec
+    args:
+      - eval-rendering-metrics
+      - --render-dir=$RENDER_DIR
+      - --gt-dir=$METRICS_GT_DIR
+      - --output-dir=$WORK/metrics/objects
+      - --rendered-image-extension=png
+      - --save-yaml
+      - --save-csv
+      - --save-parquet
+      - --object-level-metrics
+      - --dataset-path=$SEQUENCE_JSON
+      - --object-min-bbox-size=$OBJ_MIN_BBOX
+      - --object-crop-padding=$OBJ_CROP_PADDING
+      - --object-feature-batch-size=$OBJ_BATCH_SIZE
+      # The evaluator skips missing videos and per-sequence failures, so without this the task
+      # exits 0 having scored nothing.
+      - --require-object-metrics
+    produces:
+      OBJECT_METRICS_DIR: $WORK/metrics/objects
+
+  - name: gaussian_stats
+    binary: nurec
+    args:
+      - gaussian-statistics
+      - --config-name=$PARSED_CONFIG
+      - --checkpoint-name=$CHECKPOINT  # full path; a bare name fails to resolve on the image
+      - --output-file=$WORK/metrics/gaussian_statistics.yaml
+    produces:
+      GAUSSIAN_STATISTICS: $WORK/metrics/gaussian_statistics.yaml
+
+  # mode=val: test_step reads self.test_out_types, never assigned, so mode=test raises.
+  # resume is explicit; `auto` trains from scratch on a missing checkpoint and would pass.
+  - name: validate
+    binary: nurec
+    args:
+      - main
+      - --config-name=$CONFIG
+      - dataset.path=$SEQUENCE_JSON
+      - out_dir=$WORK/train
+      - mode=val
+      - logger.name=dummy
+      - logger.run_id=$RUN_ID
+      - resume=$CHECKPOINT
+      - dataset.val_camera_frame_start=0
+      - dataset.val_lidar_frame_start=0
+      - dataset.camera_ids=$CAMERAS
+      - dataset.train_camera_ids=$CAMERAS
+      - dataset.val_camera_ids=$CAMERAS
+    produces:
+      VALIDATION_METRICS: $WORK/train/$RUN_ID/val/metrics.yaml
+
+  # The published row. The chain writes four metric files in four shapes; which key feeds which
+  # published metric changes the numbers, so the mapping is pinned here rather than in whatever
+  # assembles the package. The runner updates the manifest after every task, so this task can
+  # consume reconstruction phase timings without owning a second timing map.
+  - name: benchmark_row
+    binary: nurec_tools
+    args:
+      - benchmark-row
+      - --clip-id=$CLIP_ID
+      - --validate-metrics=$WORK/train/$RUN_ID/val/metrics.yaml
+      - --rgb-metrics=$WORK/metrics/rgb/rendering_metrics.yaml
+      - --render-metrics=$WORK/renders/metrics.yaml
+      - --object-metrics=$WORK/metrics/objects/$RENDER_CAMERA/metrics.yaml
+      - --cameras=$CAMERAS
+      - --manifest=$WORK/manifest.json
+      - --output-file=$WORK/metrics/benchmark_row.json
+    produces:
+      BENCHMARK_ROW: $WORK/metrics/benchmark_row.json
+
+  # The published video, 2160 pixels high. render stays at the camera's native resolution
+  # because the metrics compare against native-resolution ground truth.
+  - name: render_video
+    binary: nurec
+    args:
+      - render
+      - --artifact-path=$ARTIFACT
+      - --output-dir=$WORK/release_video
+      - --renderer=default
+      - --image-format=png
+      - --camera-id=$RENDER_CAMERA
+      - --height=2160
+      - --replicate-training-views
+      - --calib-source=training-sensor-poses-calib
+      - --frame-step=1
+      - --frame-naming=frame-end-timestamp
+      - --output-type=color
+      - --export-video
+
+  # Last, so a reference that disagrees costs no metrics. No phase: it may fetch over the network.
+  # HF_TOKEN comes from the environment for an hf:// reference.
+  - name: inject_reference_map
+    optional: true
+    binary: nurec_tools
+    args:
+      - inject-reference-map
+      - --scene-package=$SCENE_PACKAGE
+      - --reference=$REFERENCE_USDZ
+      - --output=$WORK/release/$CLIP_ID.usdz
+    produces:
+      AUGMENTED_SCENE_PACKAGE: $WORK/release/$CLIP_ID.usdz
+      REFERENCE_MAP_REPORT: $WORK/release/$CLIP_ID.reference_map.json
+    report_outputs:
+      - AUGMENTED_SCENE_PACKAGE
+      - REFERENCE_MAP_REPORT

@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use fused Adam for every Gaussian optimizer group.
+
+model:
+  gaussian_optimizer_name: fused_adam
+  gaussian_density_optimizer_name: fused_adam
+  gaussian_scale_optimizer_name: fused_adam

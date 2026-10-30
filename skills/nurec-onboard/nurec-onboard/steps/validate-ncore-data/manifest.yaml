@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: validate-ncore-data
+description: Validate NCore V4 output, run eval, and produce a diagnosis for the build step. Use after a converter produces a shard, before run-nurec.
+requires_docker: true
+requires_gpu: false
+requires_bazel: true
+agents:
+  - claude
+  - codex
+prompt: |
+  Read the skill file at {{skill}} and follow its instructions completely.
+  Do not ask the user for input -- operate autonomously on the provided paths.
+
+  Input:
+  {{input}}

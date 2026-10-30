@@ -1,0 +1,33 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: janickm
+#
+# 3dgut_dynamic + the model-free unstructured LiDAR path.
+#
+# See nurec/datasets/README.md#model-free-unstructured-lidar for what the fields below mean and how the two
+# axes (lidar_ray_mode x use_real_lidar_rays) combine; the field docstrings live
+# on nurec/config/dataset.py. This file only records the choices.
+defaults:
+  - /apps/AV/NV/3dgut_dynamic.yaml
+  # Learned intensity + raydrop heads on every layer, so ray-drop is a trained
+  # channel rather than the geometric 1-opacity fallback.
+  - /model/gaussians/extra_signal@model.layers.background.extra_signal: [intensity, raydrop]
+  - /model/gaussians/extra_signal@model.layers.dynamic_rigids.extra_signal: [intensity, raydrop]
+  - /model/gaussians/extra_signal@model.layers.dynamic_deformables.extra_signal: [intensity, raydrop]
+
+dataset:
+  lidar_ray_mode: unstructured
+  use_real_lidar_rays: true
+  # Genuinely model-free ray-drop supervision; requires use_real_lidar_rays=true.
+  lidar_unstructured_raydrop_virtual_rays: aggregate_lattice
+
+model:
+  renderer:
+    # Must pair with dataset.lidar_ray_mode=unstructured (enforced by NuRecConfig).
+    lidar_unstructured: true
+
+loss:
+  raydrop:
+    lambda_: 1.0

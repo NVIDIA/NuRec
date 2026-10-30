@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+filegroup(
+    name = "py_files",
+    srcs = glob(["**/*.py"]),
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "lambda_schedulers.py",
+        "registry.py",
+    ],
+    deps = [
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)

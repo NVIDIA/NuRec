@@ -1,0 +1,22 @@
+Emit torch::kBFloat16 for BFloat16 tensor element type (shader-slang/slang#11040).
+
+Source change from upstream commit 7c1bfb7f2, on top of v2026.4 (which predates
+it). Without it, TensorView<BFloat16> aborts -target torch-binding with "error
+99999: unknown scalar type". Emitter fix only, tests omitted.
+
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes source/slang/slang-emit-torch.cpp of Slang v2026.4.
+
+diff --git a/source/slang/slang-emit-torch.cpp b/source/slang/slang-emit-torch.cpp
+--- a/source/slang/slang-emit-torch.cpp
++++ b/source/slang/slang-emit-torch.cpp
+@@ -31,6 +31,9 @@ void emitTorchScalarTypeName(SourceWriter* m_writer, IRInst* type)
+     case kIROp_HalfType:
+         m_writer->emit("kFloat16");
+         break;
++    case kIROp_BFloat16Type:
++        m_writer->emit("kBFloat16");
++        break;
+     case kIROp_DoubleType:
+         m_writer->emit("kFloat64");
+         break;

@@ -1,0 +1,36 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Component-only overlay: background + dynamic_deformables Gaussian
+# layers with calibration AND the post-processing chain active; sky
+# model disabled.
+#
+# Exercises the "PP without sky" path: pixels outside Gaussian-covered
+# regions composite over nothing, and the PP chain trains against
+# those renders. Expect qualitatively degraded renders in sky regions —
+# a KNOWN side effect; the purpose of this overlay is proving PP
+# toggles independently of the sky model.
+#
+# Compose example:
+#
+#     defaults:
+#       - /apps/prod/Hyperion-8.1/car2sim
+#       - /component_only: background_layer_deformables_with_calib_pp
+
+component_only:
+  # ``enabled: true`` switches this run into opt-in mode: only the
+  # components listed below are trained; every other component (unlisted,
+  # or ``state: disabled``) is turned off. Enabling every component
+  # collapses back to the parent app config's full training.
+  enabled: true
+  layers:
+    background:
+      state: enabled
+    dynamic_deformables:
+      state: enabled
+  calib:
+    state: enabled
+  post_processing:
+    state: enabled

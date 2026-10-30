@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:core_package_group",
+])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "artifact_cache.py",
+        "checkpoint.py",
+        "firing_patterns.py",
+        "mesh.py",
+        "metadata.py",
+        "ply.py",
+        "rig_trajectories.py",
+        "sequence_tracks.py",
+        "usd_default_layer.py",
+        "usd_nrend.py",
+        "utils.py",
+    ],
+    deps = [
+        "//nurec/artifact:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/instant_nurec/config:pylib",
+        "//nurec/libs/spin_mesh:pylib_cc",
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_cuboid",
+        "//nurec/utils:pylib_lidar_pattern_recovery",
+        "//nurec/utils:pylib_renamed_keys",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("point-cloud-utils"),
+        pip_requirement("poisson_recon"),
+        pip_requirement("pydantic"),
+        pip_requirement("scipy"),
+        pip_requirement("threadpoolctl"),
+        pip_requirement("usd-core"),
+    ],
+)
+
+pytest_test(
+    name = "firing_patterns_test",
+    srcs = [
+        "firing_patterns_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/artifact:pylib",
+        "//nurec/config:pylib",
+        "//nurec/models:pylib",
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+pytest_test(
+    name = "metadata_test",
+    srcs = [
+        "metadata_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/utils:pylib",
+    ],
+)
+
+pytest_test(
+    name = "mesh_test",
+    srcs = [
+        "mesh_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "sequence_tracks_test",
+    srcs = [
+        "sequence_tracks_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/artifact:pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_patch_nurec_version",
+    srcs = ["patch_nurec_version.py"],
+    deps = [
+        "//nurec/config:pylib_version",
+        "//nurec/utils:pylib_renamed_keys",
+        pip_requirement("msgpack"),
+    ],
+)
+
+pytest_test(
+    name = "patch_nurec_version_test",
+    size = "small",
+    srcs = ["patch_nurec_version_test.py"],
+    deps = [":pylib_patch_nurec_version"],
+)

@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@gpu_info//:defs.bzl", "GPU_COUNT")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# No Tracy - completely disabled (for regular run target)
+cc_library(
+    name = "tracy_utils_disabled",
+    srcs = ["tracy_utils.cpp"],
+    hdrs = [
+        "tracy_plot_types.h",
+        "tracy_utils.h",
+    ],
+    defines = [
+        # No TRACY_ENABLE = Tracy completely compiled out
+    ],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        # No Tracy or CUPTI dependencies
+    ],
+    alwayslink = True,
+)
+
+# Tracy default library (CPU-only, no GPU profiling overhead)
+cc_library(
+    name = "tracy_utils",
+    srcs = ["tracy_utils.cpp"],
+    hdrs = [
+        "tracy_plot_types.h",
+        "tracy_utils.h",
+    ],
+    defines = [
+        "TRACY_ENABLE",
+        "TRACY_NO_GPU=1",  # Explicitly disable GPU features at compile time
+    ],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@tracy",  # Use default CPU-only Tracy variant
+    ],
+    alwayslink = True,  # Force linking of all symbols
+)
+
+# Tracy GPU library (full GPU profiling with CUPTI dependency)
+cc_library(
+    name = "tracy_utils_gpu",
+    srcs = ["tracy_utils.cpp"],
+    hdrs = [
+        "tracy_plot_types.h",
+        "tracy_utils.h",
+    ],
+    defines = [
+        "TRACY_ENABLE",
+        "TRACY_HAS_GPU",
+    ],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@tracy_gpu//:tracy",  # Use GPU-enabled Tracy variant (includes CUPTI)
+    ],
+    alwayslink = True,  # Force linking of all symbols
+)
+
+cuda_library(
+    name = "tracy_utils_cuda",
+    srcs = ["tracy_utils_cuda.cu"],
+    hdrs = ["tracy_utils_cuda.cuh"],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tracy_utils_gpu",  # Only used with GPU variant (already includes @tracy_gpu//:tracy)
+        "@cuda",
+        "@rules_cuda//cuda:runtime",
+    ],
+)
+
+# Python library with Tracy completely disabled
+py_library(
+    name = "pylib_disabled",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [":tracy_utils_disabled_py.so"],
+    visibility = ["//visibility:public"],
+)
+
+# Python library for default Tracy profiling (CPU-only)
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [":tracy_utils_py.so"],
+    visibility = ["//visibility:public"],
+)
+
+# Python library for GPU Tracy profiling
+py_library(
+    name = "pylib_gpu",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [":tracy_utils_gpu_py.so"],
+    visibility = ["//visibility:public"],
+)
+
+# No Tracy Python binding (Tracy completely compiled out)
+cc_binary(
+    name = "tracy_utils_disabled_py.so",
+    srcs = ["binding_disabled.cpp"],
+    defines = [
+        # No TRACY_ENABLE = Tracy completely disabled
+    ],
+    linkshared = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tracy_utils_disabled",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_python//python/cc:current_py_cc_headers",
+        # No Tracy or CUDA/CUPTI dependencies
+    ],
+)
+
+# Default Tracy Python binding (CPU-only, no GPU profiling overhead)
+cc_binary(
+    name = "tracy_utils_py.so",
+    srcs = ["binding.cpp"],
+    defines = [
+        "TRACY_ENABLE",
+        "TRACY_NO_GPU=1",  # Explicitly disable GPU features
+        # Note: No TRACY_HAS_GPU for CPU-only
+    ],
+    linkshared = True,
+    # No special copts needed - tracy_cpu variant has correct defines
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tracy_utils",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# GPU Tracy Python binding (full GPU profiling with CUPTI dependency)
+cc_binary(
+    name = "tracy_utils_gpu_py.so",
+    srcs = ["binding_gpu.cpp"],
+    defines = [
+        "TRACY_ENABLE",
+        "TRACY_HAS_GPU",
+    ],
+    linkshared = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tracy_utils_cuda",
+        ":tracy_utils_gpu",
+        "@cuda",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_cuda//cuda:runtime",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# Exercise the public package import with each packaged binding. Importing a .so
+# directly would miss undeclared Python modules needed by __init__.py.
+pytest_test(
+    name = "tracy_import_test",
+    srcs = ["tracy_import_test.py"],
+    env = {"EXPECTED_TRACY_BINDING": "tracy_utils_py"},
+    mypy = False,
+    deps = [
+        ":pylib",
+        "//nurec:pylib",
+    ],
+)
+
+pytest_test(
+    name = "tracy_gpu_import_test",
+    srcs = ["tracy_import_test.py"],
+    env = {"EXPECTED_TRACY_BINDING": "tracy_utils_gpu_py"},
+    mypy = False,
+    tags = ["gpu"],
+    target_compatible_with = [] if GPU_COUNT > 0 else ["@platforms//:incompatible"],
+    deps = [
+        ":pylib_gpu",
+        "//nurec:pylib",
+    ],
+)
+
+pytest_test(
+    name = "tracy_disabled_import_test",
+    srcs = ["tracy_import_test.py"],
+    env = {"EXPECTED_TRACY_BINDING": "tracy_utils_disabled_py"},
+    mypy = False,
+    deps = [
+        ":pylib_disabled",
+        "//nurec:pylib",
+    ],
+)

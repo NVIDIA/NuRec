@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+# The third-party notices test checks that this vendored file is still here.
+exports_files(
+    ["inc/ku/helper_math.cuh"],
+    visibility = [],
+)
+
+cc_library(
+    name = "ku_cc",
+    hdrs = [
+        "inc/ku/common_host.h",
+    ],
+    includes = ["inc"],
+    deps = ["//deps/torch:torch_headers"],
+)
+
+cuda_library(
+    name = "ku_cuda",
+    hdrs = [
+        "inc/ku/binary_search.cuh",
+        "inc/ku/common.cuh",
+        "inc/ku/helper_math.cuh",
+        "inc/ku/morton.cuh",
+    ],
+    includes = ["inc"],
+)

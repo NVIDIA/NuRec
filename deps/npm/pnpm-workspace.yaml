@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# rules_js requires lifecycle hooks (install scripts) to be opted into
+# explicitly rather than run by default. Our only dependency is prettier, which
+# ships no install scripts, so nothing is allowed to build. Add an entry here if
+# a future package genuinely needs its install script to run.
+allowBuilds: {}

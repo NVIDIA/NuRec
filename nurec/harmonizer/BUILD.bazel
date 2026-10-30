@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "model.py",
+        "training_controller.py",
+        "utils.py",
+    ],
+    data = [
+        "//bazel/cuda_toolkit:runtime",
+    ],
+    deps = [
+        "//nurec/config:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_schedulers",
+        "//nurec/utils:pylib_types",
+        "@harmonizer//:pylib",
+        pip_requirement("torch"),
+        pip_requirement("einops"),
+        pip_requirement("torchvision"),
+        pip_requirement("kornia"),
+        pip_requirement("omegaconf"),
+        pip_requirement("transformer_engine"),
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "harmonizer_test",
+    srcs = [
+        "harmonizer_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/systems:utils",
+        pip_requirement("omegaconf"),
+    ],
+)

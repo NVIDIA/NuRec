@@ -1,0 +1,21 @@
+diff --git a/mmengine/optim/optimizer/builder.py b/mmengine/optim/optimizer/builder.py
+--- a/mmengine/optim/optimizer/builder.py
++++ b/mmengine/optim/optimizer/builder.py
+@@ -0,0 +1,5 @@
++# Modified by NVIDIA CORPORATION & AFFILIATES, 2026.
++# Changes: register Adafactor with force=True to avoid a duplicate-registration
++#          conflict with transformers.
++# Original source: https://github.com/open-mmlab/mmengine @ v0.10.5
++# Licensed under the Apache License, Version 2.0.
+@@ -166,7 +171,10 @@ def register_transformers_optimizers() -> List[str]:
+     except ImportError:
+         pass
+     else:
+-        OPTIMIZERS.register_module(name='Adafactor', module=Adafactor)
++        # Added force=True to prevent KeyError when both mmengine and transformers
++        # register Adafactor. Without this, importing mmengine after transformers raises:
++        #   KeyError: 'Adafactor is already registered in optimizer at torch.optim'
++        OPTIMIZERS.register_module(name='Adafactor', module=Adafactor, force=True)
+         transformer_optimizers.append('Adafactor')
+     return transformer_optimizers
+

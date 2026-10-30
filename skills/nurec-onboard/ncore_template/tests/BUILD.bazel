@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@ncore_template_pip_deps//:requirements.bzl", "requirement")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+# Placeholder regression test for the template converter. CI exercises this
+# inside the template workspace; the `build-ncore-converter` step excludes
+# this directory from the rsync that materializes the operator's converter
+# workspace, so that workspace never receives the platform self-verification
+# tests.
+#
+# Validator/eval binary paths are bridged from the sibling platform
+# workspace via `NCORE_VALIDATE_BIN` / `NCORE_EVAL_BIN` env vars set by
+# the CI shell and forwarded into the test sandbox with
+# `bazel test --test_env=NCORE_VALIDATE_BIN --test_env=NCORE_EVAL_BIN`.
+# Tests that depend on those binaries are guarded with
+# `@unittest.skipUnless` so local runs without the CI prelude still get
+# useful partial output from the in-process assertions.
+
+py_test(
+    name = "ncore_example_test",
+    size = "small",
+    srcs = ["ncore_example_test.py"],
+    data = [
+        "//ncore_example:convert",
+        "//ncore_example:probe",
+    ],
+    env = {
+        # Runfiles keys consumed by `NcoreExampleEntryPointSmokeTest` to
+        # resolve absolute paths to the `:convert` / `:probe` py_binary
+        # wrappers via the `python.runfiles` helper.
+        "NCORE_EXAMPLE_CONVERT_BIN_RLOCATION": "$(rlocationpath //ncore_example:convert)",
+        "NCORE_EXAMPLE_PROBE_BIN_RLOCATION": "$(rlocationpath //ncore_example:probe)",
+    },
+    main = "ncore_example_test.py",
+    deps = [
+        "//ncore_example:lib",
+        "@rules_python//python/runfiles",
+        requirement("numpy"),
+        requirement("nvidia-ncore"),
+        requirement("pyyaml"),
+    ],
+)
+
+py_test(
+    name = "utils_test",
+    size = "small",
+    srcs = ["utils_test.py"],
+    main = "utils_test.py",
+    deps = [
+        "//ncore_example:utils",
+        requirement("numpy"),
+        requirement("nvidia-ncore"),
+    ],
+)

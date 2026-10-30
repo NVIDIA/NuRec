@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Haithem Turki
+
+defaults:
+  - /apps/AV/_base_3dgut_static.yaml
+  - _waymo_mixin.yaml

@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Collect garbage every 10 steps once memory usage reaches 7e-1.
+
+system:
+  collect_garbage_mem_usage: 0.7
+  collect_garbage_check_interval: 10

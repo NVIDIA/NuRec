@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Drop predicted lidar returns whose raydrop logit exceeds 8e-1.
+
+system:
+  test:
+    lidar:
+      raydrop_threshold: 0.8

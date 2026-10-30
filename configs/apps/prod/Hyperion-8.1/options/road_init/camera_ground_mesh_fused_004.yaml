@@ -1,0 +1,17 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize the road from the fused camera point cloud using a camera-derived ground mesh.
+
+defaults:
+  - override /model/gaussians/initialization@model.layers.road.initialization: camera_ground_mesh_road
+  - _self_
+
+model:
+  layers:
+    road:
+      initialization:
+        point_cloud_path: ${dirname:${dataset.path}}/fusion/fused_004.ply
+        surface_init_min_per_face: 1
+        voxel_size: 0.3

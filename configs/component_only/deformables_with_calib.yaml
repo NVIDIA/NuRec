@@ -1,0 +1,29 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Component-only overlay: train the dynamic_deformables Gaussian layer
+# with the calibration component (pose optimization) active; everything
+# else disabled by omission.
+#
+# The calib module is model.calib as configured by the parent app; the
+# composite only decides whether it exists this run.
+#
+# Compose example:
+#
+#     defaults:
+#       - /apps/prod/Hyperion-8.1/car2sim
+#       - /component_only: deformables_with_calib
+
+component_only:
+  # ``enabled: true`` switches this run into opt-in mode: only the
+  # components listed below are trained; every other component (unlisted,
+  # or ``state: disabled``) is turned off. Enabling every component
+  # collapses back to the parent app config's full training.
+  enabled: true
+  layers:
+    dynamic_deformables:
+      state: enabled
+  calib:
+    state: enabled

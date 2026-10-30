@@ -1,0 +1,54 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Model-agnostic standalone production wrapper for instant_nurec prediction. Shared computation
+# lives in `_instant_nurec_predict_common`; this file owns staged input and output behavior.
+# Internal prediction overlays inherit it.
+defaults:
+  - /instant_nurec/dataset/concrete@dataset.predict: ncore_local_low_res
+  - _instant_nurec_predict_common@_here_
+  - artifact@predict.artifact: base
+  - _self_
+
+viewer:
+  enabled: false
+  ray_subsampling_step:
+    high_resolution: 0.4
+    low_resolution: 0.4
+
+predict:
+  artifact:
+    enabled: false
+  # PLY filtering is handled by voxelization in the common primitive-merge
+  # policy and `model.export_preprocess.density_prune_threshold`; the other
+  # `export_ply.*` thresholds are intentionally left at schema defaults.
+  export_ply:
+    enabled: true
+    save_to_dir: dataset_directory
+  render_video:
+    enabled: true
+    depth: false
+    override_sensors:
+      - sensor_id: camera_front_wide_120fov
+        height: 720
+      - sensor_id: camera_front_wide_120fov
+        height: 720
+        translation_offset: [0.0, 0.0, -8.0]
+        rotation_offset: [0.0, 40.0, 0.0, true]
+        force_pinhole: true
+
+dataset:
+  predict:
+    ncore_json_list_path: ???
+    ncore_json_base_path: ???
+
+# Specify output directory (save_dir, ckpt_dir etc will change accordingly).
+# Preserve the historical output prefix; workflows and model-specific overlays override it.
+out_dir: /instant_nurec_debug/kelvin_predict_prod
+# Dummy logger to avoid cluttering production runs.
+logger:
+  enabled: false
+  name: "dummy"
+  # Generate new run ID for each run.
+  run_id: "<generate>"

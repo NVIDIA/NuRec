@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "abstract_viewer.py",
+        "dataset_interface.py",
+        "instant_nurec_dataset_interface.py",
+        "lightning_viewer.py",
+        "lock.py",
+        "ncore_dataset_interface.py",
+        "ply_viewer.py",
+        "usdz_viewer.py",
+        "viewpoint.py",
+    ],
+    data = [
+        "@nv_assets//:nv-car",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //:run
+        "//:__pkg__",
+    ],
+    deps = [
+        "//nurec/artifact:pylib",
+        "//nurec/config:pylib",
+        "//nurec/config:pylib_parse",
+        "//nurec/libs/losses/orchestration:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/render:pylib",
+        "//nurec/systems:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_cli",
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/io/export:pylib_render",
+        pip_requirement("torch"),
+        pip_requirement("kornia"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("einops"),
+        pip_requirement("pillow"),
+        pip_requirement("viser"),
+        pip_requirement("pytorch_lightning"),
+        pip_requirement("numpy"),
+    ],
+)

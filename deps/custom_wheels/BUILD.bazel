@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Exported so check_vendored_components can verify the in-tree path of the FFmpeg, SVT-AV1 and dav1d
+# notices (components bundled in the +nre wheels).
+exports_files(
+    ["README.md"],
+    visibility = [],
+)
+
+# Change records shipped next to the upstream sources in the dev deps image's /licenses/sources.
+[
+    filegroup(
+        name = "%s_changes" % wheel.replace("-", "_"),
+        srcs = glob(["%s/*" % wheel]),
+        visibility = [],
+    )
+    for wheel in [
+        "causal-conv1d",
+        "cosmos_predict2",
+        "decord",
+        "imageio-ffmpeg",
+        "lietorch",
+        "mamba-ssm",
+        "mmcv",
+        "opencv-python",
+        "point-cloud-utils",
+        "poisson-recon",
+        "sam2",
+        "torch",
+        "transformer_engine",
+        "viser",
+        "yourdfpy",
+    ]
+]

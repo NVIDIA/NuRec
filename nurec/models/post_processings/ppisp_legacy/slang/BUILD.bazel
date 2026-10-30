@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/slang:defs.bzl", "slangtorch_library")
+
+package(default_visibility = [
+    "//:core_package_group",
+])
+
+# Compile the legacy PPISP Slang module into a SlangTorch C++ CUDA extension
+slangtorch_library(
+    name = "ppisp_legacy_cc",
+    srcs = [
+        "ppisp_legacy.slang",
+    ],
+    extra_cmd_args = "$$(cat $(location //nurec/models/post_processings:constants_txt)) -I$$(dirname $(location //nurec/libs/slang_utils:extensions_slang))",
+    visibility = ["//:core_package_group"],
+    deps = [
+        "//nurec/libs/slang_utils:extensions_slang",
+        "//nurec/models/post_processings:constants_txt",
+    ],
+)
+
+# Legacy PPISP SlangTorch C++ CUDA extension library
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "ppisp_legacy.py",
+    ],
+    deps = [
+        ":ppisp_legacy_cc",
+        "//nurec/libs/slang_utils:pylib_utils",
+        "//nurec/utils:pylib",
+        pip_requirement("torch"),
+    ],
+)

@@ -1,0 +1,8 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize the road layer from the lidar-derived ground mesh.
+
+defaults:
+  - override /model/gaussians/initialization@model.layers.road.initialization: lidar_ground_mesh_road

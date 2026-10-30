@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+poisson-recon 13.74.1 - statement of changes
+
+This wheel carries the PoissonRecon executable (https://github.com/mkazhdan/PoissonRecon, MIT),
+built from upstream commit cc9d3ade74f6fcd944a98d9835c2fe8ad831bcc5 ("Version 13.74") without
+changes, and a Python wrapper written by NVIDIA CORPORATION & AFFILIATES. The wrapper is
+poisson_recon/__init__.py inside the wheel, shipped as source in the nurec_dev_deps image under
+/opt/nvidia/nurec-build-deps/wheelhouse.

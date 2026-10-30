@@ -1,0 +1,37 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Component-only overlay: train ONLY the dynamic_deformables Gaussian
+# layer. Every other component (Gaussian layers, sky model, calib,
+# post-processing) is disabled by omission — component_only is opt-in.
+#
+# The model.* sections are NOT touched: layer configs stay fully
+# declared (their class_labels / tracks stay readable for the loss
+# mask), the sky/calib/post_processing configs keep describing the real
+# modules; the composite constructs SkipBackground / skip-calib / an
+# empty PP chain internally for disabled components.
+#
+# Masking: deformables default to [bbox_expanded] — pixels whose rays
+# hit the expanded cuboids (factor = cuboid_tracks_expand). Pure-bbox
+# supervision needs no per-pixel semantics.
+#
+# Compose onto any app config:
+#
+#     defaults:
+#       - /apps/prod/Hyperion-8.1/car2sim
+#       - /component_only: deformables_only
+#
+# If your app config sets system.test.val_render_selected_nodes, prune
+# entries referencing disabled layers — validation asserts otherwise.
+
+component_only:
+  # ``enabled: true`` switches this run into opt-in mode: only the
+  # components listed below are trained; every other component (unlisted,
+  # or ``state: disabled``) is turned off. Enabling every component
+  # collapses back to the parent app config's full training.
+  enabled: true
+  layers:
+    dynamic_deformables:
+      state: enabled

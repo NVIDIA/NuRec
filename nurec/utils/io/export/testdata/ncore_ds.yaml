@@ -1,0 +1,155 @@
+# @package _global_
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+seed: 0
+mode: train
+
+resume: null
+resume_weights_only: false
+verbose: false
+
+out_dir: "."
+
+logger:
+  name: dummy
+
+checkpoint:
+  every_n_train_steps: null
+  save_top_k: 1
+  monitor: null
+  mode: min
+  save_on_train_epoch_end: false
+  artifact: {}
+
+harmonizer: {}
+
+trainer:
+  max_epochs: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 1
+  enable_progress_bar: false
+  num_sanity_val_steps: 0
+  precision: 32
+
+dataset:
+  name: ncore
+
+  path: ???
+  seek_offset_sec: null
+  duration_sec: null
+
+  # These IDs must match sensors in @test_data_ncore_v4.
+  camera_ids: [camera_front_wide_120fov]
+  lidar_ids: [lidar_gt_top_p128_v4p5]
+  train_camera_ids: ${.camera_ids}
+  train_lidar_ids: ${.lidar_ids}
+  val_camera_ids: ${.camera_ids}
+  val_lidar_ids: ${.lidar_ids}
+
+  n_samples_per_epoch: 100
+  n_train_sample_camera_rays: 1024
+  n_train_sample_lidar_rays: 512
+  n_val_image_subsample: 4
+  n_train_sequential_image_subsample: 4
+  aux_data: true
+
+  max_dist_m: 100.0
+  val_sensor_transl_delta_m: null
+  val_sensor_rot_delta_deg: null
+
+  open_consolidated: true
+  show_progress_bars: true
+
+  cuboid_tracks_params: {}
+  valid_measurements_method: EGO
+  valid_lidarpoints_cuboid_track_params:
+    track_padding_m: [0.5, 0.5, 0.25]
+  valid_pixels_cuboid_track_params:
+    track_padding_m: [1.0, 1.0, 0.25]
+    frame_track_idxs: false
+  valid_pixels_scene_flow_params:
+    flow_min_speed_ms: 1.0
+    flow_dilate_radius: 10
+    flow_downsample_scale: 2
+  valid_pixels_traffic_light_params: {}
+  valid_pixels_frame_mask_params: {}
+  lidar_dynamic_points: {}
+  camera_point_cloud_ignore_classes: []
+  camera_point_cloud_dynamic_classes: []
+
+  samplers:
+    batch_sampler:
+      name: default
+      ratio_camera_samples: 1.0
+      ratio_lidar_samples: 1.0
+      update_n_epochs: 0
+      camera_sensor_sampler:
+        name: coverage
+        sample_all_sensors: false
+      camera_frame_sampler:
+        name: coverage
+      camera_pixel_sampler:
+        name: image-crop
+        crop_type: full_image
+        subsample: 1
+        roi_lt: null
+        roi_rb: null
+        crop_ratio: null
+      lidar_sensor_sampler:
+        name: coverage
+        sample_all_sensors: false
+      lidar_frame_sampler:
+        name: coverage
+      lidar_point_sampler:
+        name: lidar-crop
+        subsample: 1
+
+datamodule:
+  name: so
+  update_n_epochs: 1
+  train_num_workers: 0
+  train_batch_size: 1
+  val_num_workers: 0
+  test_num_workers: 0
+  mock_dataloader: false
+  prefetch:
+    enabled: false
+    queue_size: 1
+
+model:
+  name: test-model
+  train_num_rays: 1024
+  layers: {}
+  renderer:
+    name: 3dgut-gsplat
+  strategy:
+    name: mcmc
+
+system:
+  name: gaussians-system
+  save_logger: false
+  warmup_steps: 0
+  record_timings:
+    train_interval: 100
+    val_interval: 100
+  record_quality_metrics:
+    psnr_interval: 100
+  test:
+    video_fps: 30
+    track_ply: {}
+    track_orbit: {}
+    track_rotation: {}
+    background_removal: {}
+    val_render_selected_nodes: {}
+    metrics: {}
+    lidar:
+      raydrop_threshold: 0.5
+      ROI: null
+
+sensor:
+  lidar_models:
+    spinning: {}
+
+loss: null

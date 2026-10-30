@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "corridor.py",
+        "ground_mesh.py",
+    ],
+    deps = [
+        "//apps/av:pylib",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/libs/ground_mesh:pylib_cc",
+        "//nurec/libs/spin_mesh:pylib_cc",
+        "//nurec/utils:pylib",
+        "//nurec/utils/io:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("point-cloud-utils"),
+        pip_requirement("pydantic"),
+        pip_requirement("scipy"),
+        pip_requirement("threadpoolctl"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "ground_mesh_test",
+    srcs = ["ground_mesh_test.py"],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "corridor_test",
+    srcs = ["corridor_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+    ],
+)

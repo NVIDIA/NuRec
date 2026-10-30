@@ -1,0 +1,325 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+# nurec:allow-direct-py-test - the standalone spawn tests run as their own guarded main() because
+# multiprocessing `spawn` re-imports the main module and cannot safely use the pytest launcher.
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "cache_keys",
+    srcs = ["cache_keys.py"],
+    visibility = DEFAULT_VISIBILITY,
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "client_wait.py",
+        "downloader.py",
+        "ego_hood.py",
+        "grpc_server_config.py",
+        "model_owner.py",
+        "nvjpeg_batch_encoder.py",
+        "scene_cache.py",
+        "serve.py",
+        "trajectory.py",
+    ],
+    data = [
+        ":nurec_nvjpeg_batch_encoder_cc",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //:run
+        "//:__pkg__",
+    ],
+    deps = [
+        ":cache_keys",
+        ":pylib_pose",  # nurec.grpc.pose — serve.py re-exports the pose helpers
+        "//apps/viewer:pylib",
+        "//nurec/artifact:pylib",
+        "//nurec/asset_edits:pylib",  # asset-edits runtime installed by serve.py
+        "//nurec/datasets:pylib",
+        "//nurec/grpc/protos:grpc_pb2",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/render:pylib",
+        "//nurec/systems:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_cli",
+        "//nurec/utils:pylib_ncore_types",
+        "//nurec/utils/debug:pylib",
+        pip_requirement("pytorch_lightning"),
+        pip_requirement("imageio"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("torch"),
+        pip_requirement("torchvision"),
+        pip_requirement("einops"),
+        pip_requirement("scipy"),
+        pip_requirement("lietorch"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("hydra-core"),
+        pip_requirement("grpcio"),
+        pip_requirement("click"),
+        pip_requirement("requests"),
+        pip_requirement("grpcio-health-checking"),
+        # CUDA IPC transport (same-node serve-grpc delivery). serve.py still imports
+        # it under try/except, so the server degrades gracefully if IpcManager
+        # somehow fails to import despite always being a build dependency.
+        "//nurec/libs/cuda_ipc_transport:pylib",
+    ],
+)
+
+# Focused SE3 <-> gRPC pose conversion helpers (nurec.grpc.pose). Split out of the monolithic
+# `serve.py` so lightweight clients/tooling (the concurrent-render benchmark harness) can import
+# the pure pose math without transitively compiling the entire GPU serving stack pulled in by
+# `:pylib` (gaussians, render, viewer, pytorch_lightning, ...). `serve.py` re-exports for compat.
+py_library(
+    name = "pylib_pose",
+    srcs = ["pose.py"],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        # `nurec.grpc.protos.common_pb2` (grpc_types.Pose/Vec3/Quat).
+        "//nurec/grpc/protos:grpc_pb2",
+        # `nurec.utils.geometry.tquat_to_se3_matrix` (light: torch/lietorch/scipy/ncore, no GPU serving stack).
+        "//nurec/utils:pylib_geometry",
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+    ],
+)
+
+# Packages the multi-process drop-in into anything that ships `serve-grpc` (notably `//:run`), so
+# `serve-grpc --multiproc-workers N` can lazily `import nurec.grpc.multiproc_serve`. Depends on `:pylib`
+# one-directionally (serve.py's import of this module is lazy, which is what breaks the bazel cycle).
+py_library(
+    name = "pylib_multiproc",
+    srcs = ["multiproc_serve.py"],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+    deps = [
+        ":pylib",
+        # Direct deps for multiproc_serve.py's top-level imports. These resolved only transitively through
+        # :pylib before, so they would break silently if :pylib ever stopped re-exporting them.
+        "//nurec/artifact:pylib",  # from nurec.artifact.artifact import Artifact
+        "//nurec/config:pylib",  # from nurec.config.model import RendererBackend
+        "//nurec/grpc/protos:grpc_pb2",  # from nurec.grpc.protos import common_pb2, sensorsim_pb2
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/utils:pylib",  # from nurec.utils.metrics import MetricsCollector, create_metric_sample
+        "//nurec/utils:pylib_mps_prelaunch",  # mps_active delegates to the stdlib detection helper
+        pip_requirement("grpcio"),
+        pip_requirement("grpcio-health-checking"),  # from grpc_health.v1 import health, health_pb2, ...
+        pip_requirement("pyyaml"),  # multiproc_serve.py imports yaml directly (was only transitive)
+        pip_requirement("torch"),
+    ],
+)
+
+cc_binary(
+    name = "nurec_nvjpeg_batch_encoder_cc",
+    srcs = ["nvjpeg_batch_encoder.cpp"],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions and to build correct torch-extension bindings.
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libnurec_nvjpeg_batch_encoder_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        "//deps/torch:torch_headers",
+        "@cuda",
+        "@cuda//:cuda_headers",
+        "@cuda//:cuda_runtime",
+        "@cuda//:nvjpeg",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+pytest_test(
+    name = "serve_test",
+    srcs = [
+        "backend_cache_test.py",
+        "downloader_test.py",
+        "ego_hood_test.py",
+        "scene_cache_test.py",
+        "serve_asset_edits_test.py",
+        "serve_test.py",
+    ],
+    data = [
+        "nvjpeg_batch_encoder.cpp",
+    ],
+    deps = [
+        ":cache_keys",
+        ":pylib",
+        "//nurec/artifact:pylib",  # serve_asset_edits_test imports nurec.artifact directly
+        "//nurec/asset_edits:pylib",  # serve_asset_edits_test imports nurec.asset_edits directly
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("grpcio-health-checking"),  # serve_test.py imports grpc_health.v1 directly
+        pip_requirement("imageio"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "cache_keys_test",
+    size = "small",
+    srcs = ["cache_keys_test.py"],
+    deps = [":cache_keys"],
+)
+
+pytest_test(
+    name = "model_owner_test",
+    srcs = [
+        "model_owner_test.py",
+    ],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "pose_test",
+    srcs = [
+        "pose_test.py",
+    ],
+    deps = [
+        ":pylib_pose",
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("numpy"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "grpc_server_config_test",
+    srcs = [
+        "grpc_server_config_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("click"),
+    ],
+)
+
+# Consumes the production module through :pylib_multiproc (the single compile owner of
+# multiproc_serve.py) rather than recompiling it. Deps below are only what multiproc_serve_test.py
+# imports directly; production-only transitives (artifact, health, composite, MPS) arrive via the
+# library dependency.
+pytest_test(
+    name = "multiproc_serve_test",
+    srcs = [
+        "multiproc_serve_test.py",
+    ],
+    deps = [
+        ":pylib",  # nurec.grpc.{model_owner,scene_cache,serve,grpc_server_config}
+        ":pylib_multiproc",  # nurec.grpc.multiproc_serve (single compile owner)
+        "//nurec/config:pylib",  # from nurec.config.model import RendererBackend
+        "//nurec/grpc/protos:grpc_pb2",  # from nurec.grpc.protos import ...
+        pip_requirement("click"),  # from click.testing import CliRunner
+        pip_requirement("grpcio"),
+        pip_requirement("numpy"),
+        pip_requirement("pyyaml"),  # multiproc_serve_test.py imports yaml directly
+        pip_requirement("torch"),
+    ],
+)
+
+# Standalone rather than pytest-driven: multiprocessing `spawn` re-imports its main module, while the
+# repository's pytest launcher is not guarded as an import-safe multiprocessing main. This target exercises
+# the production spawn boundary directly without recursively starting pytest in each child.
+py_test(
+    name = "worker_lifecycle_spawn_test",
+    srcs = ["worker_lifecycle_spawn_test.py"],
+    main = "worker_lifecycle_spawn_test.py",
+    deps = [
+        ":pylib",  # nurec.grpc.model_owner
+        ":pylib_multiproc",
+    ],
+)
+
+mypy_test(
+    name = "worker_lifecycle_spawn_test_mypy",
+    deps = [
+        ":worker_lifecycle_spawn_test",
+    ],
+)
+
+# Standalone so a parent process can terminate the CUDA child and report a deterministic failure if
+# concurrent calls deadlock inside the native extension instead of hanging the Bazel test runner.
+py_test(
+    name = "nvjpeg_batch_encoder_concurrency_test",
+    size = "large",
+    timeout = "long",
+    srcs = ["nvjpeg_batch_encoder_concurrency_test.py"],
+    main = "nvjpeg_batch_encoder_concurrency_test.py",
+    tags = ["exclusive"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+mypy_test(
+    name = "nvjpeg_batch_encoder_concurrency_test_mypy",
+    deps = [
+        ":nvjpeg_batch_encoder_concurrency_test",
+    ],
+)
+
+py_binary(
+    name = "ego_hood_grpc_integration_test",
+    srcs = ["ego_hood_grpc_integration_test.py"],
+    main = "ego_hood_grpc_integration_test.py",
+    tags = ["manual"],
+    deps = [
+        ":pylib",
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("grpcio"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+    ],
+)
+
+# Thin executable wrapper: multiproc_serve_main.py imports main() from :pylib_multiproc (the single
+# compile owner of multiproc_serve.py). All CLI/launch logic and its transitive deps ride along via
+# the library, so the binary itself only compiles the wrapper.
+py_binary(
+    name = "multiproc_serve",
+    srcs = ["multiproc_serve_main.py"],
+    main = "multiproc_serve_main.py",
+    tags = ["manual"],  # Needs a GPU +.usdz artifact; owner + N worker gRPC servers + proxy
+    deps = [
+        ":pylib_multiproc",
+    ],
+)
+
+py_binary(
+    name = "update_generated",
+    srcs = ["update_generated.py"],
+    data = ["//nurec/grpc/protos:proto_files"],
+    main = "update_generated.py",
+    deps = [
+        pip_requirement("grpcio"),
+        pip_requirement("grpcio-tools"),
+    ],
+)

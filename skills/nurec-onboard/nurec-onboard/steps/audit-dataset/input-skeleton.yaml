@@ -1,0 +1,171 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Skeleton NuRec Onboard input generated or filled by audit-dataset.
+#
+# This file is descriptive: it records dataset facts the converter can verify
+# and translate into implementation choices. Do not place converter recipes,
+# function names, or "do not do X" instructions in this file.
+
+data:
+  name: my_dataset
+  path: /path/to/raw/sequence
+  description: >
+    High-level overview of the raw dataset: sensor modalities, sequence scope,
+    and annotation availability.
+
+  profile:
+    file_layout:
+      summary: "UNRESOLVED: Describe paths relative to data.path, file formats, important field/column names, units, dtypes, and any companion files carrying calibration or per-ray metadata."
+      root: "UNRESOLVED: Raw dataset root or sequence path used for this audit."
+      sequence_id_source: "UNRESOLVED: File, directory pattern, manifest, or archive key used to discover canonical sequence IDs."
+      raw_inputs:
+        - "UNRESOLVED: Describe each raw input path/key, format, fields, units, and dtype."
+      calibration_files:
+        - "UNRESOLVED: Calibration file, folder, topic, table, or protobuf field."
+      metadata_files:
+        - "UNRESOLVED: Metadata file, folder, topic, table, or protobuf field."
+
+    calibration_and_frames:
+      summary: "UNRESOLVED: Identify calibration files, the transform direction each file stores, native rig/world/camera/LiDAR axes, and any known origin differences between raw inputs."
+      calibration_sources:
+        - "UNRESOLVED: Calibration source file, field, datasheet, or measured probe."
+      rig_frame: "UNRESOLVED: Describe the intended rig/ego frame origin and axes."
+      world_frame: "UNRESOLVED: Describe the dataset world frame, global frame, or map frame."
+      camera_frame: "UNRESOLVED: Describe native camera axes and how they relate to OpenCV/NCore axes."
+      lidar_frame: "UNRESOLVED: Describe native LiDAR axes for each converted LiDAR family."
+      frames:
+        - "UNRESOLVED: Frame name and axis convention used by the raw dataset."
+      static_transforms:
+        - source_frame: "UNRESOLVED: Source frame name used by the raw calibration."
+          target_frame: "UNRESOLVED: Target frame name used by the raw calibration."
+          raw_stream: "UNRESOLVED: Calibration file or field containing this transform."
+          direction: "UNRESOLVED: Transform direction as stored, such as camera_to_rig or sensor_to_vehicle."
+      dynamic_transforms:
+        - source_frame: "UNRESOLVED: Source frame for the dynamic pose stream."
+          target_frame: "UNRESOLVED: Target frame for the dynamic pose stream."
+          raw_stream: "UNRESOLVED: Pose file or field containing this dynamic transform."
+          direction: "UNRESOLVED: Transform direction as stored."
+          timestamp_unit: "UNRESOLVED: Timestamp unit used by this dynamic pose stream."
+      transform_direction_conventions:
+        - "UNRESOLVED: Dataset convention for naming stored transforms."
+      known_mismatches:
+        - "UNRESOLVED: Known calibration/frame mismatch, or state that none are known."
+
+    pose_sources:
+      - id: "UNRESOLVED: Canonical pose source ID."
+        raw_stream: "UNRESOLVED: Raw pose file, topic, table, or protobuf field."
+        source_frame: "UNRESOLVED: Source frame for the stored pose."
+        target_frame: "UNRESOLVED: Target frame for the stored pose."
+        direction: "UNRESOLVED: Transform direction as stored."
+        timestamp_unit: "UNRESOLVED: Timestamp unit for pose samples."
+        coverage: "UNRESOLVED: Describe pose density, dropped intervals, and modality coverage."
+        global_frame: "UNRESOLVED: Describe any ECEF, UTM, ENU, map, or other global frame evidence."
+
+    timestamp_semantics:
+      summary: "UNRESOLVED: Describe clock source, units, camera timestamp meaning, LiDAR frame timestamp meaning, per-ray timestamp availability, and cross-sensor synchronization facts."
+      clock: "UNRESOLVED: Clock source, such as GPS, monotonic sensor time, host time, or unknown."
+      unit: "UNRESOLVED: Timestamp unit or per-field units when they differ."
+      camera_timestamp_meaning: "UNRESOLVED: State whether camera timestamps represent exposure start, center, end, readout time, or another convention."
+      lidar_frame_timestamp_meaning: "UNRESOLVED: State whether LiDAR frame timestamps represent sweep start, center, end, pose reference, or another convention."
+      per_ray_timestamps: "UNRESOLVED: Describe per-ray or per-point timestamp availability and units."
+      synchronization: "UNRESOLVED: Describe cross-sensor synchronization, offsets, or known temporal mismatches."
+
+    cameras:
+      - id: "UNRESOLVED: Canonical camera ID to use in the converter."
+        raw_stream: "UNRESOLVED: Raw camera folder, topic, table, or protobuf field."
+        model: "UNRESOLVED: Camera product/model if known."
+        resolution: "UNRESOLVED: Image resolution as [width, height]."
+        image_format: "UNRESOLVED: Encoded image format, such as jpeg, png, raw Bayer, or dataset-specific bytes."
+        model_family: "UNRESOLVED: Camera model family to derive, such as opencv_pinhole, opencv_fisheye, ftheta, or unknown."
+        intrinsics_source: "UNRESOLVED: File or field containing fx, fy, principal point, and other intrinsics."
+        distortion_model: "UNRESOLVED: Native distortion model, such as Brown-Conrady, OpenCV fisheye, FTheta, none, or unknown."
+        distortion_coeff_order: "UNRESOLVED: Native distortion coefficient names and order."
+        image_state: "UNRESOLVED: Image state, such as raw_distorted, rectified, undistorted, cropped, or resized."
+        shutter:
+          type: "UNRESOLVED: Shutter type, such as global, rolling, or unknown."
+          direction: "UNRESOLVED: Rolling-shutter readout direction, if applicable."
+          readout_duration_sec: "UNRESOLVED: Rolling-shutter readout duration in seconds, or evidence that it is unpublished."
+          timestamp_meaning: "UNRESOLVED: Camera timestamp meaning for frame timestamps."
+        masks:
+          available: "UNRESOLVED: State whether camera static masks are available."
+          entries:
+            - name: "UNRESOLVED: Mask name to expose, such as ego."
+              target: "UNRESOLVED: What this mask covers."
+              raw_stream: "UNRESOLVED: Raw mask file, folder, topic, table, or protobuf field."
+              format: "UNRESOLVED: Encoded mask format."
+              polarity: "UNRESOLVED: Whether positive pixels mean masked or valid."
+
+    lidars:
+      - id: "UNRESOLVED: Canonical LiDAR ID to use in the converter."
+        raw_stream: "UNRESOLVED: Raw LiDAR folder, topic, table, or protobuf field."
+        model: "UNRESOLVED: LiDAR product/model if known."
+        type: "UNRESOLVED: LiDAR type, such as mechanical_spinning, solid_state, flash, or merged_point_cloud."
+        raw_format: "UNRESOLVED: Raw LiDAR representation, such as cartesian_points, polar_range_image, structured_grid, or merged_point_cloud."
+        model_source: "UNRESOLVED: Source for beam/rotor model, such as calibration file, vendor table, inferred from samples, or unavailable."
+        beam_structure:
+          rows: "UNRESOLVED: Number of LiDAR rows/channels when structured."
+          columns: "UNRESOLVED: Number of azimuth columns per revolution when structured."
+          row_elevations: "UNRESOLVED: Source and units for per-row elevation angles."
+          column_azimuths: "UNRESOLVED: Source and units for column azimuth schedule."
+          row_azimuth_offsets: "UNRESOLVED: Source and units for per-row azimuth offsets."
+        spinning:
+          direction: "UNRESOLVED: Spinning direction derived from azimuth monotonicity."
+          frequency_hz: "UNRESOLVED: Spinning frequency in Hz."
+        timing:
+          frame_timestamp_meaning: "UNRESOLVED: LiDAR frame timestamp meaning."
+          per_ray_timestamps: "UNRESOLVED: Per-ray timestamp availability, source, and units."
+        per_ray_metadata:
+          - "UNRESOLVED: Per-ray field name, role, dtype, shape, units, and relation to point count."
+        intensity: "UNRESOLVED: Intensity field name, scale, normalization, and units if known."
+        motion_compensation: "UNRESOLVED: State whether points are raw, motion compensated, merged, or already transformed."
+
+    cuboids:
+      summary: "UNRESOLVED: Describe whether cuboids exist, centroid convention, dimension axis order, yaw zero direction, class vocabulary, label source, duplicate/sensor-specific labels, and coverage."
+      exists: "UNRESOLVED: State whether 3D cuboids exist."
+      raw_stream: "UNRESOLVED: Raw cuboid annotation file, folder, topic, table, or protobuf field."
+      centroid: "UNRESOLVED: Cuboid centroid convention, such as geometric center or bottom center."
+      dimensions:
+        length: "UNRESOLVED: Source field or axis that maps to cuboid length."
+        width: "UNRESOLVED: Source field or axis that maps to cuboid width."
+        height: "UNRESOLVED: Source field or axis that maps to cuboid height."
+      yaw: "UNRESOLVED: Yaw zero direction, positive direction, axis, and object local axis."
+      reference_frame: "UNRESOLVED: Frame in which cuboid positions and orientations are expressed."
+      timestamp_meaning: "UNRESOLVED: Timestamp or frame-index convention for cuboid observations."
+      track_id_source: "UNRESOLVED: Field or rule that provides stable track IDs."
+      class_vocabulary:
+        - "UNRESOLVED: Cuboid class label exactly as represented in the source data."
+      label_source: "UNRESOLVED: Label source name, such as human labels, synthetic labels, or auto labels."
+      coverage: "UNRESOLVED: Describe annotation coverage, no-label zones, missing classes, or sparse intervals."
+
+    known_gaps:
+      - "UNRESOLVED: List unresolved data-owner questions, known calibration mismatches, missing files, incomplete raw inputs, or other facts that affect NCore conversion or NuRec reconstruction."
+
+  # docs:
+  #   - /path/to/dataset_docs.md
+  #   - /path/to/dataset_docs/
+  #   - https://example.com/dataset-paper
+
+ncore:
+  camera_ids:
+    - "UNRESOLVED: Camera ID to convert, or all when every audited camera should be converted."
+  lidar_ids:
+    - "UNRESOLVED: LiDAR ID to convert."
+  seek_sec: "UNRESOLVED: Optional conversion start offset in seconds."
+  duration_sec: "UNRESOLVED: Optional conversion duration in seconds."
+  converter_dir: "UNRESOLVED: Optional converter worktree directory, or null to use the workflow default."
+  output_dir: "UNRESOLVED: Optional NCore output directory, or null to use the workflow default."
+
+nurec:
+  camera_ids:
+    - "UNRESOLVED: Camera ID to use for NuRec, or all converted cameras."
+  lidar_ids:
+    - "UNRESOLVED: Exactly one converted LiDAR ID to use for NuRec."
+  output_dir: "UNRESOLVED: Optional NuRec output directory, or null to use the workflow default."
+
+# Optional standalone audit invocation. Prefer running audit-dataset first,
+# reviewing the generated YAML, then launching nurec-onboard on that YAML.
+# audit:
+#   enabled: false
+#   output_dir: /path/to/audit-output
+#   fail_on_unresolved: true

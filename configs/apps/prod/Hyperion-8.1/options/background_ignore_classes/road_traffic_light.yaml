@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep road and traffic-light semantics out of the background layer.
+
+model:
+  layers:
+    background:
+      ignore_classes_from_layers: ["road", "traffic_light"]

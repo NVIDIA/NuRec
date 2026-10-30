@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initialize the background with 850,000 instant_nurec points plus 100,000 near and 100,000 far points.
+
+model:
+  layers:
+    background:
+      initialization:
+        num_point_cloud_points: 850_000
+        num_near_points: 100_000
+        num_far_points: 100_000

@@ -1,0 +1,12 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - override /model/post_processing@model.post_processing.b: null # Per-camera bilateral grid should be disabled in a single-camera session
+
+dataset:
+  camera_ids:
+  - camera_front_wide_120fov
+  lidar_ids:
+  - lidar_gt_top_p128

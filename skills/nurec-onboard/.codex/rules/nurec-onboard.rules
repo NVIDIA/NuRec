@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Docker commands run outside the command sandbox.
+#
+# Sandboxed commands run in a namespace without /run, so /var/run/docker.sock
+# does not exist inside it and no permission-profile setting exposes it. A
+# `decision = "allow"` rule runs a matching command outside the sandbox without
+# prompting, which is the only way a container-backed step reaches the daemon.
+# It needs no approval, so it works under `approval_policy = "never"`.
+#
+# Two conditions decide whether a matching command actually leaves the sandbox,
+# and neither reports a policy error when unmet -- Docker just fails to connect:
+#
+#   1. The permission profile must carry no `deny` entry. Codex can only enforce
+#      a denied read from inside the sandbox, so one deny entry anywhere in the
+#      filesystem table keeps every command in it, this one included.
+#   2. Every command in the shell script must match a rule, and the script must
+#      consist of literal words. So `docker ...` alone qualifies, including
+#      quoted arguments such as `--format '{{.Server.Version}}'`, while
+#      `cd /d && docker ...`, `docker ... | tee log`, `docker ... > log`, and any
+#      `$(...)` or `$VAR` argument do not. Keep each Docker invocation a single
+#      command with literal arguments; see the run-nurec step's
+#      docker-execution.md.
+prefix_rule(
+    pattern = ["docker"],
+    decision = "allow",
+    justification = "Container-backed workflow steps need the host Docker daemon.",
+    match = [
+        "docker version",
+        "docker logs nurec-reconstruction",
+        "docker run --rm --gpus all image nvidia-smi -L",
+    ],
+    not_match = [
+        "dockerd",
+    ],
+)

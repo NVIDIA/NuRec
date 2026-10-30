@@ -1,0 +1,22 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Riccardo de Lutio
+
+# intended to be added to existing configs to speed up training for debugging purposes
+
+trainer:
+  max_epochs: 2
+  check_val_every_n_epoch: 2
+
+dataset:
+  n_samples_per_epoch: 10
+
+checkpoint:
+  # Save after the two 10-step epochs complete.
+  every_n_train_steps: ${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}
+
+datamodule:
+  train_num_workers: 0
+  val_num_workers: 0

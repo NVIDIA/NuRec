@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+cuda_library(
+    name = "spin_mesh_cuda",
+    srcs = [
+        "spin_mesh.cu",
+    ],
+    hdrs = [
+        "utils.h",
+    ],
+    copts = [
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+    ],
+    deps = [
+        "//deps/torch:torch_headers",
+        "//nurec/libs/kernel_utils:ku_cc",
+        "//nurec/libs/kernel_utils:ku_cuda",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+cc_binary(
+    name = "spin_mesh_cc",
+    srcs = ["binding.cpp"],
+    copts = [
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libspin_mesh_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":spin_mesh_cuda",
+        "//deps/torch:torch_headers",
+        "//nurec/libs/kernel_utils:ku_cc",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [
+        ":spin_mesh_cc",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//bazel/docs:__pkg__",
+    ],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "spin_mesh_test",
+    srcs = ["spin_mesh_test.py"],
+    deps = [
+        ":pylib_cc",
+        "//apps/av/road_mesh:pylib",
+        pip_requirement("torch"),
+        pip_requirement("numpy"),
+        pip_requirement("parameterized"),
+        "//nurec/libs:pylib",
+        "//nurec/utils/io:pylib",
+    ],
+)

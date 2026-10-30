@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: camera-ground-mesh-road
+
+num_random_points: 0
+default_density: 0.99
+default_scale: [0.1, 0.1, 0.001]
+scale_multiplier: 1.0
+
+# Road Gaussian placement on the mesh.
+# Options:
+# - face_area_random: sample Gaussian positions inside mesh triangles, weighted by area.
+# - vertex: legacy behavior, one Gaussian per mesh vertex.
+surface_init_mode: face_area_random
+surface_init_num_gaussians: null     # explicit total count for face_area_random; null = mesh_faces * surface_init_face_multiplier
+surface_init_density_per_m2: null    # alternative count control for face_area_random; mutually exclusive with count
+surface_init_face_multiplier: 4.0    # default/cap count multiplier relative to mesh face count
+surface_init_seed: 42
+surface_init_color_mode: cell_lookup     # point_cloud_path: BEV cell color lookup; mesh_path falls back to vertex_blend
+surface_init_area_mode: projected    # projected = BEV footprint; surface = full 3D triangle area
+surface_init_min_per_face: 0         # optional coverage floor for positive-area faces; 0 = pure random sampling
+surface_init_color_neighbor_radius_cells: 1  # fixed BEV-cell search radius when sampled color cell is empty
+
+# Path to a fused point cloud PLY (world space) with per-vertex segment_id.
+# Used to extract road points when mesh_path is not provided.
+point_cloud_path: null
+
+# Path to a pre-built ground mesh PLY file (world space).
+# When set, skips reconstruction and loads the mesh directly.
+# The PLY may optionally contain per-vertex RGB colors.
+mesh_path: null
+
+# Grid meshing parameters
+voxel_size: 0.1
+smoothing_passes: 10
+min_points_per_voxel: 1
+# Grid is the default road-init topology because it is fast, local to occupied BEV cells, and
+# avoids Delaunay's long convex-hull bridges. Set `mesh_topology: delaunay` to opt back into the
+# legacy compatibility path for workflows that prefer fully filled convex-hull geometry.
+mesh_topology: grid                  # grid avoids convex-hull bridging and keeps topology local to occupied cells
+smoothing_method: neighbor_average   # legacy smoothing; local_plane is available for opt-in experiments
+local_plane_min_neighbors: 3
+local_plane_include_self: false
+
+# Mesh aggregation and robustness filters for camera road init.
+height_statistic: median             # mean or median Z per BEV cell
+color_statistic: mean                # mean or median RGB per BEV cell
+outlier_height_threshold: 0.35       # meters; drops cells whose height deviates from BEV-neighbor median
+outlier_neighbor_radius: 1
+outlier_min_neighbors: 4
+max_triangle_edge_length: 1.0        # meters in BEV; drops Delaunay gap/edge bridging triangles
+max_triangle_normal_angle_deg: 60.0  # degrees from up axis; drops near-vertical curtain triangles

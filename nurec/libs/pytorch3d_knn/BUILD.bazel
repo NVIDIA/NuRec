@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# The upstream (Meta, BSD) license of the vendored PyTorch3D kNN code. The third-party notices test
+# checks that it is still here.
+exports_files(
+    ["LICENSE"],
+    visibility = [],
+)
+
+cuda_library(
+    name = "pytorch3d_knn_cuda",
+    srcs = [
+        "knn.cu",
+    ],
+    hdrs = [
+        "dispatch.cuh",
+        "index_utils.cuh",
+        "knn.h",
+        "mink.cuh",
+    ],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+    ],
+    deps = [
+        "//deps/torch:torch_headers",
+        "//nurec/libs/kernel_utils:ku_cc",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+cc_binary(
+    name = "pytorch3d_knn_cc",
+    srcs = [
+        "binding.cpp",
+        "knn_cpu.cpp",
+    ],
+    copts = [
+        # Flags to be consistent with torch-cuda-extensions and to build correct torch-extension bindings
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libpytorch3d_knn_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":pytorch3d_knn_cuda",
+        "//deps/torch:torch_headers",
+        "//nurec/libs/kernel_utils:ku_cc",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = [
+        "__init__.py",
+        "interface.py",
+    ],
+    data = [
+        ":pytorch3d_knn_cc",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//bazel/docs:__pkg__",
+    ],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "knn_cpu_test",
+    srcs = ["knn_cpu_test.py"],
+    deps = [
+        ":pylib_cc",
+        pip_requirement("torch"),
+    ],
+)

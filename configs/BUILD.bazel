@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The public Hydra config hierarchy. The internal remainder (Tesla,
+# asset_harvesting, instant_nurec/ training+pretrained, and the in_process_instant_nurec
+# pair) keeps its own package under the internal tree and is overlaid by the
+# internal entry points' config overlay.
+
+filegroup(
+    name = "configs",
+    srcs = glob(
+        [
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        allow_empty = True,
+    ) + [
+        # sensor/lidar_model.yaml's load_json resolver reads these at runtime from
+        # //nurec/config/sensor_data.
+        "//nurec/config/sensor_data",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,259 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:asset_harvester_package_group",
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+])
+
+py_library(
+    name = "pylib_custom_modules",
+    srcs = [
+        "custom_modules.py",
+    ],
+    deps = [
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+        "//nurec/models/post_processings/bilateral_grid/cuda:pylib_cc",
+        "//nurec/utils:pylib_misc",
+        "//nurec/utils:pylib_packed_ops",
+    ],
+)
+
+py_library(
+    name = "pylib_nn_extensions",
+    srcs = [
+        "nn_extensions.py",
+    ],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("lietorch"),
+        # Add runfiles dependency for Bazel file path resolution
+        "//nurec/utils:pylib_geometry",
+    ],
+)
+
+pytest_test(
+    name = "nn_extensions_test",
+    srcs = [
+        "nn_extensions_test.py",
+    ],
+    deps = [
+        ":pylib_nn_extensions",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_utils",
+    srcs = [
+        "utils.py",
+    ],
+    deps = [
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        pip_requirement("pytorch-lightning"),
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_misc",
+    ],
+)
+
+py_library(
+    name = "pylib_tracks_calib",
+    srcs = [
+        "tracks_calib.py",
+        "tracks_calib_data.py",
+    ],
+    deps = [
+        ":pylib_nn_extensions",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib_tracks",
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib_geometry",
+        "//nurec/utils:pylib_optim",
+        "//nurec/utils:pylib_trainer",
+        "//nurec/visualdebugger:pylib",
+        pip_requirement("lietorch"),
+        pip_requirement("matplotlib"),
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_background_sampling",
+    srcs = ["background_sampling.py"],
+    deps = [
+        "//nurec/models/background_sampling_cuda:pylib_cc",
+        "@gsplat//:pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_rig_spline",
+    srcs = ["rig_spline.py"],
+    deps = [
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "background.py",
+        "calib.py",
+        "composite.py",
+        "feature_volume.py",
+        "input_embedding.py",
+        "object_feature_volume.py",
+        "post_processing.py",
+        "rig_spline.py",
+    ],
+    data = [
+        "//bazel/cuda_toolkit:runtime",
+        "@lama_model//file:big-lama.pt",
+    ],
+    deps = [
+        pip_requirement("omegaconf"),
+        pip_requirement("kornia"),
+        pip_requirement("matplotlib"),
+        pip_requirement("msgpack"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pytorch-lightning"),
+        pip_requirement("ppisp"),
+        pip_requirement("torch"),
+        pip_requirement("torch_scatter"),
+        pip_requirement("tqdm"),
+        pip_requirement("lietorch"),
+        pip_requirement("einops"),
+        pip_requirement("simple_lama_inpainting"),
+        # Add runfiles dependency for Bazel file path resolution
+        "@rules_python//python/runfiles",
+        ":pylib_custom_modules",
+        ":pylib_background_sampling",
+        ":pylib_nn_extensions",
+        ":pylib_tracks_calib",
+        ":pylib_utils",
+        # gsplat's EnvMapBackground is the base class for SkyEnvMapBackground.
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/models/post_processings:pylib_bilateral_grid",
+        "//nurec/models/post_processings:pylib_ppisp_legacy",
+        "//nurec/libs/slang_gaussians:pylib",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_optim",
+        "//nurec/utils:pylib_prober",
+        "//nurec/utils:pylib_tcnn_allocator",
+        "//nurec/utils:pylib_types",
+        "//nurec/visualdebugger:pylib",
+    ],
+)
+
+pytest_test(
+    name = "background_sampling_test",
+    srcs = ["background_sampling_test.py"],
+    deps = [
+        ":pylib_background_sampling",
+        "//nurec/models/background_sampling_cuda:pylib_cc",
+        pip_requirement("numpy"),
+        pip_requirement("opencv-python"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "background_sampling_multi_gpu_test",
+    srcs = ["background_sampling_multi_gpu_test.py"],
+    tags = ["multi-gpu"],
+    deps = [
+        ":pylib",
+        ":pylib_background_sampling",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "background_test",
+    srcs = ["background_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_background_sampling",
+        "//nurec/config:pylib",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "feature_volume_test",
+    size = "small",
+    srcs = ["feature_volume_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "post_processing_test",
+    srcs = ["post_processing_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/config:pylib",
+        "//nurec/utils:pylib_types",
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+    ],
+)
+
+pytest_test(
+    name = "calib_test",
+    srcs = ["calib_test.py"],
+    data = [
+        "testdata/apps/test_app_config.yaml",
+        "@test_data_ncore_v4//:ncore_clipgt_1sec",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/config:pylib",
+        "//nurec/config:pylib_parse",
+        "//nurec/datasets:pylib",
+        "//nurec/utils:pylib_tests",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+pytest_test(
+    name = "rig_spline_test",
+    srcs = ["rig_spline_test.py"],
+    deps = [
+        ":pylib_rig_spline",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "tracks_calib_test",
+    srcs = ["tracks_calib_test.py"],
+    deps = [
+        ":pylib_tracks_calib",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib_tracks",
+        pip_requirement("numpy"),
+        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)

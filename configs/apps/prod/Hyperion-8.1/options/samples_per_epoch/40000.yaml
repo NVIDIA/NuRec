@@ -1,0 +1,8 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use 40,000 samples per epoch.
+
+dataset:
+  n_samples_per_epoch: 40_000

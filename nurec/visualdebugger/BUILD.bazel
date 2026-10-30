@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+])
+
+py_library(
+    name = "pylib_interface",
+    srcs = ["interface.py"],
+    # Internal layering helper used only to break the deferred backend import cycle.
+    # Consumers should depend on :pylib, which carries the complete public backend.
+    visibility = ["//visibility:private"],
+    deps = [
+        "//nurec/utils:pylib_misc",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_polyscope",
+    srcs = [
+        "polyscope.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":pylib_interface",
+        "//nurec/utils:pylib_misc",
+        # External dependency
+        pip_requirement("numpy"),
+        pip_requirement("polyscope"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = ["__init__.py"],
+    visibility = ["//visibility:public"],
+    # Keep Polyscope in the runfiles of the supported facade while deferring its
+    # native import until get_visualdebugger() is called.
+    deps = [
+        ":pylib_interface",
+        ":pylib_polyscope",
+    ],
+)
+
+pytest_test(
+    name = "polyscope_test",
+    srcs = ["polyscope_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "registration_test",
+    srcs = ["registration_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec:pylib",
+    ],
+)

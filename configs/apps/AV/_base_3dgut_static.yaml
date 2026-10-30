@@ -1,0 +1,27 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Owner: Haithem Turki
+
+# order in which configs override each other (/* - denotes a relative search path)
+defaults:
+  - /base
+  - /trainer: base
+  - /dataset: ncore
+  - /datamodule: so
+  - /model: gaussians/composite/static_gaussians
+  - /model/calib: skip
+  - /model/background: sky_mlp
+  - /harmonizer: harmonizer
+  - /system: gaussians
+  - /loss: gaussians_av
+  - /model/post_processing@model.post_processing.b: bilateral_grid_per_camera
+  - /model/post_processing@model.post_processing.c: bilateral_grid_per_frame
+
+trainer:
+  precision: 32
+  check_val_every_n_epoch: 1
+
+dataset:
+  n_samples_per_epoch: 30000

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+rgb:
+  fn: l1
+  reduce:
+    name: mean
+  lambda_: 0.8
+ssim:
+  fn: ssim
+  reduce:
+    name: mean
+  lambda_: 0.2
+  window_size: 11
+  channel: 3
+  mask:
+    mode: "GT"  # choose from (constant, GT)
+    value: 0

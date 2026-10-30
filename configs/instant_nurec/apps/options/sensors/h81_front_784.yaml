@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+context_camera_ids:
+  - camera_front_wide_120fov
+
+camera_subsampler:
+  frame_width: 784
+  frame_height: 448

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# pybind11 module: exposes IpcManager to Python. Loaded as
+# `nurec.libs.cuda_ipc_transport._nre_cuda_ipc` by serve.py. Reuses
+# //nurec/libs/render_pack:render_pack_cuda for the fused HWC-f32 -> CHW-u8 pack
+# kernel rather than duplicating it.
+cc_binary(
+    name = "_nre_cuda_ipc.so",
+    srcs = ["cuda_ipc_module.cpp"],
+    linkshared = True,
+    deps = [
+        "//nurec/libs/render_pack:render_pack_cuda",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_cuda//cuda:runtime",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = ["__init__.py"],
+    data = [":_nre_cuda_ipc.so"],
+)
+
+# testonly copy of the package for the pytest target below: same data dep as
+# :pylib, kept separate so :pylib stays a plain (non-testonly) public target.
+py_library(
+    name = "testlib",
+    testonly = True,
+    srcs = ["__init__.py"],
+    data = [":_nre_cuda_ipc.so"],
+)
+
+pytest_test(
+    name = "cuda_ipc_transport_test",
+    srcs = ["cuda_ipc_transport_test.py"],
+    tags = ["gpu"],
+    deps = [
+        ":testlib",
+        pip_requirement("torch"),
+    ],
+)

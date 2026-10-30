@@ -1,0 +1,33 @@
+Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
+section 4(b)): this patch changes src/pix2pix_turbo_harmonizer.py of harmonizer.
+
+--- a/src/pix2pix_turbo_harmonizer.py
++++ b/src/pix2pix_turbo_harmonizer.py
+@@ -12,1 +12,2 @@
+-import torch
++from pathlib import Path
++import torch
+@@ -27 +28 @@
+-    base_dir: str = "/work/models/base", fast_pipeline: bool = False
++    cosmos_dir: str | None = None, fast_pipeline: bool = False
+@@ -30,3 +31,5 @@
+-    # config.dit_path = f"{base_dir}/model_fast_tokenizer.pt"
+-    # config.tokenizer["vae_pth"] = f"{base_dir}/tokenizer_fast.pth"
+-    config.dit_path = "checkpoints/nvidia/Cosmos-Predict2-0.6B-Text2Image/model.pt"
++    if cosmos_dir is None:
++        cosmos_dir = "checkpoints/nvidia/Cosmos-Predict2-0.6B-Text2Image"
++    cosmos_dir = Path(cosmos_dir)
++    config.dit_path = str(cosmos_dir / "model.pt")
++    config.tokenizer["vae_pth"] = str(cosmos_dir / "tokenizer" / "tokenizer.pth")
+@@ -199,0 +203 @@
++        cosmos_dir: str | None = None,
+@@ -218 +222 @@
+-        self.initialize_cosmos_model(device=device, dtype=dtype)
++        self.initialize_cosmos_model(device=device, dtype=dtype, cosmos_dir=cosmos_dir)
+@@ -257,2 +261,4 @@
+-    def initialize_cosmos_model(self, device: str | torch.device, dtype: torch.dtype):
+-        config = get_pipeline_config(fast_pipeline=False)
++    def initialize_cosmos_model(
++        self, device: str | torch.device, dtype: torch.dtype, cosmos_dir: str | None = None
++    ):
++        config = get_pipeline_config(cosmos_dir=cosmos_dir, fast_pipeline=False)

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - rigid_gaussians
+
+name: interpolated-table-deformable-gaussians
+
+deformation_start_iteration: 1000
+# Match the production deformable layer's expanded-cuboid contract. This is
+# consumed by component-only rendering, not by the deformation table itself.
+cuboid_tracks_expand: 0.05
+table:
+  # 10 Hz control points, linearly interpolated in position and SLERPed in
+  # orientation. Frame-major preserves sparse optimizer updates: only control
+  # columns that contribute to the current training sample receive gradients.
+  frame_period_us: 100000
+  interpolation: linear_slerp
+  storage: frame_major
+  position_smoothness: true
+  optimizer:
+    name: fused_adam
+    args:
+      lr: 0.001
+      eps: 1.e-15
+      betas: [0.9, 0.99]
+  scheduler:
+    name: StepFunCosineAnnealingLR
+    interval: step
+    args:
+      T_max: ${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}
+      min_factor: 0.0333
+      update_every_n_steps: ${trainer.annealing_update_every_n_steps}

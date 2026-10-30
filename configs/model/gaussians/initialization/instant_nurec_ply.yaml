@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: instant_nurec-ply
+translate_world_to_nurec: true # Whether to translate the positions from world to NuRec coordinates
+# Optional explicit PLY path. Default (`null`): autodetect as
+# <dataset_dir>/instant_nurec/ply/<sequence_id>/<sequence_id>.ply
+# path: null
+
+# Number of points to use from instant_nurec
+num_point_cloud_points: 3_000_000
+
+density_pruning:
+  enabled: false
+  keep: ${..num_point_cloud_points} # Only keep the top N points with the highest densities
+  density_threshold: null # 0.1 # Only keep points with densities greater than this threshold
+
+# Lidarfree car2sim uses:
+# init background: 650k + 100k + 100k = 850k
+# init road: 400k
+# init dynamic rigids: 300k
+# init dynamic deformables: 300k
+# initstatic rigids: 150k
+# init total: 2.0M
+# total: 2.3M

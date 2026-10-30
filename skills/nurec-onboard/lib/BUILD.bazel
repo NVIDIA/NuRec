@@ -1,0 +1,108 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//skills/nurec-onboard:__subpackages__"])
+
+# The launcher runs these modules with `python3 -m` rather than importing them,
+# so a launcher test needs all of them staged, not just the one it imports itself.
+filegroup(
+    name = "launcher_sources",
+    srcs = glob(
+        ["*.py"],
+        exclude = [
+            "*_test.py",
+            "launcher_test_base.py",
+        ],
+    ),
+)
+
+py_library(
+    name = "parse_input",
+    srcs = [
+        "__init__.py",
+        "parse_input.py",
+    ],
+    data = ["//skills/nurec-onboard:defaults.yaml"],
+    imports = [".."],
+    deps = [pip_requirement("pyyaml")],
+)
+
+py_library(
+    name = "codex_config",
+    srcs = ["codex_config.py"],
+    imports = [".."],
+    deps = [":parse_input"],
+)
+
+py_library(
+    name = "claude_config",
+    srcs = ["claude_config.py"],
+    imports = [".."],
+    deps = [":parse_input"],
+)
+
+pytest_test(
+    name = "parse_input_test",
+    srcs = ["parse_input_test.py"],
+    data = [
+        "//skills/nurec-onboard:examples/input-pandaset.yaml",
+        "//skills/nurec-onboard:examples/input-waymo.yaml",
+        "//skills/nurec-onboard:nurec-onboard/steps/audit-dataset/input-skeleton.yaml",
+    ],
+    deps = [
+        ":parse_input",
+        pip_requirement("pyyaml"),
+    ],
+)
+
+pytest_test(
+    name = "claude_config_test",
+    size = "small",
+    srcs = ["claude_config_test.py"],
+    deps = [":claude_config"],
+)
+
+pytest_test(
+    name = "codex_config_test",
+    size = "small",
+    srcs = ["codex_config_test.py"],
+    data = ["//skills/nurec-onboard:.codex/config.toml"],
+    deps = [":codex_config"],
+)
+
+# End-to-end tests that run `run.sh` in a temporary copy of the launcher files.
+py_library(
+    name = "launcher_test_base",
+    testonly = True,
+    srcs = [
+        "__init__.py",
+        "launcher_test_base.py",
+    ],
+    imports = [".."],
+)
+
+pytest_test(
+    name = "claude_autorun_test",
+    size = "small",
+    srcs = ["claude_autorun_test.py"],
+    data = ["//skills/nurec-onboard:launcher_test_data"],
+    deps = [
+        ":claude_config",
+        ":launcher_test_base",
+    ],
+)
+
+pytest_test(
+    name = "codex_autorun_test",
+    size = "small",
+    srcs = ["codex_autorun_test.py"],
+    data = ["//skills/nurec-onboard:launcher_test_data"],
+    deps = [
+        ":codex_config",
+        ":launcher_test_base",
+    ],
+)

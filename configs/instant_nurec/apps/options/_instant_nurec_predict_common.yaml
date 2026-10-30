@@ -1,0 +1,65 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Model-agnostic prediction computation shared by standalone and in-process instant_nurec.
+# Dataset sources and standalone output hooks belong to their respective wrappers.
+defaults:
+  # h81_front_784 is the default; multi-camera callers must override it with
+  # `instant_nurec/apps/options/sensors@dataset.predict=...` at the standalone root or
+  # `instant_nurec/apps/options/sensors@in_process_instant_nurec.dataset.predict=...` for in-process instant_nurec.
+  - sensors@dataset.predict: h81_front_784
+  # Provides radius clipping and performance improvements over older renderers.
+  - /model/gaussians/renderer@model.renderer: 3dgut_gsplat
+  - _self_
+
+shared_config:
+  n_chunks: 8
+
+system:
+  # Relative interpolation keeps this option valid both at the standalone
+  # root and when relocated below `in_process_instant_nurec`.
+  predict_batch_size: ${..shared_config.n_chunks}
+  predict_num_workers: 4
+  num_nodes: 1
+  device_count: 1
+  strategy: auto
+
+mode: predict
+
+model:
+  export_preprocess:
+    enabled: true
+    density_prune_threshold: 0.01
+    infill_road_color: true
+
+predict:
+  chunk_size: 1
+  primitive_merge:
+    enabled: true
+    overlap_strategy: frustum_ownership
+    frustum_ownership_max_diff_m: 5.0
+
+dataset:
+  predict:
+    supervision_camera_ids: ${.context_camera_ids}
+    supervision_frame_batch:
+      n_frames_per_sample: 0 # Disable supervision to save memory
+      prepend_timestamps_us: 0
+      append_timestamps_us: 0
+    # Load the full track data for every chunk.
+    cuboid_tracks_params:
+      track_extrapolate_timestamps_us: -1
+    frame_batch_samplers:
+      uniform:
+        enabled: false
+      adaptive_sequential:
+        enabled: true
+        name: adaptive_sequential
+        n_frames_per_sample: 18
+        # Five dots reach shared_config at both the standalone root and when
+        # this option is relocated below in_process_instant_nurec.
+        n_samples_per_sequence: ${.....shared_config.n_chunks}
+        max_frame_gap_timestamp_us: 750000
+    lidar_frame_batch:
+      gap_from_image_us: 0

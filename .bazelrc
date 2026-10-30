@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+## Common logic to import as shared into all projects
+
+# Opt out of the Aspect ruleset usage telemetry that aspect_rules_lint and
+# aspect_rules_py pull in via aspect_tools_telemetry.
+common --repo_env=DO_NOT_TRACK=1
+
+# Error (instead of only warning, the default) when a direct dependency
+# resolves to a version different from the declared one -- e.g. a
+# single_version_override pinned below what another module requires.
+common --check_direct_dependencies=error
+
+# Default compilation mode and compiler version
+build --compilation_mode=opt
+
+# Explicitly select a compiler version for consistent behavior across machines
+# A matching GCOV is also necessary to gather coverage data for code built with this compiler
+build --repo_env=CC=gcc-11
+build --repo_env=GCOV=gcov-11
+
+# Default CXX flags
+build --cxxopt=-std=c++17
+build --cxxopt=-Werror
+build --action_env=BAZEL_CXXOPTS=-std=c++17
+build --@rules_cuda//cuda:host_copts=-std=c++17
+build --@rules_cuda//cuda:copts=-Werror=all-warnings
+
+# Use -isystem for cc_library `includes` coming from external repositories,
+# silencing warnings that we don't control.
+build --features=external_include_paths
+build --host_features=external_include_paths
+
+# Force separate C/C++/CUDA action cache keys when doing C compiler
+# updates which bring in new ABI requirements.
+# Please increment NUREC_CC_ABI_TAG when the ABI changes.
+# Can be retired once we adopt a hermetic toolchain.
+build --copt=-DNUREC_CC_ABI_TAG=2
+build --host_copt=-DNUREC_CC_ABI_TAG=2
+build --@rules_cuda//cuda:copts=-DNUREC_CC_ABI_TAG=2
+build --@rules_cuda//cuda:host_copts=-DNUREC_CC_ABI_TAG=2
+
+# Silence warnings produced with our toolchain by some external projects
+# Note: labels not usable here for external projects due to the special handling
+# of "@" in this option, see https://github.com/bazelbuild/bazel/issues/19665
+build --host_per_file_copt=external/(pigz|zopfli).*@-w
+build --per_file_copt=external/ninja.*@-w
+
+# Enable local disk caching
+build --disk_cache=~/.cache/bazel/disk-cache/nre
+build --remote_instance_name nre
+
+# Disable remote cache uploads by default to avoid pollution in case users configure access
+# for their local builds. CI overrides this via .bazelrc.user
+build --remote_upload_local_results=false
+
+# Pass GITHUB_TOKEN for update-license-overrides target
+run:license-update --action_env=GITHUB_TOKEN
+
+# Check the ctime of input files of an action before uploading it to a remote cache (there may be cases where the Linux kernel delays writing of files, which could cause false positives)
+build --guard_against_concurrent_changes=full
+
+#? --config=mamba               Enable Mamba (this might slow down bazel start-up times)
+build:mamba --//bazel/flags:mamba=True
+
+# NuRec tools - all enabled by default
+# Override with --//bazel/flags:<tool>=False to disable specific tools
+build --//bazel/flags:ncore_aux_data=True
+build --//bazel/flags:mask_annotator=True
+
+# Default CUDA architectures to build cuda kernels for (compute-capability 80 is required for A100s, e.g., in Maglev dgxa100.* resources)
+build --@rules_cuda//cuda:archs=compute_80:sm_80;compute_86:sm_86;compute_89:sm_89;compute_90:sm_90;compute_100:sm_100;compute_120:sm_120;compute_120:compute_120
+
+# kernel_families must cover every prod path — add here if a new config uses one:
+#   - 3DGS, 3DGUT: renderer paths
+#   - ADAM: SelectiveAdam optimizer
+#   - LOSSES: fused SSIM loss (Alpasim config)
+#   - RELOC: gsplat-backed MCMC relocation and addition sampling
+build --@gsplat//bazel:kernel_families=3DGS,3DGUT,ADAM,LOSSES,RELOC
+# num_channels: camera {4, 24}, lidar {1, 2, 4} in prod; 20, 32 reserved for future.
+# 2 is required by the model-free unstructured LiDAR path: the raydrop extra
+# signal is 2-wide, so the kernel needs a 2-channel instantiation.
+build --@gsplat//bazel:num_channels=1,2,3,4,20,24,32
+# RelWithDebInfo keeps -lineinfo so nsys can attribute GPU samples to source lines.
+build --@gsplat//bazel:cmake_extra=-DCMAKE_BUILD_TYPE=RelWithDebInfo
+# Hand in a reconstructed CUDA toolkit from Bazel's hermetic components
+build --@gsplat//bazel:cuda_toolkit_root=//bazel/cuda_toolkit:gsplat_build
+
+# Collect workspace status from repository ('--stamp' needs to be enabled separately)
+build --workspace_status_command=$(pwd)/bazel/version/workspace_status.sh
+
+#? --config=cuda_80            Build kernels for compute-capability 80 only
+build:cuda_80 --@rules_cuda//cuda:archs=compute_80:sm_80
+
+#? --config=cuda_86            Build kernels for compute-capability 86 only (e.g., for Ampere machines, like the A40 in colossus machines)
+build:cuda_86 --@rules_cuda//cuda:archs=compute_86:sm_86
+
+#? --config=cuda_89            Build kernels for compute-capability 89 only
+build:cuda_89 --@rules_cuda//cuda:archs=compute_89:sm_89
+
+#? --config=cuda_90            Build kernels for compute-capability 90 only
+build:cuda_90 --@rules_cuda//cuda:archs=compute_90:sm_90
+
+#? --config=cuda_100           Build kernels for compute-capability 100 only
+build:cuda_100 --@rules_cuda//cuda:archs=compute_100:sm_100
+
+#? --config=cuda_120           Build kernels for compute-capability 120 only
+build:cuda_120 --@rules_cuda//cuda:archs=compute_120:sm_120;compute_120:compute_120
+
+#? --config=ci_test_timeout    Increased the CI test timeouts [default 60,300,900,3600 for short, moderate, long, eternal]
+build:ci_test_timeout --test_timeout=60,300,1300,3600
+
+#? --config=local_gsplat      Use the local gsplat checkout instead of the pinned remote module
+build:local_gsplat --override_module=gsplat=%workspace%/deps/gsplat
+# Forward $CCACHE_DIR into the cmake() sandbox (no-op when CCACHE_DIR is unset).
+build --action_env=CCACHE_DIR
+
+# Show outputs of failing tests by default
+test --test_output=errors
+
+# Only build test targets when executing tests
+test --build_tests_only
+
+# Add strict visibility to config_settings targets
+build --incompatible_config_setting_private_default_visibility
+
+# Mypy integration
+build --@mypy_integration//:mypy=//bazel/typing:mypy
+build --@mypy_integration//:mypy_config=//bazel/typing:mypy.ini
+build --incompatible_default_to_explicit_init_py
+
+# Code coverage measurement (Python/C++ only)
+coverage --test_timeout=180,900,3900,10800 # Triple of CI test timeouts to account for coverage collection overhead
+coverage --instrument_test_targets
+coverage --instrumentation_filter="^//"
+
+# Use a build-time venv with merged site-packages for all py_binary/py_test targets.
+build --@rules_python//python/config_settings:bootstrap_impl=script
+build --@rules_python//python/config_settings:venvs_site_packages=yes
+
+# Require OAuth2 support in rules_oci for some docker image repositories
+common --repo_env=OCI_ENABLE_OAUTH2_SUPPORT=1
+
+## -----------------------------------------------------------
+
+## Allow for optional user-specific overwrites https://docs.bazel.build/versions/main/best-practices.html#using-the-bazelrc-file
+try-import %workspace%/.bazelrc.user
+build --override_repository=nurec_run_image_oci=/opt/nvidia/nurec-build-deps/run-image-base-alias
+build --override_repository=nurec_run_image_oci_linux_amd64=/opt/nvidia/nurec-build-deps/run-image-base

@@ -1,0 +1,30 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Component-only overlay: train the background Gaussian layer WITH the
+# real sky rendering module (model.background as configured by the
+# parent app — SkyEnvMap / SkyMLP).
+#
+# Diff vs background_layer_only: sky_model is enabled, so sky pixels
+# join the loss mask and the sky module's texture/MLP receives
+# photometric supervision through the composited render.
+#
+# Compose example:
+#
+#     defaults:
+#       - /apps/prod/Hyperion-8.1/car2sim
+#       - /component_only: background_layer_with_sky_model
+
+component_only:
+  # ``enabled: true`` switches this run into opt-in mode: only the
+  # components listed below are trained; every other component (unlisted,
+  # or ``state: disabled``) is turned off. Enabling every component
+  # collapses back to the parent app config's full training.
+  enabled: true
+  layers:
+    background:
+      state: enabled
+  sky_model:
+    state: enabled

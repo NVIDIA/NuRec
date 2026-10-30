@@ -1,0 +1,14 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep masked camera pixels out of road colors without dropping the LiDAR
+# geometry they project onto. Invalid samples are first filled from valid camera
+# observations, then median aggregation is applied to all road samples.
+
+model:
+  layers:
+    road:
+      initialization:
+        color_type: camera-rgb-frame-valid-pixels
+        color_statistic: median

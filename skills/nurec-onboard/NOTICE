@@ -1,0 +1,17 @@
+NuRec Onboard
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This directory contains NVIDIA-authored agent skills, documentation, workflow
+launcher and validation code, examples, and a converter workspace template for
+onboarding datasets to NVIDIA Omniverse NuRec through the NCore V4 format.
+
+Source code, documentation, skills, and other non-code material are licensed
+under the Apache License, Version 2.0. The license text is available at
+https://www.apache.org/licenses/LICENSE-2.0.
+
+This directory does not vendor or redistribute third-party OSS source code or
+third-party binary dependencies. External tools, packages, containers, models,
+and datasets used by the workflow are obtained from their original upstream
+distribution channels and retain their own copyright notices and license terms.
+See THIRD_PARTY_NOTICES.md.

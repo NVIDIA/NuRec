@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+cc_binary(
+    name = "sm_cap",
+    srcs = ["sm_cap.c"],
+    linkopts = ["-ldl"],
+    linkshared = True,
+    target_compatible_with = ["@platforms//cpu:aarch64"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@cuda//:cudart_headers",
+        "@cuda//:nvcc_headers",
+    ],
+)
+
+filegroup(
+    name = "_empty",
+    srcs = [],
+)
+
+# Alias referenced by the rules_python patch as the default value of the
+# `_sm_cap` private attr on py_binary/py_test; resolves to the shim on
+# aarch64 and to an empty filegroup on every other architecture so x86_64
+# runfiles stay free of the aarch64-only shim.
+alias(
+    name = "sm_cap_runfiles",
+    actual = select({
+        "@platforms//cpu:aarch64": ":sm_cap",
+        "//conditions:default": ":_empty",
+    }),
+    visibility = ["//visibility:public"],
+)

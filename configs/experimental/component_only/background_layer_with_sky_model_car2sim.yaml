@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Example app: component-only 'background_layer_with_sky_model' on top of the
+# /apps/prod/Hyperion-8.1/car2sim preset. See configs/component_only/background_layer_with_sky_model.yaml.
+
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim
+  - /component_only: background_layer_with_sky_model
+  - _self_
+
+system:
+  test:
+    val_render_selected_nodes: {}

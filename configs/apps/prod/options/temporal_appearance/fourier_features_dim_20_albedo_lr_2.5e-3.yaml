@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporal appearance with 20 Fourier features and the base 2.5e-3 albedo learning rate.
+
+fourier_features_dim: 20

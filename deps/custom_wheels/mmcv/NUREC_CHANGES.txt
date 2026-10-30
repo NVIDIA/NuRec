@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+mmcv 2.2.0+git3a5fb4b9pt2.11.0cu128sm80to120ptx100 - statement of changes
+
+This wheel is built from mmcv (https://github.com/open-mmlab/mmcv, Apache License 2.0) at commit
+3a5fb4b96ab1b241e7379adf7c326ef6edef6515 (v2.2.0). The files below were modified by NVIDIA
+CORPORATION & AFFILIATES, 2026.
+
+Changes applied by the NuRec build:
+- mmcv/version.py: __version__ set to the local version above; version_info parses only the part
+  before "+".
+- setup.py: get_version() reads __version__ from an explicit namespace passed to exec(), since
+  Python 3.13 no longer lets exec() write into locals().

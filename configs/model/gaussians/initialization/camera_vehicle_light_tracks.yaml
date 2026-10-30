@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - camera_dynamic_tracks
+
+name: camera-vehicle-light-tracks
+
+# SAM3 publishes source-frame masks and an exact source-provenance manifest.
+# Resolve the standard aux location once and retain it in saved configs so
+# checkpoint loading does not depend on the continued presence of aux files.
+# Explicit mask paths take precedence. With no aux artifact, skip this layer.
+# Set sam3_aux_dir to null to disable discovery, or a path for custom layouts.
+sam3_aux_dir: ${sam3_aux_dir:${dataset.path},${.mask_dir},${.mask_manifest_path}}
+mask_dir: null
+mask_manifest_path: null
+cuboid_clamp_distance_m: 0.15
+
+num_point_cloud_points_per_track: 2048
+num_point_cloud_points_in_layer: 20000
+scale_multiplier: 0.4
+voxel_size_m: 0.02
+spatial_propagation_k: 4
+spatial_propagation_iterations: 2
+min_scale_voxel_ratio: 0.2

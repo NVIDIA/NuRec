@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib_test_utils",
+    srcs = [
+        "test_utils.py",
+    ],
+    deps = [
+        "//nurec/utils:pylib_trainer",
+    ],
+)
+
+py_library(
+    name = "pylib_selected_gaussian_nodes",
+    srcs = ["selected_gaussian_nodes.py"],
+    deps = [
+        pip_requirement("torch"),
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/gaussians:pylib",
+    ],
+)
+
+py_library(
+    name = "pylib_gsplat_mcmc_adapter",
+    srcs = ["gsplat_mcmc_adapter.py"],
+    deps = [
+        ":pylib_selected_gaussian_nodes",
+        pip_requirement("torch"),
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "base.py",
+        "cuboid_mcmc.py",
+        "gsplat.py",
+        "mcmc.py",
+    ],
+    deps = [
+        ":pylib_gsplat_mcmc_adapter",
+        ":pylib_selected_gaussian_nodes",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("torch"),
+        pip_requirement("omegaconf"),
+        pip_requirement("tqdm"),
+        "//nurec/datasets:pylib",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/utils:pylib_optim",
+        "//nurec/utils:pylib_types",
+    ],
+)
+
+pytest_test(
+    name = "base_test",
+    srcs = ["base_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_test_utils",
+    ],
+)
+
+pytest_test(
+    name = "gsplat_mcmc_adapter_test",
+    srcs = ["gsplat_mcmc_adapter_test.py"],
+    deps = [
+        ":pylib_gsplat_mcmc_adapter",
+        ":pylib_selected_gaussian_nodes",
+        pip_requirement("torch"),
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+    ],
+)
+
+pytest_test(
+    name = "gsplat_test",
+    srcs = ["gsplat_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_test_utils",
+    ],
+)
+
+pytest_test(
+    name = "mcmc_test",
+    srcs = ["mcmc_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_test_utils",
+    ],
+)
+
+pytest_test(
+    name = "cuboid_mcmc_test",
+    srcs = ["cuboid_mcmc_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_selected_gaussian_nodes",
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "mcmc_ddp_test",
+    srcs = ["mcmc_ddp_test.py"],
+    tags = ["multi-gpu"],
+    deps = [
+        ":pylib",
+        ":pylib_test_utils",
+        pip_requirement("torch"),
+        "//nurec/config:pylib",
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/systems:pylib",
+    ],
+)
+
+pytest_test(
+    name = "selected_gaussian_nodes_tests",
+    srcs = ["selected_gaussian_nodes_tests.py"],
+    deps = [
+        ":pylib_selected_gaussian_nodes",
+        pip_requirement("torch"),
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/gaussians:pylib",
+    ],
+)

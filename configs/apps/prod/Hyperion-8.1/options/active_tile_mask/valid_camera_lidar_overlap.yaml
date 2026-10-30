@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Skip fully-INVALID camera tiles AND cull lidar tiles outside the valid-camera overlap
+# (crops lidar supervision to the camera field of view). Pair with the compensated
+# lidar_loss_weight (1.25e-3): the crop changes the lidar loss normalization.
+
+model:
+  renderer:
+    active_tile_mask:
+      enabled: true
+      strategy: valid_camera_lidar_overlap

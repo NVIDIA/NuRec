@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+load("//bazel/slang:defs.bzl", "slangtorch_library")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "collector.py",
+        "collector_slang.py",
+    ],
+    deps = [
+        "//nurec/libs/slang_gaussians:pylib",
+        "//nurec/libs/slang_utils:pylib_utils",
+        "//nurec/models:pylib_tracks_calib",
+        "//nurec/utils:pylib_cached_device_tensor",
+    ],
+)
+
+genrule(
+    name = "generate_collector_test_prebuilt_configs",
+    testonly = True,
+    srcs = ["collector_test_prebuilt_configs.json"],
+    outs = [
+        "collector-test-configs.slang",
+        "collector-test-configs.json",
+    ],
+    cmd = "$(location //nurec/libs/slang_gaussians:codegen) --input-json $(SRCS) --output-slang $(location collector-test-configs.slang) --output-json $(location collector-test-configs.json)",
+    tools = ["//nurec/libs/slang_gaussians:codegen"],
+)
+
+slangtorch_library(
+    name = "collector_test_slang_cc",
+    testonly = True,
+    srcs = [
+        "collector-test-configs.slang",
+        "//nurec/libs/slang_gaussians:collector_slang_module",
+    ],
+    deps = [
+        "//nurec/libs/slang_utils:extensions_slang",
+    ],
+)
+
+pytest_test(
+    name = "collect_test",
+    srcs = ["collect_test.py"],
+    data = [
+        ":collector-test-configs.json",
+    ],
+    deps = [
+        ":collector_test_slang_cc",
+        ":pylib",
+        "//nurec/config:pylib",
+        "//nurec/datasets:pylib_tracks",
+        "//nurec/models:pylib_tracks_calib",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_binary(
+    name = "benchmark_collector",
+    srcs = ["benchmark_collector.py"],
+    main = "benchmark_collector.py",
+    deps = [
+        ":pylib",
+    ],
+)

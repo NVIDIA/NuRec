@@ -1,0 +1,10 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Disable Gaussian flattening with a max-to-median scale ratio threshold of five.
+
+loss:
+  gaussian_flatten:
+    lambda_: 0.0
+    max_to_median_ratio_threshold: 5.0

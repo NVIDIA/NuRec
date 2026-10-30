@@ -1,0 +1,7 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - /apps/prod/Hyperion-8.1/car2sim_lidarfree
+  - override /apps/prod/options/subsampling/3dgut: batch_sampler_2

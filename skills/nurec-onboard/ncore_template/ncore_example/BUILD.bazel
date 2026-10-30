@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@ncore_template_pip_deps//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+# Mirrors NCore's `tools/data_converter/<dataset>/BUILD.bazel` pattern:
+# `converter.py` is the converter class + CLI entry, `utils.py` is the
+# converter-author toolkit (LiDAR / camera / pose helpers), both flat at
+# the package root.
+
+py_library(
+    name = "utils",
+    srcs = [
+        "__init__.py",
+        "utils.py",
+    ],
+    visibility = ["//tests:__pkg__"],
+    deps = [
+        requirement("numpy"),
+        requirement("nvidia-ncore"),
+    ],
+)
+
+py_library(
+    name = "lib",
+    srcs = [
+        "converter.py",
+        "dataset_probe.py",
+    ],
+    visibility = ["//tests:__pkg__"],
+    deps = [
+        ":utils",
+        requirement("click"),
+        requirement("numpy"),
+        requirement("nvidia-ncore"),
+    ],
+)
+
+py_binary(
+    name = "convert",
+    srcs = ["converter.py"],
+    main = "converter.py",
+    visibility = ["//tests:__pkg__"],
+    deps = [":lib"],
+)
+
+py_binary(
+    name = "probe",
+    srcs = ["dataset_probe.py"],
+    main = "dataset_probe.py",
+    visibility = ["//tests:__pkg__"],
+    deps = [":lib"],
+)

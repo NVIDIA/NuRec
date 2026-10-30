@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+torch 2.11.0+cu128.nre1 - statement of changes
+
+This wheel is the upstream PyTorch 2.11.0+cu128 wheel (https://github.com/pytorch/pytorch, BSD
+3-Clause), from https://download.pytorch.org/whl/cu128, with its metadata modified by NVIDIA
+CORPORATION & AFFILIATES, 2026. No source file and no binary is changed.
+
+Changes to the wheel metadata (*.dist-info):
+- METADATA: each `Requires-Dist: cuda-toolkit[<extras>]` requirement is replaced by one plain
+  requirement per extra on the distribution that provides it (for example cublas ->
+  nvidia-cublas-cu12), with the same version specifier and environment marker.
+- METADATA, RECORD and the dist-info directory name: version set to the local version
+  2.11.0+cu128.nre1.

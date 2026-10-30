@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@mypy_integration//:mypy.bzl", "mypy_test")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib_gaussian_codec",
+    srcs = [
+        "__init__.py",
+        "gaussian_codec.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        "//nurec/utils:pylib_morton",
+        pip_requirement("torch"),
+    ],
+)
+
+mypy_test(
+    name = "gaussian_codec_mypy",
+    timeout = "long",
+    deps = [
+        ":pylib_gaussian_codec",
+    ],
+)
+
+pytest_test(
+    name = "gaussian_codec_test",
+    srcs = ["gaussian_codec_test.py"],
+    env = {
+        "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+    },
+    deps = [
+        ":pylib_gaussian_codec",
+        pip_requirement("numpy"),
+        pip_requirement("safetensors"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_usdz",
+    srcs = [
+        "__init__.py",
+        "usdz.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [],
+    deps = [
+        ":pylib_gaussian_codec",
+        "//nurec/artifact:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/io:pylib",
+        "//nurec/utils/upgrade:pylib",
+        pip_requirement("omegaconf"),
+        pip_requirement("pyyaml"),
+        pip_requirement("safetensors"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "usdz_test",
+    srcs = ["usdz_test.py"],
+    deps = [
+        ":pylib_usdz",
+        "//nurec/config:pylib",
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/io:pylib",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "pylib_cli",
+    srcs = [
+        "__init__.py",
+        "compress_usdz.py",
+        "decompress_usdz.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//:__pkg__",
+    ],
+    deps = [
+        ":pylib_usdz",
+        pip_requirement("click"),
+    ],
+)
+
+mypy_test(
+    name = "compression_cli_mypy",
+    timeout = "long",
+    deps = [
+        ":pylib_cli",
+    ],
+)
+
+py_binary(
+    name = "compress_usdz",
+    srcs = [
+        "compress_usdz.py",
+    ],
+    main = "compress_usdz.py",
+    deps = [
+        ":pylib_cli",
+    ],
+)
+
+py_binary(
+    name = "decompress_usdz",
+    srcs = [
+        "decompress_usdz.py",
+    ],
+    main = "decompress_usdz.py",
+    deps = [
+        ":pylib_cli",
+    ],
+)

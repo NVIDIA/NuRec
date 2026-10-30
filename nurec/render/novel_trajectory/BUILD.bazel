@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "controllers.py",
+        "render_novel_trajectory.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        # Add visibility for //:run
+        "//:__pkg__",
+    ],
+    deps = [
+        "//nurec/artifact:pylib",
+        "//nurec/config:pylib",
+        "//nurec/datamodules:pylib",
+        "//nurec/datasets:pylib",
+        "//nurec/grpc:pylib",
+        "//nurec/grpc/protos:grpc_pb2",
+        "//nurec/render:pylib",
+        "//nurec/systems:pylib",
+        "//nurec/utils:pylib",
+        "//nurec/utils:pylib_misc",
+        "//nurec/utils:pylib_ncore_utils",
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/debug:pylib",
+        "//nurec/utils/io:pylib",
+        "//nurec/utils/io/export:pylib",
+        pip_requirement("aiofiles"),
+        pip_requirement("click"),
+        pip_requirement("lietorch"),
+        pip_requirement("numpy"),
+        pip_requirement("imageio"),
+        pip_requirement("imageio-ffmpeg"),
+        pip_requirement("setuptools"),
+        pip_requirement("scipy"),
+    ],
+)
+
+pytest_test(
+    name = "render_novel_trajectory_test",
+    size = "medium",
+    srcs = [
+        "render_novel_trajectory_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("numpy"),
+    ],
+)

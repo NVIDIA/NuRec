@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+exclude = [
+    # Prevent checking ci-cache files
+    ".ci-keep",
+]
+
+[tool.ruff.lint]
+# Stick with the default rule set from ruff 0.15. We're now using a
+# newer version with many additional rules provided by default, and
+# we have not yet invested into fixing the thousands of findings that
+# it reveals. Tracked in https://jirasw.nvidia.com/browse/NRE-4668.
+select = ["E4", "E7", "E9", "F"]
+# Additionally enable `isort` import sorting (I) plus RUF018 (assignment
+# expressions in asserts), so a single `ruff check` run by
+# bazel/format/ruff_isort.sh handles ordering, linting, and
+# PYTHONOPTIMIZE safety. RUF018 catches `assert (x := ...)` which is
+# stripped under -O.
+extend-select = ["I", "RUF018"]
+
+[tool.ruff.lint.per-file-ignores]
+# Generated protobuf modules are not hand-edited; do not lint them
+"*_pb2.py" = ["F401", "F403", "F405", "E402"]
+"*_pb2_grpc.py" = ["F401", "F403", "F405", "E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["apps", "workflows", "nurec", "libs", "ncore", "ncore_internal"]
+default-section = "third-party"
+known-third-party = ["wandb"] # prevent local wandb folders to be treaded as different package - see https://github.com/astral-sh/ruff/issues/8571
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+lines-between-types = 1
+lines-after-imports = 2
+
+[tool.pyright]
+exclude = ["bazel**/"]
+
+[build-system]
+requires = ["setuptools>=42", "wheel", "pydantic", "pyyaml"]
+build-backend = "setuptools.build_meta"

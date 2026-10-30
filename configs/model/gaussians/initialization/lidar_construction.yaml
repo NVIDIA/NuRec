@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: lidar-construction
+# Consume object instances from the dataset's standard auxiliary data.
+camera_id: null
+lidar_id: null
+default_scale: 0.02
+default_density: 0.5
+scale_multiplier: 1.0

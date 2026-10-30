@@ -1,0 +1,359 @@
+diff --git a/py/private/py_image_layer.bzl b/py/private/py_image_layer.bzl
+index 8f3d4d5..fc31fa3 100644
+--- a/py/private/py_image_layer.bzl
++++ b/py/private/py_image_layer.bzl
+@@ -33,6 +33,60 @@ oci_image(
+ load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
+ load("@tar.bzl//tar:mtree.bzl", "mtree_mutate", "mtree_spec")
+ load("@tar.bzl//tar:tar.bzl", "tar")
++def _venv_dedup_mtree_impl(ctx):
++    """Rewrite mtree so venv paths that point to the same external/ target as a runfiles path become type=link. Inputs are venv-related runfiles only."""
++    out = ctx.actions.declare_file(ctx.attr.name + ".spec")
++    binary_info = ctx.attr.binary[DefaultInfo]
++    runfiles = binary_info.default_runfiles
++    # Match any runfile under a .venv
++    venv_inputs = []
++    if runfiles:
++        for f in runfiles.files.to_list():
++            if ".venv" in f.path:
++                venv_inputs.append(f)
++    args = [
++        ctx.file.mtree.path,
++        "-o",
++        out.path,
++        "--venv-pattern",
++        ctx.attr.venv_pattern,
++    ]
++    inputs = depset(
++        [ctx.file.mtree, ctx.attr.binary[DefaultInfo].files_to_run.executable],
++        transitive = [depset(venv_inputs)] if venv_inputs else [],
++    )
++    ctx.actions.run(
++        executable = ctx.executable._venv_dedup_mtree,
++        arguments = args,
++        inputs = inputs,
++        outputs = [out],
++        mnemonic = "VenvDedupMtree",
++    )
++    return [DefaultInfo(files = depset([out]))]
++
++venv_dedup_mtree = rule(
++    implementation = _venv_dedup_mtree_impl,
++    attrs = {
++        "binary": attr.label(
++            mandatory = True,
++            doc = "The binary whose runfiles are in the mtree (used by macro for dependency; venv_dedup_mtree only reads mtree).",
++        ),
++        "mtree": attr.label(
++            allow_single_file = True,
++            mandatory = True,
++            doc = "Input mtree from mtree_spec.",
++        ),
++        "venv_pattern": attr.string(
++            default = "\\.venv/",
++            doc = "Regex for mtree paths that belong to the venv (e.g. run.venv/...).",
++        ),
++        "_venv_dedup_mtree": attr.label(
++            default = "//py/tools/venv_dedup_mtree:venv_dedup_mtree",
++            executable = True,
++            cfg = "exec",
++        ),
++    },
++)
+ 
+ default_layer_groups = {
+     # match *only* external repositories containing a Python interpreter,
+@@ -110,6 +164,8 @@ def py_image_layer(
+         root = "/",
+         layer_groups = {},
+         compress = "gzip",
++        compressor = None,
++        compressor_args = "",
+         tar_args = [],
+         compute_unused_inputs = 1,
+         platform = None,
+@@ -120,6 +176,11 @@ def py_image_layer(
+ 
+     > Requires `awk` to be installed on the host machine/rbe runner.
+ 
++    Venv dedup: paths under the venv (e.g. run.venv/...) that point to the same file as a path
++    under runfiles are emitted as type=link (relative symlink to the runfiles path) in the mtree,
++    so the tar packages the file once at the runfiles path and the venv path is a symlink to it.
++    All other runfiles (and venv-only content) are packaged as normal files.
++
+     For better performance, it is recommended to split the output of a py_binary into multiple layers.
+     This can be done by grouping files into layers based on their path by using the `layer_groups` attribute.
+ 
+@@ -142,6 +203,8 @@ def py_image_layer(
+         root: Path to where the layers should be rooted. If not specified, the layers will be rooted at the workspace root.
+         layer_groups: Additional layer groups to create. They are used to group files into layers based on their path. In the form of: ```{"<name>": "regex_to_match_against_file_paths"}```
+         compress: Compression algorithm to use. Default is gzip. See: https://github.com/bazel-contrib/bazel-lib/blob/main/docs/tar.md#tar_rule-compress
++        compressor: Compressor to use. Default is None.
++        compressor_args: Additional arguments to pass to the compressor. Default is "".
+         compute_unused_inputs: Whether to compute unused inputs. Default is 1. See: https://github.com/bazel-contrib/bazel-lib/blob/main/docs/tar.md#tar_rule-compute_unused_inputs
+         platform: The platform to use for the transition. Default is None. See: https://github.com/bazel-contrib/bazel-lib/blob/main/docs/transitions.md#platform_transition_binary-target_platform
+         owner: An owner uid for the uncompressed files. See mtree_mutate: https://github.com/bazel-contrib/bazel-lib/blob/main/docs/tar.md#mutating-the-tar-contents
+@@ -158,22 +221,29 @@ def py_image_layer(
+     # Produce the manifest for a tar file of our py_binary, but don't tar it up yet, so we can split
+     # into fine-grained layers for better pull, push and remote cache performance.
+     manifest_name = name + ".manifest"
++    mtree_spec(
++        name = manifest_name + ".raw",
++        srcs = [binary],
++        **kwargs
++    )
++    venv_dedup_mtree(
++        name = manifest_name + ".venv_deduped",
++        binary = binary,
++        mtree = manifest_name + ".raw",
++        **kwargs
++    )
+     if owner:
+-        mtree_spec(
+-            name = manifest_name + ".preprocessed",
+-            srcs = [binary],
+-            **kwargs
+-        )
+         mtree_mutate(
+             name = manifest_name,
+-            mtree = name + ".manifest.preprocessed",
++            mtree = manifest_name + ".venv_deduped",
+             owner = owner,
+             group = group,
++            **kwargs
+         )
+     else:
+-        mtree_spec(
++        native.alias(
+             name = manifest_name,
+-            srcs = [binary],
++            actual = manifest_name + ".venv_deduped",
+             **kwargs
+         )
+ 
+@@ -192,6 +262,8 @@ def py_image_layer(
+             srcs = [binary],
+             mtree = "{}.{}.manifest.spec".format(name, group_name),
+             compress = compress,
++            compressor = compressor,
++            compressor_args = compressor_args,
+             compute_unused_inputs = compute_unused_inputs,
+             args = tar_args,
+             **kwargs
+diff --git a/py/tools/venv_dedup_mtree/BUILD.bazel b/py/tools/venv_dedup_mtree/BUILD.bazel
+new file mode 100644
+index 0000000..5af1f10
+--- /dev/null
++++ b/py/tools/venv_dedup_mtree/BUILD.bazel
+@@ -0,0 +1,10 @@
++load("//py:defs.bzl", "py_binary")
++
++package(default_visibility = ["//py:__subpackages__"])
++
++py_binary(
++    name = "venv_dedup_mtree",
++    srcs = ["main.py"],
++    main = "main.py",
++    visibility = ["//py/private:__pkg__"],
++)
+diff --git a/py/tools/venv_dedup_mtree/main.py b/py/tools/venv_dedup_mtree/main.py
+new file mode 100644
+index 0000000..1f13510
+--- /dev/null
++++ b/py/tools/venv_dedup_mtree/main.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++"""
++Rewrite mtree so venv paths that point to the same target as a runfiles path
++under external/ become type=link (relative symlink to the runfiles path).
++
++Matching is by logical path under "external/". Venv symlinks are resolved with
++up to two readlinks (sandbox path then venv target), so only the venv directory
++is needed as input.
++"""
++
++import argparse
++import os
++import re
++import sys
++
++
++def decode_vis(s: str) -> str:
++    return s.replace("\\040", " ")
++
++
++def encode_vis(s: str) -> str:
++    """Encode space for mtree output (reverse of decode_vis)."""
++    return s.replace(" ", "\\040")
++
++
++_BAZELOUT_CONFIG_RE = re.compile(r'^bazel-out/[^/]+/((?!bin/|genfiles/|testlogs/).+)')
++
++
++def logical_path_under_external(value: str) -> str | None:
++    """Normalize content= or link= to the segment under external/, or None.
++
++    Also handles rules_python venvs_site_packages=yes: venv symlinks resolve
++    through bazel-out/<config>/REPO/... instead of directly to external/REPO/...;
++    treat them as equivalent for deduplication purposes.
++    """
++    if not value:
++        return None
++    idx = value.find("external/")
++    if idx >= 0:
++        return value[idx:]
++    # rules_python venvs_site_packages=yes: venv symlinks resolve through
++    # bazel-out/<config>/ rather than external/; normalise them so dedup works.
++    m = _BAZELOUT_CONFIG_RE.match(value)
++    if m:
++        return "external/" + m.group(1)
++    return None
++
++
++def _parse_line(raw: str):
++    """Parse a non-empty mtree line. Returns (path_decoded, content_val, link_val) or None for skip."""
++    parts = raw.split()
++    if not parts:
++        return (None, None, None)
++    path_dec = decode_vis(parts[0])
++    content_val = None
++    link_val = None
++    for p in parts[1:]:
++        if p.startswith("content="):
++            content_val = decode_vis(p[8:])
++            break
++    for p in parts[1:]:
++        if p.startswith("link="):
++            link_val = decode_vis(p[5:])
++            break
++    return (path_dec, content_val, link_val)
++
++
++def _get_logical(content_val: str | None, link_val: str | None) -> str | None:
++    logical = logical_path_under_external(content_val) if content_val else None
++    if logical is None and link_val:
++        logical = logical_path_under_external(link_val)
++    return logical
++
++
++def _venv_line_to_link(raw: str, link_target: str) -> str:
++    """
++    Rewrite a venv mtree line from type=file content=... to type=link link=<target>.
++    Mtree uses \\040 for space; backslashes in the replacement must be escaped for re.sub.
++    """
++    link_enc = encode_vis(link_target).replace("\\", "\\\\")
++    line = re.sub(r"type=file\b", "type=link", raw, count=1)
++    if re.search(r"\bcontent=", line):
++        line = re.sub(r"\bcontent=.+$", f"link={link_enc}", line, count=1)
++    if re.search(r"\blink=", line):
++        line = re.sub(r"\blink=.+$", f"link={link_enc}", line, count=1)
++    return line
++
++
++def _resolve_content_path_to_logical(content_val: str) -> str | None:
++    """
++    Resolve mtree content= via up to two readlinks. First hop may be a sandbox
++    absolute path; second hop is the venv symlink (relative, contains external/).
++    """
++    if not content_val:
++        return None
++    path_to_follow = content_val
++    for _ in range(2):
++        if not os.path.islink(path_to_follow):
++            return None
++        try:
++            target = os.readlink(path_to_follow)
++        except OSError:
++            return None
++        if not target:
++            return None
++        next_path = (
++            target
++            if os.path.isabs(target)
++            else os.path.normpath(os.path.join(os.path.dirname(path_to_follow), target))
++        )
++        logical = logical_path_under_external(next_path)
++        if logical is not None:
++            return logical
++        path_to_follow = next_path
++    return None
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="Deduplicate venv entries in mtree as relative links to runfiles.")
++    parser.add_argument("mtree", help="Input mtree file")
++    parser.add_argument("-o", "--output", default="-", help="Output mtree file (- for stdout)")
++    parser.add_argument(
++        "--venv-pattern",
++        default=r"\.venv/",
++        help="Regex for mtree paths that belong to the venv",
++    )
++    args = parser.parse_args()
++    venv_re = re.compile(args.venv_pattern)
++
++    out = sys.stdout if args.output == "-" else open(args.output, "w")
++    try:
++        with open(args.mtree, "r") as f:
++            lines = [line.rstrip("\n") for line in f]
++        # Pass 1: build runfiles map and infer the runfiles directory name.
++        runfiles_by_logical: dict[str, str] = {}
++        runfiles_dir: str | None = None
++        for raw in lines:
++            if not raw or raw.startswith("#"):
++                continue
++            path_dec, content_val, link_val = _parse_line(raw)
++            if path_dec is None:
++                continue
++            if venv_re.search(path_dec):
++                # e.g. "run.runfiles/_main/_run.venv/..." -> "run.runfiles"
++                # e.g. "apps/nurec_tools.runfiles/_main/apps/_nurec_tools.venv/..." -> "apps/nurec_tools.runfiles"
++                if runfiles_dir is None:
++                    m = re.search(r'^(.*?\.runfiles)/', path_dec)
++                    if m:
++                        runfiles_dir = m.group(1)
++                continue
++            logical = _get_logical(content_val, link_val)
++            if logical and logical not in runfiles_by_logical:
++                runfiles_by_logical[logical] = path_dec
++
++        # Pass 2: output with venv rewrites
++        for raw in lines:
++            if not raw or raw.startswith("#"):
++                print(raw, file=out)
++                continue
++            path_dec, content_val, link_val = _parse_line(raw)
++            if path_dec is None:
++                print(raw, file=out)
++                continue
++            if not venv_re.search(path_dec):
++                print(raw, file=out)
++                continue
++            # Resolve venv entry to logical path (content/link or readlink(s)).
++            logical = _get_logical(content_val, link_val)
++            if not logical and content_val:
++                logical = _resolve_content_path_to_logical(content_val)
++            # If this logical path exists as runfiles, emit a symlink to it instead of the file.
++            if logical and logical in runfiles_by_logical:
++                runfiles_path = runfiles_by_logical[logical]
++                venv_dir = path_dec.rsplit("/", 1)[0] if "/" in path_dec else "."
++                link_target = os.path.relpath(runfiles_path, venv_dir)
++                print(_venv_line_to_link(raw, link_target), file=out)
++            elif logical and logical.startswith("external/") and runfiles_dir:
++                # Directory symlinks: the venv entry is a symlink to a whole directory
++                # (e.g. a package dir or .dist-info dir).  Such entries have no content=
++                # in the runfiles map, so the lookup above misses them.  Derive the
++                # runfiles path directly: external/REPO/... -> BINARY.runfiles/REPO/...
++                runfiles_path = runfiles_dir + "/" + logical[len("external/"):]
++                venv_dir = path_dec.rsplit("/", 1)[0] if "/" in path_dec else "."
++                link_target = os.path.relpath(runfiles_path, venv_dir)
++                print(_venv_line_to_link(raw, link_target), file=out)
++            else:
++                print(raw, file=out)
++        return 0
++    finally:
++        if out is not sys.stdout:
++            out.close()
++
++
++if __name__ == "__main__":
++    sys.exit(main())

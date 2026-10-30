@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//skills/nurec-onboard:__subpackages__"])
+
+exports_files(
+    [
+        ".codex/config.toml",
+        "defaults.yaml",
+        "examples/input-pandaset.yaml",
+        "examples/input-waymo.yaml",
+        "nurec-onboard/SKILL.md",
+        "nurec-onboard/steps/audit-dataset/input-skeleton.yaml",
+        "nurec-onboard/steps/run-nurec/config-skeleton.yaml",
+        "nurec-onboard/steps/run-nurec/SKILL.md",
+    ],
+    visibility = ["//skills/nurec-onboard:__subpackages__"],
+)
+
+# Every checkout path the launcher reads.
+filegroup(
+    name = "launcher_test_data",
+    srcs = [
+        ".claude/settings.local.template.json",
+        ".codex/config.toml",
+        ".codex/rules/nurec-onboard.rules",
+        "defaults.yaml",
+        "run.sh",
+        "//skills/nurec-onboard/lib:launcher_sources",
+    ] + glob(["nurec-onboard/**"]),
+)
+
+# Asserts the converter template's toolchain versions and NCore pin match the
+# enclosing repository's, that its shared package pins don't trail the
+# enclosing repository's, and that the NCore doc links agree. See the script
+# header for the full rationale.
+sh_binary(
+    name = "version_check",
+    srcs = ["version_check.sh"],
+)

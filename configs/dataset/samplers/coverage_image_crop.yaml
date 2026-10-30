@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - image_crop
+
+batch_sampler:
+  # Coverage couples the sensor and frame choice through a shared schedule: the sensor sampler picks the
+  # sensor the schedule scheduled and the frame sampler draws that sensor's scheduled frame, so every
+  # (sensor, frame) pair is covered once per pass across ALL active sensors (see CoverageFrameSampler).
+  # Both halves MUST be coverage for multi-sensor training (enforced by BaseBatchSampler).
+  camera_sensor_sampler:
+    name: coverage # Type of the camera sensor sampler one of [uniform, coverage, skip]
+  camera_frame_sampler:
+    name: coverage # Type of the camera frame sampler one of [uniform, timestamp, holdout, coverage, skip]
+
+  lidar_sensor_sampler:
+    name: coverage # Type of the lidar sensor sampler one of [uniform, coverage, skip]
+  lidar_frame_sampler:
+    name: coverage # Type of the lidar frame sampler one of [uniform, timestamp, holdout, coverage, skip]

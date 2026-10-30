@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - direct
+
+# Direct calibration with a 1e-4 learning rate.
+optimizer:
+  args:
+    lr: 1.0e-4

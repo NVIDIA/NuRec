@@ -1,0 +1,29 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep camera-derived lights and interpolated deformables actor-local under MCMC.
+
+model:
+  strategy:
+    add:
+      # Interpolated-table rows have stable Gaussian identities, so dynamic
+      # deformables may be recycled within an actor but cannot be added globally.
+      fixed_count_layer_ids: ["vehicle_lights", "static_vehicle_lights", "dynamic_deformables"]
+    relocate:
+      same_track_layer_ids: ["vehicle_lights", "static_vehicle_lights", "dynamic_deformables"]
+      min_gaussians_per_track:
+        vehicle_lights: 16
+        static_vehicle_lights: 16
+        dynamic_deformables: 128
+    perturb:
+      noise_lr:
+        layers:
+          vehicle_lights: 100.0
+          static_vehicle_lights: 100.0
+          # Perturbing a canonical point translates its full trajectory. The
+          # reduced rate retains exploration without large actor excursions.
+          dynamic_deformables: 500.0
+      max_position_offset_m:
+        vehicle_lights: 0.02
+        static_vehicle_lights: 0.02

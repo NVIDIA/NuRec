@@ -1,0 +1,197 @@
+diff --git a/build_tools/pytorch.py b/build_tools/pytorch.py
+index 4563a02..8e85e6c 100644
+--- a/build_tools/pytorch.py
++++ b/build_tools/pytorch.py
+@@ -62,9 +62,6 @@ def setup_pytorch_extension(
+ 
+     cuda_architectures = cuda_archs()
+ 
+-    if "70" in cuda_architectures:
+-        nvcc_flags.extend(["-gencode", "arch=compute_70,code=sm_70"])
+-
+     # Version-dependent CUDA options
+     try:
+         version = cuda_version()
+@@ -80,10 +77,16 @@ def setup_pytorch_extension(
+             )
+         )
+ 
+-        if "80" in cuda_architectures:
+-            nvcc_flags.extend(["-gencode", "arch=compute_80,code=sm_80"])
+-        if "90" in cuda_architectures:
+-            nvcc_flags.extend(["-gencode", "arch=compute_90,code=sm_90"])
++        support_cuda_architectures = [
++            "75", # Turing
++            "80", "86", "87", "88", # Ampere
++            "89", # Ada
++            "90", # Hopper
++            "100", "110", "120", "121", # Blackwell
++        ]
++        for cuda_arch in support_cuda_architectures:
++            if cuda_arch in cuda_architectures:
++                nvcc_flags.extend(["-gencode", f"arch=compute_{cuda_arch},code=sm_{cuda_arch}"])
+ 
+     # Libraries
+     library_dirs = []
+diff --git a/build_tools/utils.py b/build_tools/utils.py
+index d846b87..354d5fa 100644
+--- a/build_tools/utils.py
++++ b/build_tools/utils.py
+@@ -190,7 +190,7 @@ def cuda_path() -> Tuple[str, str]:
+ 
+ @functools.lru_cache(maxsize=None)
+ def cuda_archs() -> str:
+-    return os.getenv("NVTE_CUDA_ARCHS", "70;80;89;90")
++    return os.getenv("NVTE_CUDA_ARCHS", "75;80;86;89;90;100;120")
+ 
+ 
+ def cuda_version() -> Tuple[int, ...]:
+diff --git a/build_tools/wheel_utils/build_wheels.sh b/build_tools/wheel_utils/build_wheels.sh
+old mode 100644
+new mode 100755
+index 7682a2b..5999d87
+--- a/build_tools/wheel_utils/build_wheels.sh
++++ b/build_tools/wheel_utils/build_wheels.sh
+@@ -8,8 +8,8 @@ PLATFORM=${1:-manylinux_2_28_x86_64}
+ BUILD_METAPACKAGE=${2:-true}
+ BUILD_COMMON=${3:-true}
+ BUILD_PYTORCH=${4:-true}
+-BUILD_JAX=${5:-true}
+-BUILD_PADDLE=${6:-true}
++BUILD_JAX=${5:-false}
++BUILD_PADDLE=${6:-false}
+ 
+ export NVTE_RELEASE_BUILD=1
+ export TARGET_BRANCH=${TARGET_BRANCH:-}
+@@ -23,7 +23,7 @@ git submodule update --init --recursive
+ 
+ if $BUILD_METAPACKAGE ; then
+         cd /TransformerEngine
+-        NVTE_BUILD_METAPACKAGE=1 /opt/python/cp310-cp310/bin/python setup.py bdist_wheel 2>&1 | tee /wheelhouse/logs/metapackage.txt
++        NVTE_BUILD_METAPACKAGE=1 python setup.py bdist_wheel 2>&1 | tee /wheelhouse/logs/metapackage.txt
+         mv dist/* /wheelhouse/
+ fi
+ 
+@@ -32,15 +32,15 @@ if $BUILD_COMMON ; then
+         WHL_BASE="transformer_engine-${VERSION}"
+ 
+         # Create the wheel.
+-        /opt/python/cp38-cp38/bin/python setup.py bdist_wheel --verbose --python-tag=py3 --plat-name=$PLATFORM 2>&1 | tee /wheelhouse/logs/common.txt
++        python setup.py bdist_wheel --verbose --python-tag=py3 --plat-name=$PLATFORM 2>&1 | tee /wheelhouse/logs/common.txt
+ 
+         # Repack the wheel for cuda specific package, i.e. cu12.
+-        /opt/python/cp38-cp38/bin/wheel unpack dist/*
++        wheel unpack dist/*
+         # From python 3.10 to 3.11, the package name delimiter in metadata got changed from - (hyphen) to _ (underscore).
+         sed -i "s/Name: transformer-engine/Name: transformer-engine-cu12/g" "transformer_engine-${VERSION}/transformer_engine-${VERSION}.dist-info/METADATA"
+         sed -i "s/Name: transformer_engine/Name: transformer_engine_cu12/g" "transformer_engine-${VERSION}/transformer_engine-${VERSION}.dist-info/METADATA"
+         mv "${WHL_BASE}/${WHL_BASE}.dist-info" "${WHL_BASE}/transformer_engine_cu12-${VERSION}.dist-info"
+-        /opt/python/cp38-cp38/bin/wheel pack ${WHL_BASE}
++        wheel pack ${WHL_BASE}
+ 
+         # Rename the wheel to make it python version agnostic.
+         whl_name=$(basename dist/*)
+@@ -51,17 +51,17 @@ if $BUILD_COMMON ; then
+ fi
+ 
+ if $BUILD_PYTORCH ; then
+-	cd /TransformerEngine/transformer_engine/pytorch
+-	/opt/python/cp38-cp38/bin/pip install torch
+-	/opt/python/cp38-cp38/bin/python setup.py sdist 2>&1 | tee /wheelhouse/logs/torch.txt
+-	cp dist/* /wheelhouse/
++        cd /TransformerEngine/transformer_engine/pytorch
++        pip install torch
++        python setup.py bdist_wheel 2>&1 | tee /wheelhouse/logs/torch.txt
++        cp dist/* /wheelhouse/
+ fi
+ 
+ if $BUILD_JAX ; then
+-	cd /TransformerEngine/transformer_engine/jax
+-	/opt/python/cp310-cp310/bin/pip install "jax[cuda12_local]" jaxlib
+-	/opt/python/cp310-cp310/bin/python setup.py sdist 2>&1 | tee /wheelhouse/logs/jax.txt
+-	cp dist/* /wheelhouse/
++        cd /TransformerEngine/transformer_engine/jax
++        pip install "jax[cuda12_local]" jaxlib
++        python setup.py sdist 2>&1 | tee /wheelhouse/logs/jax.txt
++        cp dist/* /wheelhouse/
+ fi
+ 
+ if $BUILD_PADDLE ; then
+@@ -96,5 +96,5 @@ if $BUILD_PADDLE ; then
+                 /opt/python/cp312-cp312/bin/pip uninstall -y transformer-engine transformer-engine-cu12 paddlepaddle-gpu
+ 
+                 mv dist/* /wheelhouse/
+-	fi
++        fi
+ fi
+diff --git a/setup.py b/setup.py
+index 0b0639a..bd04268 100644
+--- a/setup.py
++++ b/setup.py
+@@ -93,7 +93,7 @@ def setup_requirements() -> Tuple[List[str], List[str], List[str]]:
+     # Framework-specific requirements
+     if not bool(int(os.getenv("NVTE_RELEASE_BUILD", "0"))):
+         if "pytorch" in frameworks:
+-            install_reqs.extend(["torch", "flash-attn>=2.0.6,<=2.6.3,!=2.0.9,!=2.1.0"])
++            install_reqs.extend(["torch", "flash-attn>=2.0.6,<=2.7.4,!=2.0.9,!=2.1.0"])
+             test_reqs.extend(["numpy", "onnxruntime", "torchvision", "prettytable"])
+         if "jax" in frameworks:
+             install_reqs.extend(["jax", "flax>=0.7.1"])
+diff --git a/transformer_engine/__init__.py b/transformer_engine/__init__.py
+index b18ded9..f800def 100644
+--- a/transformer_engine/__init__.py
++++ b/transformer_engine/__init__.py
+@@ -13,7 +13,7 @@ try:
+     from . import pytorch
+ except (ImportError, StopIteration) as e:
+     pass
+-
++'''
+ try:
+     from . import jax
+ except (ImportError, StopIteration) as e:
+@@ -33,5 +33,5 @@ try:
+     import transformer_engine_paddle
+ except ImportError:
+     pass
+-
++'''
+ __version__ = str(metadata.version("transformer_engine"))
+diff --git a/transformer_engine/pytorch/__init__.py b/transformer_engine/pytorch/__init__.py
+index c409733..3a5d4bd 100644
+--- a/transformer_engine/pytorch/__init__.py
++++ b/transformer_engine/pytorch/__init__.py
+@@ -16,7 +16,6 @@ from importlib.metadata import version
+ from transformer_engine.common import get_te_path, is_package_installed
+ from transformer_engine.common import _get_sys_extension
+ 
+-
+ def _load_library():
+     """Load shared library with Transformer Engine C extensions"""
+     module_name = "transformer_engine_torch"
+diff --git a/transformer_engine/pytorch/attention.py b/transformer_engine/pytorch/attention.py
+index bacadf2..fa077e5 100644
+--- a/transformer_engine/pytorch/attention.py
++++ b/transformer_engine/pytorch/attention.py
+@@ -91,7 +91,7 @@ _NVTE_FUSED_ATTN = int(os.getenv("NVTE_FUSED_ATTN", "1"))
+ _NVTE_UNFUSED_ATTN = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+ _flash_attn_version = PkgVersion(get_pkg_version("flash-attn"))
+ _flash_attn_version_required = PkgVersion("2.0.6")
+-_flash_attn_max_version = PkgVersion("2.6.3")
++_flash_attn_max_version = PkgVersion("2.7.4")
+ _flash_attn_2_plus = _flash_attn_version >= PkgVersion("2")
+ _flash_attn_2_1_plus = _flash_attn_version >= PkgVersion("2.1")
+ _flash_attn_2_3_plus = _flash_attn_version >= PkgVersion("2.3")
+diff --git a/transformer_engine/pytorch/setup.py b/transformer_engine/pytorch/setup.py
+index 034e671..75d863f 100644
+--- a/transformer_engine/pytorch/setup.py
++++ b/transformer_engine/pytorch/setup.py
+@@ -56,7 +56,7 @@ if __name__ == "__main__":
+         description="Transformer acceleration library - Torch Lib",
+         ext_modules=ext_modules,
+         cmdclass={"build_ext": CMakeBuildExtension},
+-        install_requires=["torch", "flash-attn>=2.0.6,<=2.6.3,!=2.0.9,!=2.1.0"],
++        install_requires=["torch", "flash-attn>=2.0.6,<=2.7.4,!=2.0.9,!=2.1.0"],
+         tests_require=["numpy", "onnxruntime", "torchvision"],
+     )
+     if any(x in sys.argv for x in (".", "sdist", "bdist_wheel")):

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+
+bool_flag(
+    name = "mamba",
+    build_setting_default = False,
+    visibility = ["//bazel/conditions:__pkg__"],
+)
+
+bool_flag(
+    name = "mask_annotator",
+    build_setting_default = False,
+    visibility = ["//bazel/conditions:__pkg__"],
+)
+
+bool_flag(
+    name = "ncore_aux_data",
+    build_setting_default = False,
+    visibility = ["//bazel/conditions:__pkg__"],
+)

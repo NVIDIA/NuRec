@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Codex autorun policy for nurec-onboard.
+#
+# run.sh supplies canonical read/write roots, documentation domains, and the
+# documented Docker socket allowlist entry for Docker-backed workflows as
+# per-run overrides.
+#
+# Container-backed steps reach the daemon because the `docker` rule in
+# .codex/rules/nurec-onboard.rules resolves to `allow`, and Codex honors an
+# `allow` decision by running the command on the host instead of in the sandbox.
+# The socket entry itself grants nothing on Linux, where the sandbox namespace
+# omits /run.
+approval_policy = "never"
+default_permissions = "nurec-onboard"
+web_search = "disabled"
+allow_login_shell = false
+
+# Each step reasons over a long specification before writing code, and the model
+# catalog's own default for the current models is "medium". Do not raise this to
+# "ultra": that level delegates work to sub-agents automatically, which the
+# workflow's inline-execution requirement forbids.
+model_reasoning_effort = "xhigh"
+
+# Starts the network proxy that enforces the profile's domain rules. Without it
+# the rules below are inert and sandboxed commands have no name resolution at
+# all: the proxy is what resolves hostnames on their behalf.
+[features]
+network_proxy = true
+
+[permissions.nurec-onboard]
+description = "Fail-closed NuRec onboarding with launcher-scoped access."
+
+[permissions.nurec-onboard.filesystem]
+":minimal" = "read"
+
+[permissions.nurec-onboard.network]
+enabled = true
+allow_local_binding = false
+dangerously_allow_non_loopback_proxy = false
+dangerously_allow_all_unix_sockets = false
+
+[permissions.nurec-onboard.network.domains]
+"bcr.bazel.build" = "allow"
+"download-r2.pytorch.org" = "allow"
+"download.pytorch.org" = "allow"
+"files.pythonhosted.org" = "allow"
+"github.com" = "allow"
+"ghcr.io" = "allow"
+"objects.githubusercontent.com" = "allow"
+"pypi.org" = "allow"
+"release-assets.githubusercontent.com" = "allow"
+"releases.bazel.build" = "allow"

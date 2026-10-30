@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "explicit_inputs.py",
+        "interface.py",
+        "ncore_v4.py",
+        "registry.py",
+    ],
+    visibility = [
+        "//apps/av/aux_gen:__pkg__",
+        "//nurec:__subpackages__",
+    ],
+    deps = [
+        "//nurec/utils:pylib_ncore_types",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("pillow"),
+        pip_requirement("universal-pathlib"),
+    ],
+)
+
+pytest_test(
+    name = "explicit_inputs_test",
+    srcs = ["explicit_inputs_test.py"],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "ncore_v4_test",
+    srcs = ["ncore_v4_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("universal-pathlib"),
+    ],
+)
+
+pytest_test(
+    name = "registry_test",
+    srcs = ["registry_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("universal-pathlib"),
+    ],
+)

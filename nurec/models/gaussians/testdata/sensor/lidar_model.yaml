@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+lidar_models:
+  # Manufacturer calibration data from https://www.hesaitech.com keeps equivalence
+  # checks on physically valid sensor geometry.
+  HESAI_Pandar128: ${load_json:nurec/config/sensor_data/hesai_pandar128.json}
+  HESAI_AT128: ${load_json:nurec/config/sensor_data/hesai_at128.json}

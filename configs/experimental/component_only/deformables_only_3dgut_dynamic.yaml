@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Example app: component-only 'deformables_only' on top of the
+# /apps/AV/NV/3dgut_dynamic preset. See configs/component_only/deformables_only.yaml.
+
+defaults:
+  - /apps/AV/NV/3dgut_dynamic
+  - /component_only: deformables_only
+  - _self_
+
+system:
+  test:
+    val_render_selected_nodes: {}

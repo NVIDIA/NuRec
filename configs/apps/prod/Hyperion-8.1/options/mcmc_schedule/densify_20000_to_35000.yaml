@@ -1,0 +1,24 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Densify from step 20,000 through step 35,000, then stop add and relocation.
+#
+# Holds the gaussian budget low for the first 20,000 samples so the optimizer
+# settles, then densifies through sample 35,000. Perturb fires every step
+# throughout training. The maximum Gaussian count is owned separately by
+# the mcmc_max_gaussians option group.
+#
+model:
+  strategy:
+    add:
+      start_iteration: 20_000
+      end_iteration: 35_000
+
+    relocate:
+      end_iteration: 35_000
+
+    perturb:
+      start_iteration: 1
+      end_iteration: ${dataset.n_samples_per_epoch}
+      frequency: 1

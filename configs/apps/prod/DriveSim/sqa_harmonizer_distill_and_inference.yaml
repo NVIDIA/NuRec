@@ -1,0 +1,8 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  # Configs override each other in the listed order (/ denotes config root)
+  - sqa_default
+  - override /apps/prod/options/harmonizer/3dgut: distill_and_inference

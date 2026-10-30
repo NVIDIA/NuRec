@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+point-cloud-utils 0.34.0+nre1 - statement of changes
+
+This wheel is built from point-cloud-utils (https://github.com/fwilliams/point-cloud-utils, MIT) at
+commit 47b99b66b0efaba5052b1bd347b1e350d0dbd707. Its build fetches libigl at
+68684132e5defbb68d03914e8f243da8eeff95c5 (MPL-2.0), shipped next to this record. The files below
+were modified by NVIDIA CORPORATION & AFFILIATES, 2026.
+
+Changes applied by the NuRec build:
+- src/**/*.cpp: every "PyErr_CheckSignals() != 0" becomes
+  "PyGILState_GetThisThreadState() != nullptr && PyErr_CheckSignals() != 0" (26 call sites), so the
+  signal check runs only on threads that own a Python thread state.
+- setup.py: version="0.34.0+nre1".

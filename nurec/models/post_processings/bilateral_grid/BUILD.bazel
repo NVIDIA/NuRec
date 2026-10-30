@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = [
+    "//:core_package_group",
+])
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "bilateral_grid.py",
+        "bilateral_grid_cuda.py",
+    ],
+    deps = [
+        pip_requirement("torch"),
+        "//nurec/models/base:pylib",
+        "//nurec/models/post_processings/bilateral_grid/cuda:pylib_cc",
+        "//nurec/utils:pylib",
+        "@gsplat//:pylib",
+    ],
+)
+
+pytest_test(
+    name = "bilateral_grid_test",
+    srcs = [
+        "bilateral_grid_test.py",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/libs/losses/models:pylib",
+        "@gsplat//:pylib",
+    ],
+)
+
+pytest_test(
+    name = "bilateral_grid_cuda_test",
+    srcs = [
+        "bilateral_grid_cuda_test.py",
+    ],
+    data = [
+        "@test_data_prober_generated//:bilateral_grid_per_camera",
+    ],
+    deps = [
+        ":pylib",
+        "//nurec/utils:pylib_prober",
+        "@gsplat//:pylib",
+    ],
+)

@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Disable lidar far clipping and retain a 1,000-meter camera far clip.
+
+model:
+  renderer:
+    culling:
+      far_clip_distance_lidar: 3.402823466e+38
+      far_clip_distance_camera: 1000.0

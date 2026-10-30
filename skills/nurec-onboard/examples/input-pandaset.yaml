@@ -1,0 +1,296 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Public reference input for one PandaSet sequence.
+
+data:
+  name: pandaset
+  # Required: replace with the absolute path to the downloaded PandaSet sequence.
+  path: /path/to/pandaset/084
+  description: >
+    PandaSet autonomous-driving sequence with six surround cameras, two LiDARs,
+    GNSS/IMU metadata, and 3D cuboid annotations.
+
+  profile:
+    file_layout:
+      summary: "Sequence directory has per-camera raw inputs, merged LiDAR, raw LiDAR (lidar_raw/), metadata, and cuboids; the static calibration comes from the PandaSet devkit and is placed in the dataset root."
+      root: /path/to/pandaset/084
+      sequence_id_source: "Sequence directory name, e.g. 084."
+      raw_inputs:
+        - name: cameras
+          files: "camera/<id> images, intrinsics.json, timestamps.json, poses.json"
+        - name: lidar
+          files: "lidar/ merged point clouds, lidar/poses.json, lidar/timestamps.json"
+          columns: [x, y, z, i, t, d]
+        - name: lidar_raw
+          files: "Required Pandar64 polar measurements in lidar_raw/<frame>.pkl.gz"
+          columns: [laser_id, column_id, elevation, azimuth_col, azimuth_col_corrected, distance, intensity]
+        - name: cuboids
+          files: "annotations/cuboids/{frame:02d}.pkl.gz"
+      # Not in the dataset download: copy the devkit's docs/static_extrinsic_calibration.yaml
+      # into the dataset root (see the README's PandaSet section).
+      calibration_files: ["../static_extrinsic_calibration.yaml"]
+      metadata_files: ["meta/timestamps.json", "meta/gps.json"]
+
+    calibration_and_frames:
+      summary: "Static calibration maps the Hesai-native Pandar64 frame into each OpenCV camera frame; one rigid offset relates that frame to the lidar/poses.json frame."
+      calibration_sources: ["static_extrinsic_calibration.yaml", "camera/<id>/poses.json", "lidar/poses.json"]
+      rig_frame: "lidar/poses.json frame: +Y forward, +X right, +Z up, ground-anchored."
+      world_frame: "PandaSet world frame used by camera/<id>/poses.json and lidar/poses.json."
+      camera_frame: "OpenCV axes in both camera/<id>/poses.json and static_extrinsic_calibration.yaml."
+      lidar_frame: "Pandar64/Hesai-native frame, the static calibration's reference: +Y rear, +X left, +Z up (about 178 degrees from the lidar/poses.json frame)."
+      frames: [hesai_native_lidar, pandaset_world, opencv_camera]
+      static_transforms:
+        - source_frame: hesai_native_lidar
+          target_frame: sensor
+          raw_stream: static_extrinsic_calibration.yaml
+          direction: lidar_reference_to_sensor
+      dynamic_transforms:
+        - source_frame: camera
+          target_frame: pandaset_world
+          raw_stream: "camera/<id>/poses.json"
+          direction: camera_to_world
+          timestamp_unit: floating_point_seconds
+        - source_frame: lidar
+          target_frame: pandaset_world
+          raw_stream: lidar/poses.json
+          direction: lidar_to_world
+          timestamp_unit: floating_point_seconds
+      transform_direction_conventions:
+        - "camera/<id>/poses.json contains per-image camera-to-world poses."
+        - "lidar/poses.json contains per-frame poses in the same world frame."
+      known_mismatches:
+        - "lidar/poses.json is not the Pandar64 calibration frame. Composing each camera's per-image pose with its static calibration gives one rigid Pandar64-to-lidar/poses.json offset for sequence 084 (about -178 degrees about +Z with native +Z tilted 0.9 degrees from pose +Z, translation (0, 0.81, 1.86) m); all six cameras agree within 0.01 degrees and 3 cm."
+
+    pose_sources:
+      - id: camera_poses
+        raw_stream: "camera/<id>/poses.json"
+        source_frame: camera
+        target_frame: pandaset_world
+        direction: camera_to_world
+        timestamp_unit: floating_point_seconds
+        coverage: "Per-image camera poses; frame-0 camera z positions are approximately +1.54 m to +1.82 m."
+        global_frame: "PandaSet world frame."
+      - id: lidar_poses
+        raw_stream: lidar/poses.json
+        source_frame: lidar
+        target_frame: pandaset_world
+        direction: lidar_to_world
+        timestamp_unit: floating_point_seconds
+        coverage: "Per-frame LiDAR poses; frame-0 position is ground anchored at (0, 0, 0)."
+        global_frame: "PandaSet world frame; the Pandar64 sits about 1.86 m above the lidar/poses.json origin (see known_mismatches)."
+
+    timestamp_semantics:
+      summary: "GPS-clock floating-point seconds; camera timestamps are exposure end and LiDAR frame timestamps are sweep end."
+      clock: GPS
+      unit: floating_point_seconds
+      camera_timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+      lidar_frame_timestamp_meaning: "Sweep end, per PandaSet paper Section III-A."
+      per_ray_timestamps: "lidar_raw/<frame>.pkl.gz has no t column; its rows match the d == 0 (Pandar64) rows of lidar/<frame>.pkl.gz one to one, in order, and those carry per-point t."
+      synchronization: "In sequence 084 lidar/timestamps.json is within roughly 1-2 ms of max per-point t."
+
+    cameras:
+      - id: back_camera
+        raw_stream: camera/back_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/back_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+      - id: front_camera
+        raw_stream: camera/front_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/front_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+      - id: front_left_camera
+        raw_stream: camera/front_left_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/front_left_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+      - id: front_right_camera
+        raw_stream: camera/front_right_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/front_right_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+      - id: left_camera
+        raw_stream: camera/left_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/left_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+      - id: right_camera
+        raw_stream: camera/right_camera
+        model: Leopard LI-USB30-AR023ZWDRB
+        resolution: [1920, 1080]
+        image_format: null
+        model_family: opencv_pinhole
+        intrinsics_source: "camera/right_camera/intrinsics.json and static_extrinsic_calibration.yaml."
+        distortion_model: "None in the shipped images; the Brown-Conrady D in static_extrinsic_calibration.yaml describes the unrectified sensor, and the devkit projects with K only."
+        distortion_coeff_order: []
+        image_state: rectified
+        shutter:
+          type: rolling
+          direction: top_to_bottom
+          readout_duration_sec: null
+          timestamp_meaning: "Exposure end, per PandaSet paper Section III-A."
+        masks:
+          available: false
+          entries: []
+
+    lidars:
+      - id: main_pandar64
+        raw_stream: lidar_raw
+        model: Hesai Pandar64
+        type: mechanical_spinning
+        raw_format: "Uncompensated Pandar64-only spherical measurements."
+        model_source: "lidar_raw/ per-point fields."
+        beam_structure:
+          rows: 64
+          columns: 1800
+          row_elevations: "lidar_raw: elevation, constant per laser_id."
+          column_azimuths: "lidar_raw: azimuth_col, 0.2-degree steps per column_id. column_id counts across frames; each frame holds 1852 columns, and the first 52 repeat the end of the previous sweep."
+          row_azimuth_offsets: "lidar_raw: azimuth_col_corrected - azimuth_col, constant per laser_id, up to +/-5.21 degrees."
+        spinning:
+          direction: "cw: azimuth_col rises 0.2 degrees per column, from native +Y toward +X."
+          frequency_hz: 10.0
+        timing:
+          frame_timestamp_meaning: "Sweep end, per PandaSet paper Section III-A."
+          per_ray_timestamps: "From the t column of the d == 0 rows of lidar/<frame>.pkl.gz, which match lidar_raw/<frame>.pkl.gz rows one to one."
+        per_ray_metadata:
+          - name: laser_id
+            role: row_index
+            dtype: integer
+          - name: column_id
+            role: column_index
+            dtype: integer
+          - name: azimuth_col
+            role: azimuth_degrees
+            convention: "0 at native +Y (rear), 180 at native -Y (forward), increasing from +Y toward +X; azimuth_col_corrected adds the per-laser offset."
+        intensity: "Intensity columns are present in lidar_raw/."
+        motion_compensation: "Uncompensated."
+      - id: pandargt
+        raw_stream: lidar
+        model: Hesai PandarGT
+        type: forward_facing
+        raw_format: "Merged world-frame compensated points."
+        model_source: null
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: null
+          column_azimuths: null
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from PandarGT azimuth ordering before conversion if this LiDAR is converted."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Sweep end, per PandaSet paper Section III-A."
+          per_ray_timestamps: "t column of the d == 1 rows of lidar/<frame>.pkl.gz."
+        per_ray_metadata: []
+        intensity: "Intensity columns are present in lidar/."
+        motion_compensation: "Motion-compensated world-frame merged points."
+
+    cuboids:
+      summary: "3D cuboids are stored per frame."
+      exists: true
+      raw_stream: "annotations/cuboids/{frame:02d}.pkl.gz"
+      centroid: geometric_center
+      dimensions:
+        length: y
+        width: x
+        height: z
+      yaw: "Counter-clockwise Z-axis rotation; yaw=0 aligns object local +Y length axis with world +Y."
+      reference_frame: pandaset_world
+      timestamp_meaning: "Per-frame cuboids match the Pandar64 sweep of the same frame index. An object's points are captured up to one sweep (median about 50 ms) before the frame timestamp, so a moving object's cuboid reflects its position at that capture time."
+      track_id_source: uuid
+      class_vocabulary: []
+      label_source: cuboids
+      coverage: null
+
+    known_gaps:
+      - "The rigid offset between the Pandar64 and the lidar/poses.json frame isn't published; it has to be recovered from the data."
+      - "lidar/ and lidar_raw/ expose different LiDAR representations: merged world-frame compensated points versus Pandar64-only uncompensated polar measurements."
+      - "The rolling-shutter readout duration is not published in official PandaSet calibration files."
+      - "PandaSet ships no ego masks."
+      - "PandaSet cuboid sensor_id values encode label association: 0 = Pandar64, 1 = PandarGT, -1 = sensor-agnostic; dual-LiDAR objects may have sibling records."
+
+  docs:
+    - https://github.com/scaleapi/pandaset-devkit
+    # Links the PandaSet Raw Data Instructions (Pandar64 polar-to-XYZ formula and lidar_raw column meanings); required for the lidar_raw path.
+    - https://github.com/scaleapi/pandaset-devkit/issues/67#issuecomment-674403708
+    - https://arxiv.org/abs/2112.12610
+
+ncore:
+  camera_ids: [back_camera, front_camera, front_left_camera, front_right_camera, left_camera, right_camera]
+  lidar_ids: [main_pandar64]
+  seek_sec: null
+  duration_sec: null
+  converter_dir: null
+  output_dir: null
+
+nurec:
+  camera_ids: [back_camera, front_camera, front_left_camera, front_right_camera, left_camera, right_camera]
+  lidar_ids: [main_pandar64]
+  output_dir: null

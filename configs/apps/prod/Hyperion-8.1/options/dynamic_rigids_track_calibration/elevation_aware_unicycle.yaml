@@ -1,0 +1,8 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use elevation-aware unicycle track calibration for dynamic rigid objects.
+
+defaults:
+  - override /model/tracks_calib@model.layers.dynamic_rigids.tracks_calib: elevation_aware_unicycle

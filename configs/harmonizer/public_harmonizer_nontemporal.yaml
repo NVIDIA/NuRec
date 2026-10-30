@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: public-harmonizer-nontemporal
+model_url: https://huggingface.co/nvidia/Harmonizer/resolve/f2bae9823e07d281c9dce6581d06118d675e08c3/harmonizer_nontemporal.pt
+model_resolution: [576, 1024]
+model_filename: "harmonizer_nontemporal.pt"
+
+inference:
+  use_color_transfer: false
+
+training:
+  use_color_transfer: false

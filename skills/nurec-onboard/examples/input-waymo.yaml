@@ -1,0 +1,341 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Public reference input for a Waymo Open Dataset Perception v1 segment.
+
+data:
+  name: waymo
+  # Required: replace with the absolute path to a directory containing one
+  # segment-..._with_camera_labels.tfrecord file.
+  path: /path/to/waymo/perception/segment-10023947602400723454_1120_000_1140_000_with_camera_labels
+  description: >
+    Waymo Open Dataset Perception v1 segment with five surround cameras, five
+    LiDARs, ego poses, and 3D laser labels stored in one TFRecord.
+
+  profile:
+    file_layout:
+      summary: "Images, calibrations, LiDAR range images, ego poses, and laser labels are stored inside Frame protobuf records in the TFRecord."
+      root: /path/to/waymo/perception/segment-10023947602400723454_1120_000_1140_000_with_camera_labels
+      sequence_id_source: "TFRecord filename stem: segment-10023947602400723454_1120_000_1140_000_with_camera_labels."
+      raw_inputs:
+        - name: camera_images
+          format: "JPEG-compressed CameraImage messages"
+        - name: lidar_range_images
+          format: "Laser ri_return1/ri_return2 range images"
+          channels: [range, intensity, elongation, is_in_no_label_zone]
+        - name: laser_labels
+          format: "Frame.laser_labels protobuf fields"
+      calibration_files: ["Frame.context.camera_calibrations", "Frame.context.laser_calibrations"]
+      metadata_files: ["Frame.pose", "Frame.timestamp_micros", "CameraImage.pose", "CameraImage.pose_timestamp"]
+
+    calibration_and_frames:
+      summary: "Calibration is stored in Frame.context; Waymo camera axes differ from OpenCV axes."
+      calibration_sources: ["CameraCalibration", "LaserCalibration"]
+      rig_frame: "Vehicle frame: x-forward, y-left, z-up."
+      world_frame: "Global frame: East-North-Up."
+      camera_frame: "Waymo camera frame has x out of the lens, z up, and y/z plane parallel to the camera plane; differs from OpenCV camera axes."
+      lidar_frame: "LaserCalibration defines each LiDAR sensor frame and sensor-to-vehicle transform."
+      frames: [vehicle, global, waymo_camera, lidar]
+      static_transforms:
+        - source_frame: camera
+          target_frame: vehicle
+          raw_stream: CameraCalibration.extrinsic
+          direction: camera_to_vehicle
+        - source_frame: lidar
+          target_frame: vehicle
+          raw_stream: LaserCalibration.extrinsic
+          direction: sensor_to_vehicle
+      dynamic_transforms:
+        - source_frame: vehicle
+          target_frame: global
+          raw_stream: Frame.pose
+          direction: vehicle_to_global
+          timestamp_unit: seconds
+        - source_frame: vehicle
+          target_frame: global
+          raw_stream: CameraImage.pose
+          direction: vehicle_to_global
+          timestamp_unit: seconds
+      transform_direction_conventions:
+        - "CameraCalibration.extrinsic stores camera-to-vehicle transforms."
+        - "LaserCalibration.extrinsic stores sensor-to-vehicle transforms."
+      known_mismatches: []
+
+    pose_sources:
+      - id: frame_pose
+        raw_stream: Frame.pose
+        source_frame: vehicle
+        target_frame: global
+        direction: vehicle_to_global
+        timestamp_unit: seconds
+        coverage: "Per-frame; approximately vehicle pose near frame middle and label reference frame."
+        global_frame: "East-North-Up."
+      - id: camera_image_pose
+        raw_stream: CameraImage.pose
+        source_frame: vehicle
+        target_frame: global
+        direction: vehicle_to_global
+        timestamp_unit: seconds
+        coverage: "Per-camera image samples at CameraImage.pose_timestamp."
+        global_frame: "East-North-Up."
+      - id: camera_image_velocity
+        raw_stream: CameraImage.velocity
+        source_frame: vehicle
+        target_frame: null
+        direction: velocity_at_pose_timestamp
+        timestamp_unit: seconds
+        coverage: "Per-camera image velocity samples; angular velocity observed in vehicle frame."
+        global_frame: "East-North-Up."
+
+    timestamp_semantics:
+      summary: "Frame timestamp, frame pose, image pose timestamp, and TOP per-pixel pose tensor have different meanings."
+      clock: null
+      unit: "microseconds for Frame.timestamp_micros; seconds for CameraImage.pose_timestamp."
+      camera_timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+      lidar_frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+      per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+      synchronization: "Frame.pose and Frame.timestamp_micros are separated by roughly half a LiDAR sweep; TOP first return carries range_image_pose_compressed [H, W, 6]."
+
+    cameras:
+      - id: FRONT
+        raw_stream: "Frame.images[name=FRONT]"
+        model: null
+        resolution: null
+        image_format: jpeg
+        model_family: opencv_pinhole
+        intrinsics_source: Frame.context.camera_calibrations
+        distortion_model: "OpenCV radial and tangential."
+        distortion_coeff_order: [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+        image_state: raw_distorted
+        shutter:
+          type: rolling
+          direction: LEFT_TO_RIGHT
+          readout_duration_sec: null
+          timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+        masks:
+          available: false
+          entries: []
+      - id: FRONT_LEFT
+        raw_stream: "Frame.images[name=FRONT_LEFT]"
+        model: null
+        resolution: null
+        image_format: jpeg
+        model_family: opencv_pinhole
+        intrinsics_source: Frame.context.camera_calibrations
+        distortion_model: "OpenCV radial and tangential."
+        distortion_coeff_order: [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+        image_state: raw_distorted
+        shutter:
+          type: rolling
+          direction: LEFT_TO_RIGHT
+          readout_duration_sec: null
+          timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+        masks:
+          available: false
+          entries: []
+      - id: FRONT_RIGHT
+        raw_stream: "Frame.images[name=FRONT_RIGHT]"
+        model: null
+        resolution: null
+        image_format: jpeg
+        model_family: opencv_pinhole
+        intrinsics_source: Frame.context.camera_calibrations
+        distortion_model: "OpenCV radial and tangential."
+        distortion_coeff_order: [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+        image_state: raw_distorted
+        shutter:
+          type: rolling
+          direction: LEFT_TO_RIGHT
+          readout_duration_sec: null
+          timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+        masks:
+          available: false
+          entries: []
+      - id: SIDE_LEFT
+        raw_stream: "Frame.images[name=SIDE_LEFT]"
+        model: null
+        resolution: null
+        image_format: jpeg
+        model_family: opencv_pinhole
+        intrinsics_source: Frame.context.camera_calibrations
+        distortion_model: "OpenCV radial and tangential."
+        distortion_coeff_order: [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+        image_state: raw_distorted
+        shutter:
+          type: rolling
+          direction: LEFT_TO_RIGHT
+          readout_duration_sec: null
+          timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+        masks:
+          available: false
+          entries: []
+      - id: SIDE_RIGHT
+        raw_stream: "Frame.images[name=SIDE_RIGHT]"
+        model: null
+        resolution: null
+        image_format: jpeg
+        model_family: opencv_pinhole
+        intrinsics_source: Frame.context.camera_calibrations
+        distortion_model: "OpenCV radial and tangential."
+        distortion_coeff_order: [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+        image_state: raw_distorted
+        shutter:
+          type: rolling
+          direction: LEFT_TO_RIGHT
+          readout_duration_sec: null
+          timestamp_meaning: "CameraImage.pose_timestamp corresponds to CameraImage.pose."
+        masks:
+          available: false
+          entries: []
+
+    lidars:
+      - id: TOP
+        raw_stream: "Frame.lasers[name=TOP]"
+        model: null
+        type: mechanical_spinning
+        range: long
+        raw_format: "Range images in Laser messages."
+        model_source: "LaserCalibration.beam_inclinations when populated; otherwise beam_inclination_min and beam_inclination_max."
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: "Row 0 corresponds to maximum inclination."
+          column_azimuths: "Columns represent azimuth; column 0 is -x direction and center is +x direction modulo per-sensor heading."
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from Waymo range-image azimuth ordering before conversion."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+          per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+        per_ray_metadata:
+          - name: range_image_pose_compressed
+            role: per_pixel_ego_pose
+        intensity: "Calibrated reflectance floats, typically small positive values."
+        motion_compensation: "TOP first return includes range_image_pose_compressed."
+      - id: FRONT
+        raw_stream: "Frame.lasers[name=FRONT]"
+        model: null
+        type: mechanical_spinning
+        range: short
+        raw_format: "Range images in Laser messages."
+        model_source: "LaserCalibration.beam_inclinations when populated; otherwise beam_inclination_min and beam_inclination_max."
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: "Row 0 corresponds to maximum inclination."
+          column_azimuths: "Columns represent azimuth; column 0 is -x direction and center is +x direction modulo per-sensor heading."
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from Waymo range-image azimuth ordering before conversion."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+          per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+        per_ray_metadata: []
+        intensity: "Calibrated reflectance floats, typically small positive values."
+        motion_compensation: "Short-range LiDAR lacks TOP per-pixel pose tensor."
+      - id: SIDE_LEFT
+        raw_stream: "Frame.lasers[name=SIDE_LEFT]"
+        model: null
+        type: mechanical_spinning
+        range: short
+        raw_format: "Range images in Laser messages."
+        model_source: "LaserCalibration.beam_inclinations when populated; otherwise beam_inclination_min and beam_inclination_max."
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: "Row 0 corresponds to maximum inclination."
+          column_azimuths: "Columns represent azimuth; column 0 is -x direction and center is +x direction modulo per-sensor heading."
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from Waymo range-image azimuth ordering before conversion."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+          per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+        per_ray_metadata: []
+        intensity: "Calibrated reflectance floats, typically small positive values."
+        motion_compensation: "Short-range LiDAR lacks TOP per-pixel pose tensor."
+      - id: SIDE_RIGHT
+        raw_stream: "Frame.lasers[name=SIDE_RIGHT]"
+        model: null
+        type: mechanical_spinning
+        range: short
+        raw_format: "Range images in Laser messages."
+        model_source: "LaserCalibration.beam_inclinations when populated; otherwise beam_inclination_min and beam_inclination_max."
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: "Row 0 corresponds to maximum inclination."
+          column_azimuths: "Columns represent azimuth; column 0 is -x direction and center is +x direction modulo per-sensor heading."
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from Waymo range-image azimuth ordering before conversion."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+          per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+        per_ray_metadata: []
+        intensity: "Calibrated reflectance floats, typically small positive values."
+        motion_compensation: "Short-range LiDAR lacks TOP per-pixel pose tensor."
+      - id: REAR
+        raw_stream: "Frame.lasers[name=REAR]"
+        model: null
+        type: mechanical_spinning
+        range: short
+        raw_format: "Range images in Laser messages."
+        model_source: "LaserCalibration.beam_inclinations when populated; otherwise beam_inclination_min and beam_inclination_max."
+        beam_structure:
+          rows: null
+          columns: null
+          row_elevations: "Row 0 corresponds to maximum inclination."
+          column_azimuths: "Columns represent azimuth; column 0 is -x direction and center is +x direction modulo per-sensor heading."
+          row_azimuth_offsets: null
+        spinning:
+          direction: "UNRESOLVED: Derive spinning direction from Waymo range-image azimuth ordering before conversion."
+          frequency_hz: null
+        timing:
+          frame_timestamp_meaning: "Frame.timestamp_micros is timestamp of first TOP LiDAR scan within frame."
+          per_ray_timestamps: "Explicit per-point LiDAR timestamps are not provided."
+        per_ray_metadata: []
+        intensity: "Calibrated reflectance floats, typically small positive values."
+        motion_compensation: "Short-range LiDAR lacks TOP per-pixel pose tensor."
+
+    cuboids:
+      summary: "3D cuboids are Frame.laser_labels."
+      exists: true
+      raw_stream: Frame.laser_labels
+      centroid: geometric_center
+      dimensions:
+        length: length
+        width: width
+        height: height
+      yaw: "Angle required to rotate +x to the front-face surface normal, normalized to [-pi, pi)."
+      reference_frame: Frame.pose
+      timestamp_meaning: "Laser label timestamp follows the containing Frame."
+      track_id_source: "Frame.laser_labels.id"
+      class_vocabulary: [vehicle, pedestrian, sign, cyclist]
+      label_source: laser_labels
+      coverage: "Frame.no_label_zones are global-frame polygons where objects may be unannotated."
+
+    known_gaps:
+      - "Frame.timestamp_micros, Frame.pose, image pose timestamps, and the TOP per-pixel pose tensor live at different temporal references and must be cross-checked against each other."
+      - "Short-range LiDARs lack the TOP per-pixel pose tensor."
+      - "Ego masks are not described by the public Waymo segment facts in this example."
+
+  docs:
+    - https://waymo.com/open/data/perception/
+
+ncore:
+  camera_ids: [FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT]
+  lidar_ids: [TOP]
+  seek_sec: null
+  duration_sec: null
+  converter_dir: null
+  output_dir: null
+
+nurec:
+  camera_ids: [FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT]
+  lidar_ids: [TOP]
+  output_dir: null

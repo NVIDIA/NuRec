@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: ppisp-post-processing
+
+# Controller settings
+use_controller: false
+controller_distillation: true
+controller_distillation_steps: 0  # 0 = disabled; set to e.g. 5000 to extend training for controller distillation
+
+# Regularization weights (forwarded to the PPISP library's PPISPConfig)
+exposure_mean: 1.0
+vig_center: 0.02
+vig_channel: 0.1
+vig_non_pos: 0.01
+color_mean: 1.0
+crf_channel: 0.1
+
+# PPISP main params optimizer
+ppisp_lr: 0.002
+ppisp_eps: 1.e-15
+ppisp_betas: [0.9, 0.999]
+
+# Controller optimizer (fixed LR, no scheduler)
+controller_lr: 0.001
+controller_eps: 1.e-15
+controller_betas: [0.9, 0.999]
+
+# Scheduler settings for PPISP main params
+scheduler_type: linear_exp
+scheduler_base_lr: 0.002
+scheduler_warmup_steps: 500
+scheduler_start_factor: 0.01
+scheduler_decay_max_steps: 30000
+scheduler_final_factor: 0.01

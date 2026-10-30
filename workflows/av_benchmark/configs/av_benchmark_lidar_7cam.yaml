@@ -1,0 +1,1370 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The AV Benchmark training preset. Captured from a run of this workflow, then reduced to the
+# values that differ from the schema defaults, so what is written here is what the benchmark
+# chose rather than what NuRecConfig already says. The lidar models are in sensor/;
+# out_dir and dataset.path are declared missing because the spec supplies them every run.
+defaults:
+- sensor/hyperion8_1_lidar
+- _self_
+seed: 42
+mode: train
+resume: null
+resume_weights_only: false
+verbose: false
+out_dir: ???
+logger:
+  enabled: false
+  run_id: av_benchmark
+  name: dummy
+checkpoint:
+  every_n_train_steps: 30000
+  save_top_k: 1
+  monitor: train/psnr
+  mode: max
+  save_on_train_epoch_end: true
+  artifact:
+    enabled: true
+harmonizer:
+  training:
+    enabled: false
+  inference:
+    enabled: false
+prober:
+  batch_limit: 0
+scopedtimer:
+  profiling_backend: NVTX
+trainer:
+  device_count: 1
+  max_epochs: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  enable_progress_bar: true
+  num_sanity_val_steps: 0
+  plugins: []
+  precision: 32
+dataset:
+  n_samples_per_epoch: 500
+  n_train_sample_camera_rays: 6144
+  n_val_image_subsample: 2
+  n_train_sequential_image_subsample: 4
+  aux_data: true
+  name: ncore
+  samplers:
+    batch_sampler:
+      name: default
+      ratio_camera_samples: 1.0
+      ratio_lidar_samples: 1.0
+      update_n_epochs: 0
+      camera_sensor_sampler:
+        name: coverage
+        sample_all_sensors: false
+      camera_frame_sampler:
+        name: coverage
+      camera_pixel_sampler:
+        name: image-crop
+        crop_type: full_image
+        subsample: 2
+        roi_lt: null
+        roi_rb: null
+        crop_ratio: null
+      lidar_sensor_sampler:
+        name: coverage
+        sample_all_sensors: false
+      lidar_frame_sampler:
+        name: coverage
+      lidar_point_sampler:
+        name: lidar-crop
+        subsample: 1
+  path: ???
+  seek_offset_sec: null
+  duration_sec: null
+  camera_ids:
+  - camera_front_wide_120fov
+  - camera_front_tele_30fov
+  - camera_cross_right_120fov
+  - camera_cross_left_120fov
+  - camera_rear_left_70fov
+  - camera_rear_right_70fov
+  - camera_rear_tele_30fov
+  lidar_ids:
+  - lidar_top_360fov
+  train_camera_ids:
+  - camera_front_wide_120fov
+  - camera_front_tele_30fov
+  - camera_cross_right_120fov
+  - camera_cross_left_120fov
+  - camera_rear_left_70fov
+  - camera_rear_right_70fov
+  - camera_rear_tele_30fov
+  train_lidar_ids:
+  - lidar_top_360fov
+  val_camera_ids:
+  - camera_front_wide_120fov
+  - camera_front_tele_30fov
+  - camera_cross_right_120fov
+  - camera_cross_left_120fov
+  - camera_rear_left_70fov
+  - camera_rear_right_70fov
+  - camera_rear_tele_30fov
+  val_lidar_ids:
+  - lidar_top_360fov
+  max_dist_m: 150.0
+  val_lidar: true
+  val_sensor_transl_delta_m: null
+  val_sensor_rot_delta_deg: null
+  val_camera_frame_step: 3
+  val_lidar_frame_step: 3
+  open_consolidated: true
+  cuboid_tracks_params:
+    track_min_distance_m: 1.0
+    track_min_displacement_m: 1.0
+    track_min_speed_ms: 0.1
+    track_label_sources:
+    - AUTOLABEL
+  valid_measurements_method: EGO
+  valid_lidarpoints_cuboid_track_params:
+    track_padding_m:
+    - 0.5
+    - 0.5
+    - 0.25
+  valid_pixels_cuboid_track_params:
+    track_padding_m:
+    - 1.0
+    - 1.0
+    - 0.25
+    frame_track_idxs: false
+  valid_pixels_scene_flow_params:
+    flow_min_speed_ms: 1.4
+    flow_dilate_radius: 20
+    flow_downsample_scale: 2
+  valid_pixels_traffic_light_params: {}
+  valid_pixels_frame_mask_params: {}
+  lidar_dynamic_points: {}
+  camera_point_cloud_ignore_classes:
+  - egocar
+  - sky
+  camera_point_cloud_dynamic_classes:
+  - person
+  - rider
+  - car
+  - truck
+  - bus
+  - train
+  - motorcycle
+  - bicycle
+  generate_static_rigid_cuboid_tracks:
+    visibility_check_camera_ids:
+    - camera_front_wide_120fov
+    rigid_classes:
+    - traffic light
+    - traffic sign
+  val_camera_frame_start: 0
+  val_lidar_frame_start: 0
+datamodule:
+  update_n_epochs: 0
+  train_num_workers: 24
+  train_batch_size: 1
+  val_num_workers: 8
+  test_num_workers: 8
+  mock_dataloader: false
+  name: so
+  prefetch:
+    enabled: false
+    queue_size: 2
+model:
+  name: gaussians-composite
+  train_num_rays: 9999999999
+  layers:
+    background:
+      name: sh-gaussians
+      initialization:
+        name: lidar-rig-trajectory
+        local_debug_dir: null
+        scale_multiplier: 0.2
+        num_point_cloud_points: 850000
+        num_near_points: 100000
+        num_far_points: 100000
+        far_radius_factor: 20
+        observation_scale_factor: 0.01
+        default_density: 0.5
+        default_scale: 0.1
+        lidar_ids: null
+        camera_ids: null
+        step_frame: 1
+        non_dynamic_points_only: true
+      ignore_classes_from_layers:
+      - road
+      density_activation: sigmoid
+      scale_activation: exp
+      rotation_activation: normalize
+      progressive_training:
+        init_n_features: 0
+        max_n_features: 3
+        increase_frequency: 1000
+        increase_step: 1
+      particle:
+        density_kernel_planar: false
+        density_kernel_degree: 2
+        density_kernel_min_response: 0.0113
+        ray_spread_filter_enabled: false
+        radiance_sph_degree: 3
+        radiance_sph_O0: true
+        extra_signal_dim: 0
+        camera_extra_signal_dim: 20
+        lidar_extra_signal_dim: 3
+        lidar_extra_signal_sph_degree: 0
+      fourier_features_dim: 5
+      time_embed:
+        name: holistic-remap-time-input-embedding
+        remap_min: 0
+        remap_max: 1
+      precision: 32
+      transmittance_threshold: 0.0001
+      scale_pos_lr_by_scene_extent: true
+      optimizers:
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          positions:
+            args:
+              lr: 5.06e-05
+        scheduler:
+          name: ExponentialLR
+          interval: step
+          args:
+            gamma: 0.9998465061085267
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          densities:
+            args:
+              lr: 0.05
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          scales:
+            args:
+              lr: 0.005
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          features_albedo:
+            args:
+              lr: 0.00025
+          features_specular:
+            args:
+              lr: 0.000125
+          rotations:
+            args:
+              lr: 0.001
+          extra_signal:
+            args:
+              lr: 0.01
+          camera_extra_signal:
+            args:
+              lr: 0.01
+          lidar_extra_signal:
+            args:
+              lr: 0.01
+      extra_signal:
+        semantic_logits:
+          n_signal_dim: 20
+          sensor_type: camera
+          activation: none
+        intensity:
+          n_signal_dim: 1
+          sensor_type: lidar
+          activation: none
+        raydrop:
+          n_signal_dim: 2
+          sensor_type: lidar
+          activation: softmax-channel-0
+      tracks:
+        is_standalone: true
+    road:
+      name: sh-gaussians
+      initialization:
+        name: lidar-rig-trajectory-road
+        local_debug_dir: null
+        scale_multiplier: 0.2
+        num_point_cloud_points: 400000
+        num_random_points: 100000
+        far_radius_factor: 20
+        observation_scale_factor: 0.01
+        default_density: 0.5
+        default_scale:
+        - 0.1
+        - 0.1
+        - 0.001
+        lidar_ids: null
+        camera_ids: null
+        step_frame: 1
+        project_to_z_offset: true
+        z_offset: 0
+        projection: orthographic
+        non_dynamic_points_only: true
+        init_with_normals: false
+      class_labels:
+      - road
+      density_activation: sigmoid
+      scale_activation: exp
+      rotation_activation: normalize
+      progressive_training:
+        init_n_features: 0
+        max_n_features: 3
+        increase_frequency: 1000
+        increase_step: 1
+      particle:
+        density_kernel_planar: false
+        density_kernel_degree: 2
+        density_kernel_min_response: 0.0113
+        ray_spread_filter_enabled: false
+        radiance_sph_degree: 3
+        radiance_sph_O0: true
+        extra_signal_dim: 0
+        camera_extra_signal_dim: 20
+        lidar_extra_signal_dim: 3
+        lidar_extra_signal_sph_degree: 0
+      fourier_features_dim: 1
+      time_embed:
+        name: holistic-remap-time-input-embedding
+        remap_min: 0
+        remap_max: 1
+      precision: 32
+      transmittance_threshold: 0.0001
+      optimizer:
+        params:
+          scales:
+            args:
+              lr: 0.001
+      optimizers:
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          positions:
+            args:
+              lr: 1.0e-06
+        scheduler:
+          name: ExponentialLR
+          interval: step
+          args:
+            gamma: 0.9998465061085267
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          densities:
+            args:
+              lr: 0.0001
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          scales:
+            args:
+              lr: 0.0001
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          features_albedo:
+            args:
+              lr: 0.0025
+          features_specular:
+            args:
+              lr: 0.000125
+          rotations:
+            args:
+              lr: 0.0001
+          extra_signal:
+            args:
+              lr: 0.01
+          camera_extra_signal:
+            args:
+              lr: 0.01
+          lidar_extra_signal:
+            args:
+              lr: 0.01
+      extra_signal:
+        semantic_logits:
+          n_signal_dim: 20
+          sensor_type: camera
+          activation: none
+        intensity:
+          n_signal_dim: 1
+          sensor_type: lidar
+          activation: none
+        raydrop:
+          n_signal_dim: 2
+          sensor_type: lidar
+          activation: softmax-channel-0
+      tracks:
+        is_standalone: true
+    dynamic_rigids:
+      name: rigid-gaussians
+      initialization:
+        name: lidar-dynamic-tracks
+        local_debug_dir: null
+        scale_multiplier: 0.2
+        num_point_cloud_points_per_track: 5000
+        num_point_cloud_points_in_layer: 300000
+        default_density: 0.5
+        keep_all_track_poses: false
+        default_scale: 0.1
+        symmetric_axis: Y
+      density_activation: sigmoid
+      scale_activation: exp
+      rotation_activation: normalize
+      progressive_training:
+        init_n_features: 0
+        max_n_features: 3
+        increase_frequency: 1000
+        increase_step: 1
+      particle:
+        density_kernel_planar: false
+        density_kernel_degree: 2
+        density_kernel_min_response: 0.0113
+        ray_spread_filter_enabled: false
+        radiance_sph_degree: 3
+        radiance_sph_O0: true
+        extra_signal_dim: 0
+        camera_extra_signal_dim: 20
+        lidar_extra_signal_dim: 3
+        lidar_extra_signal_sph_degree: 0
+      fourier_features_dim: 20
+      time_embed:
+        name: individual-remap-time-input-embedding
+        remap_min: 0
+        remap_max: 1
+      fourier_freeze_until_step: 10000
+      precision: 32
+      transmittance_threshold: 0.0001
+      scale_pos_lr_by_scene_extent: true
+      optimizers:
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          positions:
+            args:
+              lr: 4.0e-05
+        scheduler:
+          name: ExponentialLR
+          interval: step
+          args:
+            gamma: 0.9998465061085267
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          densities:
+            args:
+              lr: 0.05
+          features_albedo:
+            args:
+              lr: 0.0025
+          features_specular:
+            args:
+              lr: 0.000125
+          rotations:
+            args:
+              lr: 0.001
+          scales:
+            args:
+              lr: 0.005
+          extra_signal:
+            args:
+              lr: 0.01
+          camera_extra_signal:
+            args:
+              lr: 0.01
+          lidar_extra_signal:
+            args:
+              lr: 0.01
+      extra_signal:
+        semantic_logits:
+          n_signal_dim: 20
+          sensor_type: camera
+          activation: none
+        intensity:
+          n_signal_dim: 1
+          sensor_type: lidar
+          activation: none
+        raydrop:
+          n_signal_dim: 2
+          sensor_type: lidar
+          activation: softmax-channel-0
+      tracks:
+        is_standalone: false
+        label_classes:
+        - automobile
+        - bus
+        - Bus
+        - Car
+        - Emergency Vehicle
+        - heavy_truck
+        - Medium-sized Truck
+        - Other Vehicle - Construction Vehicle
+        - Other Vehicle - Pedicab
+        - Other Vehicle - Uncommon
+        - other_vehicle
+        - Pickup Truck
+        - protruding_object
+        - Rolling Containers
+        - Semi-truck
+        - Towed Object
+        - trailer
+        - Train
+        - train_or_tram_car
+        - Tram / Subway
+        - Trolley
+        - trolley_bus
+        - vehicle
+        is_dynamic: true
+      optimize_track_albedo: false
+      optimize_track_scale: false
+      track_albedo:
+        start_global_step: 500
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 1.0e-05
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+      track_scale:
+        start_global_step: 500
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 1.0e-05
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+      tracks_calib:
+        visualize: false
+        name: direct-tracks-calib
+        delta_frame: local
+        start_global_step: 500
+        log_to_prog_bar: false
+        fix_first_pose: true
+        fix_last_pose: true
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 0.0001
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+    dynamic_deformables:
+      name: deformable-gaussians
+      initialization:
+        name: lidar-dynamic-tracks
+        local_debug_dir: null
+        scale_multiplier: 0.2
+        num_point_cloud_points_per_track: 5000
+        num_point_cloud_points_in_layer: 300000
+        default_density: 0.5
+        keep_all_track_poses: false
+        default_scale: 0.1
+        symmetric_axis: null
+      density_activation: sigmoid
+      scale_activation: exp
+      rotation_activation: normalize
+      progressive_training:
+        init_n_features: 0
+        max_n_features: 3
+        increase_frequency: 1000
+        increase_step: 1
+      particle:
+        density_kernel_planar: false
+        density_kernel_degree: 2
+        density_kernel_min_response: 0.0113
+        ray_spread_filter_enabled: false
+        radiance_sph_degree: 3
+        radiance_sph_O0: true
+        extra_signal_dim: 0
+        camera_extra_signal_dim: 20
+        lidar_extra_signal_dim: 3
+        lidar_extra_signal_sph_degree: 0
+      fourier_features_dim: 1
+      time_embed:
+        name: individual-remap-time-input-embedding
+        remap_min: 0
+        remap_max: 1
+      precision: 32
+      transmittance_threshold: 0.0001
+      scale_pos_lr_by_scene_extent: true
+      optimizers:
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          positions:
+            args:
+              lr: 0.00016
+        scheduler:
+          name: ExponentialLR
+          interval: step
+          args:
+            gamma: 0.9998465061085267
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          densities:
+            args:
+              lr: 0.05
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          scales:
+            args:
+              lr: 0.005
+      - name: fused_adam
+        args:
+          lr: 0.01
+          eps: 1.0e-15
+          betas:
+          - 0.9
+          - 0.99
+        params:
+          features_albedo:
+            args:
+              lr: 0.0025
+          features_specular:
+            args:
+              lr: 0.000125
+          rotations:
+            args:
+              lr: 0.001
+          extra_signal:
+            args:
+              lr: 0.01
+          camera_extra_signal:
+            args:
+              lr: 0.01
+          lidar_extra_signal:
+            args:
+              lr: 0.01
+      extra_signal:
+        semantic_logits:
+          n_signal_dim: 20
+          sensor_type: camera
+          activation: none
+        intensity:
+          n_signal_dim: 1
+          sensor_type: lidar
+          activation: none
+        raydrop:
+          n_signal_dim: 2
+          sensor_type: lidar
+          activation: softmax-channel-0
+      tracks:
+        is_standalone: false
+        label_classes:
+        - animal
+        - Animals - Bird
+        - Animals - Other Animals
+        - bicycle
+        - Bicycle
+        - bicycle_with_rider
+        - cycle
+        - cyclist
+        - CYCLIST
+        - motorcycle
+        - Motorcycle
+        - motorcycle_with_rider
+        - Motorized Scooter
+        - Pedestrian with Object
+        - pedestrian
+        - Pedestrian
+        - person
+        - person_group
+        - Personal mobility device
+        - rider
+        - stroller
+        is_dynamic: true
+      optimize_track_albedo: false
+      optimize_track_scale: false
+      track_albedo:
+        start_global_step: 500
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 1.0e-05
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+      track_scale:
+        start_global_step: 500
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 1.0e-05
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+      tracks_calib:
+        visualize: false
+        name: direct-tracks-calib
+        delta_frame: local
+        start_global_step: 500
+        log_to_prog_bar: false
+        fix_first_pose: true
+        fix_last_pose: true
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 1.0e-05
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: SequentialLR
+          interval: step
+          milestones:
+          - 500
+          - 500
+          schedulers:
+          - name: ConstantLR
+            args:
+              factor: 0.0
+              total_iters: 500
+          - name: LinearLR
+            interval: step
+            args:
+              start_factor: 0.01
+              end_factor: 1.0
+              total_iters: 0
+          - name: StepFunCosineAnnealingLR
+            interval: step
+            args:
+              T_max: 29500
+              min_factor: 0.0333
+              update_every_n_steps: 1000
+      deform_network:
+        feature_volume:
+          time_input_embedding:
+            name: individual-remap-time-input-embedding
+            remap_min: 0
+            remap_max: 1
+          instance_input_embedding:
+            name: weighted-instance-input-embedding
+            embedding_dim: 1
+            requires_grad: false
+            weight_init_config:
+              method: linspace
+              from_: 0.05
+              to_: 0.95
+          name: hash-grid-object
+          include_xyz: false
+          output:
+            signal_dim: 16
+            extra_signal_dim: 0
+          n_output_dims: 16
+          seed: 42
+          enable_jit_if_supported: false
+          double_backward_skip_input_grad: true
+          hash_grid_encoding_config:
+            otype: Permuto
+            n_features_per_level: 2
+            log2_hashmap_size: 19
+            base_resolution: 16
+            n_levels: 16
+            max_resolution: 4096
+            max_input_grad_dims: 3
+          encoding_interp_config:
+            interp_type: linear
+            lambda_: 2.0
+          encoding_prog_config:
+            n_initial_levels: 10
+            update_frequency: 500
+            n_levels_per_update: 1
+          encoding_lod_config: null
+          mlp_network_config:
+            otype: FullyFusedMLP
+            activation: ReLU
+            output_activation: none
+            n_neurons: 64
+            n_hidden_layers: 1
+        deform_rotations: true
+        rotations_from_identity: true
+        deform_scales: false
+        precision: 32
+        optimizer:
+          name: fused_adam
+          args:
+            lr: 0.001
+            eps: 1.0e-15
+            betas:
+            - 0.9
+            - 0.99
+        scheduler:
+          name: StepFunCosineAnnealingLR
+          interval: step
+          args:
+            T_max: 30000
+            min_factor: 0.0333
+            update_every_n_steps: 1000
+      deformnet_start_iteration: 1000
+      cuboid_tracks_expand: 0.05
+      smoothness_frame_steps: 5
+  calib:
+    name: free-pose-calib
+    lidar:
+      enabled: false
+    camera:
+      enabled: true
+    optimizer:
+      name: fused_adam
+      args:
+        lr: 0.0001
+        eps: 1.0e-15
+        betas:
+        - 0.9
+        - 0.99
+        weight_decay: 1.0e-06
+    scheduler:
+      name: SequentialLR
+      interval: step
+      schedulers:
+      - name: ConstantLR
+        args:
+          factor: 0.0
+          total_iters: 250
+      - name: LinearLR
+        interval: step
+        args:
+          start_factor: 0.01
+          end_factor: 1.0
+          total_iters: 0
+      - name: StepFunCosineAnnealingLR
+        interval: step
+        args:
+          T_max: 29750
+          min_factor: 0.0333
+          update_every_n_steps: 1000
+      milestones:
+      - 250
+      - 250
+  background:
+    name: sky-env-map
+    width: 512
+    height: 512
+    envmap_type: cubemap
+    should_inpaint: true
+    inpaint_threshold: 0.05
+    inpaint_kernel_size: 10
+    min_grad_updates: 1000
+    saturate_radiance: false
+  renderer:
+    name: 3dgut-gsplat
+    projection:
+      ut_require_all_sigma_points: true
+    culling:
+      near_clip_distance: 0.2
+      far_clip_distance_camera: 1000.0
+      far_clip_distance_lidar: 200.0
+      rect_bounding: true
+      tight_opacity_bounding: true
+      tile_based: true
+      enable_ray_based_culling: true
+    outputs:
+      camera:
+        enable_normals: false
+        enable_ray_gradients: true
+      lidar:
+        enable_features: false
+        enable_normals: false
+        enable_ray_gradients: true
+      scene:
+        enable_cumulated_weights: true
+        enable_visibility: true
+    render:
+      mode: kbuffer
+    use_rays: true
+    sh_features_dtype: fp16
+    renderer_config: parallel_batch
+  strategy:
+    name: mcmc
+    print_stats: true
+    exclude_layer_ids:
+    - road
+    relocate:
+      end_iteration: 35000
+      max_invisible_steps: 1000
+    perturb:
+      end_iteration: 30000
+    add:
+      start_iteration: 20000
+      end_iteration: 35000
+  post_processing:
+    b:
+      name: ppisp-post-processing
+system:
+  save_logger: true
+  warmup_steps: 0
+  test:
+    save_results: true
+    save_inputs: true
+    save_videos: true
+    video_fps: 10
+    track_ply:
+      overrides: {}
+      transform:
+      - - 1
+        - 0
+        - 0
+        - 0
+      - - 0
+        - 0
+        - -1
+        - 0
+      - - 0
+        - 1
+        - 0
+        - 0
+      - - 0
+        - 0
+        - 0
+        - 1
+    track_orbit:
+      track_ids: []
+      distance: 5
+      n_frames: 45
+      render_width: 512
+      render_height: 256
+      video_fps: 5
+    track_rotation:
+      track_ids: []
+      angle_per_frame: 0
+      angle_offsets: []
+    background_removal:
+      track_ids: []
+      track_shift_m:
+      - 0
+      - 0
+      - 0
+      track_padding_m:
+      - 0
+      - 0
+      - 0
+    val_render_selected_nodes:
+      road_only:
+      - road
+      background_only:
+      - background
+    metrics:
+      cpsnr:
+        enabled: true
+        classes: null
+      ssim:
+        enabled: false
+      lpips:
+        enabled: false
+    lidar:
+      raydrop_threshold: 0.5
+      ROI:
+        min_m: null
+        max_m: null
+  optimizers:
+  - name: fused_adam
+    args:
+      lr: 0.01
+      eps: 1.0e-15
+      betas:
+      - 0.9
+      - 0.99
+    params:
+      background:
+        args:
+          lr: 0.001
+    scheduler:
+      name: StepFunCosineAnnealingLR
+      interval: step
+      args:
+        T_max: 30000
+        min_factor: 0.0333
+        update_every_n_steps: 1000
+  record_timings:
+    train_interval: 1000
+    val_interval: 1000
+  record_quality_metrics:
+    psnr_interval: 100
+  name: gaussians-system
+loss:
+  rgb:
+    fn: l1
+    lambda_: 0.8
+    reduce:
+      name: mean
+  ssim:
+    fn: ssim
+    lambda_: 0.2
+    reduce:
+      name: mean
+    window_size: 11
+    channel: 3
+    mask:
+      mode: GT
+      value: 0.0
+  background:
+    fn: mse
+    lambda_: 0.05
+    reduce:
+      name: mean
+  background_lidar:
+    fn: mse
+    lambda_: 0.05
+    reduce:
+      name: mean
+  sky_env_map_background:
+    fn: total_variation_spatial
+    lambda_: 0.01
+    reduce:
+      name: mean
+  lidar:
+    fn: l1
+    lambda_: 0.005
+    reduce:
+      name: mean
+  bilateral_grid_per_frame_spatial_tv:
+    fn: total_variation_spatial
+    lambda_: 0.001
+    reduce:
+      name: mean
+  bilateral_grid_per_frame_temporal_tv:
+    fn: total_variation_temporal
+    lambda_: 1.0
+    reduce:
+      name: mean
+  bilateral_grid_per_camera_tv:
+    fn: total_variation_spatial
+    lambda_: 0.001
+    reduce:
+      name: mean
+  bilateral_grid_drift:
+    fn: identity_distance
+    lambda_: 0.001
+    reduce:
+      name: mean
+  ppisp:
+    fn: ppisp_loss
+    lambda_: 1.0
+    reduce:
+      name: mean
+    lambdas:
+      exposure_mean: 0.001
+      exposure_smooth: 1.0
+      vig_center: 0.02
+      vig_channel: 0.01
+      vig_non_pos: 0.01
+      color_mean: 0.01
+      color_smooth: 1.0
+      crf_range: 0.01
+      crf_gamma: 0.001
+      crf_channel: 0.01
+  deform_smoothness:
+    fn: abs
+    lambda_: 0.01
+    reduce:
+      name: mean
+  unicycle_pose:
+    fn: abs
+    lambda_: 0.01
+    reduce:
+      name: mean
+    lambdas:
+      consistency: 0.5
+      smoothness: 0.01
+      pose: 0.1
+  out_of_bound:
+    fn: l1
+    lambda_: 1.0
+    reduce:
+      name: mean
+  background_in_track_gaussian:
+    fn: bce_with_logits
+    lambda_: 0.1
+    reduce:
+      name: mean
+    layer_names:
+    - background
+    layer_labels_to_use: {}
+  semantic:
+    fn: cross_entropy
+    lambda_: 0.001
+    reduce:
+      name: mean
+    start_step: 1000
+  intensity:
+    fn: mse
+    lambda_: 1.0
+    reduce:
+      name: mean
+  raydrop:
+    fn: mse
+    lambda_: 0.1
+    reduce:
+      name: mean
+  normal:
+    fn: l1
+    lambda_: 0.0
+    reduce:
+      name: mean
+  gaussian_flatten:
+    fn: abs
+    lambda_: 0.0
+    reduce:
+      name: mean
+    max_to_median_ratio_threshold: 1.0
+    axes_type: fixed
+    allow_missing_supervision: false
+  road_gaussians:
+    fn: abs
+    lambda_: 1.0
+    reduce:
+      name: mean
+    layer_name: road
+    n_samples: 10
+    grid_len: 0.2
+    min: 2.0
+    range: 4.0
+    rotation_lambda: 10.0
+  node_semantic_gaussians:
+    fn: bce_with_logits
+    lambda_: 1.0
+    reduce:
+      name: mean
+    start_step: 1000
+    layer_labels_to_use:
+      road:
+      - road
+    layer_labels_to_exclude:
+      background:
+      - road
+  gaussian_z_scale:
+    fn: abs
+    lambda_: 1.0
+    reduce:
+      name: mean
+    layer_name: road
+    road_z_scale: 0.001
+  gaussian_scale:
+    fn: abs
+    lambda_: 0.005
+    reduce:
+      name: mean
+    visibility_filter: true
+    layer_lambdas:
+      road: 0.01
+  gaussian_density:
+    fn: abs
+    lambda_: 0.005
+    reduce:
+      name: mean
+    visibility_filter: true
+    layer_lambdas:
+      road: 1.0
+version:
+  version_major: 26
+  version_minor: 10
+  version_patch: 55
+  git_commit_sha_short: 2a2eb468
+  git_commit_date: '2026-09-17T10:05:16-07:00'
+  version_string: 26.10.55-2a2eb468
+save_dir: <sentinel>
+ckpt_dir: <sentinel>
+config_dir: <sentinel>
+run_id: av_benchmark
+train_config_name: <sentinel>
+matmul_precision: medium
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
+  run:
+    dir: .

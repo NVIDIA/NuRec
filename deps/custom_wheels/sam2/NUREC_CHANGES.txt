@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+sam2 1.1.0+pt2.11.0cu128sm80to120ptx100 - statement of changes
+
+This wheel is built from the sam2 1.1.0 sdist (https://pypi.org/project/sam2/1.1.0/, Apache
+License 2.0). The file below was modified by NVIDIA CORPORATION & AFFILIATES, 2026.
+
+Changes applied by the NuRec build:
+- setup.py: NAME changed from "SAM-2" to "sam2", and VERSION set to the local version above.

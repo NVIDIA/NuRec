@@ -1,0 +1,33 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# order in which configs override each other (/* - denotes a relative search path)
+defaults:
+  - /apps/AV/NV/3dgut_dynamic.yaml
+  - _alpasim_mixin
+
+# overwrite some of the default parameters
+loss: 
+  lidar:
+    lambda_: 0.03
+
+checkpoint:
+  every_n_train_steps: ${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}
+
+# This below section is changed to the original 3dgut config to gain some performance
+# Note: this sacrifices some quality.
+
+dataset:
+  # note: was 2048 before, reduced in order to gain some performance
+  n_train_sample_lidar_rays: 1024
+  n_samples_per_epoch: 25000
+
+model:
+  layers:
+    background:
+      initialization:
+        num_point_cloud_points: 800000
+    dynamic_rigids:
+      initialization:
+        num_point_cloud_points: 3500

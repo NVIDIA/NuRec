@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+blank_issues_enabled: false
+
+# Usage questions go to the forum. Source questions use question.md.
+# Security reporting follows the existing SECURITY.md policy.
+contact_links:
+  - name: 💬 Submit a question (usage, how-to)
+    url: https://forums.developer.nvidia.com/c/omniverse/platform/nurec/752
+    about: >
+      For usage questions and discussion, please post on the NVIDIA Developer Forum (Omniverse / NuRec category).
+  - name: Report a security vulnerability
+    url: https://github.com/NVIDIA/NuRec/security/policy
+    about: >
+      Follow our security policy. Do not report vulnerabilities in public issues.

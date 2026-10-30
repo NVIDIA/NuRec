@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_pkg//:mappings.bzl", "pkg_filegroup", "pkg_files", "strip_prefix")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+# Proto files in their proper directory
+pkg_files(
+    name = "proto_files_positioned",
+    srcs = ["//nurec/grpc/protos:proto_files"],
+    prefix = "nurec/grpc/protos",
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+# Script file in its proper directory
+pkg_files(
+    name = "script_positioned",
+    srcs = ["//nurec/grpc:update_generated.py"],
+    prefix = "nurec/grpc",
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+# Root level files
+pkg_files(
+    name = "root_files",
+    srcs = [
+        "README.md",
+        "requirements.txt",
+    ],
+    prefix = "nurec",
+)
+
+# Combine all file groups
+pkg_filegroup(
+    name = "all_distribution_files",
+    srcs = [
+        ":proto_files_positioned",
+        ":root_files",
+        ":script_positioned",
+    ],
+)
+
+# Customer distribution tarball
+pkg_tar(
+    name = "customer_distribution_tarball",
+    srcs = [":all_distribution_files"],
+    visibility = ["//visibility:public"],
+)

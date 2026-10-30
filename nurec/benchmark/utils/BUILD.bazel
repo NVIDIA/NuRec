@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "bbox_projector.py",
+        "detailed_metrics_writer.py",
+        "object_data_loader.py",
+        "object_level_iq_metric_visualization.py",
+        "occlusion_utils.py",
+        "shard_data_manager.py",
+    ],
+    visibility = DEFAULT_VISIBILITY + [
+        "//nurec/benchmark:__pkg__",
+    ],
+    deps = [
+        "//nurec/metrics/impl:pylib",
+        "//nurec/metrics/impl/utils:pylib",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils:pylib_ncore_utils",
+        "//nurec/utils:pylib_types",
+        pip_requirement("matplotlib"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("numpy"),
+        pip_requirement("opencv-python"),
+        pip_requirement("pyyaml"),
+        pip_requirement("scipy"),
+        pip_requirement("torch"),
+        pip_requirement("tqdm"),
+        pip_requirement("universal-pathlib"),
+    ],
+)
+
+pytest_test(
+    name = "bbox_projector_test",
+    size = "small",
+    srcs = [
+        "bbox_projector_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "object_data_loader_test",
+    size = "small",
+    srcs = [
+        "object_data_loader_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "shard_data_manager_test",
+    size = "small",
+    srcs = [
+        "shard_data_manager_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)
+
+pytest_test(
+    name = "occlusion_utils_test",
+    size = "small",
+    srcs = [
+        "occlusion_utils_test.py",
+    ],
+    deps = [
+        ":pylib",
+    ],
+)

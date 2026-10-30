@@ -1,0 +1,83 @@
+Decode PAI camera video in presentation order. PyNvVideoCodec SimpleDecoder[i] returns frames out of
+place on HEVC streams with B-frames (versions 2.0.4, 2.2.0-2.2.3). Drop once ncore or PyNvVideoCodec carries the fix.
+
+--- a/tools/data_converter/pai/converter.py	2026-10-07 11:30:15.956309487 +0000
++++ b/tools/data_converter/pai/converter.py	2026-10-07 11:30:15.960309487 +0000
+@@ -32,13 +32,14 @@
+ 
+ from __future__ import annotations
+ 
++import itertools
+ import json
+ import logging
+ import tempfile
+ 
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Callable, Dict, Literal, cast
++from typing import Callable, Dict, Iterator, Literal, cast
+ 
+ import click
+ import DracoPy  # ty:ignore[unresolved-import]
+@@ -99,6 +100,24 @@
+ CONVERTER_VERSION = "1.0.0"
+ 
+ 
++def _decode_rgb_frames(video_path: Path) -> Iterator[np.ndarray]:
++    """Yield the video's frames as HWC uint8 RGB arrays, in presentation order.
++
++    Demuxes and decodes packet by packet: SimpleDecoder's frame indexing returns frames out of place on HEVC
++    streams with B-frames.
++    """
++    demuxer = nvc.CreateDemuxer(str(video_path))
++    decoder = nvc.CreateDecoder(
++        gpuid=0,  # the container sees its one GPU as 0
++        codec=demuxer.GetNvCodecId(),
++        usedevicememory=False,
++        outputColorType=nvc.OutputColorType.RGB,  # ty: ignore[unresolved-attribute]
++    )
++    for packet in itertools.chain(demuxer, [nvc.PacketData()]):  # the empty packet flushes the decoder
++        for frame in decoder.Decode(packet):
++            yield np.array(np.from_dlpack(frame))  # copy: the decoder reuses its output surfaces
++
++
+ @dataclass(kw_only=True, slots=True)
+ class PaiLocalConverterConfig(FileBasedDataConverterConfig):
+     """Configuration for local PAI conversion (``pai-v4``).
+@@ -775,22 +794,18 @@
+             video_path = self.provider.get_video_path(camera_id)
+             self.logger.info(f"Extracting {len(timestamps_df)} frames from {video_path.name}")
+ 
+-            # Decode video using PyNvVideoCodec (MIT license, GPU-accelerated H.264 decode).
+-            # use_device_memory=False: frames are returned in host (CPU) memory as numpy-compatible
+-            # objects, since the downstream pipeline (JPEG encoding via pillow) is CPU-based.
+-            # output_color_type=RGB: interleaved uint8 HWC format matching the expected numpy array layout.
+-            decoder = nvc.SimpleDecoder(
+-                str(video_path),
+-                use_device_memory=False,
+-                output_color_type=nvc.OutputColorType.RGB,  # ty: ignore[unresolved-attribute]
+-            )
++            # Decode sequentially in presentation order with PyNvVideoCodec (MIT license, GPU-accelerated),
++            # into host-memory RGB frames for the CPU JPEG encoding below.
++            frames = _decode_rgb_frames(video_path)
+ 
+             for frame_idx in tqdm.tqdm(range(len(timestamps_df)), desc=f"Camera {camera_id}"):
+                 # Keep timestamp as int because as these might be negative
+                 frame_end_timestamp_us = int(timestamps_df.iloc[frame_idx]["timestamp"])
+ 
+                 # Read the image / forward the reader
+-                image = np.from_dlpack(decoder[frame_idx])
++                image = next(frames, None)
++                if image is None:
++                    raise ValueError(f"{video_path.name}: {frame_idx} frames decoded, {len(timestamps_df)} timestamps")
+ 
+                 # Compute start of frame from rolling shutter delay
+                 frame_start_timestamp_us = frame_end_timestamp_us - shutter_delay_us
+@@ -817,6 +832,7 @@
+                     generic_data={},
+                     generic_meta_data=generic_meta_data,
+                 )
++            frames.close()  # frees the decoder session before the next camera
+ 
+ 
+ # ---------------------------------------------------------------------------

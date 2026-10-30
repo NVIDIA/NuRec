@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - 3dgut_gsplat
+
+# GSplat renderer config for artifacts that will also be rendered with 3DGRT.
+# Mirrors the culling profile of 3dgut4rt_nrend for training compatibility
+# with the external RTX NRend renderer. Factory name stays 3dgut-gsplat.
+
+projection:
+  # Don't reject a Gaussian because part of its UT envelope is outside the image.
+  ut_require_all_sigma_points: false
+
+culling:
+  # Disable mean-position near rejection — 3DGRT clips rays, not Gaussian centers.
+  near_clip_distance: 0.0
+  # Disable opacity-threshold shrinking and tile-based culling — these do not
+  # match the primitive envelope that 3DGRT traces.
+  tight_opacity_bounding: false
+  tile_based: false
+
+outputs:
+  scene:
+    enable_visibility: true
+    enable_cumulated_weights: true

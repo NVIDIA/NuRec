@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Weight intensity by 1 and raydrop by 1e-1.
+
+loss:
+  intensity:
+    lambda_: 1.0
+  raydrop:
+    lambda_: 0.1

@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+nurec:
+  dev_deps_image: null # Defaults to the selected checkout's build-image pin.
+  source_dir: null # Defaults to the enclosing checkout.
+
+execution:
+  max_inner_iterations: 10 # Validate-and-fix retry cap.
+  max_outer_iterations: 5 # NCore-data fix retry cap after NuRec diagnostics.
+  max_config_iterations: 5 # NuRec config-fix retry cap.

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: audit-dataset
+description: Audit a raw sensor dataset and generate a NuRec Onboard input YAML. Use standalone before the workflow to profile data quality, without converting or reconstructing.
+requires_docker: true
+requires_gpu: false
+requires_bazel: true
+agents:
+  - claude
+  - codex
+prompt: |
+  Read the skill file at {{skill}} and follow its instructions completely.
+  This is a dataset audit and input-YAML generation step. Do not scaffold
+  a converter, do not run conversion, and do not launch NuRec. Produce the
+  generated input YAML, data-quality report, and audit profile only.
+
+  Input:
+  {{input}}

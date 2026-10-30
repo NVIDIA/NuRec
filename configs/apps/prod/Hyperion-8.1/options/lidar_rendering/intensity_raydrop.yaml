@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Render learned intensity and raydrop attributes for every Gaussian layer.
+
+defaults:
+  - /model/gaussians/extra_signal@model.layers.background.extra_signal: [intensity, raydrop]
+  - /model/gaussians/extra_signal@model.layers.road.extra_signal: [intensity, raydrop]
+  - /model/gaussians/extra_signal@model.layers.dynamic_deformables.extra_signal: [intensity, raydrop]
+  - /model/gaussians/extra_signal@model.layers.dynamic_rigids.extra_signal: [intensity, raydrop]

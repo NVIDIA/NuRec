@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# NVIDIA NuRec gRPC Protos - Python Requirements
+# 
+# Install these dependencies to generate Python code from proto files:
+# python -m pip install -r nurec/requirements.txt
+#
+# Then run the generation script:
+# python nurec/grpc/update_generated.py
+
+grpcio>=1.78.0
+grpcio-tools>=1.50.0
+protobuf>=4.21.0

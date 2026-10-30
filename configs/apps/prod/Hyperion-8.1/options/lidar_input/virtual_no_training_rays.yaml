@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Use the virtual lidar stream without sampling lidar rays during training.
+
+dataset:
+  interp_with_rig: false
+  lidar_ids:
+    - lidar_virtual
+  n_train_sample_lidar_rays: 0

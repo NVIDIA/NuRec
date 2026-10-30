@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: build-ncore-converter
+description: Scaffold and implement an NCore V4 converter, or fix a diagnosed issue. Use when onboarding a dataset to NCore V4 or when validate-ncore-data returns a converter-side diagnosis.
+requires_docker: true
+requires_gpu: false
+requires_bazel: true
+agents:
+  - claude
+  - codex
+prompt: |
+  Read the skill file at {{skill}} and follow its instructions completely.
+  Do not ask the user for input -- infer everything autonomously from the
+  data directory and description provided below.
+
+  Input:
+  {{input}}

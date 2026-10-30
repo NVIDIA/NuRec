@@ -1,0 +1,44 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Drop predicted lidar returns whose raydrop probability exceeds 6.5e-1.
+#
+# WHY NOT 0.8: the raydrop head's composited output is NOT a calibrated
+# probability. Extra signals are alpha-PREMULTIPLIED and composited over a ZERO
+# background, then squashed by softmax-channel-0. A ray that hits nothing
+# composites logits (0, 0) -> softmax -> EXACTLY 0.5, and a ray with partial
+# coverage is pulled toward 0.5 in proportion to its alpha. Dropped rays are
+# largely the low-alpha population, so a 0.8 cut is close to unreachable for
+# them: it saturates precision and collapses recall.
+#
+# WHY NOT LOWER: aggregate metrics do NOT capture the binding constraint.
+# ROAD SURFACE is only ~13% of returns, so global chamfer can improve while the
+# road gets worse. Road-MASKED evaluation (RayFlags.ROAD_SEMANTIC) over 15
+# benchmark clips at 30k steps, structured path -- fraction of TRUE road returns
+# wrongly dropped, and road-only chamfer vs the 0.8 baseline:
+#
+#   thr    road dropped (mean / WORST clip)   road-only chamfer (mean / WORST)
+#   0.80        0.24% /  1.74%                     +0.0% /  +0.0%
+#   0.70        0.67% /  4.31%                     +1.8% / +10.1%
+#   0.65        1.39% /  7.44%                     +3.9% / +25.1%
+#   0.60        3.27% / 13.83%                     +7.4% / +39.2%
+#   0.55        8.63% / 28.50%                    +17.6% / +77.5%
+#   0.50       36.34% / 61.52%                    +77.7% /+178.5%
+#
+# 0.65 is chosen on the WORST-clip column (a default must be safe on the worst
+# clip, not the mean) while still delivering, globally: structured -3.5% chamfer
+# / +16.5% raydrop_IoU, and unstructured -16.6% chamfer / +18.4% raydrop_IoU.
+#
+# The constraint comes from the STRUCTURED path only. The model-free unstructured
+# path drops <=0.46% of road even in its worst clip at this threshold, because its
+# median predicted drop-probability on true road returns is ~0.21 versus ~0.50 for
+# structured -- structured road returns sit on top of the 0.5 no-hit pinning point.
+#
+# Customers are precision-sensitive (false positives can cause the ego vehicle to
+# brake unexpectedly; false negatives are rarely reported), so the conservative end
+# of the safe range is deliberate. 0.70 is the next stricter option if needed.
+system:
+  test:
+    lidar:
+      raydrop_threshold: 0.65

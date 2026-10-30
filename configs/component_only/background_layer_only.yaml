@@ -1,0 +1,31 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Component-only overlay: train ONLY the background Gaussian layer.
+#
+# A bare background entry is sugar for scope {residual: enabled}: the
+# background owns the complement region — everything no other component
+# claims. Disabled siblings' regions (their boxes / semantic classes)
+# and sky pixels are carved OUT of the residual: they are in nobody's
+# mask and receive no supervision.
+#
+# Requires per-pixel semantic labels (NCORE aux_data + semantic aux):
+# the residual must identify sky pixels and carve semantic siblings.
+#
+# Compose example:
+#
+#     defaults:
+#       - /apps/prod/Hyperion-8.1/car2sim
+#       - /component_only: background_layer_only
+
+component_only:
+  # ``enabled: true`` switches this run into opt-in mode: only the
+  # components listed below are trained; every other component (unlisted,
+  # or ``state: disabled``) is turned off. Enabling every component
+  # collapses back to the parent app config's full training.
+  enabled: true
+  layers:
+    background:
+      state: enabled

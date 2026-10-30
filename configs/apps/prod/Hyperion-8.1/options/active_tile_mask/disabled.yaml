@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Disable active tile masking. Exists so that a preset opting out of an inherited
+# selection says so in its defaults list, instead of relying on a silent schema default.
+
+model:
+  renderer:
+    active_tile_mask:
+      enabled: false

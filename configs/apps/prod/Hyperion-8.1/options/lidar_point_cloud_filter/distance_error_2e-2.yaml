@@ -1,0 +1,12 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Save points whose predicted distance error is below 2e-2 meters.
+
+system:
+  test:
+    lidar:
+      floating_point_filter:
+        enabled: true
+        threshold: 0.02

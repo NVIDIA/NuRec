@@ -1,0 +1,57 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Four-camera Car2Sim preset.
+
+defaults:
+  # Base recipe and production features.
+  - /apps/AV/_base_3dgut_dynamic_road_semantic.yaml
+  - /apps/prod/options/artifact: default
+  - /apps/prod/options/harmonizer/3dgut: disabled
+  - /apps/prod/options/mesh: disabled
+  - /apps/prod/options/ground: enabled
+
+  # Sensors, sampling, and calibration.
+  - /apps/prod/options/subsampling/3dgut: batch_sampler_4
+  - /apps/prod/Hyperion-8.1/options/sensors: hyperion8.1_4cam_1lidar
+  - /apps/prod/Hyperion-8.1/options/validation: default
+  - /apps/prod/options/calib: enabled
+  - /apps/prod/Hyperion-8.1/options/lidar_calibration: disabled
+  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "30000"
+  - /apps/prod/Hyperion-8.1/options/lidar_rays_per_train_sample: "2048"
+  - /apps/prod/Hyperion-8.1/options/cuboid_track_label_sources: autolabel
+  - /apps/prod/Hyperion-8.1/options/visible_track_split: pedestrians_5s
+
+  # Layer initialization and temporal appearance.
+  - /apps/prod/Hyperion-8.1/options/background_init: instant_nurec_ply
+  - /apps/prod/Hyperion-8.1/options/background_init_points: "800000"
+  - /apps/prod/Hyperion-8.1/options/road_init: lidar_ground_mesh
+  - /apps/prod/Hyperion-8.1/options/road_init_points: "400000"
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_init_points: "300000"
+  - /apps/prod/Hyperion-8.1/options/dynamic_deformables_init_points: "300000"
+  - /apps/prod/Hyperion-8.1/options/vehicle_light_layer: dynamic_15000
+  - /apps/prod/options/temporal_appearance@model.layers.dynamic_rigids: fourier_features_dim_20
+  - /apps/prod/options/temporal_appearance@model.layers.background: fourier_features_dim_5
+
+  # Training strategy and optimizers.
+  - /apps/AV/module_mixins/_mcmc_mixin.yaml
+  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "2000000"
+  - /apps/prod/Hyperion-8.1/options/gaussian_optimizer: selective_adam
+
+  # Losses and rendering.
+  - /apps/prod/Hyperion-8.1/options/renderer_culling: lidar_200m_camera_1000m
+  - /apps/prod/Hyperion-8.1/options/lidar_loss_weight: "3e-2"
+  - /apps/prod/Hyperion-8.1/options/background_in_track_loss: person_vehicle_bce_1e-1
+
+  # Checkpointing and runtime behavior.
+  - /apps/prod/Hyperion-8.1/options/checkpoint_interval: end_of_training
+  - /apps/prod/Hyperion-8.1/options/runtime_gc: usage_7e-1_every_10_steps
+
+  # Config-group overrides inherited from the base recipe.
+  - override /model/gaussians/strategy@model.strategy: mcmc
+  - override /model/post_processing@model.post_processing.b: ppisp
+  - override /model/post_processing@model.post_processing.c: null
+  - override /logger: dummy
+
+  - _self_

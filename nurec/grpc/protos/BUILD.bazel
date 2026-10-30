@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@mypy_integration//:rules.bzl", "mypy_stubs")
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+DEFAULT_VISIBILITY = [
+    "//:core_package_group",
+    "//bazel/docs:__pkg__",
+]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+filegroup(
+    name = "py_files",
+    srcs = glob(["**/*.py"]),
+)
+
+# Proto files for customer distribution
+filegroup(
+    name = "proto_files",
+    srcs = [
+        "common.proto",
+        "ipc.proto",
+        "sensorsim.proto",
+    ],
+    visibility = [
+        "//nurec/grpc:__pkg__",
+        "//nurec/grpc/release:__pkg__",
+    ],
+)
+
+py_library(
+    name = "grpc_pb2",
+    srcs = [
+        ":py_files",
+    ],
+    visibility = [
+        "//nurec/datasets/samplers:__pkg__",
+        "//nurec/grpc:__pkg__",
+        "//nurec/instant_nurec:__pkg__",
+        "//nurec/render/novel_trajectory:__pkg__",
+        "//nurec/utils/io/export:__pkg__",
+    ],
+    deps = [
+        pip_requirement("protobuf"),
+        pip_requirement("grpcio"),
+        ":grpc_pb2_stubs",
+    ],
+)
+
+filegroup(
+    name = "pyi_files",
+    srcs = glob(["**/*.pyi"]),
+)
+
+mypy_stubs(
+    name = "grpc_pb2_stubs",
+    srcs = [
+        ":pyi_files",
+    ],
+)
+
+pytest_test(
+    name = "ipc_proto_test",
+    srcs = ["ipc_proto_test.py"],
+    deps = [":grpc_pb2"],
+)

@@ -1,0 +1,9 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep the road layer out of MCMC add, relocation, and perturbation.
+
+model:
+  strategy:
+    exclude_layer_ids: ["road"]

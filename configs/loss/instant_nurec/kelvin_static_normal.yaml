@@ -1,0 +1,17 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kelvin static normal-loss component.
+# Use /instant_nurec/apps/options/_kelvin_static_normal for the complete model-and-loss setup.
+
+defaults:
+  - kelvin_static
+
+# Adding normal loss on top of base kelvin_static losses
+normal:
+  fn: normal_cosine
+  reduce:
+    name: mean
+  lambda_: 0.1
+  allow_missing_supervision: false

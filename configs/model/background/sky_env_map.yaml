@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: sky-env-map
+composite_in_linear_space: false
+width: 512
+height: 512
+should_inpaint: true
+inpaint_threshold: 5e-2
+inpaint_kernel_size: 10
+envmap_type: cubemap # choices [equirectangular, cubemap]
+saturate_radiance: false
+# Restrict envmap texture gradients to rays labeled SKY_SEMANTIC.
+filter_texture_updates_by_sky: false
+
+# Number of iterations before we start tracking gradients,
+# which we use for determining where we inpaint the environment map,
+# ideally after the geometry converges a bit
+min_grad_updates: 1000

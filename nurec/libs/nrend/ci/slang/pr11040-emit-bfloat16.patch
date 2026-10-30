@@ -1,0 +1,15 @@
+Emit torch::kBFloat16 for BFloat16 tensor element type (shader-slang/slang#11040).
+
+diff --git a/source/slang/slang-emit-torch.cpp b/source/slang/slang-emit-torch.cpp
+--- a/source/slang/slang-emit-torch.cpp
++++ b/source/slang/slang-emit-torch.cpp
+@@ -31,6 +31,9 @@ void emitTorchScalarTypeName(SourceWriter* m_writer, IRInst* type)
+     case kIROp_HalfType:
+         m_writer->emit("kFloat16");
+         break;
++    case kIROp_BFloat16Type:
++        m_writer->emit("kBFloat16");
++        break;
+     case kIROp_DoubleType:
+         m_writer->emit("kFloat64");
+         break;

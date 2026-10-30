@@ -1,0 +1,16 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Weight the lidar loss by 1.25e-3.
+#
+# This is the base 5e-3 scaled by 0.25 to compensate for the lidar crop under active tile
+# masking: once inactive-tile lidar rays are stamped INVALID, the 1/n_valid_lidar
+# normalization in losses_module.py divides by N_active instead of N_total, up-weighting
+# the lidar loss by 1/active_fraction. Selected by configs that pick the
+# active_tile_mask: valid_camera_lidar_overlap option — the only strategy that crops lidar
+# supervision, so nothing else needs this compensation.
+
+loss:
+  lidar:
+    lambda_: 0.00125

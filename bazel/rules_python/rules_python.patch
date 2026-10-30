@@ -1,0 +1,304 @@
+diff --git a/python/private/py_executable.bzl b/python/private/py_executable.bzl
+index 0e7e292..fe25504 100644
+--- a/python/private/py_executable.bzl
++++ b/python/private/py_executable.bzl
+@@ -91,6 +91,15 @@ EXECUTABLE_ATTRS = dicts.add(
+         "_default_to_explicit_init_py_flag": attr.label(default = "//python/config_settings:incompatible_default_to_explicit_init_py"),
+         "_python_import_all_repositories_flag": attr.label(default = "//python/config_settings:experimental_python_import_all_repositories"),
+         "_python_path_flag": attr.label(default = "//python/config_settings:python_path"),
++        # NuRec patch: LD_PRELOAD shim activated at runtime on aarch64 to cap the
++        # arch tokens and runtime-reported compute capability CUDA 12.8 rejects
++        # (SM 12.1 -> 12.0 DGX Spark / GB10, SM 10.3 -> 10.0 GB300). Resolves to
++        # the shim on aarch64 and an empty filegroup elsewhere (x86_64 unaffected).
++        "_sm_cap": attr.label(
++            default = "@@//deps/sm_cap:sm_cap_runfiles",
++            allow_files = True,
++            cfg = "target",
++        ),
+     },
+     {
+         "interpreter_args": lambda: attrb.StringList(
+@@ -1252,6 +1261,9 @@ def py_executable_base_impl(ctx, *, semantics, is_test, inherited_environment =
+         extra_common_runfiles = [
+             cc_details.extra_runfiles,
+             native_deps_details.runfiles,
++            # NuRec patch: ship libsm_cap.so in every executable's runfiles
++            # so the stage1 bootstrap can LD_PRELOAD it on aarch64.
++            ctx.runfiles(files = ctx.files._sm_cap),
+         ],
+     )
+     exec_result = _create_executable(
+diff --git a/python/private/pypi/parse_requirements.bzl b/python/private/pypi/parse_requirements.bzl
+index 580989e..2482858 100644
+--- a/python/private/pypi/parse_requirements.bzl
++++ b/python/private/pypi/parse_requirements.bzl
+@@ -654,7 +654,8 @@ def _add_dists(*, requirement, index_urls, target_platform, logger = None):
+             sdist = maybe_sdist
+             continue
+ 
+-        logger.warn(lambda: "Could not find a whl or an sdist with hash {}; note that the index may be advertising digests calculated with a different hash algorithm".format(digest))
++        # Prevent spamming of warnings
++        # logger.warn(lambda: "Could not find a whl or an sdist with hash {}; note that the index may be advertising digests calculated with a different hash algorithm".format(digest))
+ 
+     yanked = {}
+     for dist in whls + [sdist]:
+diff --git a/python/private/stage1_bootstrap_template.sh b/python/private/stage1_bootstrap_template.sh
+index 4374ff9..1a05052 100644
+--- a/python/private/stage1_bootstrap_template.sh
++++ b/python/private/stage1_bootstrap_template.sh
+@@ -133,6 +133,123 @@ if [[ -n "$RULES_PYTHON_TESTING_TELL_RUNFILES_ROOT" ]]; then
+   export RULES_PYTHON_TESTING_RUNFILES_ROOT="$RUNFILES_DIR"
+ fi
+ 
++# NuRec patch: on aarch64, cap the reported/used CUDA arch to a forward-
++# compatible one on hardware CUDA 12.8 nvrtc/ptxas reject: SM 12.1 (DGX
++# Spark / GB10) -> 12.0 and SM 10.3 (GB300) -> 10.0. Other aarch64 GPUs
++# (e.g. GH200 SM 9.0) are left untouched.
++if [[ "$(uname -m)" == "aarch64" ]]; then
++  _compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1)
++  if [[ "$_compute_cap" == "12.1" ]]; then
++    # LD_PRELOAD the sm_cap shim: rewrites sm_121 -> sm_120 in nvrtcCompileProgram
++    # options (via dlsym) and clamps the reported compute capability 12.1 -> 12.0.
++    _sm_cap="$RUNFILES_DIR/_main/deps/sm_cap/libsm_cap.so"
++    if [[ -f "$_sm_cap" ]]; then
++      export LD_PRELOAD="${_sm_cap}${LD_PRELOAD:+:$LD_PRELOAD}"
++    fi
++    # Tell torch's JIT path to compile for SM 12.0.
++    export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0+PTX}"
++    # Tell triton's NVIDIA backend to compile for SM 12.0. TRITON_OVERRIDE_ARCH
++    # is triton's public knob (feeds parse_options). TRITON_OVERRIDE_SM_ARCH is
++    # added by deps/triton/triton.patch and fixes the paths the public knob
++    # doesn't reach (sm_arch_from_capability suffix and the `.target sm_{int}`
++    # regex substitution in make_ptx).
++    export TRITON_OVERRIDE_ARCH="${TRITON_OVERRIDE_ARCH:-sm120}"
++    export TRITON_OVERRIDE_SM_ARCH="${TRITON_OVERRIDE_SM_ARCH:-sm_120}"
++    # Autotuned Triton GEMMs use arch-specific instructions the generic target lacks.
++    export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS="${TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS:-ATEN}"
++  elif [[ "$_compute_cap" == "10.3" ]]; then
++    # GB300 (Blackwell Ultra) reports SM 10.3: same as the SM 12.1 block above,
++    # but cap to the forward-compatible SM 10.0 (+PTX) and rewrite sm_103 -> sm_100.
++    _sm_cap="$RUNFILES_DIR/_main/deps/sm_cap/libsm_cap.so"
++    if [[ -f "$_sm_cap" ]]; then
++      export LD_PRELOAD="${_sm_cap}${LD_PRELOAD:+:$LD_PRELOAD}"
++    fi
++    export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0+PTX}"
++    export TRITON_OVERRIDE_ARCH="${TRITON_OVERRIDE_ARCH:-sm100}"
++    export TRITON_OVERRIDE_SM_ARCH="${TRITON_OVERRIDE_SM_ARCH:-sm_100}"
++    export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS="${TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS:-ATEN}"
++  fi
++  unset _compute_cap _sm_cap
++fi
++
++# NuRec patch: point the runtime JIT (slangtorch, torch cpp_extension,
++# Transformer Engine) at the CUDA toolkit subset staged in runfiles, and put
++# its libraries on the loader path: prebuilt extensions such as tinycudann
++# carry no usable RPATH, so libnvrtc only resolves through the global search
++# path. Exported whether or not the target depends on the toolkit, so that one
++# missing that dependency fails the same way everywhere instead of picking up
++# whatever CUDA the machine happens to have.
++_cuda_home="$RUNFILES_DIR/_main/bazel/cuda_toolkit/runtime"
++export CUDA_HOME="$_cuda_home"
++export PATH="$_cuda_home/bin:$PATH"
++export LD_LIBRARY_PATH="$_cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++unset _cuda_home
++
++# NuRec patch: the runtime JIT (slangtorch + torch cpp_extension) drives nvcc,
++# which (CUDA 12.8) rejects host gcc > 14. Only replace the host compiler when
++# the default one is actually unusable (a gcc newer than 14, or none at all):
++# forcing $CC/$CXX otherwise changes the compiler torch records for its
++# prebuilt/cached extensions, so they get rebuilt from scratch on every run --
++# a multi-minute JIT recompile that times tests out. A user-provided $CC/$CXX
++# is always honored, and a one-sided override is mirrored so they never diverge.
++if [[ -n "${CC:-}" || -n "${CXX:-}" ]]; then
++  export CC="${CC:-$CXX}"
++  export CXX="${CXX:-$CC}"
++else
++  # Probe the default host C++ compiler torch/nvcc use when $CXX is unset and
++  # expand __GNUC__ to read its gcc major version (clang reports 4, so it is
++  # left untouched). Only a gcc > 14 -- or no compiler at all -- is replaced;
++  # overriding an already-usable default would force a full extension recompile.
++  _def_cxx=
++  for _c in c++ g++; do
++    if command -v "$_c" >/dev/null 2>&1; then _def_cxx="$_c"; break; fi
++  done
++  _need_override=
++  if [[ -z "$_def_cxx" ]]; then
++    _need_override=1
++  else
++    _defmaj=$(printf '__GNUC__\n' | "$_def_cxx" -E -P -x c++ - 2>/dev/null | tr -dc '0-9')
++    if [[ -n "$_defmaj" && "$_defmaj" -gt 14 ]]; then _need_override=1; fi
++  fi
++  if [[ -n "$_need_override" ]]; then
++    # Both halves of the same version: $CC has to stay a C compiler, since
++    # Triton feeds it the C launcher it generates for every kernel, and mixing
++    # versions between the two would mix ABIs.
++    _jit_cc=
++    _jit_cxx=
++    for _cand in 11 14 13 12; do
++      if [[ -x "/usr/bin/gcc-${_cand}" && -x "/usr/bin/g++-${_cand}" ]]; then
++        _jit_cc="/usr/bin/gcc-${_cand}"
++        _jit_cxx="/usr/bin/g++-${_cand}"
++        break
++      fi
++    done
++    if [[ -z "$_jit_cxx" ]]; then
++      echo "ERROR: NuRec runtime JIT needs a host gcc <= 14 (nvcc/CUDA 12.8 limit)," >&2
++      echo "       but the default host compiler is unusable and no gcc/g++ pair" >&2
++      echo "       was found. Install one, e.g.: sudo apt-get install gcc-11 g++-11" >&2
++      exit 1
++    fi
++    # gcc < 13 lacks the native _Float16 slang's generated host code uses; alias
++    # it to __fp16. Gated on aarch64 since __fp16 is an Arm-only storage type.
++    if [[ "$(uname -m)" == "aarch64" ]]; then
++      if ! printf 'typedef _Float16 h;\n' | "$_jit_cxx" -x c++ -std=c++17 -fsyntax-only - 2>/dev/null; then
++        _tmp=$(mktemp "${TMPDIR:-/tmp}/nurec-jit-host-cxx.XXXXXX") || {
++          echo "ERROR: failed to create temporary JIT host wrapper" >&2
++          exit 1
++        }
++        chmod 700 "$_tmp"
++        printf '#!/bin/sh\nexec %s -D_Float16=__fp16 "$@"\n' "$_jit_cxx" > "$_tmp"
++        chmod +x "$_tmp"
++        _jit_cxx="$_tmp"
++      fi
++    fi
++    export CC="$_jit_cc"
++    export CXX="$_jit_cxx"
++  fi
++  unset _def_cxx _defmaj _need_override _jit_cc _jit_cxx _tmp _cand
++fi
++
+ function find_python_interpreter() {
+   runfiles_root="$1"
+   interpreter_path="$2"
+diff --git a/python/private/stage2_bootstrap_template.py b/python/private/stage2_bootstrap_template.py
+index f445ad2..bc297cb 100644
+--- a/python/private/stage2_bootstrap_template.py
++++ b/python/private/stage2_bootstrap_template.py
+@@ -484,6 +484,116 @@ def _add_site_packages(site_packages):
+     sys.path[first_global_offset:0] = added_dirs
+ 
+ 
++def _nurec_preinit_cuda_under_flock():
++    """NuRec patch: pre-create the CUDA primary context on aarch64 (DGX Spark).
++
++    GB10 has unified memory, so a primary context is backed by order-9 (2 MiB)
++    contiguous system pages. A parallel Bazel build's page-cache churn starves
++    those for seconds at a time (MemFree still in the gigabytes), and
++    cuDevicePrimaryCtxRetain fails with CUDA_ERROR_OUT_OF_MEMORY, which torch
++    reports as "CUDA error: out of memory" on the first CUDA call. So retain it
++    here, before any user code, retrying until the famine clears.
++
++    The flock (which also serializes context creation, a separate aarch64 race)
++    is held per attempt and dropped while backing off, otherwise every other
++    test process on the host queues behind the full budget. pycuda.autoinit
++    goes under the same lock as a second context-creation path. It has never
++    been seen to hit the famine, so it is not retried.
++    """
++    if os.uname().machine != "aarch64":
++        return
++    import ctypes
++    try:
++        cuda = ctypes.CDLL("libcuda.so.1")
++    except OSError:
++        return  # non-CUDA environment, nothing to do
++    import contextlib
++    import fcntl
++    import random
++    import time
++    import warnings
++
++    cuda_error_out_of_memory = 2
++    # Retry for as much as 60s to catch most famine situations.
++    budget_s = 60.0
++
++    # Per-user lock path: 0o600 mode + UID in the name avoid umask-induced
++    # downgrade to per-user serialization (mode 0o666 is &'d with umask, so
++    # the first process to create the file decides the perms for everyone)
++    # and dodge predictable-path symlink races from other local users.
++    lock_path = os.path.join(
++        os.environ.get("TMPDIR", "/tmp"), f".nurec-cuda-init.{os.getuid()}.lock"
++    )
++    try:
++        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
++    except OSError as e:
++        warnings.warn_explicit(
++            f"cannot open CUDA init lock file {lock_path}: {e}; skipping CUDA preinit",
++            RuntimeWarning,
++            filename="rules_python",
++            lineno=0,
++        )
++        return
++
++    def _warn(msg):
++        warnings.warn_explicit(
++            msg, RuntimeWarning, filename="rules_python", lineno=0
++        )
++
++    @contextlib.contextmanager
++    def _locked():
++        fcntl.flock(lock_fd, fcntl.LOCK_EX)
++        try:
++            yield
++        finally:
++            fcntl.flock(lock_fd, fcntl.LOCK_UN)
++
++    try:
++        with _locked():
++            rc = cuda.cuInit(0)
++        if rc != 0:
++            _warn(f"cuInit(0) returned {rc}; skipping CUDA preinit")
++            return
++
++        # Holding the primary context for this process's lifetime makes torch's
++        # later cudaSetDevice / cudaStreamIsCapturing find it already created.
++        ctx = ctypes.c_void_p()
++        started = time.monotonic()
++        deadline = started + budget_s
++        attempts = 0
++        while True:
++            attempts += 1
++            with _locked():
++                rc = cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), 0)
++            if rc != cuda_error_out_of_memory or time.monotonic() >= deadline:
++                break
++            # Jittered so the waiters do not re-collide on the lock in lockstep.
++            time.sleep(random.uniform(0.2, 1.5))
++        if rc != 0:
++            # Reports the real attempt count and elapsed time: a non-OOM error
++            # breaks out on the first call, without exhausting the budget.
++            _warn(
++                f"cuDevicePrimaryCtxRetain returned {rc} after {attempts} "
++                f"attempt(s) in {time.monotonic() - started:.1f}s; this "
++                "process will likely fail on its first CUDA call"
++            )
++
++        # Cached once imported, so the later `import pycuda.autoinit` from
++        # mmseg.trt.trt_utils is a no-op.
++        with _locked():
++            try:
++                import pycuda.autoinit  # noqa: F401
++            except ImportError:
++                pass  # pycuda not installed in this binary
++            except Exception as e:
++                _warn(
++                    f"pycuda.autoinit failed under flock: {e}; "
++                    "TRT context creation may surface failures"
++                )
++    finally:
++        os.close(lock_fd)
++
++
+ def main():
+     print_verbose("initial argv:", values=sys.argv)
+     print_verbose("initial cwd:", os.getcwd())
+@@ -520,6 +630,10 @@ def main():
+         )
+         _add_site_packages(site_packages)
+ 
++    # CUDA-context pre-init runs after sys.path is set up so the pycuda
++    # branch of the flock function can import pycuda from the venv.
++    _nurec_preinit_cuda_under_flock()
++
+     print_verbose("runfiles root:", runfiles_root)
+ 
+     runfiles_envkey, runfiles_envvalue = runfiles_envvar(runfiles_root)

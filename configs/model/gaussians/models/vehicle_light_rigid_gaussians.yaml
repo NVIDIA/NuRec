@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - rigid_gaussians
+
+name: "vehicle-light-rigid-gaussians"
+fourier_features_dim: 1
+features_albedo_lr: 0.0125 # LR x5 for vehicle-light color; base SH layers remain at 0.0025

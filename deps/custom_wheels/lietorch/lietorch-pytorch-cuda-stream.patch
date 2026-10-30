@@ -1,0 +1,324 @@
+diff --git a/lietorch/extras/altcorr_kernel.cu b/lietorch/extras/altcorr_kernel.cu
+index 3fc38ca..c0c6d05 100644
+--- a/lietorch/extras/altcorr_kernel.cu
++++ b/lietorch/extras/altcorr_kernel.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ #include <torch/extension.h>
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -275,7 +276,7 @@ std::vector<torch::Tensor> altcorr_cuda_forward(
+   const dim3 blocks(B, (H+BLOCK_H-1)/BLOCK_H, (W+BLOCK_W-1)/BLOCK_W);
+   const dim3 threads(BLOCK_H, BLOCK_W);
+ 
+-  altcorr_forward_kernel<float><<<blocks, threads>>>(
++  altcorr_forward_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+     fmap1.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     fmap2.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     coords.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+@@ -309,7 +310,7 @@ std::vector<torch::Tensor> altcorr_cuda_backward(
+   const dim3 blocks(B, (H1+BLOCK_H-1)/BLOCK_H, (W1+BLOCK_W-1)/BLOCK_W);
+   const dim3 threads(BLOCK_H, BLOCK_W);
+ 
+-  altcorr_backward_kernel<float><<<blocks, threads>>>(
++  altcorr_backward_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+     fmap1.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     fmap2.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     coords.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+diff --git a/lietorch/extras/corr_index_kernel.cu b/lietorch/extras/corr_index_kernel.cu
+index 37e3222..bf5ab11 100644
+--- a/lietorch/extras/corr_index_kernel.cu
++++ b/lietorch/extras/corr_index_kernel.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ #include <torch/extension.h>
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -143,7 +144,7 @@ std::vector<torch::Tensor> corr_index_cuda_forward(
+     {batch_size, 2*radius+1, 2*radius+1, ht, wd}, opts);
+ 
+   AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.scalar_type(), "sampler_forward_kernel", ([&] {
+-    corr_index_forward_kernel<scalar_t><<<blocks, threads>>>(
++    corr_index_forward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+       volume.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+       coords.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+       corr.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+@@ -174,7 +175,7 @@ std::vector<torch::Tensor> corr_index_cuda_backward(
+ 
+ 
+   AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.scalar_type(), "sampler_backward_kernel", ([&] {
+-    corr_index_backward_kernel<scalar_t><<<blocks, threads>>>(
++    corr_index_backward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+       coords.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+       corr_grad.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+       volume_grad.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+diff --git a/lietorch/extras/se3_builder.cu b/lietorch/extras/se3_builder.cu
+index 38401fe..0c9690a 100644
+--- a/lietorch/extras/se3_builder.cu
++++ b/lietorch/extras/se3_builder.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ #include <torch/extension.h>
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -380,7 +381,7 @@ std::vector<torch::Tensor> se3_build_cuda(
+   torch::Tensor H = torch::zeros({batch_size, 6, 6, ht, wd}, opts);
+   torch::Tensor b = torch::zeros({batch_size, 6, 1, ht, wd}, opts);
+ 
+-  se3_build_forward_kernel<<<grid, NUM_THREADS>>>(
++  se3_build_forward_kernel<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     attention.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     transforms.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     points.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+@@ -416,7 +417,7 @@ std::vector<torch::Tensor> se3_build_backward_cuda(
+   torch::Tensor targets_grad = torch::zeros_like(targets);
+   torch::Tensor weights_grad = torch::zeros_like(weights);
+ 
+-  se3_build_backward_kernel<<<grid, NUM_THREADS>>>(
++  se3_build_backward_kernel<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     attention.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     transforms.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     points.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+diff --git a/lietorch/extras/se3_inplace_builder.cu b/lietorch/extras/se3_inplace_builder.cu
+index e96547d..8356f5c 100644
+--- a/lietorch/extras/se3_inplace_builder.cu
++++ b/lietorch/extras/se3_inplace_builder.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ #include <torch/extension.h>
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -611,7 +612,7 @@ std::vector<torch::Tensor> dense_se3_forward_cuda(
+   torch::Tensor H = torch::zeros({batch_size, 6, 6, ht, wd}, opts);
+   torch::Tensor b = torch::zeros({batch_size, 6, 1, ht, wd}, opts);
+ 
+-  dense_se3_forward_kernel<<<grid, NUM_THREADS>>>(
++  dense_se3_forward_kernel<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     transforms.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     embeddings.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     points.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+@@ -649,7 +650,7 @@ std::vector<torch::Tensor> dense_se3_backward_cuda(
+ 
+   // backward pass split into two kernels to avoid atomics
+ 
+-  dense_se3_backward_kernel1<<<grid, NUM_THREADS>>>(
++  dense_se3_backward_kernel1<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     transforms.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     embeddings.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     points.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+@@ -663,7 +664,7 @@ std::vector<torch::Tensor> dense_se3_backward_cuda(
+     weights_grad.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     radius);
+ 
+-  dense_se3_backward_kernel2<<<grid, NUM_THREADS>>>(
++  dense_se3_backward_kernel2<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     transforms.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     embeddings.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+     points.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+diff --git a/lietorch/extras/se3_solver.cu b/lietorch/extras/se3_solver.cu
+index b724b1d..6868c11 100644
+--- a/lietorch/extras/se3_solver.cu
++++ b/lietorch/extras/se3_solver.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ #include <torch/extension.h>
+ #include <vector>
+ 
+@@ -160,7 +161,7 @@ std::vector<torch::Tensor> cholesky_solve6x6_forward_cuda(torch::Tensor H, torch
+   torch::Tensor x = torch::zeros_like(b);
+   dim3 grid = dim3(batch_size, (ht*wd + NUM_THREADS-1) / NUM_THREADS);
+ 
+-  cholesky_solve6x6_forward_kernel<<<grid, NUM_THREADS>>>(
++  cholesky_solve6x6_forward_kernel<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     H.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     b.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     x.packed_accessor32<float,5,torch::RestrictPtrTraits>());
+@@ -178,7 +179,7 @@ std::vector<torch::Tensor> cholesky_solve6x6_backward_cuda(torch::Tensor H, torc
+   torch::Tensor db = torch::zeros_like(b);
+   dim3 grid = dim3(batch_size, (ht*wd + NUM_THREADS-1) / NUM_THREADS);
+ 
+-  cholesky_solve6x6_backward_kernel<<<grid, NUM_THREADS>>>(
++  cholesky_solve6x6_backward_kernel<<<grid, NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+     H.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     b.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+     dx.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+diff --git a/lietorch/src/lietorch_gpu.cu b/lietorch/src/lietorch_gpu.cu
+index dff5c75..3d9162c 100644
+--- a/lietorch/src/lietorch_gpu.cu
++++ b/lietorch/src/lietorch_gpu.cu
+@@ -1,3 +1,4 @@
++#include <ATen/cuda/CUDAContext.h>
+ 
+ #include "lietorch_gpu.h"
+ #include <Eigen/Dense>
+@@ -301,7 +302,7 @@ torch::Tensor exp_forward_gpu(int group_id, torch::Tensor a) {
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, a.scalar_type(), "exp_forward_kernel", ([&] {
+         X = torch::zeros({batch_size, group_t::N}, a.options());
+-        exp_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        exp_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             a.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             batch_size);
+@@ -315,7 +316,7 @@ std::vector<torch::Tensor> exp_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor da = torch::zeros(a.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, a.scalar_type(), "exp_backward_kernel", ([&] {
+-        exp_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        exp_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+             da.data_ptr<scalar_t>(), 
+@@ -331,7 +332,7 @@ torch::Tensor log_forward_gpu(int group_id, torch::Tensor X) {
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "log_forward_kernel", ([&] {
+         a = torch::zeros({batch_size, group_t::K}, X.options());
+-        log_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        log_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+             batch_size);
+@@ -345,7 +346,7 @@ std::vector<torch::Tensor> log_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor dX = torch::zeros(X.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "log_backward_kernel", ([&] {
+-        log_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        log_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             dX.data_ptr<scalar_t>(), 
+@@ -360,7 +361,7 @@ torch::Tensor inv_forward_gpu(int group_id, torch::Tensor X) {
+     torch::Tensor Y = torch::zeros_like(X);
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "inv_forward_kernel", ([&] {
+-        inv_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        inv_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             Y.data_ptr<scalar_t>(), 
+             batch_size);
+@@ -374,7 +375,7 @@ std::vector<torch::Tensor> inv_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor dX = torch::zeros(X.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "inv_backward_kernel", ([&] {
+-        inv_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        inv_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             dX.data_ptr<scalar_t>(), 
+@@ -390,7 +391,7 @@ torch::Tensor mul_forward_gpu(int group_id, torch::Tensor X, torch::Tensor Y) {
+     torch::Tensor Z = torch::zeros_like(X);
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "mul_forward_kernel", ([&] {
+-        mul_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        mul_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             Y.data_ptr<scalar_t>(), 
+             Z.data_ptr<scalar_t>(), 
+@@ -406,7 +407,7 @@ std::vector<torch::Tensor> mul_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor dY = torch::zeros(Y.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "mul_backward_kernel", ([&] {
+-        mul_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        mul_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             Y.data_ptr<scalar_t>(), 
+@@ -423,7 +424,7 @@ torch::Tensor adj_forward_gpu(int group_id, torch::Tensor X, torch::Tensor a) {
+     torch::Tensor b = torch::zeros(a.sizes(), a.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "adj_forward_kernel", ([&] {
+-        adj_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        adj_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+             b.data_ptr<scalar_t>(), 
+@@ -439,7 +440,7 @@ std::vector<torch::Tensor> adj_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor da = torch::zeros(a.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "adj_backward_kernel", ([&] {
+-        adj_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        adj_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+@@ -457,7 +458,7 @@ torch::Tensor adjT_forward_gpu(int group_id, torch::Tensor X, torch::Tensor a) {
+     torch::Tensor b = torch::zeros(a.sizes(), a.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "adjT_forward_kernel", ([&] {
+-        adjT_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        adjT_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+             b.data_ptr<scalar_t>(), 
+@@ -473,7 +474,7 @@ std::vector<torch::Tensor> adjT_backward_gpu(int group_id, torch::Tensor grad, t
+     torch::Tensor da = torch::zeros(a.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "adjT_backward_kernel", ([&] {
+-        adjT_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        adjT_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+@@ -492,7 +493,7 @@ torch::Tensor act_forward_gpu(int group_id, torch::Tensor X, torch::Tensor p) {
+     torch::Tensor q = torch::zeros(p.sizes(), p.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "act_forward_kernel", ([&] {
+-        act_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        act_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             p.data_ptr<scalar_t>(), 
+             q.data_ptr<scalar_t>(),
+@@ -508,7 +509,7 @@ std::vector<torch::Tensor> act_backward_gpu(int group_id, torch::Tensor grad, to
+     torch::Tensor dp = torch::zeros(p.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "act_backward_kernel", ([&] {
+-        act_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        act_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             p.data_ptr<scalar_t>(), 
+@@ -525,7 +526,7 @@ torch::Tensor act4_forward_gpu(int group_id, torch::Tensor X, torch::Tensor p) {
+     torch::Tensor q = torch::zeros(p.sizes(), p.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "act4_forward_kernel", ([&] {
+-        act4_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        act4_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             p.data_ptr<scalar_t>(), 
+             q.data_ptr<scalar_t>(),
+@@ -541,7 +542,7 @@ std::vector<torch::Tensor> act4_backward_gpu(int group_id, torch::Tensor grad, t
+     torch::Tensor dp = torch::zeros(p.sizes(), grad.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "act4_backward_kernel", ([&] {
+-        act4_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        act4_backward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             grad.data_ptr<scalar_t>(), 
+             X.data_ptr<scalar_t>(), 
+             p.data_ptr<scalar_t>(), 
+@@ -559,7 +560,7 @@ torch::Tensor as_matrix_forward_gpu(int group_id, torch::Tensor X) {
+     torch::Tensor T4x4 = torch::zeros({X.size(0), 4, 4}, X.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "as_matrix_forward_kernel", ([&] {
+-        as_matrix_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        as_matrix_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             T4x4.data_ptr<scalar_t>(), 
+             batch_size);
+@@ -575,7 +576,7 @@ torch::Tensor orthogonal_projector_gpu(int group_id, torch::Tensor X) {
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "orthogonal_projector_kernel", ([&] {
+         P = torch::zeros({X.size(0), group_t::N, group_t::N}, X.options());
+-        orthogonal_projector_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        orthogonal_projector_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             P.data_ptr<scalar_t>(), 
+             batch_size);
+@@ -590,7 +591,7 @@ torch::Tensor jleft_forward_gpu(int group_id, torch::Tensor X, torch::Tensor a)
+     torch::Tensor b = torch::zeros(a.sizes(), a.options());
+ 
+     DISPATCH_GROUP_AND_FLOATING_TYPES(group_id, X.scalar_type(), "jleft_forward_kernel", ([&] {
+-        jleft_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS>>>(
++        jleft_forward_kernel<group_t, scalar_t><<<NUM_BLOCKS(batch_size), NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+             X.data_ptr<scalar_t>(), 
+             a.data_ptr<scalar_t>(), 
+             b.data_ptr<scalar_t>(), 

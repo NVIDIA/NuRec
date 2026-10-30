@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+transformer_engine 1.11.0+...nre1 - statement of changes (Apache License 2.0, section 4(b))
+
+This wheel is built from NVIDIA TransformerEngine (https://github.com/NVIDIA/TransformerEngine,
+Apache License 2.0), release_v1.11 line, via an NVIDIA fork
+at commit cafd8e50200a5cd3eb269b7cc2a8d5ecc091374f. The
+upstream LICENSE is retained. The files below were modified by NVIDIA CORPORATION &
+AFFILIATES, 2026, relative to upstream tag v1.11. This file is the statement of changes; the
+modified files themselves carry no in-file notice.
+
+Changes in the fork (relative to upstream v1.11):
+- transformer_engine/__init__.py: JAX and Paddle imports disabled.
+- transformer_engine/pytorch/__init__.py: whitespace only.
+- transformer_engine/pytorch/attention.py: _flash_attn_max_version 2.6.3 -> 2.7.4.
+- transformer_engine/pytorch/setup.py, setup.py: flash-attn requirement upper bound 2.6.3 -> 2.7.4.
+- build_tools/pytorch.py: nvcc -gencode flags for sm_75..sm_121 (sm_70 removed).
+- build_tools/utils.py: default NVTE_CUDA_ARCHS 70;80;89;90 -> 75;80;86;89;90;100;120.
+- build_tools/wheel_utils/build_wheels.sh: build script changes (not used for this wheel).
+
+Changes applied by the NuRec build:
+- softmax_onnx_type_utils.patch: transformer_engine/pytorch/softmax.py imports _type_utils from
+  torch.onnx._internal.torchscript_exporter (PyTorch 2.11).
+- te_onnx_extensions.py patch (te_onnx_extensions.patch): same relocation for _type_utils and jit_utils.
+
+The wheel version carries the local segment +<git hash>pt<torch>cu<cuda><archs>.nre1, and is
+compiled against PyTorch 2.11 / CUDA 12.8 for sm80-sm120 (rebuild, no further source changes).

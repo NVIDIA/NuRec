@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: weighted-instance-input-embedding
+
+embedding_dim: 1
+requires_grad: false
+weight_init_config:
+  method: linspace
+  from_: 0.05
+  to_: 0.95

@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GSplat Renderer Configuration (3DGUT formulation)
+#
+# Self-contained: does not inherit from any legacy renderer config so that their deprecation
+# can land without dragging this file along.
+
+name: 3dgut-gsplat
+
+# Conservative camera sizing per device/mode:
+#   3*pinhole + 2*fisheye + FTheta + transformed-K variants.
+# Conservative LiDAR geometry sizing per device/mode: 3*distinct geometries.
+# Each distinct LiDAR geometry/device/mode/tiling combination uses one frame
+# context entry. Count normal and inference separately when both are used.
+# Override any capacity with model.renderer.<setting>=<entries>.
+max_camera_tensor_cache_entries: 4096
+max_lidar_geometry_cache_entries: 1024
+max_lidar_frame_context_cache_entries: 1024
+
+# Output dtype of the Slang collector's SH coefficients into gsplat.
+sh_features_dtype: fp16
+
+# Rasterization mode for gsplat
+# Options: "classic" (standard 3DGS) or "antialiased" (Mip-Splatting)
+# 3DGUT uses classic, which dilates by min_projected_ray_radius
+# but does not apply the antialiased opacity compensation factor.
+rasterize_mode: classic
+
+# Whether to use FreePoseCalib's rays as input
+# or let gsplat create the rays internally.
+use_rays: True
+
+# Route the lidar branch through gsplat's model-free render_unstructured
+# (true measured ray geometry + per-ray timestamps) instead of the structured
+# gridded rasterization. Camera path is unaffected.
+lidar_unstructured: False
+
+# Logging level: [0=FATAL, 1=ERROR, 2=WARNING, 3=INFO, 4=DEBUG]
+log_level: 3
+
+use_gsplat_for_camera_rendering: True
+
+# option for future MGPU support (local preparation before global rendering)
+prepare_before_render: false
+
+# Selects the eval3d batch policy passed to gsplat.rasterization():
+# - mixed_batch:    serial fwd, parallel bwd (default)
+# - parallel_batch: fully parallel fwd+bwd
+renderer_config: parallel_batch
+
+# 3DGUT projection parameters
+projection:
+  n_rolling_shutter_iterations: 5
+  ut_dim: 3
+  ut_alpha: 1.0
+  ut_beta: 2.0
+  ut_kappa: 0.0
+  ut_require_all_sigma_points: true
+  image_margin_factor: 0.1
+  min_projected_ray_radius: 0.5477225575051661 # gsplat default of √0.3
+
+culling:
+  near_clip_distance: 0.2
+  far_clip_distance_camera: 3.402823466e+38 # max float
+  far_clip_distance_lidar: 3.402823466e+38 # max float
+  # near_far_z_culling : for backward compatibility
+  near_far_z_culling: false
+  rect_bounding: true
+  tight_opacity_bounding: true
+  tile_based: true
+  enable_ray_based_culling: true
+  # gsplat exact dead-pair pre-cull for the unstructured lidar path
+  # (exact/bit-identical; drops (gaussian, tile) pairs where no actual ray in the
+  # tile comes near the Gaussian under eval3d's own metric).
+  #
+  # REQUIRED for dense / high-Gaussian-count scenes: the unstructured model is
+  # omnidirectional (a Gaussian gets a pair for every angular tile it overlaps)
+  # while the rays are directional and sparse/holey, so under densification the
+  # vast majority of (gaussian, tile) pairs are dead. Measured: the cull drops
+  # n_isects by ~58% at 2.8M Gaussians and by ~99.7% (1.48B -> 2.6M) in the
+  # heavily-densified regime. Without it the (gaussian, tile) pair count reaches
+  # ~1B and overflows the eval3d rasterizer's int32 fwd_batch_state buffer
+  # (total_batches * state_dim * pixels_per_tile > INT32_MAX), crashing training.
+  # The cull's effectiveness GROWS with density, so the ~26% net-loss seen on a
+  # sparse benchmark does not apply once densification kicks in.
+  cull_dead_pairs_lidar_unstructured: true
+
+  # gsplat per-Gaussian angular-bounding-box method for the unstructured lidar
+  # render (the acceleration-structure candidate test). "ut" = the 7-sigma-point
+  # unscented-transform AABB (default, cheap but UNDER-COVERS near/large-footprint
+  # gaussians -- see gsplat FINDINGS Phase 38); "pbf" = the exact closed-form
+  # silhouette box everywhere (~1.4x); "hybrid" = exact PBF for gaussians within
+  # pbf_near_range_lidar_unstructured, cheap UT beyond (recovers PBF-correct near
+  # coverage at ~UT cost; car2sim A/B: chamfer -37%, depth -82% vs ut).
+  box_method_lidar_unstructured: ut
+  # Range threshold (m) for the "hybrid" box: gaussians whose center is closer than
+  # this use the exact PBF box, farther ones use the cheap UT box. Only used when
+  # box_method_lidar_unstructured=hybrid. Tuned on car2sim 30k (pbf_near_range
+  # sweep): the near-geometry quality win lives in the ~5-8m band -- 8m matches the
+  # full 15m quality (chamfer 0.187 vs 0.173, depth_medae 0.037 vs 0.036) at lower
+  # cost, while 5m collapses back to ut (chamfer 0.300) and 25m is ~2.5x slower for
+  # no gain.
+  pbf_near_range_lidar_unstructured: 8.0
+
+  # Rolling-shutter single-cover UT box for the unstructured lidar render. When
+  # true, the UT (sigma-point) box projects each sigma point at its OWN converged
+  # frame-time (per-sigma-point rolling-shutter iteration seeded from the tiling's
+  # measured per-cell mean time) instead of unioning the whole frame-start/end
+  # ego-motion arc -- narrowing the azimuth box and slicing the seg time-window, so
+  # candidate (gaussian, tile) pairs drop ~28% on a P128-like grid (gsplat FINDINGS
+  # Phase 42/43). It can slightly UNDER-COVER near/large gaussians (~0.3% dropped
+  # hits), so it is ONLY valid with box_method_lidar_unstructured=hybrid (near
+  # gaussians keep the exact PBF box; only the far UT branch uses RS) and ONLY on
+  # single-cover frames (multi-visit/time-tiled frames reject it). Default off.
+  rs_single_cover_lidar_unstructured: false
+
+render:
+  mode: kbuffer # in [kbuffer, splat]
+  k_buffer_size: 0
+  enable_warp_atomic_optim: true
+
+tiling:
+  # Tile-size selection strategy for the gsplat 3DGUT rasterizer:
+  #   RESOLUTION (default): gsplat derives the tile size from the sensor resolution.
+  #     For LiDAR this caps in-tile elements at 8*8=64 and can silently DROP returns.
+  #   custom: pass the tile_size_* fields below through verbatim (256 pts/tile for
+  #     LiDAR), so no returns are dropped -- the fair choice for LiDAR A/B runs.
+  strategy: RESOLUTION
+  camera:
+    tile_width: 16
+    tile_height: 16
+  lidar:
+    tile_size_elevation: 16
+    tile_size_azimuth: 16
+    n_bins_elevation: 16  # number of tiles in the elevation direction to use for LiDAR rendering
+    resolution_elevation: 1600
+    densification_factor_azimuth: 8
+
+antialiasing:
+  lidar_divergence: 0.002 # FIXME: move this to the sensor model
+
+profiling:
+  frequency: 0
+
+outputs:  # Per-sensor rendering output channels configuration
+  lidar:
+    enable_features: false              # Basic radiance features (RGB) - disabled for LiDAR as intensity is sensor-specific
+    enable_extended_features: true      # Additional computed features beyond radiance (e.g., semantic features)
+    enable_sensor_features: true        # Sensor-specific extended features (e.g., LiDAR intensity, reflectance)
+    enable_normals: false               # Surface normal computation - disabled for performance optimization
+    enable_ray_gradients: false         # Ray gradient computation for backpropagation - expensive, only enable when training calibration
+  camera:
+    enable_features: true               # Basic radiance features (RGB) - enabled for cameras as they capture visible light
+    enable_extended_features: true      # Additional computed features beyond radiance (e.g., depth, semantic labels)
+    enable_sensor_features: true        # Sensor-specific extended features (camera-specific processing)
+    enable_normals: false               # Surface normal computation - disabled for performance, enable for normal maps
+    enable_ray_gradients: false         # Ray gradient computation - enable only when training view-dependent calibration parameters
+  scene:
+    enable_cumulated_weights: false     # Enable per-element cumulated weights output
+    enable_visibility: false            # Enable per-element visibility mask output (GUT renderer only)

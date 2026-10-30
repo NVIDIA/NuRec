@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - base
+
+name: gaussians-system
+max_split_size_mb: null # Read docs before using: https://pytorch.org/docs/stable/notes/cuda.html#environment-variables
+save_logger: true
+record_timings:
+  train_interval: 1000
+  val_interval: 1000
+record_quality_metrics:
+  psnr_interval: 100
+
+test:
+  save_results: true
+  save_inputs: false
+  save_videos: true
+  save_stats: false
+  save_metrics_parquet: false
+  save_extra_signals: false
+  separate_val_dir_per_step: false
+  use_camera_name_dirs: false
+  frame_naming: batch-index
+  video_fps: 30
+  track_ply:
+    overrides: {}
+    transform: [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]
+  track_orbit:
+    track_ids: []
+    distance: 5
+    n_frames: 45
+    render_width: 512
+    render_height: 256
+    video_fps: 5
+  track_rotation:
+    track_ids: []
+    angle_per_frame: 0
+    angle_offsets: []
+  # Background gaussians in these tracks will be removed
+  background_removal:
+    track_ids: []
+    track_shift_m: [0, 0, 0]
+    track_padding_m: [0, 0, 0]
+
+  # Generate additional renderings using only the specified layers
+  # Example:
+  # val_render_selected_nodes:
+  #   background_only:
+  #     - background
+  #   no_deformables:
+  #     - background
+  #     - dynamic_rigids
+  val_render_selected_nodes: {}
+  metrics:
+    cpsnr:
+      enabled: true
+      classes: null  # If specified, only compute cpsnr for these classes, else for all classes
+    ssim:
+      enabled: false
+    lpips:
+      enabled: false
+  lidar:
+    # Threshold for filtering based on raydrop probability, [0-1], used in point
+    # cloud post-processing during inference. NOTE: the composited raydrop signal
+    # is NOT a calibrated probability -- it is alpha-premultiplied over a zero
+    # background, so a no-hit ray sits at exactly 0.5 and low-alpha (typically
+    # dropped) rays are pulled toward 0.5. Thresholds well above 0.5 therefore
+    # saturate precision and collapse recall. See the measurements in
+    # options/lidar_return_filter/raydrop_threshold_65e-2.yaml.
+    raydrop_threshold: 0.5
+    opacity_threshold: 0.0    # drop predicted returns with accumulated opacity <= this value, applied before metrics & viz export (mirrors gRPC SensorSim). [0-1]; 0 disables. gRPC uses 0.8.
+    ROI:                # If definesd, region of interest for evaluation, indicating a circular ROI with minimum and maximum distances (in meters).
+      min_m: null
+      max_m: null
+    save_renders:
+      enabled: false
+      root: [0, 0, 0] # camera position (in lidar sensor coordinates)
+      look_dir: [1, 0, 0] # camera look direction (in lidar sensor coordinates)
+      up_dir: [0, 0, 1] # camera up direction (in lidar sensor coordinates)
+      radius: 0.04 # point cloud radius
+    floating_point_filter:
+      enabled: false
+      threshold: 0.02 # The higher the threshold, the fewer floating-point numbers are filtered out.
+      neighbor_source: rangeview   # ray-neighbour source: "rangeview" (structured 2D grid) or "angle" (sensor-agnostic, for unstructured/model-free lidar).
+      elevation_resolution_deg: null   # angle path only: elevation row (scanline) spacing in deg; null = auto-label rings from the elevation gaps, RAISES if the rings are not separable (interleaved-elevation sensors like ET30X -- set explicitly, ~FOV_el/n_beams).
+      azimuth_max_gap_deg: null   # angle path only: max azimuth gap (deg) for two rays to count as neighbours (skips scan holes); null = auto (3x native spacing).
+
+warmup_steps: 0
+optimizers:
+  - name: fused_adam
+    args:
+      lr: 0.01
+      eps: 1.e-15
+      betas: [0.9, 0.99]
+    params:
+      background:
+        args:
+          lr: 0.001 # Lower LR found to be helpful in 3DGRT need experimentation
+    scheduler:
+      name: StepFunCosineAnnealingLR
+      interval: step
+      args:
+        T_max: ${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}
+        min_factor: 0.0333
+        update_every_n_steps: ${trainer.annealing_update_every_n_steps}

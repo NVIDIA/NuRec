@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+lietorch 0.3+gite7df865pt2.11.0cu128sm80to120ptx100.nre1 - statement of changes
+
+This wheel is built from lietorch (https://github.com/princeton-vl/lietorch, BSD 3-Clause) at
+commit e7df86554156b36846008d8ddbcc4d8521a16554, with its eigen submodule at
+824272cde8ca2541e8b67b0887f5ded92b128d1f. The files below were modified by NVIDIA CORPORATION &
+AFFILIATES, 2026.
+
+Changes applied by the NuRec build (lietorch-pytorch-cuda-stream.patch):
+- lietorch/extras/*.cu and lietorch/src/lietorch_gpu.cu: include ATen/cuda/CUDAContext.h and launch
+  every kernel on at::cuda::getCurrentCUDAStream() instead of the default stream.
+- pyproject.toml, setup.py: version set to the local version above.

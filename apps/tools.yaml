@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# from {{ tool.import_path }} import {{ tool.import_symbol }} as {{ tool.import_alias | default(tool.import_symbol) }}
+tools:
+  - name: "ncore-aux-data"
+    import_path: "apps.av.aux_gen.ncore_aux_data"
+    import_symbol: "cli"
+    import_alias: "ncore_aux_data_cli"
+  - name: "pai-convert"
+    import_path: "tools.data_converter.pai.converter"
+    import_symbol: "cli"
+    import_alias: "pai_convert_cli"
+  - name: "pai-clip-dl"
+    import_path: "tools.data_converter.pai.pai_remote.cli"
+    import_symbol: "main"
+    import_alias: "pai_clip_dl_cli"
+  - name: "mask-annotator"
+    import_path: "apps.av.avmask_annotator.mask_annotator"
+    import_symbol: "run_mask_annotator"
+  - name: "benchmark-row"
+    import_path: "workflows.av_benchmark.benchmark_row"
+    import_symbol: "cli"
+    import_alias: "benchmark_row_cli"
+  - name: "inject-reference-map"
+    import_path: "workflows.av_benchmark.reference_map"
+    import_symbol: "cli"
+    import_alias: "inject_reference_map_cli"

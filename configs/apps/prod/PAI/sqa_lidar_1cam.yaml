@@ -1,0 +1,15 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SQA preset for sequences converted from PhysicalAI-AV. PAI clips are Hyperion 8 data, so the
+# Hyperion-8.1 preset applies unchanged except for the lidar ID, which the PAI converter names
+# differently. The camera keeps its Hyperion name.
+
+defaults:
+  - /apps/prod/Hyperion-8.1/sqa_lidar_1cam
+  - _self_
+
+dataset:
+  lidar_ids:
+    - lidar_top_360fov

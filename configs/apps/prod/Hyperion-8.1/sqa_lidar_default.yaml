@@ -1,0 +1,13 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Four-camera SQA preset with lidar attribute rendering and validation.
+
+defaults:
+  - sqa_default
+  - /apps/prod/Hyperion-8.1/options/lidar_rendering: intensity_raydrop
+  - /apps/prod/Hyperion-8.1/options/lidar_validation: enabled
+  - /apps/prod/Hyperion-8.1/options/lidar_attribute_loss_weights: intensity_1_raydrop_1e-1
+  - override /apps/prod/Hyperion-8.1/options/sensors: hyperion8.1_4cam_1lidar
+  - _self_

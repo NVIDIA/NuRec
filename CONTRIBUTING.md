@@ -63,9 +63,7 @@ opening a new one.
   the proposed approach, and any alternatives you considered.
 - Prior discussion is required for new features, changes to public APIs or
   configs, and non-trivial refactors.
-- For source questions, use the **Question / General Discussion** issue form
-  (`question`).
-- Usage questions and NuRec container help:
+- Questions and NuRec container help:
   [NVIDIA Developer Forum — NuRec](https://forums.developer.nvidia.com/c/omniverse/platform/nurec/752).
 - Issue triage and priority: maintainers triage new issues and prioritize them
   against NVIDIA's roadmap. Priority is not guaranteed, and an issue may be

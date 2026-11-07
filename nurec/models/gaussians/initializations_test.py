@@ -39,6 +39,7 @@ from nurec.models.gaussians.initializations import (
     NoPointsFoundException,
     compute_vertex_normals,
     pcu,
+    points_in_any_frustum,
 )
 from nurec.models.gaussians.utils import PLYGaussianLoader, write_ply_3dgs
 from nurec.utils.geometry import quat_to_so3_matrix
@@ -2190,6 +2191,80 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 model.initialize_from_datasource(summary)
         finally:
             pcu.load_triangle_mesh = orig
+
+
+def _box_frustum(x_offset: float, device: torch.device) -> CameraFrustum:
+    """Box frustum over x in [x_offset - 1, x_offset + 1], y in [-1, 1], z in [0.1, 2], with the corners in
+    CameraFrustum's order for a camera looking along +z with y pointing down (all plane normals point inwards)."""
+    near_z, far_z = 0.1, 2.0
+    corners = torch.tensor(
+        [
+            [-1.0, 1.0, near_z],
+            [-1.0, -1.0, near_z],
+            [1.0, -1.0, near_z],
+            [1.0, 1.0, near_z],
+            [-1.0, 1.0, far_z],
+            [-1.0, -1.0, far_z],
+            [1.0, -1.0, far_z],
+            [1.0, 1.0, far_z],
+        ],
+        dtype=torch.float32,
+    )
+    corners[:, 0] += x_offset
+    return CameraFrustum(corners=corners, device=device)
+
+
+def test_points_in_any_frustum_matches_stacked_masks() -> None:
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    frusta = [_box_frustum(x_offset, device) for x_offset in (-4.0, -2.0, 0.0, 2.5, 6.0)]
+    generator = torch.Generator().manual_seed(0)
+    points = (
+        torch.rand(4000, 3, generator=generator) * torch.tensor([16.0, 4.0, 4.0]) - torch.tensor([8.0, 2.0, 1.0])
+    ).to(device)
+
+    for camera_frusta in (frusta[:1], frusta):
+        expected = torch.vstack([frustum.points_in_frustum(points) for frustum in camera_frusta]).sum(0) > 0
+        assert expected.any() and not expected.all()
+        assert torch.equal(points_in_any_frustum(points, camera_frusta), expected)
+
+    inside = torch.tensor([[0.0, 0.0, 1.0], [6.5, 0.5, 0.5]], device=device)
+    outside = torch.tensor([[0.0, 0.0, 3.0], [-5.5, 0.0, 1.0], [4.0, 0.0, 1.0]], device=device)
+    assert points_in_any_frustum(inside, frusta).all()
+    assert not points_in_any_frustum(outside, frusta).any()
+
+
+def test_points_in_any_frustum_requires_frusta() -> None:
+    with pytest.raises(ValueError):
+        points_in_any_frustum(torch.zeros(3, 3), [])
+
+
+class _HalfSpaceFrustum:
+    """Cheap frustum stand-in that accepts the points with x above a threshold."""
+
+    def __init__(self, x_min: float):
+        self.x_min = x_min
+
+    def points_in_frustum(self, points: torch.Tensor) -> torch.Tensor:
+        return points[:, 0] > self.x_min
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="measures CUDA peak memory")
+def test_points_in_any_frustum_memory_does_not_grow_with_frusta() -> None:
+    device = torch.device("cuda")
+    num_points, num_frusta = 1_000_000, 2_000
+    points = torch.rand(num_points, 3, device=device)
+    frusta = [_HalfSpaceFrustum(1.0 - 0.5 * i / num_frusta) for i in range(num_frusta)]
+
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    baseline = torch.cuda.memory_allocated(device)
+    mask = points_in_any_frustum(points, cast(list[CameraFrustum], frusta))
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device) - baseline
+
+    # Stacking the per-frustum masks first would need num_frusta * num_points bytes (2 GB here).
+    assert peak < 16 * num_points
+    assert torch.equal(mask, points[:, 0] > frusta[-1].x_min)
 
 
 if __name__ == "__main__":

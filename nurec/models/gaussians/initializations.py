@@ -50,7 +50,7 @@ from nurec.utils.knn import knn_points
 from nurec.utils.lidar_object_init_points import build_lidar_cone_init_points
 from nurec.utils.misc import sync_objects_or_raise, to_numpy, to_torch, unpack_optional
 from nurec.utils.profiling import ScopedTimer
-from nurec.utils.types import FrameConversion, PointCloud
+from nurec.utils.types import CameraFrustum, FrameConversion, PointCloud
 from nurec.visualdebugger import get_visualdebugger
 
 
@@ -78,6 +78,21 @@ def _resolve_num_workers(value: int) -> int:
     if value <= 1:
         return 1
     return value
+
+
+def points_in_any_frustum(points: torch.Tensor, camera_frusta: list[CameraFrustum]) -> torch.Tensor:
+    """Return a ``[N]`` boolean mask of the points that lie inside at least one of the camera frusta.
+
+    The frusta are tested one at a time and their masks OR-ed into a single mask, so memory stays ``O(N)``
+    however many frusta (camera frames) the sequence has. Stacking every per-frustum mask first needs
+    ``O(num_frusta * N)`` memory, which runs out of GPU memory on long sequences.
+    """
+    if len(camera_frusta) == 0:
+        raise ValueError("points_in_any_frustum needs at least one camera frustum")
+    visibility_mask = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+    for camera_frustum in camera_frusta:
+        visibility_mask |= camera_frustum.points_in_frustum(points).to(visibility_mask.device)
+    return visibility_mask
 
 
 class BaseInitialization(BaseModel, ABC):
@@ -509,10 +524,7 @@ class InitializationMixin(BaseInitialization):
             random_pts = torch.cat(random_pts_list, dim=0)
 
             # check visibility using camera frusta
-            visibility_mask = (
-                torch.vstack([camera_frustum.points_in_frustum(random_pts) for camera_frustum in camera_frusta]).sum(0)
-                > 0
-            )
+            visibility_mask = points_in_any_frustum(random_pts, camera_frusta)
 
             random_pts = random_pts[visibility_mask]
             if visualizer is not None:
@@ -713,9 +725,7 @@ class RoadInitializationMixin(BaseInitialization):
 
             random_pts = base_pts + torch.cat([offset_x, offset_y, offset_z], dim=1)
 
-            visibility_mask = (
-                torch.vstack([frustum.points_in_frustum(random_pts) for frustum in camera_frusta]).sum(0) > 0
-            )
+            visibility_mask = points_in_any_frustum(random_pts, camera_frusta)
             random_pts = random_pts[visibility_mask]
 
             random_pts, rand_nearest_ego_indices = self._project_to_ego_z_plane(random_pts, ego_c2nurec, ego_positions)

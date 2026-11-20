@@ -777,7 +777,7 @@ class PackedBackwardDiff(torch.autograd.Function):
 
             if has_first_fill or ctx.needs_input_grad[3]:
                 grad_first_fill = grad_output[first_inds]
-                grad_first_fill[non_empty.logical_not()] == 0
+                grad_first_fill[non_empty.logical_not()] = 0
 
         return grad_feat, None, grad_prepend, grad_first_fill
 

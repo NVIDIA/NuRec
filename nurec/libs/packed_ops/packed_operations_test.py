@@ -893,6 +893,17 @@ class TestPackedArithmeticOperations(NonDeterministicTestCase):
         prepends_grad_torch = torch.autograd.grad(out_torch, prepends, out_grad, retain_graph=True)[0]
         self._compareTensor(prepends_grad_ours.data.cpu(), prepends_grad_torch.data.cpu())
 
+        # Backward difference with first fill (pack 1 is empty, so its first_fill gradient must be 0)
+        first_fill = torch.tensor(
+            [10.0, 5.0, 3.0, -2.0, 8.0, 8.0], dtype=torch.float, device=torch.device("cuda"), requires_grad=True
+        )
+        out_ours = packed_backward_diff(v_packed, v_pack_info, None, first_fill)
+        out_torch = packed_backward_diff_torch_simple(v_packed, v_pack_info, None, first_fill)
+        self._compareTensor(out_ours.data.cpu(), out_torch.data.cpu())
+        first_fill_grad_ours = torch.autograd.grad(out_ours, first_fill, out_grad, retain_graph=True)[0]
+        first_fill_grad_torch = torch.autograd.grad(out_torch, first_fill, out_grad, retain_graph=True)[0]
+        self._compareTensor(first_fill_grad_ours.data.cpu(), first_fill_grad_torch.data.cpu())
+
 
 class TestPackedSearchSorted(CommonTestCase):
     def setUp(self) -> None:

@@ -4,6 +4,7 @@
 load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("@rules_python//python:packaging.bzl", "py_wheel")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 
 DEFAULT_VISIBILITY = [
@@ -65,4 +66,16 @@ py_wheel(
         ":info",
         ":pylib",
     ],
+)
+
+# Usage: bazel run //nurec/artifact:publish_wheel -- <registry url> (credentials from ~/.netrc)
+sh_binary(
+    name = "publish_wheel",
+    srcs = ["publish_wheel.sh"],
+    args = ["$(rlocationpath :wheel)"],
+    data = [
+        ":wheel",
+        "@multitool//tools/uv",
+    ],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
 )

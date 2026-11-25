@@ -4,6 +4,8 @@
 # Use the defaults to import the samplers, if you list more they will be combined
 defaults:
   - samplers: coverage_image_crop  # Include samplers/coverage_image_crop.yaml
+  - /image_resolution/camera@_global_.dataset.n_val_image_resolution: relative_4
+  - /image_resolution/camera@_global_.dataset.n_train_sequential_image_resolution: relative_4
 
 name: ncore
 
@@ -48,7 +50,6 @@ max_dist_m: 150.0
 n_samples_per_epoch: 30000
 n_train_sample_camera_rays: 6144
 n_train_sample_lidar_rays: 2048
-n_val_image_subsample: 4
 val_camera: true # If enabled, will return camera rays in validation/test time.
 val_lidar: false # If enabled, will return lidar rays in validation/test time.
 val_sensor_transl_delta_m: null # Translation (meters, relative to rig frame) / rotation (deg, XYZ / roll-pitch-yaw Euler angles relative
@@ -98,7 +99,6 @@ lidar_model_parameter_cwccw_fallback: false # If enabled, try to apply a backwar
 lidar_model_parameter_nominal_values: {}
 
 # The following parameters are used for 'train_sequential' dataset splits, which exhaustively provide datasource samples in linear order (e.g., used for modules such as the uncertainty estimators that need to be fitted against training rays at the end of training)
-n_train_sequential_image_subsample: 4
 train_sequential_camera: true
 train_sequential_lidar: false
 train_sequential_camera_frame_start: 0

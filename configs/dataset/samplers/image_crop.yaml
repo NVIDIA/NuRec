@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_1
+
 batch_sampler:
   name: default # Type of the batch sampler
   ratio_camera_samples: 1.0 # ratio of the camera samples that will come from this sampler
@@ -15,7 +18,6 @@ batch_sampler:
   camera_pixel_sampler:
     name: image-crop # Type of the camera frame sampler one of [uniform, image-crop, skip]
     crop_type: full_image # possible values: [full_image, preset_roi, random_crop]
-    subsample: 1 # subsample factor of the cropped region
     roi_lt: null # the left top point of preset roi: (x, y). The x, y are normalized by image width and height respectively. In [0,1]
     roi_rb: null # the right bottom point of preset roi: (x, y). The x, y are normalized by image width and height respectively. In [0,1]
     crop_ratio: null  # the crop ratio (crop_width / orig_width and crop_height / orig_height). In (0, 1)

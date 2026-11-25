@@ -29,7 +29,7 @@ def _compute_test_name_hash(name):
 
     return h
 
-def pytest_test(name, srcs, mypy = True, deps = [], args = [], tags = [], env = {}, **kwargs):
+def pytest_test(name, srcs, mypy = True, deps = [], args = [], tags = [], restricted_tag_reason = None, env = {}, **kwargs):
     """Call pytest using a common wrapper script and register mypy test (optionally, default=True).
 
     GPU Load Balancing:
@@ -45,9 +45,17 @@ def pytest_test(name, srcs, mypy = True, deps = [], args = [], tags = [], env = 
         args: Additional arguments to pass to pytest
         tags: Tags for the test. Use "multi-gpu" tag to prevent GPU assignment
               (for tests that natively use multiple GPUs)
+        restricted_tag_reason: Required justification to waive usage of restricted tags (exclusive,
+              external, local, no-cache, no-remote-cache), which limit caching or parallelism.
+              These tags should rarely be necessary.
         env: Additional environment variables for the test
         **kwargs: Additional arguments passed to py_test
     """
+
+    restricted_tags = ["exclusive", "external", "local", "no-cache", "no-remote-cache"]
+    used_restricted_tags = [t for t in tags if t in restricted_tags]
+    if used_restricted_tags and not restricted_tag_reason:
+        fail("pytest_test %s uses restricted tags %s, which reduce test parallelism or caching, and should rarely be necessary. Explain the choice in attribute restricted_tag_reason if this target really needs them." % (name, used_restricted_tags))
 
     # Compute hash from test name for GPU load balancing
     test_name_hash = _compute_test_name_hash(name)

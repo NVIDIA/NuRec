@@ -17,11 +17,14 @@ namespace nurec_render_pack {
 // Launches the fused conversion on `stream`. dst must point to at least
 // width * height * 3 bytes of GPU memory. Returns cudaSuccess on launch
 // success, otherwise the cudaError_t from the launch.
+// src_row_stride is in float elements; zero means width * 3. A larger stride
+// packs a left-aligned crop without copying the source raster.
 cudaError_t launch_render_pack_hwc_f32_to_chw_u8(
     const float* src_hwc_f32,
     uint8_t* dst_chw_u8,
     uint32_t width,
     uint32_t height,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    uint64_t src_row_stride = 0);
 
 } // namespace nurec_render_pack

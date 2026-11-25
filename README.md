@@ -22,9 +22,9 @@ NVIDIA Omniverse™ NuRec is a set of APIs and libraries that leverage Gaussian-
 **NuRec 26.10**
 
 - **Modular SDK source.** Inspect and customize GPU-accelerated building blocks, reconstruction models, training systems, and rendering services. Start with the [source overview](#repository-overview), [sensor library](nurec/libs/sensors/README.md), and [loss library](nurec/libs/losses/README.md).
-- **Container-based development and execution.** Build a development container from the GHCR development dependencies image, and use separate runtime images for the reconstruction application and tools. See [build setup](#build-develop-and-run-from-source) and the [AV benchmark workflow](workflows/av_benchmark/README.md).
+- **Container-based development and execution.** Build a development container with the pre-installed dependencies copied in from the GHCR development dependencies image, and use separate runtime images for the reconstruction application and tools. See [build setup](#build-develop-and-run-from-source) and the [AV benchmark workflow](workflows/av_benchmark/README.md).
 - **LiDAR v2:** Reconstruct a scene from measured rays and render observations for spinning and solid-state sensors with different scan patterns, sensor geometries, and timing, including simultaneous multi-LiDAR rendering at new vehicle poses. See the [LiDAR implementation](nurec/utils/unstructured_lidar.py) and [sensor API](nurec/grpc/protos/sensorsim.proto).
-- **Radar reprojection.** Update recorded radar returns and Doppler estimates for simulated vehicle and actor poses, supporting closed-loop sensor-fusion evaluation within the coverage of recorded viewpoints. See the [repository][radar-repo] and [build and usage guide][radar-usage].
+- **Radar reprojection.** Update recorded radar returns and Doppler estimates for simulated vehicle and actor poses, supporting closed-loop sensor-fusion evaluation within the coverage of recorded viewpoints. Use the standalone CPU library or gRPC service; see the [repository][radar-repo] and [build and usage guide][radar-usage].
 - **A reproducible AV benchmark workflow.** Run a defined reconstruction-to-evaluation chain with task timings, image and object metrics, and scene export. See the [workflow](workflows/av_benchmark/README.md).
 - **A Physical AI dataset refresh.** Updated reconstructions and benchmark results for Physical AI scenes; the [dataset card][dataset-av-nurec] is the source for available versions.
 
@@ -178,7 +178,7 @@ NuRec assets are distributed through six channels. Use the one that matches what
 | Datasets                       | Hugging Face: [Physical AI collection][physical-ai-collection]                              | Accept each dataset's terms on Hugging Face      | Per dataset; see [Datasets](#datasets)               |
 | Python packages                | PyPI                                                                                        | `pip install nvidia-ncore`, `pip install gsplat` | Apache 2.0                                           |
 
-**Choosing between GHCR and NGC.** Use the GHCR development dependencies image to build a development container for this repository. Runtime containers are distributed through NVIDIA NGC. Follow the [release notes][release-notes] for the image names and tags appropriate to your release.
+**Choosing between GHCR and NGC.** Build the development container for this repository from `deps/docker/Dockerfile-dev.build`, copying in the pre-installed dependencies from the GHCR development dependencies image. Runtime containers are distributed through NVIDIA NGC. Follow the [release notes][release-notes] for the image names and tags appropriate to your release.
 
 ## Build, develop, and run from source
 

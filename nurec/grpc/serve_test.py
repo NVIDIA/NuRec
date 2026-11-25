@@ -3,8 +3,10 @@
 
 import asyncio
 import contextlib
+import gc
 import hashlib
 import io
+import math
 import os
 import socket
 import tempfile
@@ -20,13 +22,16 @@ if TYPE_CHECKING:
     from nurec.render.actors import ActorTracks
 
 from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from concurrent import futures
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import grpc
 import imageio.v2 as iio
 import numpy as np
+import pytest
 import torch
 
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc  # type: ignore
@@ -36,6 +41,7 @@ import ncore.data
 from nurec.artifact import Artifact
 from nurec.grpc.cache_keys import SCENE_ID_HEADER, SCENE_URL_HEADER, BackendCacheKey, SceneCacheKey
 from nurec.grpc.client_wait import wait_for_grpc_server
+from nurec.grpc.fatal_worker import FatalWorkerExceptionInterceptor, FatalWorkerIncident, FatalWorkerState
 from nurec.grpc.grpc_server_config import (
     HARMONIZER_TEMPORAL_COSMOS_BASE_MODEL_URL,
     HARMONIZER_TEMPORAL_COSMOS_TOKENIZER_URL,
@@ -44,13 +50,15 @@ from nurec.grpc.grpc_server_config import (
     GrpcServerConfig,
 )
 from nurec.grpc.nvjpeg_batch_encoder import NvjpegBatchEncoder
-from nurec.grpc.protos import ipc_pb2
-from nurec.grpc.protos.common_pb2 import Empty, Pose, PoseAtTime
+from nurec.grpc.protos import ipc_pb2, rdma_pb2
+from nurec.grpc.protos.common_pb2 import Empty, Pose, PoseAtTime, VersionId
 from nurec.grpc.protos.common_pb2 import Trajectory as ProtoTrajectory
 from nurec.grpc.protos.sensorsim_pb2 import (
     LIDAR_FLOATING_FILTER_SOURCE_ANGLE,
     LIDAR_FLOATING_FILTER_SOURCE_RANGEVIEW,
+    AspectState,
     AvailableCamerasRequest,
+    AvailableCamerasReturn,
     AvailableDynamicObjectsRequest,
     AvailableTrajectoriesRequest,
     BatchCameraRenderRequest,
@@ -68,24 +76,36 @@ from nurec.grpc.protos.sensorsim_pb2 import (
     FthetaCameraParam,
     HarmonizerSessionId,
     ImageFormat,
+    LidarFiringPatternRequest,
+    LidarFiringPatternReturn,
+    LidarOutputMode,
     LidarRenderFilter,
     LidarRenderRequest,
     LidarRenderReturn,
+    LidarReturnType,
     LidarSpec,
     LinearCde,
     OpenCVFisheyeCameraParam,
     OpenCVPinholeCameraParam,
     OverlayBoundingBoxSource,
+    PosePair,
+    PrefetchSceneRequest,
     RestoreModelParametersRequest,
     RGBRenderRequest,
     RGBRenderReturn,
 )
 from nurec.grpc.protos.sensorsim_pb2 import BivariateWindshieldModelParameters as ProtoWParams
-from nurec.grpc.protos.sensorsim_pb2_grpc import SensorsimServiceStub, add_SensorsimServiceServicer_to_server
+from nurec.grpc.protos.sensorsim_pb2_grpc import (
+    SensorsimServiceServicer,
+    SensorsimServiceStub,
+    add_SensorsimServiceServicer_to_server,
+)
 from nurec.grpc.scene_cache import SceneCache
 from nurec.grpc.serve import (
     BATCH_RENDER_REQUEST_CHUNK_SIZE,
+    LEGACY_SENSORSIM_SERVICE_NAME,
     ArtifactRegistration,
+    AssetBank,
     Backend,
     CacheFullError,
     CacheWaitAbortedError,
@@ -97,21 +117,38 @@ from nurec.grpc.serve import (
     NoSpareBackendsError,
     PendingBatchRGBEncode,
     PendingCameraRenderOutput,
+    PreparedBackend,
+    PreparedScene,
+    RdmaTransportUnavailableError,
     SceneDownloadInterceptor,
     SceneNotFoundError,
     SensorSimService,
     ServerMetricsManager,
     TimestampOutOfRangeError,
     TorchCamera,
+    _AutomaticGcPause,
+    _camera_batch_incompatibility,
+    _CameraBatchDispatch,
     _classify_render_exception,
+    _fill_firing_pattern,
     _grpc_backend_cache_wait_policy,
+    _local_file_fingerprint,
+    _register_local_artifact,
+    _rig_trajectory_to_grpc_trajectory,
     _serve_once_harmonizer_loaded,
+    _validate_local_artifact,
     actor_tracks_from_grpc,
     actor_tracks_to_grpc,
+    actors_snapshot_from_render_request,
+    add_sensorsim_servicer_to_server,
+    collect_cuda_worker_diagnostics,
     download_scene_to_cache,
     is_local_scene_uri,
 )
-from nurec.render.render import CameraFrame, LidarRayBundle, MissingRenderOutputError
+from nurec.lidar.firing_patterns.schema import LidarFiringPatternTemplatesData
+from nurec.lidar.firing_patterns.templates import LidarFiringPatternTemplate
+from nurec.render.render import CameraFrame, LidarRayBundle, LidarRayFrame, MissingRenderOutputError, RenderableModel
+from nurec.utils.batch import RenderingData
 from nurec.utils.metrics import MetricsCollector
 from nurec.utils.types import FrameConversion, HalfClosedInterval, RigTrajectories
 from nurec.utils.visualize import SEMANTICS_COLOR_LUT_DEFAULT_SIZE
@@ -139,6 +176,106 @@ def _test_backend_cache_key(scene_id: str = "scene") -> BackendCacheKey:
     return BackendCacheKey(SceneCacheKey(scene_id=scene_id), "0" * 64)
 
 
+@pytest.mark.parametrize("change", ["chmod", "hardlink", "touch", "replace"])
+def test_local_artifact_validation_accepts_unchanged_content(tmp_path: Path, change: str) -> None:
+    source = tmp_path / "scene.usdz"
+    source.write_bytes(_artifact_bytes("scene"))
+    registration = _register_local_artifact(Artifact(source), SceneCacheKey(scene_id="scene"))
+    if change == "chmod":
+        source.chmod(0o600)
+    elif change == "hardlink":
+        (tmp_path / "link.usdz").hardlink_to(source)
+    elif change == "touch":
+        os.utime(source, ns=(0, 0))
+    else:
+        replacement = tmp_path / "replacement.usdz"
+        replacement.write_bytes(source.read_bytes())
+        replacement.replace(source)
+    current = _local_file_fingerprint(source)
+    if change in ("touch", "replace"):
+        assert current != registration.source_fingerprint
+    _validate_local_artifact(registration)
+    assert registration.source_fingerprint == current
+    with mock.patch.object(Artifact, "sha256_footprint", new_callable=mock.PropertyMock) as digest:
+        _validate_local_artifact(registration)
+        digest.assert_not_called()
+
+
+def test_local_artifact_validation_detects_change_during_hash(tmp_path: Path) -> None:
+    source = tmp_path / "scene.usdz"
+    source.write_bytes(_artifact_bytes("scene"))
+    registration = _register_local_artifact(Artifact(source), SceneCacheKey(scene_id="scene"))
+    fingerprint = registration.source_fingerprint
+    with (
+        mock.patch("nurec.grpc.serve._local_file_fingerprint", side_effect=[(1, 2, 3, 4, 5), fingerprint]),
+        pytest.raises(ValueError, match="changed while it was validated"),
+    ):
+        _validate_local_artifact(registration)
+
+
+@pytest.mark.parametrize("camera_only", [False, True])
+def test_metadata_change_allows_prefetch_and_sync_load(tmp_path: Path, camera_only: bool) -> None:
+    source = tmp_path / "scene.usdz"
+    source.write_bytes(_artifact_bytes("scene"))
+    service = _make_service_no_server(camera_only=camera_only)
+    key = SceneCacheKey(scene_id="scene")
+    registration = _register_local_artifact(Artifact(source), key)
+    service._artifact_registrations[key.key_hash] = registration
+    os.utime(source, ns=(0, 0))
+    prepared = mock.MagicMock(spec=PreparedBackend)
+    prepared.backend_cache_key = registration.backend_cache_key
+    backend = TestRenderGrpcStatusCodes._make_backend(registration.backend_cache_key)
+    prepared.activate.return_value = backend
+    with mock.patch.object(PreparedBackend, "from_artifact", return_value=prepared) as prepare:
+        prepared_scene = service._prepare_scene(key)
+    prepare.assert_called_once()
+    assert prepare.call_args.kwargs["camera_only"] is camera_only
+    assert prepared_scene is not None
+    source.touch()
+    with (
+        mock.patch.object(service._scene_prefetch, "take", return_value=prepared_scene),
+        mock.patch.object(Backend, "from_artifact") as sync_load,
+    ):
+        with service.get_backend(key) as loaded:
+            assert loaded is backend
+        prepared.activate.assert_called_once_with()
+        sync_load.assert_not_called()
+    service.backend_cache.evict_one_spare()
+    backend = TestRenderGrpcStatusCodes._make_backend(registration.backend_cache_key)
+    with mock.patch.object(Backend, "from_artifact", return_value=backend) as sync_load:
+        with service.get_backend(key) as loaded:
+            assert loaded is backend
+        sync_load.assert_called_once()
+        assert sync_load.call_args.kwargs["camera_only"] is camera_only
+    service.close()
+
+
+def test_prefetch_wait_timeout_falls_back_to_sync_load(tmp_path: Path) -> None:
+    source = tmp_path / "scene.usdz"
+    source.write_bytes(_artifact_bytes("scene"))
+    service = _make_service_no_server()
+    key = SceneCacheKey(scene_id="scene")
+    registration = _register_local_artifact(Artifact(source), key)
+    service._artifact_registrations[key.key_hash] = registration
+    service._backend_cache_wait_timeout_s = 0.0
+    backend = TestRenderGrpcStatusCodes._make_backend(registration.backend_cache_key)
+
+    def take(_key, *, check_wait):
+        check_wait()
+        pytest.fail("prefetch wait should expire")
+
+    with (
+        mock.patch.object(service._scene_prefetch, "take", side_effect=take),
+        mock.patch.object(service._scene_prefetch, "discard") as discard,
+        mock.patch.object(Backend, "from_artifact", return_value=backend) as sync_load,
+    ):
+        with service.get_backend(key) as loaded:
+            assert loaded is backend
+        discard.assert_called_once_with(key)
+        sync_load.assert_called_once()
+        assert service.backend_cache.pending_global == 0
+
+
 def _lidar_model_parameters(n_rows: int = 4, n_columns: int = 8) -> ncore.data.ConcreteLidarModelParametersUnion:
     """Minimal spinning lidar intrinsics for LidarBank tests.
 
@@ -157,17 +294,27 @@ def _lidar_model_parameters(n_rows: int = 4, n_columns: int = 8) -> ncore.data.C
     )
 
 
-def _firing_pattern_npz(n_rays: int) -> bytes:
-    """A pattern serialised the way an artifact carries it, as ``firing_patterns/<id>.npz``."""
-    directions = np.zeros((n_rays, 3), dtype=np.float32)
-    directions[:, 0] = 1.0
-    buffer = io.BytesIO()
-    np.savez(
-        buffer,
-        directions_sensor=directions,
-        timestamp_offsets_us=np.arange(n_rays, dtype=np.int64),
-        frame_duration_us=np.asarray(max(n_rays - 1, 1), dtype=np.int64),
+def _firing_pattern_npz(n_rays: int, template_count: int = 1, *, frame_period_us: int = 100) -> bytes:
+    """Templates serialized as an artifact's ``firing_patterns/<id>.npz`` member."""
+    template_directions = []
+    for phase in range(template_count):
+        angle = phase * 0.01
+        directions = np.zeros((n_rays, 3), dtype=np.float32)
+        directions[:, 0] = np.cos(angle)
+        directions[:, 1] = np.sin(angle)
+        template_directions.append(directions)
+    data = LidarFiringPatternTemplatesData(
+        directions_sensor=np.concatenate(template_directions),
+        timestamp_offsets_us=np.tile(np.arange(n_rays, dtype=np.int64), template_count),
+        template_ray_offsets=np.arange(0, (template_count + 1) * n_rays, n_rays, dtype=np.int64),
+        packet_ray_offsets=np.arange(0, (template_count + 1) * n_rays, n_rays, dtype=np.int64),
+        template_packet_offsets=np.arange(template_count + 1, dtype=np.int64),
+        reference_frame_start_us=1_000,
+        frame_period_us=frame_period_us,
+        frame_start_tolerance_us=1,
     )
+    buffer = io.BytesIO()
+    np.savez(buffer, **data.artifact_arrays())
     return buffer.getvalue()
 
 
@@ -207,6 +354,61 @@ def _lidar_artifact(*lidars: tuple, firing_patterns: dict[str, bytes] | None = N
     return artifact
 
 
+class TestAutomaticGcPause(unittest.TestCase):
+    def test_nested_pauses_resume_collection_once(self):
+        pause = _AutomaticGcPause()
+        was_enabled = gc.isenabled()
+        with pause.paused():
+            self.assertFalse(gc.isenabled())
+            with pause.paused():
+                self.assertFalse(gc.isenabled())
+            self.assertFalse(gc.isenabled())
+        self.assertEqual(gc.isenabled(), was_enabled)
+
+    def test_leaves_collection_disabled_when_it_was_disabled(self):
+        was_enabled = gc.isenabled()
+        self.addCleanup(gc.enable if was_enabled else gc.disable)
+        gc.disable()
+        with _AutomaticGcPause().paused():
+            self.assertFalse(gc.isenabled())
+        self.assertFalse(gc.isenabled())
+
+    def test_resumes_collection_when_the_load_fails(self):
+        pause = _AutomaticGcPause()
+        was_enabled = gc.isenabled()
+        with self.assertRaises(RuntimeError), pause.paused():
+            raise RuntimeError("load failed")
+        self.assertEqual(gc.isenabled(), was_enabled)
+
+
+class TestAssetBankDimsOffset(unittest.TestCase):
+    """The track padding is read from the artifact's parsed config as a plain mapping."""
+
+    @staticmethod
+    def _artifact(parsed_config: dict) -> mock.Mock:
+        artifact = mock.Mock(spec=Artifact)
+        artifact.external_assets = {}
+        artifact.parsed_config = parsed_config
+        return artifact
+
+    def test_reads_the_configured_track_padding(self):
+        bank = AssetBank(
+            self._artifact({"dataset": {"valid_pixels_cuboid_track_params": {"track_padding_m": [1.0, 1.0, 0.25]}}})
+        )
+        self.assertEqual(list(bank._dims_offset), [1.0, 1.0, 0.25])
+
+    def test_defaults_to_zero_padding_when_the_key_is_absent(self):
+        for parsed_config in (
+            {},
+            {"dataset": {}},
+            {"dataset": None},
+            {"dataset": {"valid_pixels_cuboid_track_params": None}},
+        ):
+            with self.subTest(parsed_config=parsed_config):
+                bank = AssetBank(self._artifact(parsed_config))
+                self.assertEqual(list(bank._dims_offset), [0.0, 0.0, 0.0])
+
+
 class TestLidarBank(unittest.TestCase):
     """LidarBank keeps every lidar of the artifact, keyed by logical sensor id."""
 
@@ -236,7 +438,7 @@ class TestLidarBank(unittest.TestCase):
     def test_get_entry_rejects_unknown_id(self):
         bank = LidarBank(_lidar_artifact(("lidar_top", 0, True)))
 
-        with self.assertRaisesRegex(ValueError, "Unknown lidar 'nope'"):
+        with self.assertRaisesRegex(KeyError, "Unknown lidar 'nope'"):
             bank.get_entry("nope")
 
     def test_get_entry_without_id_requires_a_single_lidar(self):
@@ -247,12 +449,46 @@ class TestLidarBank(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple lidars"):
             multi.get_entry()
 
-    def test_firing_pattern_is_read_from_the_artifact(self):
+    def test_firing_pattern_templates_are_read_from_the_artifact(self):
         bank = LidarBank(
             _lidar_artifact(("lidar_top", 0, False), firing_patterns={"lidar_top": _firing_pattern_npz(7)})
         )
 
-        self.assertEqual(bank.get_entry("lidar_top").firing_pattern.n_rays, 7)
+        templates = bank.get_entry("lidar_top").firing_pattern_templates
+        self.assertIsNotNone(templates)
+        self.assertEqual(templates.templates[0].n_rays, 7)
+
+    def test_select_firing_pattern_delegates_to_template_phase_selection(self):
+        entry = LidarBank(
+            _lidar_artifact(
+                ("lidar_top", 0, False),
+                firing_patterns={"lidar_top": _firing_pattern_npz(7, template_count=2)},
+            )
+        ).get_entry("lidar_top")
+
+        self.assertIs(entry.select_firing_pattern(1_000), entry.firing_pattern_templates.templates[0])
+        self.assertIs(entry.select_firing_pattern(1_100), entry.firing_pattern_templates.templates[1])
+
+    def test_explicit_firing_pattern_id_takes_precedence_over_frame_time(self):
+        entry = LidarBank(
+            _lidar_artifact(
+                ("lidar_top", 0, False),
+                firing_patterns={"lidar_top": _firing_pattern_npz(7, template_count=2)},
+            )
+        ).get_entry("lidar_top")
+        requested = entry.firing_pattern_templates.templates[1]
+
+        self.assertIs(entry.select_firing_pattern(1_000, requested.pattern_id(100)), requested)
+
+    def test_explicit_unknown_firing_pattern_id_is_not_found(self):
+        entry = LidarBank(
+            _lidar_artifact(("lidar_top", 0, False), firing_patterns={"lidar_top": _firing_pattern_npz(7)})
+        ).get_entry("lidar_top")
+
+        with self.assertRaisesRegex(KeyError, "Unknown firing pattern id 'not-a-pattern'") as caught:
+            entry.select_firing_pattern(1_000, "not-a-pattern")
+
+        self.assertEqual(_classify_render_exception(caught.exception)[0], grpc.StatusCode.NOT_FOUND)
 
     def test_bundle_is_built_once_and_skipped_without_intrinsics(self):
         bank = LidarBank(_lidar_artifact(("lidar_top", 0, True), ("lidar_blind", 1, False)))
@@ -280,10 +516,16 @@ class TestBackendLidarDispatch(unittest.TestCase):
             point_positions=torch.empty((0, 3), dtype=torch.float32),
             point_intensities=None,
         )
+        model.render_lidar_ray_frame_from_ray_bundle.return_value = LidarRayFrame(
+            ray_distances=torch.ones(7, dtype=torch.float32),
+            ray_valid=torch.ones(7, dtype=torch.bool),
+            ray_intensities=None,
+        )
         backend = Backend(
             renderable_model=model,
             camera_bank=mock.Mock(),
             world_to_nurec=FrameConversion(matrix=np.eye(4, dtype=np.float32)),
+            scene_time_range_us=HalfClosedInterval(0, 2**64),
             lidar_bank=LidarBank(artifact),
             asset_bank=mock.Mock(),
             source_artifact=artifact,
@@ -294,7 +536,12 @@ class TestBackendLidarDispatch(unittest.TestCase):
 
     @staticmethod
     def _request(lidar_id: str = "") -> LidarRenderRequest:
-        request = LidarRenderRequest(lidar_id=lidar_id, frame_start_us=1_000, frame_end_us=1_100)
+        request = LidarRenderRequest(
+            lidar_id=lidar_id,
+            frame_start_us=1_000,
+            frame_end_us=1_100,
+            output_mode=LidarOutputMode.LIDAR_OUTPUT_PER_RAY,
+        )
         request.sensor_pose.start_pose.quat.w = 1.0
         request.sensor_pose.end_pose.quat.w = 1.0
         return request
@@ -307,36 +554,370 @@ class TestBackendLidarDispatch(unittest.TestCase):
             firing_patterns={"model_free": _firing_pattern_npz(7)},
         )
 
-    def test_dispatches_a_modeled_lidar_to_the_structured_builder(self):
+    @staticmethod
+    def _hybrid_artifact() -> mock.Mock:
+        return _lidar_artifact(
+            ("hybrid", 5, True),
+            firing_patterns={"hybrid": _firing_pattern_npz(7, template_count=2)},
+        )
+
+    def test_defaults_a_modeled_lidar_to_point_cloud_without_exposed_geometry(self):
         backend = self._backend(self._mixed_artifact())
+        request = self._request("modeled")
+        request.ClearField("output_mode")
         with (
             mock.patch("nurec.grpc.serve.LidarModelBundle.load_from_config", return_value=mock.sentinel.model),
             mock.patch.object(LidarRayBundle, "build", return_value=mock.sentinel.bundle) as build,
             mock.patch.object(LidarRayBundle, "build_model_free") as build_model_free,
         ):
-            backend.render_lidar_request(self._request("modeled"))
+            response = backend.render_lidar_request(request)
 
         build.assert_called_once()
         self.assertIs(build.call_args.kwargs["lidar_model"], mock.sentinel.model)
         self.assertEqual(build.call_args.kwargs["unique_sensor_idx"], 3)
         build_model_free.assert_not_called()
+        self.assertEqual(response.num_return_layers, 0)
         backend.renderable_model.render_lidar_frame_from_ray_bundle.assert_called_once()
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_not_called()
+
+    def test_rejects_explicit_per_ray_output_for_a_modeled_lidar(self):
+        request = self._request("modeled")
+        request.output_mode = LidarOutputMode.LIDAR_OUTPUT_PER_RAY
+        self._assert_rejected_before_ray_preparation(
+            request, "artifact-resident firing pattern", ModelIncompatibilityError
+        )
+
+    def _assert_rejected_before_ray_preparation(self, request, message, exception_type=ValueError):
+        backend = self._backend(self._mixed_artifact())
+        with (
+            mock.patch("nurec.grpc.serve.LidarEntry.bundle") as bundle,
+            mock.patch("nurec.grpc.serve.torch.tensor") as tensor,
+            mock.patch.object(LidarRayBundle, "build") as build,
+            mock.patch.object(LidarRayBundle, "build_model_free") as build_model_free,
+            mock.patch.object(backend, "_update_aspect_states") as update_aspects,
+            self.assertRaisesRegex(exception_type, message),
+        ):
+            backend.render_lidar_request(request)
+
+        bundle.assert_not_called()
+        tensor.assert_not_called()
+        build.assert_not_called()
+        build_model_free.assert_not_called()
+        update_aspects.assert_not_called()
+        backend._get_lidar_stream.assert_not_called()
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_not_called()
+        backend.renderable_model.render_lidar_frame_from_ray_bundle.assert_not_called()
 
     def test_dispatches_a_model_free_lidar_to_the_observed_pattern_builder(self):
         backend = self._backend(self._mixed_artifact())
+        request = self._request("model_free")
+        request.return_types.append(LidarReturnType.LIDAR_RETURN_STRONGEST)
         with (
             mock.patch.object(LidarRayBundle, "build") as build,
             mock.patch.object(
                 LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle
             ) as build_model_free,
         ):
-            backend.render_lidar_request(self._request("model_free"))
+            response = backend.render_lidar_request(request)
 
         build.assert_not_called()
         build_model_free.assert_called_once()
-        self.assertEqual(build_model_free.call_args.kwargs["firing_pattern"].n_rays, 7)
+        self.assertEqual(
+            build_model_free.call_args.kwargs["firing_pattern_template"].n_rays,
+            7,
+        )
+        self.assertEqual(build_model_free.call_args.kwargs["frame_period_us"], 100)
         self.assertEqual(build_model_free.call_args.kwargs["unique_sensor_idx"], 4)
+        self.assertEqual(list(response.return_types), [LidarReturnType.LIDAR_RETURN_STRONGEST])
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_called_once()
+        backend.renderable_model.render_lidar_frame_from_ray_bundle.assert_not_called()
+
+    def test_stored_pattern_precedes_intrinsics_without_building_model(self):
+        backend = self._backend(self._hybrid_artifact())
+        request = self._request("hybrid")
+        with (
+            mock.patch("nurec.grpc.serve.LidarModelBundle.load_from_config") as load_model,
+            mock.patch.object(
+                LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle
+            ) as build_model_free,
+        ):
+            response = backend.render_lidar_request(request)
+
+        load_model.assert_not_called()
+        build_model_free.assert_called_once()
+        self.assertTrue(response.firing_pattern_id)
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_called_once()
+
+    def test_hybrid_lidar_explicit_point_cloud_still_uses_stored_pattern(self):
+        backend = self._backend(self._hybrid_artifact())
+        request = self._request("hybrid")
+        request.output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+        with (
+            mock.patch("nurec.grpc.serve.LidarModelBundle.load_from_config") as load_model,
+            mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle),
+        ):
+            backend.render_lidar_request(request)
+
+        load_model.assert_not_called()
         backend.renderable_model.render_lidar_frame_from_ray_bundle.assert_called_once()
+
+    def test_hybrid_lidar_unknown_pattern_does_not_fall_back_to_model(self):
+        backend = self._backend(self._hybrid_artifact())
+        request = self._request("hybrid")
+        request.firing_pattern_id = "missing"
+        with (
+            mock.patch("nurec.grpc.serve.LidarModelBundle.load_from_config") as load_model,
+            self.assertRaisesRegex(KeyError, "Unknown firing pattern id"),
+        ):
+            backend.render_lidar_request(request)
+
+        load_model.assert_not_called()
+
+    def test_accepts_first_and_multiple_requested_return_layers(self):
+        supported = (
+            [LidarReturnType.LIDAR_RETURN_FIRST],
+            [LidarReturnType.LIDAR_RETURN_FIRST, LidarReturnType.LIDAR_RETURN_STRONGEST],
+            [LidarReturnType.LIDAR_RETURN_STRONGEST, LidarReturnType.LIDAR_RETURN_FIRST],
+        )
+        for requested in supported:
+            with self.subTest(requested=requested):
+                backend = self._backend(self._mixed_artifact())
+                request = self._request("model_free")
+                request.return_types.extend(requested)
+                with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+                    response = backend.render_lidar_request(request)
+
+                self.assertEqual(response.num_return_layers, len(requested))
+                self.assertEqual(list(response.return_types), requested)
+                backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_called_once()
+
+    def test_return_layer_wire_values_reserve_zero_for_unspecified(self):
+        """Keep real layers distinct from an explicitly transmitted zero sentinel."""
+        self.assertEqual(LidarReturnType.LIDAR_RETURN_UNSPECIFIED, 0)
+        self.assertEqual(LidarReturnType.LIDAR_RETURN_FIRST, 1)
+        self.assertEqual(LidarReturnType.LIDAR_RETURN_STRONGEST, 2)
+        for values in ([], [0], [1], [2], [1, 2], [99]):
+            with self.subTest(values=values):
+                request = LidarRenderRequest(return_types=values)
+                decoded = LidarRenderRequest.FromString(request.SerializeToString())
+                self.assertEqual(list(decoded.return_types), values)
+
+    def test_rejects_unspecified_return_layers_before_preparing_rays(self):
+        """Reject the zero sentinel alone or mixed with a supported layer."""
+        for values in (
+            [LidarReturnType.LIDAR_RETURN_UNSPECIFIED],
+            [LidarReturnType.LIDAR_RETURN_STRONGEST, LidarReturnType.LIDAR_RETURN_UNSPECIFIED],
+        ):
+            with self.subTest(values=values):
+                request = self._request("model_free")
+                request.return_types.extend(values)
+                self._assert_rejected_before_ray_preparation(request, "unsupported LiDAR return layer")
+
+    def test_rejects_duplicate_requested_return_layers(self):
+        request = self._request("model_free")
+        request.return_types.extend([LidarReturnType.LIDAR_RETURN_STRONGEST, LidarReturnType.LIDAR_RETURN_STRONGEST])
+        self._assert_rejected_before_ray_preparation(request, "return layers must be unique")
+
+    def test_rejects_unknown_return_layers_before_preparing_rays(self):
+        request = self._request("model_free")
+        request.return_types.append(99)
+        self._assert_rejected_before_ray_preparation(request, "unsupported LiDAR return layer")
+
+    def test_explicit_point_cloud_mode_uses_stored_geometry(self):
+        backend = self._backend(self._mixed_artifact())
+        request = self._request("model_free")
+        request.output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+
+        with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+            backend.render_lidar_request(request)
+
+        self.assertTrue(request.HasField("output_mode"))
+        backend.renderable_model.render_lidar_frame_from_ray_bundle.assert_called_once()
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_not_called()
+
+    def test_rejects_an_unknown_output_mode(self):
+        for lidar_id in ("model_free", "modeled"):
+            with self.subTest(lidar_id=lidar_id):
+                request = self._request(lidar_id)
+                request.output_mode = 99
+                self._assert_rejected_before_ray_preparation(request, "unsupported lidar output mode 99")
+
+    def test_render_request_explicit_pattern_id_overrides_timestamp_phase(self):
+        artifact = _lidar_artifact(
+            ("model_free", 4, False),
+            firing_patterns={"model_free": _firing_pattern_npz(7, template_count=2)},
+        )
+        backend = self._backend(artifact)
+        requested = backend.lidar_bank.get_entry("model_free").firing_pattern_templates.templates[1]
+        request = self._request("model_free")
+        request.firing_pattern_id = requested.pattern_id(100)
+
+        with mock.patch.object(
+            LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle
+        ) as build_model_free:
+            backend.render_lidar_request(request)
+
+        self.assertIs(build_model_free.call_args.kwargs["firing_pattern_template"], requested)
+
+    def test_variable_phase_ray_counts_reach_lookup_and_render_buffers(self):
+        data = LidarFiringPatternTemplatesData(
+            directions_sensor=np.tile(np.array([[1, 0, 0]], dtype=np.float32), (10, 1)),
+            timestamp_offsets_us=np.arange(10, dtype=np.int64),
+            template_ray_offsets=np.array([0, 4, 10], dtype=np.int64),
+            packet_ray_offsets=np.array([0, 2, 4, 6, 10], dtype=np.int64),
+            template_packet_offsets=np.array([0, 2, 4], dtype=np.int64),
+            reference_frame_start_us=1_000,
+            frame_period_us=100,
+            frame_start_tolerance_us=1,
+        )
+        buffer = io.BytesIO()
+        np.savez(buffer, **data.artifact_arrays())
+        backend = self._backend(
+            _lidar_artifact(
+                ("model_free", 4, False),
+                firing_patterns={"model_free": buffer.getvalue()},
+            )
+        )
+        for phase, count in enumerate((4, 6)):
+            with self.subTest(phase=phase):
+                request = self._request("model_free")
+                request.frame_start_us += 100 * phase
+                request.frame_end_us += 100 * phase
+                pattern = backend.get_lidar_firing_pattern(
+                    LidarFiringPatternRequest(
+                        lidar_id="model_free",
+                        frame_start_us=request.frame_start_us,
+                    )
+                )
+                self.assertEqual(pattern.num_rays, count)
+                self.assertEqual(len(pattern.directions_sensor), count * 3 * 4)
+                np.testing.assert_array_equal(
+                    np.frombuffer(pattern.packet_layout.ray_offsets_u32_le, dtype="<u4"),
+                    [0, 2, count],
+                )
+                backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.return_value = LidarRayFrame(
+                    ray_distances=torch.ones(count),
+                    ray_valid=torch.ones(count, dtype=torch.bool),
+                    ray_intensities=torch.ones(count),
+                )
+                with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+                    rendered = backend.render_lidar_request(request)
+                self.assertEqual(rendered.num_rays, count)
+                self.assertEqual(len(rendered.ray_distances_m_buffer), count * 4)
+                self.assertEqual(rendered.firing_pattern_id, pattern.firing_pattern_id)
+
+    def test_pattern_lookup_uses_time_by_default_and_explicit_id_with_precedence(self):
+        artifact = _lidar_artifact(
+            ("model_free", 4, False),
+            firing_patterns={"model_free": _firing_pattern_npz(7, template_count=2)},
+        )
+        backend = self._backend(artifact)
+        templates = backend.lidar_bank.get_entry("model_free").firing_pattern_templates.templates
+
+        selected_by_time = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(lidar_id="model_free", frame_start_us=1_100)
+        )
+        selected_by_id = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(
+                lidar_id="model_free",
+                frame_start_us=1_000,
+                firing_pattern_id=templates[1].pattern_id(100),
+            )
+        )
+
+        self.assertEqual(selected_by_time.firing_pattern_id, templates[1].pattern_id(100))
+        self.assertEqual(selected_by_id.firing_pattern_id, templates[1].pattern_id(100))
+        self.assertEqual(selected_by_id.frame_period_us, 100)
+        self.assertEqual(selected_by_id.packet_layout.num_packets, 1)
+
+    def test_pattern_lookup_reports_whether_the_full_request_window_is_in_scene(self):
+        artifact = _lidar_artifact(
+            ("model_free", 4, False),
+            firing_patterns={"model_free": _firing_pattern_npz(7, template_count=2)},
+        )
+        backend = self._backend(artifact)
+        backend.scene_time_range_us = HalfClosedInterval(1_000, 1_200)
+        backend.camera_bank = object()  # type: ignore[assignment]
+
+        contained = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(lidar_id="model_free", frame_start_us=1_100)
+        )
+        crosses_end = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(lidar_id="model_free", frame_start_us=1_101)
+        )
+        before_start = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(lidar_id="model_free", frame_start_us=999)
+        )
+        unspecified_start = backend.get_lidar_firing_pattern(
+            LidarFiringPatternRequest(lidar_id="model_free", firing_pattern_id=contained.firing_pattern_id)
+        )
+
+        assert contained.HasField("requested_frame_within_scene_time_range")
+        assert contained.requested_frame_within_scene_time_range
+        assert crosses_end.HasField("requested_frame_within_scene_time_range")
+        assert not crosses_end.requested_frame_within_scene_time_range
+        assert before_start.HasField("requested_frame_within_scene_time_range")
+        assert not before_start.requested_frame_within_scene_time_range
+        assert not unspecified_start.HasField("requested_frame_within_scene_time_range")
+
+    def test_pattern_cache_ids_cover_frame_period_for_lookup_and_rendering(self):
+        artifact = _lidar_artifact(
+            ("fast", 4, False),
+            ("slow", 5, False),
+            ("same_as_fast", 6, False),
+            firing_patterns={
+                "fast": _firing_pattern_npz(7, frame_period_us=100),
+                "slow": _firing_pattern_npz(7, frame_period_us=200),
+                "same_as_fast": _firing_pattern_npz(7, frame_period_us=100),
+            },
+        )
+        backend = self._backend(artifact)
+        patterns = {
+            lidar_id: backend.get_lidar_firing_pattern(LidarFiringPatternRequest(lidar_id=lidar_id))
+            for lidar_id in ("fast", "slow", "same_as_fast")
+        }
+        self.assertEqual(patterns["fast"].directions_sensor, patterns["slow"].directions_sensor)
+        self.assertEqual(patterns["fast"].timestamp_offsets_us, patterns["slow"].timestamp_offsets_us)
+        self.assertEqual(patterns["fast"].packet_layout, patterns["slow"].packet_layout)
+        self.assertNotEqual(patterns["fast"].firing_pattern_id, patterns["slow"].firing_pattern_id)
+        self.assertEqual(patterns["fast"], patterns["same_as_fast"])
+        cache = {pattern.firing_pattern_id: pattern for pattern in patterns.values()}
+        self.assertEqual(len(cache), 2)
+
+        for lidar_id, period in (("fast", 100), ("slow", 200)):
+            expected = patterns[lidar_id]
+            self.assertEqual(expected.frame_period_us, period)
+            pinned = backend.get_lidar_firing_pattern(
+                LidarFiringPatternRequest(lidar_id=lidar_id, firing_pattern_id=expected.firing_pattern_id)
+            )
+            self.assertEqual(pinned, expected)
+            for include_pattern in (False, True):
+                with self.subTest(lidar_id=lidar_id, include_pattern=include_pattern):
+                    request = self._request(lidar_id)
+                    request.frame_end_us = request.frame_start_us + period
+                    request.firing_pattern_id = expected.firing_pattern_id
+                    request.include_firing_pattern = include_pattern
+                    with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+                        response = backend.render_lidar_request(request)
+                    self.assertEqual(response.firing_pattern_id, expected.firing_pattern_id)
+                    self.assertEqual(cache[response.firing_pattern_id].frame_period_us, period)
+                    self.assertEqual(response.HasField("firing_pattern"), include_pattern)
+                    if include_pattern:
+                        self.assertEqual(response.firing_pattern, expected)
+
+            other_id = patterns["slow" if lidar_id == "fast" else "fast"].firing_pattern_id
+            with self.assertRaisesRegex(KeyError, "Unknown firing pattern id"):
+                backend.get_lidar_firing_pattern(
+                    LidarFiringPatternRequest(lidar_id=lidar_id, firing_pattern_id=other_id)
+                )
+            request = self._request(lidar_id)
+            request.firing_pattern_id = other_id
+            with (
+                mock.patch.object(LidarRayBundle, "build_model_free") as build_model_free,
+                self.assertRaisesRegex(KeyError, "Unknown firing pattern id"),
+            ):
+                backend.render_lidar_request(request)
+            build_model_free.assert_not_called()
 
     def test_omitted_id_on_multi_lidar_artifact_is_invalid_argument(self):
         backend = self._backend(self._mixed_artifact())
@@ -347,6 +928,124 @@ class TestBackendLidarDispatch(unittest.TestCase):
         status, message = _classify_render_exception(caught.exception)
         self.assertEqual(status, grpc.StatusCode.INVALID_ARGUMENT)
         self.assertIn("multiple lidars", message)
+
+    def test_pattern_backed_lidars_default_to_nonempty_point_clouds(self):
+        legacy = io.BytesIO()
+        np.savez(
+            legacy,
+            directions_sensor=np.tile([1.0, 0.0, 0.0], (7, 1)).astype(np.float32),
+            timestamp_offsets_us=np.arange(7, dtype=np.int64),
+            frame_duration_us=np.array(100, dtype=np.int64),
+        )
+        for artifact, lidar_id in (
+            (self._mixed_artifact(), "model_free"),
+            (self._hybrid_artifact(), "hybrid"),
+            (_lidar_artifact(("legacy", 0, False), firing_patterns={"legacy": legacy.getvalue()}), "legacy"),
+        ):
+            with self.subTest(lidar_id=lidar_id):
+                backend = self._backend(artifact)
+                backend.renderable_model.render_lidar_frame_from_ray_bundle.return_value.point_positions = torch.ones(
+                    1, 3
+                )
+                request = self._request(lidar_id)
+                request.ClearField("output_mode")
+                with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+                    response = backend.render_lidar_request(request)
+                self.assertEqual(response.num_points, 1)
+                self.assertEqual(len(response.point_xyzs_buffer), 12)
+                self.assertEqual(response.num_return_layers, 0)
+                backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_not_called()
+
+    def test_point_cloud_rejects_per_ray_options_before_preparing_rays(self):
+        for options in (
+            {"include_firing_pattern": True},
+            {"return_types": [LidarReturnType.LIDAR_RETURN_STRONGEST]},
+            {"return_types": [99]},
+            {"return_types": [0, 0]},
+        ):
+            for explicit in (False, True):
+                with self.subTest(options=options, explicit=explicit):
+                    request = self._request("model_free")
+                    request.ClearField("output_mode")
+                    if explicit:
+                        request.output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+                    request.MergeFrom(LidarRenderRequest(**options))
+                    self._assert_rejected_before_ray_preparation(request, "require LIDAR_OUTPUT_PER_RAY")
+
+    def test_invalid_artifact_scale_is_rejected_before_gpu_work(self):
+        for scale in (0.0, -1.0, float("inf"), float("nan")):
+            backend = self._backend(self._mixed_artifact())
+            backend.world_to_nurec = mock.Mock(target_scale=scale)
+            with (
+                mock.patch.object(LidarRayBundle, "build_model_free") as build,
+                self.assertRaisesRegex(ModelIncompatibilityError, "finite and positive") as caught,
+            ):
+                backend.render_lidar_request(self._request("model_free"))
+            build.assert_not_called()
+            backend._get_lidar_stream.assert_not_called()
+            self.assertEqual(_classify_render_exception(caught.exception)[0], grpc.StatusCode.FAILED_PRECONDITION)
+
+    def test_rendered_ray_count_must_match_pattern_even_without_embedding(self):
+        backend = self._backend(self._mixed_artifact())
+        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.return_value = LidarRayFrame(
+            ray_distances=torch.ones(6),
+            ray_valid=torch.ones(6, dtype=torch.bool),
+            ray_intensities=None,
+        )
+        with (
+            mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle),
+            self.assertRaisesRegex(RuntimeError, "Rendered 6 rays.*7 rays"),
+        ):
+            backend.render_lidar_request(self._request("model_free"))
+
+    def test_multiphase_lookup_requires_a_selector_but_singleton_does_not(self):
+        backend = self._backend(self._hybrid_artifact())
+        with self.assertRaisesRegex(ValueError, "2 phases; set frame_start_us or firing_pattern_id"):
+            backend.get_lidar_firing_pattern(LidarFiringPatternRequest(lidar_id="hybrid"))
+        singleton = self._backend(self._mixed_artifact())
+        self.assertTrue(
+            singleton.get_lidar_firing_pattern(LidarFiringPatternRequest(lidar_id="model_free")).firing_pattern_id
+        )
+
+    def test_point_cloud_and_per_ray_agree_in_metres_with_scaled_scene(self):
+        for scale in (0.5, 1.0, 2.0):
+            with self.subTest(scale=scale):
+                backend = self._backend(self._mixed_artifact())
+                backend.world_to_nurec = FrameConversion.from_origin_scale_axis(np.zeros(3), scale, [0, 1, 2])
+                frame = LidarRayFrame(
+                    ray_distances=torch.arange(1, 8, dtype=torch.float32),
+                    ray_valid=torch.ones(7, dtype=torch.bool),
+                    ray_intensities=None,
+                )
+                rays = torch.zeros(7, 6)
+                rays[:, 3] = 1
+                bundle = mock.Mock(T_nurec_sensor_end=torch.eye(4))
+                backend.renderable_model._render_lidar_rays.return_value = (frame, rays)
+                backend.renderable_model.render_lidar_frame_from_ray_bundle.side_effect = lambda *args, **kwargs: (
+                    RenderableModel.render_lidar_frame_from_ray_bundle(backend.renderable_model, *args, **kwargs)
+                )
+                backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.return_value = frame
+                request = self._request("model_free")
+                with mock.patch.object(LidarRayBundle, "build_model_free", return_value=bundle):
+                    per_ray = backend.render_lidar_request(request)
+                    request.output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+                    point_cloud = backend.render_lidar_request(request)
+                distances = np.frombuffer(per_ray.ray_distances_m_buffer, dtype="<f4")
+                xyz = np.frombuffer(point_cloud.point_xyzs_buffer, dtype="<f4").reshape(-1, 3)
+                np.testing.assert_allclose(distances, np.arange(1, 8) / scale)
+                np.testing.assert_allclose(np.linalg.norm(xyz, axis=1), distances)
+
+    def test_point_cloud_preserves_unclipped_intensities(self):
+        backend = self._backend(self._mixed_artifact())
+        backend.renderable_model.render_lidar_frame_from_ray_bundle.return_value = mock.Mock(
+            point_positions=torch.ones(2, 3),
+            point_intensities=torch.tensor([-0.2, 1.2]),
+        )
+        request = self._request("model_free")
+        request.output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+        with mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle):
+            response = backend.render_lidar_request(request)
+        np.testing.assert_allclose(np.frombuffer(response.point_intensities_buffer, dtype="<f4"), [-0.2, 1.2])
 
 
 class TestCamera(unittest.TestCase):
@@ -512,6 +1211,68 @@ class TestOpencvPinholeCameraModelParameters(unittest.TestCase):
 
 
 class TestActorTracksConversion(unittest.TestCase):
+    @staticmethod
+    def _signed_tracks(timestamps, quaternions=None):
+        from nurec.render.actors import ActorTracks
+
+        if quaternions is None:
+            quaternions = [[0, 0, 0, 1]] * len(timestamps)
+        return ActorTracks.from_dict_cpu(
+            {
+                "tracks_data": {
+                    "tracks_id": ["44"],
+                    "tracks_poses": [[[3 + t / 1000, 0, 0, *q] for t, q in zip(timestamps, quaternions)]],
+                    "tracks_timestamps_us": [timestamps],
+                    "tracks_label_class": ["automobile"],
+                    "tracks_flags": ["DYNAMIC|CONTROLLABLE"],
+                },
+                "cuboidtracks_data": {"cuboids_dims": [[4.5, 2, 1.8]]},
+            }
+        )
+
+    def test_negative_keyframes_are_clipped_with_interpolated_zero_pose(self):
+        objects = actor_tracks_to_grpc(self._signed_tracks([-2622, 1000, 2000]), {"44": "car"})
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].asset_id, "car")
+        poses = objects[0].trajectory.poses
+        self.assertEqual([p.timestamp_us for p in poses], [0, 1000, 2000])
+        np.testing.assert_allclose([p.pose.vec.x for p in poses], [3, 4, 5], atol=1e-5)
+
+    def test_existing_zero_keyframe_is_not_duplicated(self):
+        objects = actor_tracks_to_grpc(self._signed_tracks([-2622, 0, 1000]))
+        self.assertEqual([p.timestamp_us for p in objects[0].trajectory.poses], [0, 1000])
+
+    def test_zero_boundary_interpolates_rotation_as_well_as_translation(self):
+        tracks = self._signed_tracks([-1000, 1000], [[0, 0, 0, 1], [0, 0, 2**-0.5, 2**-0.5]])
+        pose = actor_tracks_to_grpc(tracks)[0].trajectory.poses[0].pose
+        self.assertAlmostEqual(pose.vec.x, 3, places=5)
+        self.assertAlmostEqual(pose.quat.z, np.sin(np.pi / 8), places=5)
+        self.assertAlmostEqual(pose.quat.w, np.cos(np.pi / 8), places=5)
+
+    def test_tracks_ending_before_zero_are_omitted(self):
+        self.assertEqual(actor_tracks_to_grpc(self._signed_tracks([-2622, -1000])), [])
+
+    def test_clipped_zero_singleton_round_trips_without_extending_its_lifetime(self):
+        objects = actor_tracks_to_grpc(self._signed_tracks([-1000, 0]))
+        self.assertEqual([p.timestamp_us for p in objects[0].trajectory.poses], [0])
+        imported = actor_tracks_from_grpc(objects)
+        snapshot = imported.get_snapshot_at_frame(0, 1)
+        self.assertEqual(snapshot.actor_ids, ["44"])
+        np.testing.assert_allclose(snapshot.actor_poses.cpu().numpy()[0, :, 0], [3, 3], atol=1e-5)
+        self.assertEqual(imported.get_snapshot_at_frame(1, 2).num_actors(), 0)
+        round_tripped = actor_tracks_to_grpc(imported)
+        self.assertEqual([p.timestamp_us for p in round_tripped[0].trajectory.poses], [0])
+        self.assertAlmostEqual(round_tripped[0].trajectory.poses[0].pose.vec.x, 3, places=5)
+
+    def test_unsigned_trajectory_rejects_decreasing_timestamps(self):
+        from nurec.grpc.trajectory import QVec, Trajectory
+
+        with self.assertRaises(AssertionError):
+            Trajectory(
+                timestamps_us=np.array([18446744073709548994, 1000], dtype=np.uint64),
+                poses=QVec.from_se3(np.stack([np.eye(4), np.eye(4)])),
+            )
+
     def test_actor_tracks_round_trip(self):
         track = DynamicObjectTrack()
         track.id = "1"
@@ -574,6 +1335,194 @@ class TestActorTracksConversion(unittest.TestCase):
             np.testing.assert_equal(converted_pose_at_time.pose.quat.x, original_pose_at_time.pose.quat.x)
             np.testing.assert_equal(converted_pose_at_time.pose.quat.y, original_pose_at_time.pose.quat.y)
             np.testing.assert_equal(converted_pose_at_time.pose.quat.z, original_pose_at_time.pose.quat.z)
+
+
+class TestLidarPerRayEncoding(unittest.TestCase):
+    """Backend._lidar_ray_frame_to_grpc: the wire form of a per-ray render."""
+
+    def _backend(self, target_scale: float = 1.0):
+        backend = object.__new__(Backend)
+        backend.world_to_nurec = FrameConversion.from_origin_scale_axis(
+            target_origin=np.zeros(3, dtype=np.float32), target_scale=target_scale, target_axis=[0, 1, 2]
+        )
+        return backend
+
+    @staticmethod
+    def _frame(distances, valid, intensities=None):
+        return LidarRayFrame(
+            ray_distances=torch.tensor(distances, dtype=torch.float32),
+            ray_valid=torch.tensor(valid, dtype=torch.bool),
+            ray_intensities=None if intensities is None else torch.tensor(intensities, dtype=torch.float32),
+        )
+
+    def test_reports_every_emitted_ray_including_the_ones_that_did_not_return(self):
+        # The point of the per-ray form: index i is stable for one firing-pattern ID, so a
+        # dropped ray occupies its slot rather than shifting the rest.
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.5, 9.0, 3.25], [True, False, True], [0.5, 0.0, 0.25])
+        )
+
+        self.assertEqual(result.num_rays, 3)
+        np.testing.assert_allclose(np.frombuffer(result.ray_distances_m_buffer, dtype=np.float32), [1.5, 9.0, 3.25])
+        np.testing.assert_allclose(np.frombuffer(result.ray_intensities_buffer, dtype=np.float32), [0.5, 0.0, 0.25])
+
+    def test_valid_mask_is_packed_lsb_first_as_the_proto_documents(self):
+        # Rays 0 and 2 valid -> 0b101 in the low bits of the first byte. Big-endian packing
+        # would decode as rays 5 and 7 on the client, silently mislabelling every return.
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame([1.0, 2.0, 3.0], [True, False, True]))
+
+        self.assertEqual(result.ray_valid_masks_packed[0] & 0b111, 0b101)
+        unpacked = np.unpackbits(
+            np.frombuffer(result.ray_valid_masks_packed, dtype=np.uint8), count=3, bitorder="little"
+        )
+        np.testing.assert_array_equal(unpacked, [1, 0, 1])
+
+    def test_valid_mask_covers_a_ray_count_that_is_not_a_whole_byte(self):
+        n = 437040  # the ET30x frame: 1214 columns x 360 lines
+        valid = np.zeros(n, dtype=bool)
+        valid[[0, 7, 8, n - 1]] = True
+
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame(np.zeros(n), valid))
+
+        self.assertEqual(len(result.ray_valid_masks_packed), (n + 7) // 8)
+        unpacked = np.unpackbits(
+            np.frombuffer(result.ray_valid_masks_packed, dtype=np.uint8), count=n, bitorder="little"
+        )
+        np.testing.assert_array_equal(np.flatnonzero(unpacked), [0, 7, 8, n - 1])
+
+    def test_point_cloud_fields_stay_empty(self):
+        # A client reading the wrong pair of fields should get nothing, not stale points.
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame([1.0], [True]))
+
+        self.assertEqual(result.num_points, 0)
+        self.assertEqual(result.point_xyzs_buffer, b"")
+        self.assertEqual(len(result.point_xyzs), 0)
+
+    def test_intensity_is_omitted_when_the_model_predicts_none(self):
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame([1.0, 2.0], [True, True]))
+
+        self.assertEqual(result.ray_intensities_buffer, b"")
+        self.assertEqual(result.num_rays, 2)
+
+    def test_firing_pattern_is_absent_unless_the_request_asked_for_it(self):
+        # The default keeps a response inside gRPC's stock 4 MiB receive limit; embedding the
+        # selected pattern would repeat ~8 MiB in every frame instead of caching it by ID.
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame([1.0], [True]))
+
+        self.assertFalse(result.HasField("firing_pattern"))
+
+    def test_selected_pattern_id_is_returned_without_embedding_the_pattern(self):
+        pattern = LidarFiringPatternTemplate(
+            directions_sensor=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+            timestamp_offsets_us=np.array([0], dtype=np.int64),
+        )
+
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.0], [True]),
+            firing_pattern_id=pattern.pattern_id(15),
+        )
+
+        self.assertEqual(result.firing_pattern_id, pattern.pattern_id(15))
+        self.assertFalse(result.HasField("firing_pattern"))
+
+    def test_embedded_firing_pattern_matches_the_standalone_rpc(self):
+        # A client mixing the two sources must not see them disagree about the sensor.
+        pattern = LidarFiringPatternTemplate(
+            directions_sensor=np.eye(3, dtype=np.float32)[:, :3],
+            timestamp_offsets_us=np.array([0, 5, 10], dtype=np.int64),
+        )
+
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.0, 2.0, 3.0], [True, True, False]),
+            firing_pattern=pattern,
+            firing_pattern_id=pattern.pattern_id(15),
+            frame_period_us=15,
+        )
+
+        self.assertTrue(result.HasField("firing_pattern"))
+        expected = LidarFiringPatternReturn()
+        _fill_firing_pattern(pattern, 15, expected)
+        self.assertEqual(result.firing_pattern, expected)
+        self.assertEqual(result.firing_pattern.num_rays, 3)
+        self.assertEqual(result.firing_pattern_id, pattern.pattern_id(15))
+
+    def test_embedded_pattern_carries_the_grid_when_the_sensor_has_one(self):
+        # A unit that fires a whole column at once: the grid follows from these times.
+        pattern = LidarFiringPatternTemplate(
+            directions_sensor=np.tile(np.array([1.0, 0.0, 0.0], np.float32), (6, 1)),
+            timestamp_offsets_us=np.repeat(np.arange(3, dtype=np.int64) * 49, 2),
+            packet_ray_offsets=np.array([0, 2, 4, 6], dtype=np.int64),
+        )
+
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.0] * 6, [True] * 6),
+            firing_pattern=pattern,
+            firing_pattern_id=pattern.pattern_id(3 * 49),
+            frame_period_us=3 * 49,
+        )
+
+        self.assertEqual((result.firing_pattern.num_columns, result.firing_pattern.num_rows), (3, 2))
+        self.assertEqual(result.firing_pattern.packet_layout.num_packets, 3)
+        np.testing.assert_array_equal(
+            np.frombuffer(result.firing_pattern.packet_layout.ray_offsets_u32_le, dtype="<u4"),
+            [0, 2, 4, 6],
+        )
+        self.assertEqual(result.firing_pattern.timestamp_offsets_us, b"")
+        np.testing.assert_array_equal(
+            np.frombuffer(result.firing_pattern.packet_layout.timestamp_offsets_us, dtype=np.int64),
+            [0, 49, 98],
+        )
+
+    def test_embedded_pattern_keeps_per_ray_timestamps_when_they_vary_inside_a_packet(self):
+        pattern = LidarFiringPatternTemplate(
+            directions_sensor=np.tile(np.array([1.0, 0.0, 0.0], np.float32), (3, 1)),
+            timestamp_offsets_us=np.array([0, 5, 10], dtype=np.int64),
+            packet_ray_offsets=np.array([0, 3], dtype=np.int64),
+        )
+
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.0] * 3, [True] * 3),
+            firing_pattern=pattern,
+            firing_pattern_id=pattern.pattern_id(15),
+            frame_period_us=15,
+        )
+
+        np.testing.assert_array_equal(
+            np.frombuffer(result.firing_pattern.timestamp_offsets_us, dtype=np.int64),
+            [0, 5, 10],
+        )
+        self.assertEqual(result.firing_pattern.packet_layout.timestamp_offsets_us, b"")
+
+    def test_encodes_one_strongest_return_layer(self):
+        result = self._backend()._lidar_ray_frame_to_grpc(self._frame([1.0], [True]))
+
+        self.assertEqual(result.num_return_layers, 1)
+        self.assertEqual(list(result.return_types), [LidarReturnType.LIDAR_RETURN_STRONGEST])
+
+    def test_first_layer_repeats_the_strongest_layer(self):
+        result = self._backend()._lidar_ray_frame_to_grpc(
+            self._frame([1.0, 2.0, 3.0], [True, False, True], [0.1, 0.2, 0.3]),
+            return_types=(LidarReturnType.LIDAR_RETURN_FIRST, LidarReturnType.LIDAR_RETURN_STRONGEST),
+        )
+
+        self.assertEqual(result.num_return_layers, 2)
+        self.assertEqual(
+            list(result.return_types),
+            [LidarReturnType.LIDAR_RETURN_FIRST, LidarReturnType.LIDAR_RETURN_STRONGEST],
+        )
+        distances = np.frombuffer(result.ray_distances_m_buffer, dtype=np.float32).reshape(2, 3)
+        intensities = np.frombuffer(result.ray_intensities_buffer, dtype=np.float32).reshape(2, 3)
+        np.testing.assert_allclose(distances[0], distances[1])
+        np.testing.assert_allclose(intensities[0], intensities[1])
+        self.assertEqual(result.ray_valid_masks_packed, bytes([0b101, 0b101]))
+
+    def test_scaled_world_to_nurec_distances_are_reported_in_metres(self):
+        result = self._backend(target_scale=0.5)._lidar_ray_frame_to_grpc(self._frame([0.5, 1.0], [True, True]))
+
+        np.testing.assert_allclose(
+            np.frombuffer(result.ray_distances_m_buffer, dtype=np.float32),
+            [1.0, 2.0],
+        )
 
 
 class TestLidarRenderFilter(unittest.TestCase):
@@ -936,16 +1885,22 @@ class TestRenderErrorClassification(unittest.TestCase):
         self.assertEqual(status, grpc.StatusCode.DEADLINE_EXCEEDED)
         self.assertEqual(message, "deadline")
 
-    def test_grpc_backend_cache_wait_policy_prefers_client_remaining_time(self):
-        context = mock.MagicMock()
-        context.is_active.return_value = True
-        context.time_remaining.return_value = 5.0
-        before = time.monotonic()
-        policy = _grpc_backend_cache_wait_policy(context)
-        assert policy is not None
-        assert policy.wait_deadline is not None
-        self.assertLessEqual(policy.wait_deadline, before + 5.1)
-        self.assertGreater(policy.wait_deadline, before + 4.5)
+    def test_backend_cache_wait_policy_bounds_deadline(self):
+        client_deadline = mock.MagicMock()
+        client_deadline.is_active.return_value = True
+        client_deadline.time_remaining.return_value = 5.0
+        no_client_deadline = mock.MagicMock()
+        no_client_deadline.is_active.return_value = True
+        no_client_deadline.time_remaining.return_value = None
+
+        for context, server_timeout_s in ((client_deadline, 10.0), (no_client_deadline, 5.0), (None, 5.0)):
+            with self.subTest(context=context):
+                before = time.monotonic()
+                policy = _grpc_backend_cache_wait_policy(context, server_timeout_s=server_timeout_s)
+                assert policy is not None
+                assert policy.wait_deadline is not None
+                self.assertLessEqual(policy.wait_deadline, before + 5.1)
+                self.assertGreater(policy.wait_deadline, before + 4.5)
 
     def test_grpc_backend_cache_wait_policy_respects_inactive_context(self):
         context = mock.MagicMock()
@@ -978,6 +1933,37 @@ class TestRenderErrorClassification(unittest.TestCase):
         assert policy.abort_reason is not None
         self.assertEqual(policy.abort_reason(), CacheWaitAbortedReason.DEADLINE_EXCEEDED)
 
+    def test_grpc_backend_cache_wait_policy_stops_for_fatal_worker(self):
+        context = mock.MagicMock()
+        context.is_active.return_value = True
+        context.time_remaining.return_value = None
+        fatal_worker_state = FatalWorkerState()
+        policy = _grpc_backend_cache_wait_policy(context, fatal_worker_state=fatal_worker_state)
+        assert policy is not None
+        assert policy.should_continue is not None
+        self.assertTrue(policy.should_continue())
+
+        fatal_worker_state.mark_fatal(
+            FatalWorkerIncident(
+                rpc_method="render_rgb",
+                scene_ids=("scene",),
+                request_id=None,
+                process_id=1,
+                diagnostics={},
+            )
+        )
+
+        self.assertFalse(policy.should_continue())
+        assert policy.abort_reason is not None
+        self.assertEqual(policy.abort_reason(), CacheWaitAbortedReason.WORKER_UNAVAILABLE)
+
+    def test_cache_wait_aborted_worker_unavailable_maps_to_unavailable(self):
+        status, message = _classify_render_exception(
+            CacheWaitAbortedError("stopped", CacheWaitAbortedReason.WORKER_UNAVAILABLE)
+        )
+        self.assertEqual(status, grpc.StatusCode.UNAVAILABLE)
+        self.assertIn("replacement worker", message)
+
     def test_no_spare_backends_maps_to_resource_exhausted(self):
         status, message = _classify_render_exception(NoSpareBackendsError("no spare backends"))
         self.assertEqual(status, grpc.StatusCode.RESOURCE_EXHAUSTED)
@@ -988,6 +1974,57 @@ class TestRenderErrorClassification(unittest.TestCase):
         self.assertEqual(status, grpc.StatusCode.UNKNOWN)
         self.assertEqual(message, "unexpected")
 
+    def test_cuda_worker_diagnostics_use_cuda_identity_independently_of_visibility(self):
+        class _CudaUuid:
+            def __str__(self):
+                return "01234567-89ab-cdef-0123-456789abcdef"
+
+        for visibility in (None, "0,1", "GPU-a,GPU-b", "MIG-test", ",", ""):
+            with (
+                self.subTest(visibility=visibility),
+                mock.patch.dict("os.environ", {}, clear=True),
+                mock.patch("nurec.grpc.serve.torch.cuda.current_device", return_value=1),
+                mock.patch(
+                    "nurec.grpc.serve.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid=_CudaUuid())
+                ) as properties,
+                mock.patch(
+                    "nurec.grpc.serve.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0, stdout="580.65\n580.65\n"),
+                ) as run,
+            ):
+                if visibility is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = visibility
+                diagnostics = collect_cuda_worker_diagnostics()
+                self.assertEqual(diagnostics["gpu_uuid"], f"GPU-{_CudaUuid()}")
+                self.assertEqual(diagnostics["nvidia_driver_version"], "580.65")
+                self.assertEqual(diagnostics["cuda_device_index"], "1")
+                properties.assert_called_once_with(1)
+                self.assertFalse(any(arg.startswith("--id=") for arg in run.call_args.args[0]))
+
+    def test_cuda_identity_survives_driver_query_failure(self):
+        with (
+            mock.patch("nurec.grpc.serve.torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "nurec.grpc.serve.torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(uuid="01234567-89ab-cdef-0123-456789abcdef"),
+            ),
+            mock.patch("nurec.grpc.serve.subprocess.run", side_effect=FileNotFoundError),
+        ):
+            diagnostics = collect_cuda_worker_diagnostics()
+        self.assertEqual(diagnostics["gpu_uuid"], "GPU-01234567-89ab-cdef-0123-456789abcdef")
+        self.assertEqual(diagnostics["nvidia_driver_version"], "unavailable")
+
+    def test_cuda_device_failure_does_not_guess_a_gpu(self):
+        with (
+            mock.patch("nurec.grpc.serve.torch.cuda.current_device", side_effect=RuntimeError("no device")),
+            mock.patch("nurec.grpc.serve.torch.cuda.get_device_properties") as properties,
+            mock.patch("nurec.grpc.serve.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="")),
+        ):
+            diagnostics = collect_cuda_worker_diagnostics()
+        self.assertEqual(diagnostics["gpu_uuid"], "unavailable")
+        self.assertEqual(diagnostics["cuda_device_index"], "unavailable")
+        properties.assert_not_called()
+
 
 class TestBackendDynamicObjectValidation(unittest.TestCase):
     def test_dynamic_object_updates_require_server_flag(self):
@@ -995,6 +2032,7 @@ class TestBackendDynamicObjectValidation(unittest.TestCase):
             renderable_model=mock.MagicMock(),
             camera_bank=mock.MagicMock(),
             world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=mock.MagicMock(),
             asset_bank=mock.MagicMock(),
             source_artifact=mock.MagicMock(),
@@ -1012,6 +2050,7 @@ class TestBackendDynamicObjectValidation(unittest.TestCase):
             renderable_model=renderable_model,
             camera_bank=mock.MagicMock(),
             world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=mock.MagicMock(),
             asset_bank=mock.MagicMock(),
             source_artifact=mock.MagicMock(),
@@ -1035,6 +2074,7 @@ class TestBackendDynamicObjectValidation(unittest.TestCase):
             renderable_model=renderable_model,
             camera_bank=mock.MagicMock(),
             world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=mock.MagicMock(),
             asset_bank=asset_bank,
             source_artifact=mock.MagicMock(),
@@ -1062,6 +2102,54 @@ class TestBackendDynamicObjectValidation(unittest.TestCase):
         torch.testing.assert_close(passed_offset, torch.zeros(3))
 
 
+class TestBackendEditRollback(unittest.TestCase):
+    @staticmethod
+    def _make_backend() -> tuple[Backend, mock.MagicMock]:
+        model = mock.MagicMock()
+        model.supports_edit_actors.return_value = True
+        backend = Backend(
+            renderable_model=model,
+            camera_bank=mock.MagicMock(),
+            world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
+            lidar_bank=mock.MagicMock(),
+            asset_bank=mock.MagicMock(),
+            source_artifact=mock.MagicMock(),
+            backend_cache_key=_test_backend_cache_key(),
+        )
+        return backend, model
+
+    def test_fatal_edit_error_bypasses_training_parameter_rollback(self):
+        for operation in ("replace_assets", "insert_assets"):
+            with self.subTest(operation=operation):
+                backend, model = self._make_backend()
+                failure = RuntimeError("CUDA error: an illegal memory access was encountered")
+                actions = {"replace_assets": [], "insert_assets": []}
+                actions[operation] = [mock.MagicMock()]
+                with mock.patch.object(backend, operation, side_effect=failure):
+                    with self.assertRaises(RuntimeError) as raised:
+                        backend.edit_assets(**actions)
+
+                self.assertIs(raised.exception, failure)
+                model.save_training_parameters.assert_called_once()
+                model.restore_training_parameters.assert_not_called()
+
+    def test_recoverable_edit_error_restores_training_parameters(self):
+        for operation in ("replace_assets", "insert_assets"):
+            with self.subTest(operation=operation):
+                backend, model = self._make_backend()
+                failure = RuntimeError("asset edit failed")
+                actions = {"replace_assets": [], "insert_assets": []}
+                actions[operation] = [mock.MagicMock()]
+                with mock.patch.object(backend, operation, side_effect=failure):
+                    with self.assertRaises(RuntimeError) as raised:
+                        backend.edit_assets(**actions)
+
+                self.assertIs(raised.exception, failure)
+                model.save_training_parameters.assert_called_once()
+                model.restore_training_parameters.assert_called_once()
+
+
 class TestRenderGrpcStatusCodes(unittest.TestCase):
     def _start_service(
         self,
@@ -1069,8 +2157,10 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
         max_backends_per_scene=None,
         max_workers=1,
         server_config: GrpcServerConfig | None = None,
+        fatal_worker_interceptor: FatalWorkerExceptionInterceptor | None = None,
     ):
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+        interceptors = [] if fatal_worker_interceptor is None else [fatal_worker_interceptor]
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers), interceptors=interceptors)
         server_config = server_config or GrpcServerConfig()
         service = SensorSimService(
             server,
@@ -1084,7 +2174,13 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             metrics_output_dir=None,
             enable_editing_actors=False,
             server_config=server_config,
+            fatal_worker_interceptor=fatal_worker_interceptor,
         )
+        if fatal_worker_interceptor is not None:
+            fatal_worker_interceptor.configure_shutdown(
+                mark_unhealthy=service.backend_cache.wake_waiters,
+                stop_server=server.stop,
+            )
         add_SensorsimServiceServicer_to_server(service, server)
         port = server.add_insecure_port("localhost:0")
         server.start()
@@ -1100,6 +2196,7 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             renderable_model=mock.MagicMock(),
             camera_bank=mock.MagicMock(),
             world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=mock.MagicMock(),
             asset_bank=mock.MagicMock(),
             source_artifact=mock.MagicMock(),
@@ -1150,6 +2247,10 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             server.stop(0)
 
     def test_get_loaded_scenes_returns_cache_snapshot(self):
+        """get_loaded_scenes reports the cache capacity and each scene's loaded and reusable instance counts.
+
+        get_version reports the current API version.
+        """
         server, channel, stub, service = self._start_service(cache_size=3)
         try:
             in_use_a = self._make_backend(_test_backend_cache_key("scene-a"))
@@ -1172,7 +2273,8 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
                 ],
                 [("scene-a", 2, 1), ("scene-b", 1, 1)],
             )
-            self.assertEqual(stub.get_version(Empty()).grpc_api_version.patch, 5)
+            api_version = stub.get_version(Empty()).grpc_api_version
+            self.assertEqual((api_version.major, api_version.minor, api_version.patch), (0, 1, 0))
         finally:
             channel.close()
             server.stop(0)
@@ -1228,6 +2330,96 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             channel.close()
             server.stop(0)
 
+    def test_unknown_firing_pattern_id_returns_not_found(self):
+        server, channel, stub, service = self._start_service()
+        backend = mock.MagicMock()
+        backend.get_lidar_firing_pattern.side_effect = KeyError("Unknown firing pattern id 'missing'")
+
+        @contextlib.contextmanager
+        def backend_ctx(*args, **kwargs):
+            yield backend
+
+        try:
+            with (
+                mock.patch.object(
+                    service,
+                    "_request_scene_cache_key",
+                    return_value=SceneCacheKey(scene_id="scene"),
+                ),
+                mock.patch.object(service, "get_backend", backend_ctx),
+                self.assertRaises(grpc.RpcError) as ctx,
+            ):
+                stub.get_lidar_firing_pattern(
+                    LidarFiringPatternRequest(
+                        scene_id="scene",
+                        firing_pattern_id="missing",
+                    )
+                )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+            self.assertIn("Unknown firing pattern id 'missing'", ctx.exception.details())
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_lidar_wire_round_trip_and_capability_statuses(self):
+        server, channel, stub, service = self._start_service()
+        fixture = TestBackendLidarDispatch()
+        backend = fixture._backend(fixture._mixed_artifact())
+
+        @contextlib.contextmanager
+        def backend_ctx(*args, **kwargs):
+            yield backend
+
+        try:
+            with (
+                mock.patch.object(service, "_request_scene_cache_key", return_value=SceneCacheKey(scene_id="scene")),
+                mock.patch.object(service, "get_backend", backend_ctx),
+                mock.patch.object(LidarRayBundle, "build_model_free", return_value=mock.sentinel.bundle),
+            ):
+                request = fixture._request("model_free")
+                request.scene_id = "scene"
+                request.include_firing_pattern = True
+                response = stub.render_lidar(request)
+                self.assertEqual(response.num_rays, 7)
+                self.assertEqual(list(response.return_types), [LidarReturnType.LIDAR_RETURN_STRONGEST])
+                self.assertEqual(response.firing_pattern_id, response.firing_pattern.firing_pattern_id)
+                np.testing.assert_array_equal(np.frombuffer(response.ray_distances_m_buffer, dtype="<f4"), np.ones(7))
+                np.testing.assert_array_equal(
+                    np.frombuffer(response.firing_pattern.timestamp_offsets_us, dtype="<i8"), np.arange(7)
+                )
+                for values in ([0], [2, 0], [99]):
+                    with self.subTest(return_types=values):
+                        invalid = fixture._request("model_free")
+                        invalid.scene_id = "scene"
+                        invalid.return_types.extend(values)
+                        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.reset_mock()
+                        with self.assertRaises(grpc.RpcError) as caught:
+                            stub.render_lidar(invalid)
+                        self.assertEqual(caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+                        backend.renderable_model.render_lidar_ray_frame_from_ray_bundle.assert_not_called()
+                for rpc, req, expected in (
+                    (stub.render_lidar, fixture._request("modeled"), grpc.StatusCode.FAILED_PRECONDITION),
+                    (
+                        stub.get_lidar_firing_pattern,
+                        LidarFiringPatternRequest(lidar_id="modeled"),
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                    ),
+                    (stub.render_lidar, fixture._request("missing"), grpc.StatusCode.NOT_FOUND),
+                    (
+                        stub.get_lidar_firing_pattern,
+                        LidarFiringPatternRequest(lidar_id="missing"),
+                        grpc.StatusCode.NOT_FOUND,
+                    ),
+                ):
+                    req.scene_id = "scene"
+                    with self.subTest(lidar=req.lidar_id, rpc=rpc), self.assertRaises(grpc.RpcError) as caught:
+                        rpc(req)
+                    self.assertEqual(caught.exception.code(), expected)
+        finally:
+            channel.close()
+            server.stop(0)
+
     def test_spare_hit_uses_queued_acquisition_without_loading_artifact(self):
         server, channel, _, service = self._start_service(cache_size=1, max_backends_per_scene=1)
         scene_key = SceneCacheKey(scene_id="scene")
@@ -1241,6 +2433,7 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             service._artifact_registrations[scene_key.key_hash] = registration
         service.backend_cache.put(registration.backend_cache_key.key_hash, backend)
         service.backend_cache.checkin(backend)
+        service._scene_prefetch = mock.MagicMock()
         original_acquire = service.backend_cache.checkout_or_reserve
 
         try:
@@ -1260,9 +2453,178 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
 
             queued_acquire.assert_called_once()
             from_artifact.assert_not_called()
+            service._scene_prefetch.discard.assert_called_once_with(scene_key)
+            service._scene_prefetch.take.assert_not_called()
         finally:
             channel.close()
             server.stop(0)
+
+    def test_prefetched_backend_activates_without_synchronous_reload(self):
+        server, channel, _, service = self._start_service(cache_size=1, max_backends_per_scene=1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "scene.usdz"
+            source.write_bytes(b"scene")
+            scene_key = SceneCacheKey.from_url("scene", source.as_uri())
+            fingerprint = _local_file_fingerprint(source)
+            registration = ArtifactRegistration(
+                _registered_artifact(source, "scene"),
+                False,
+                scene_key,
+                source_fingerprint=fingerprint,
+            )
+            prepared = mock.MagicMock(spec=PreparedBackend)
+            prepared.backend_cache_key = registration.backend_cache_key
+            backend = self._make_backend(registration.backend_cache_key)
+            prepared.activate.return_value = backend
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.take.return_value = PreparedScene(
+                registration,
+                prepared,
+            )
+            with service._artifact_registry_lock:
+                service._artifact_registrations[scene_key.key_hash] = registration
+
+            try:
+                with mock.patch.object(Backend, "from_artifact") as from_artifact:
+                    with service.get_backend(SceneCacheKey(scene_id="scene")) as acquired:
+                        self.assertIs(acquired, backend)
+
+                prepared.activate.assert_called_once_with()
+                from_artifact.assert_not_called()
+                service._scene_prefetch.take.assert_called_once_with(scene_key, check_wait=mock.ANY)
+            finally:
+                channel.close()
+                server.stop(0)
+
+    def test_prefetch_activation_failure_loads_synchronously(self):
+        server, channel, _, service = self._start_service(cache_size=1, max_backends_per_scene=1)
+        scene_key = SceneCacheKey(scene_id="scene")
+        source = Path("/scenes/scene.usdz")
+        registration = ArtifactRegistration(
+            _registered_artifact(source, "scene"),
+            False,
+            scene_key,
+            source_fingerprint=(1, 2, 3, 4, 5),
+        )
+        prepared = mock.MagicMock(spec=PreparedBackend)
+        prepared.backend_cache_key = registration.backend_cache_key
+        prepared.activate.side_effect = RuntimeError("activation failed")
+        service._scene_prefetch = mock.MagicMock()
+        service._scene_prefetch.take.return_value = PreparedScene(
+            registration,
+            prepared,
+        )
+        with service._artifact_registry_lock:
+            service._artifact_registrations[scene_key.key_hash] = registration
+        loaded_backend = self._make_backend(registration.backend_cache_key)
+        artifact = mock.MagicMock(sha256_footprint=registration.backend_cache_key.content_sha256)
+        artifact_context = mock.MagicMock()
+        artifact_context.temporary_cache.return_value.__enter__.return_value = artifact
+
+        try:
+            with (
+                mock.patch("nurec.grpc.serve._local_file_fingerprint", return_value=(1, 2, 3, 4, 5)),
+                mock.patch("nurec.grpc.serve.Artifact", return_value=artifact_context),
+                mock.patch.object(Backend, "from_artifact", return_value=loaded_backend) as load,
+                mock.patch("nurec.grpc.serve.torch.cuda.empty_cache"),
+            ):
+                with service.get_backend(scene_key) as acquired:
+                    self.assertIs(acquired, loaded_backend)
+
+            prepared.activate.assert_called_once_with()
+            load.assert_called_once()
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_terminal_prefetch_activation_errors_do_not_reload(self):
+        def check(activation_error: Exception) -> None:
+            server, channel, _, service = self._start_service(cache_size=1, max_backends_per_scene=1)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source = Path(temp_dir) / "scene.usdz"
+                source.write_bytes(b"scene")
+                scene_key = SceneCacheKey.from_url("scene", source.as_uri())
+                fingerprint = _local_file_fingerprint(source)
+                registration = ArtifactRegistration(
+                    _registered_artifact(source, "scene"),
+                    False,
+                    scene_key,
+                    source_fingerprint=fingerprint,
+                )
+                prepared = mock.MagicMock(spec=PreparedBackend)
+                prepared.backend_cache_key = registration.backend_cache_key
+                prepared.activate.side_effect = activation_error
+                service._scene_prefetch = mock.MagicMock()
+                service._scene_prefetch.take.return_value = PreparedScene(
+                    registration,
+                    prepared,
+                )
+                with service._artifact_registry_lock:
+                    service._artifact_registrations[scene_key.key_hash] = registration
+
+                def run_factory(*_args, **kwargs):
+                    return kwargs["backend_factory"]()
+
+                try:
+                    with (
+                        mock.patch.object(service.backend_cache, "put_with_retries", side_effect=run_factory),
+                        mock.patch.object(Backend, "from_artifact") as load,
+                        mock.patch("nurec.grpc.serve.torch.cuda.empty_cache"),
+                        self.assertRaises(type(activation_error)),
+                    ):
+                        with service.get_backend(scene_key):
+                            pass
+
+                    prepared.activate.assert_called_once_with()
+                    load.assert_not_called()
+                finally:
+                    channel.close()
+                    server.stop(0)
+
+        for activation_error in (
+            torch.cuda.OutOfMemoryError("activation OOM"),
+            ModelIncompatibilityError("model mismatch"),
+        ):
+            with self.subTest(error=type(activation_error).__name__):
+                check(activation_error)
+
+    def test_fatal_prefetch_activation_error_propagates_without_cleanup(self):
+        server, channel, _, service = self._start_service(cache_size=1, max_backends_per_scene=1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "scene.usdz"
+            source.write_bytes(b"scene")
+            scene_key = SceneCacheKey.from_url("scene", source.as_uri())
+            fingerprint = _local_file_fingerprint(source)
+            registration = ArtifactRegistration(
+                _registered_artifact(source, "scene"),
+                False,
+                scene_key,
+                source_fingerprint=fingerprint,
+            )
+            prepared = mock.MagicMock(spec=PreparedBackend)
+            prepared.backend_cache_key = registration.backend_cache_key
+            prepared.activate.side_effect = RuntimeError("CUDA error: an illegal memory access was encountered")
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.take.return_value = PreparedScene(registration, prepared)
+            with service._artifact_registry_lock:
+                service._artifact_registrations[scene_key.key_hash] = registration
+
+            try:
+                with (
+                    mock.patch.object(Backend, "from_artifact") as load,
+                    mock.patch("nurec.grpc.serve._cleanup_failed_backend") as cleanup,
+                    self.assertRaisesRegex(RuntimeError, "illegal memory access"),
+                ):
+                    with service.get_backend(scene_key):
+                        pass
+
+                prepared.activate.assert_called_once_with()
+                load.assert_not_called()
+                cleanup.assert_not_called()
+                self.assertEqual(service.backend_cache.pending_global, 0)
+            finally:
+                channel.close()
+                server.stop(0)
 
     def test_missing_scene_wins_over_saturated_cache_with_unset_limit(self):
         server, channel, _, service = self._start_service(cache_size=1)
@@ -1313,7 +2675,8 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
         errors = []
         original_wait = service.backend_cache._wait_for_capacity
 
-        def construct(artifact, _renderer, _stride, backend_cache_key, **_kwargs):
+        def construct(artifact, _renderer, _stride, backend_cache_key, **kwargs):
+            self.assertFalse(kwargs["camera_only"])
             self.assertEqual(backend_cache_key, backend.backend_cache_key)
             artifact._checkpoint = io.BytesIO(b"checkpoint")
             constructed_artifacts.append(artifact)
@@ -1350,6 +2713,7 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
                     return_value=hashlib.sha256(str(source).encode()).hexdigest(),
                 ),
                 mock.patch.object(Backend, "from_artifact", side_effect=construct) as from_artifact,
+                mock.patch("nurec.grpc.serve._local_file_fingerprint", return_value=(1, 2, 3, 4, 5)),
                 mock.patch.object(service.backend_cache, "_wait_for_capacity", side_effect=record_wait),
                 mock.patch("nurec.grpc.serve.BACKEND_CACHE_WAIT_POLL_S", 0.01),
                 futures.ThreadPoolExecutor(max_workers=2) as executor,
@@ -1392,7 +2756,8 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
         constructed_artifacts = []
         constructed_artifacts_lock = threading.Lock()
 
-        def construct(artifact, _renderer, _stride, backend_cache_key, **_kwargs):
+        def construct(artifact, _renderer, _stride, backend_cache_key, **kwargs):
+            self.assertFalse(kwargs["camera_only"])
             with constructed_artifacts_lock:
                 constructed_artifacts.append(artifact)
             constructors_ready.wait(timeout=5)
@@ -1411,6 +2776,7 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
                     return_value=hashlib.sha256(str(source).encode()).hexdigest(),
                 ),
                 mock.patch.object(Backend, "from_artifact", side_effect=construct),
+                mock.patch("nurec.grpc.serve._local_file_fingerprint", return_value=(1, 2, 3, 4, 5)),
                 futures.ThreadPoolExecutor(max_workers=2) as executor,
             ):
                 calls = [executor.submit(acquire_backend) for _ in range(2)]
@@ -1579,6 +2945,10 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             ),
             ("render_lidar", lambda stub: stub.render_lidar(LidarRenderRequest(scene_id="scene"))),
             (
+                "get_lidar_firing_pattern",
+                lambda stub: stub.get_lidar_firing_pattern(LidarFiringPatternRequest(scene_id="scene")),
+            ),
+            (
                 "get_available_cameras",
                 lambda stub: stub.get_available_cameras(AvailableCamerasRequest(scene_id="scene")),
             ),
@@ -1619,11 +2989,12 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
             channel.close()
             server.stop(0)
 
-    def test_backend_capacity_errors_preserve_legacy_endpoint_behavior(self):
+    def test_backend_capacity_errors_match_endpoint_status_contracts(self):
         expected_statuses = {
             "render_rgb": grpc.StatusCode.RESOURCE_EXHAUSTED,
             "batch_render_rgb": grpc.StatusCode.RESOURCE_EXHAUSTED,
-            "render_lidar": grpc.StatusCode.FAILED_PRECONDITION,
+            "render_lidar": grpc.StatusCode.RESOURCE_EXHAUSTED,
+            "get_lidar_firing_pattern": grpc.StatusCode.RESOURCE_EXHAUSTED,
             "get_available_cameras": grpc.StatusCode.FAILED_PRECONDITION,
             "get_available_trajectories": grpc.StatusCode.FAILED_PRECONDITION,
             "get_external_asset_objects": grpc.StatusCode.UNKNOWN,
@@ -1700,6 +3071,56 @@ class TestRenderGrpcStatusCodes(unittest.TestCase):
                 response = stub.edit_assets(EditAssetsRequest(scene_id="scene"))
             self.assertFalse(response.success)
             self.assertIn("Failed to edit assets: edit failed", response.message)
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_edit_assets_does_not_swallow_fatal_worker_error(self):
+        backend = mock.MagicMock()
+        backend.edit_assets.side_effect = RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        @contextlib.contextmanager
+        def _return_backend(*args, **kwargs):
+            yield backend
+
+        server, channel, _, service = self._start_service()
+        try:
+            with (
+                mock.patch.object(service, "get_backend", _return_backend),
+                self.assertRaisesRegex(RuntimeError, "illegal memory access"),
+            ):
+                service.edit_assets(EditAssetsRequest(scene_id="scene"), mock.MagicMock())
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_get_available_cameras_fatal_worker_error_exits_through_server_interceptor(self):
+        terminate_worker = mock.Mock()
+        interceptor = FatalWorkerExceptionInterceptor(terminate_worker=terminate_worker)
+        backend = mock.MagicMock()
+        backend.get_available_cameras.side_effect = RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        @contextlib.contextmanager
+        def _return_backend(*args, **kwargs):
+            yield backend
+
+        server, channel, stub, service = self._start_service(fatal_worker_interceptor=interceptor)
+        try:
+            with mock.patch.object(service, "get_backend", _return_backend):
+                with self.assertRaises(grpc.RpcError):
+                    stub.get_available_cameras(AvailableCamerasRequest(scene_id="scene"))
+            self.assertTrue(interceptor.wait_for_shutdown(timeout=2))
+            terminate_worker.assert_called_once_with(1)
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_item_does_not_swallow_fatal_worker_error(self):
+        server, channel, _, service = self._start_service()
+        error = RuntimeError("CUDA error: an illegal memory access was encountered")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "illegal memory access"):
+                service._batch_rgb_error_item("cam", error)
         finally:
             channel.close()
             server.stop(0)
@@ -1895,8 +3316,7 @@ class TestHarmonizerDeferredLoad(unittest.TestCase):
         """_camera_render_return_from_request must pass its context through, not drop it, so a
         cancelled/expired RPC waiting on the model load is still detected (see MR review). The
         Harmonizer is opt-in per request, so the request asks for it."""
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(CameraFrame(color_image=torch.zeros(4, 4, 3)))
             service.harmonizer_enabled = True
             with mock.patch.object(service, "get_backend", backend_ctx):
@@ -1909,9 +3329,6 @@ class TestHarmonizerDeferredLoad(unittest.TestCase):
             mock_await.assert_called_once()
             (context_arg,) = mock_await.call_args.args
             self.assertIsNotNone(context_arg)
-        finally:
-            channel.close()
-            server.stop(0)
 
 
 class TestHarmonizerSession(unittest.TestCase):
@@ -2219,44 +3636,452 @@ class TestHarmonizerSession(unittest.TestCase):
             channel.close()
             server.stop(0)
 
-    def test_batch_render_rgb_rejected_under_temporal(self):
-        # Batch rendering is parallel/unordered, incompatible with the autoregressive temporal
-        # harmonizer's per-session history.
+    @staticmethod
+    def _rgb_batch_item(camera_name: str, **request_fields) -> BatchRGBRenderRequestItem:
+        """Build a PNG batch_render_rgb item for scene "scene" with the given request fields."""
+        return BatchRGBRenderRequestItem(
+            camera_name=camera_name,
+            request=RGBRenderRequest(scene_id="scene", image_format=ImageFormat.PNG, **request_fields),
+        )
+
+    @staticmethod
+    def _camera_batch_item(camera_name: str, **request_fields) -> BatchCameraRenderRequestItem:
+        """Build a colour batch_render_camera item for scene "scene" with the given request fields."""
+        return BatchCameraRenderRequestItem(
+            camera_name=camera_name,
+            request=CameraRenderRequest(
+                scene_id="scene",
+                render_products=[CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR],
+                **request_fields,
+            ),
+        )
+
+    def _assert_harmonized_with(self, model: mock.Mock, expected_states: list) -> None:
+        """Assert each Harmonizer call got exactly the expected session object, in order.
+
+        Compared by identity: HarmonizerState is a dataclass, so two fresh sessions compare equal.
+        """
+        self.assertEqual(len(model.call_args_list), len(expected_states))
+        for call, expected in zip(model.call_args_list, expected_states):
+            self.assertIs(call.args[2], expected)
+
+    def test_batch_render_rgb_routes_each_item_to_its_own_temporal_session(self):
+        """One session per camera is the intended batch pattern: distinct sessions are independent
+        frame sequences, so a batch of them renders, each conditioned on its own history.
+        """
         server, channel, stub, service = self._start_service(temporal_enabled=True)
         try:
-            request = BatchRGBRenderRequest(
-                items=[
-                    BatchRGBRenderRequestItem(
-                        camera_name="cam", request=RGBRenderRequest(scene_id="scene", apply_harmonizer=True)
+            session_a = stub.create_harmonizer_session(Empty()).session_id
+            session_b = stub.create_harmonizer_session(Empty()).session_id
+            state_a = service._harmonizer_sessions[session_a]
+            state_b = service._harmonizer_sessions[session_b]
+            service._harmonizer_model = mock.Mock(side_effect=lambda pixels, _img_size, _state: pixels)
+            service._harmonizer_ready.set()
+
+            backend = mock.MagicMock()
+            backend.render_rgb_request.return_value = (torch.zeros((2, 2, 3)), (2, 2))
+
+            @contextlib.contextmanager
+            def _backend_ctx(*args, **kwargs):
+                yield backend
+
+            with mock.patch.object(service, "get_backend", _backend_ctx):
+                response = stub.batch_render_rgb(
+                    BatchRGBRenderRequest(
+                        items=[
+                            self._rgb_batch_item("cam_a", apply_harmonizer=True, harmonizer_session_id=session_a),
+                            self._rgb_batch_item("cam_b", apply_harmonizer=True, harmonizer_session_id=session_b),
+                            self._rgb_batch_item("cam_raw"),
+                        ]
                     )
-                ]
-            )
-            with self.assertRaises(grpc.RpcError) as ctx:
-                stub.batch_render_rgb(request)
-            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+                )
+
+            self.assertEqual([item.success for item in response.items], [True, True, True])
+            self._assert_harmonized_with(service._harmonizer_model, [state_a, state_b])
         finally:
             channel.close()
             server.stop(0)
 
-    def test_batch_render_camera_rejected_under_temporal(self):
-        # Like batch_render_rgb, batch camera rendering cannot maintain temporal per-session history.
+    def test_batch_render_rgb_rejects_a_repeated_temporal_session_before_rendering(self):
+        """A session is one coherent frame sequence; two items in the same batch would touch it twice
+        with no defined order, so the whole batch is refused and nothing renders.
+        """
         server, channel, stub, service = self._start_service(temporal_enabled=True)
         try:
-            request = BatchCameraRenderRequest(
-                items=[
+            session = stub.create_harmonizer_session(Empty()).session_id
+            get_backend = mock.MagicMock()
+
+            with mock.patch.object(service, "get_backend", get_backend):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_rgb(
+                        BatchRGBRenderRequest(
+                            items=[
+                                self._rgb_batch_item("cam_a", apply_harmonizer=True, harmonizer_session_id=session),
+                                self._rgb_batch_item("cam_b", apply_harmonizer=True, harmonizer_session_id=session),
+                            ]
+                        )
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("at most once per batch", ctx.exception.details())
+            self.assertIn("'cam_a'", ctx.exception.details())
+            self.assertIn("'cam_b'", ctx.exception.details())
+            get_backend.assert_not_called()
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_unknown_temporal_session_fails_the_whole_batch(self):
+        """A bad session on any item fails the batch before anything renders or resets, so the
+        opt-out item's session keeps its history.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session = stub.create_harmonizer_session(Empty()).session_id
+            state = service._harmonizer_sessions[session]
+            state.push(torch.zeros((3, 2, 2)))
+            get_backend = mock.MagicMock()
+
+            with mock.patch.object(service, "get_backend", get_backend):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_rgb(
+                        BatchRGBRenderRequest(
+                            items=[
+                                self._rgb_batch_item("cam_ok", apply_harmonizer=False, harmonizer_session_id=session),
+                                self._rgb_batch_item("cam_bad", apply_harmonizer=True, harmonizer_session_id="nope"),
+                            ]
+                        )
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+            self.assertIn("item[1] 'cam_bad'", ctx.exception.details())
+            get_backend.assert_not_called()
+            self.assertEqual(len(state.history), 1)
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_temporal_opt_in_without_session_fails_the_whole_batch(self):
+        """An opted-in item without a session fails the batch with INVALID_ARGUMENT before anything renders."""
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            get_backend = mock.MagicMock()
+
+            with mock.patch.object(service, "get_backend", get_backend):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_rgb(
+                        BatchRGBRenderRequest(items=[self._rgb_batch_item("cam", apply_harmonizer=True)])
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("item[0] 'cam'", ctx.exception.details())
+            get_backend.assert_not_called()
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_camera_rejects_a_repeated_temporal_session_before_rendering(self):
+        """batch_render_camera refuses two items that name one session, before anything renders."""
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session = stub.create_harmonizer_session(Empty()).session_id
+            get_backend = mock.MagicMock()
+
+            with mock.patch.object(service, "get_backend", get_backend):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_camera(
+                        BatchCameraRenderRequest(
+                            items=[
+                                self._camera_batch_item("cam_a", apply_harmonizer=True, harmonizer_session_id=session),
+                                self._camera_batch_item("cam_b", apply_harmonizer=True, harmonizer_session_id=session),
+                            ]
+                        )
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("at most once per batch", ctx.exception.details())
+            get_backend.assert_not_called()
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_camera_routes_each_item_to_its_own_temporal_session(self):
+        """batch_render_camera renders JPEG items through the batched nvJPEG encoder and every other
+        format inline, so both branches must carry the item's own session.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session_jpeg = stub.create_harmonizer_session(Empty()).session_id
+            session_png = stub.create_harmonizer_session(Empty()).session_id
+            state_jpeg = service._harmonizer_sessions[session_jpeg]
+            state_png = service._harmonizer_sessions[session_png]
+            service._harmonizer_model = mock.Mock(side_effect=lambda pixels, _img_size, _state: pixels)
+            service._harmonizer_ready.set()
+
+            backend = mock.MagicMock()
+            backend.render_camera_request.return_value = (CameraFrame(color_image=torch.zeros(2, 2, 3)), None, None)
+            backend.source_artifact.semantic_class_colors = None
+            backend.source_artifact.semantic_class_names = None
+
+            @contextlib.contextmanager
+            def _backend_ctx(*args, **kwargs):
+                yield backend
+
+            encoder = mock.MagicMock()
+            encoder.max_batch_size = BATCH_RENDER_REQUEST_CHUNK_SIZE
+            encoder.encode.side_effect = lambda images, _quality: [b"jpeg"] * len(images)
+
+            # A chunk size of 1 puts the two items in different chunks.
+            with (
+                mock.patch.object(service, "get_backend", _backend_ctx),
+                mock.patch.object(service, "_get_nvjpeg_batch_encoder", return_value=encoder),
+                mock.patch("nurec.grpc.serve.BATCH_RENDER_REQUEST_CHUNK_SIZE", 1),
+            ):
+                response = stub.batch_render_camera(
+                    BatchCameraRenderRequest(
+                        items=[
+                            self._camera_batch_item(
+                                "cam_jpeg",
+                                image_format=ImageFormat.JPEG,
+                                image_quality=90,
+                                apply_harmonizer=True,
+                                harmonizer_session_id=session_jpeg,
+                            ),
+                            self._camera_batch_item(
+                                "cam_png",
+                                image_format=ImageFormat.PNG,
+                                apply_harmonizer=True,
+                                harmonizer_session_id=session_png,
+                            ),
+                        ]
+                    )
+                )
+
+            self.assertEqual([item.success for item in response.items], [True, True])
+            self._assert_harmonized_with(service._harmonizer_model, [state_jpeg, state_png])
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_routes_ipc_and_encoded_items_to_their_own_temporal_sessions(self):
+        """batch_render_rgb writes use_cuda_ipc items into reserved buffers and encodes the rest,
+        so both branches must carry the item's own session.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session_ipc = stub.create_harmonizer_session(Empty()).session_id
+            session_png = stub.create_harmonizer_session(Empty()).session_id
+            state_ipc = service._harmonizer_sessions[session_ipc]
+            state_png = service._harmonizer_sessions[session_png]
+            service._harmonizer_model = mock.Mock(side_effect=lambda pixels, _img_size, _state: pixels)
+            service._harmonizer_ready.set()
+
+            backend = mock.MagicMock()
+            backend.render_rgb_request.return_value = (torch.zeros((2, 2, 3)), (2, 2))
+
+            @contextlib.contextmanager
+            def _backend_ctx(*args, **kwargs):
+                yield backend
+
+            mgr = mock.MagicMock()
+            mgr.reserve_buffers.return_value = [3]
+
+            # A chunk size of 1 puts the two items in different chunks.
+            with (
+                mock.patch.object(service, "get_backend", _backend_ctx),
+                mock.patch("nurec.grpc.serve.BATCH_RENDER_REQUEST_CHUNK_SIZE", 1),
+                mock.patch.object(service, "_get_ipc_mgr", return_value=mgr),
+                mock.patch.object(
+                    service,
+                    "_ipc_write_reserved_rgb",
+                    return_value=RGBRenderReturn(format="rgb_uint8_planar", buffer_id=3),
+                ),
+            ):
+                response = stub.batch_render_rgb(
+                    BatchRGBRenderRequest(
+                        items=[
+                            BatchRGBRenderRequestItem(
+                                camera_name="cam_ipc",
+                                request=RGBRenderRequest(
+                                    scene_id="scene",
+                                    use_cuda_ipc=True,
+                                    ipc_session_id="ipc",
+                                    image_format=ImageFormat.RGB_UINT8_PLANAR,
+                                    apply_harmonizer=True,
+                                    harmonizer_session_id=session_ipc,
+                                ),
+                            ),
+                            self._rgb_batch_item("cam_png", apply_harmonizer=True, harmonizer_session_id=session_png),
+                        ]
+                    )
+                )
+
+            self.assertEqual([item.success for item in response.items], [True, True])
+            self.assertEqual(response.items[0].result.buffer_id, 3)
+            self._assert_harmonized_with(service._harmonizer_model, [state_ipc, state_png])
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_bad_temporal_session_fails_before_reserving_ipc_buffers(self):
+        """Sessions are resolved before CUDA IPC buffers are reserved, so a failed batch holds none."""
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            mgr = mock.MagicMock()
+
+            with mock.patch.object(service, "_get_ipc_mgr", return_value=mgr):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_rgb(
+                        BatchRGBRenderRequest(
+                            items=[
+                                BatchRGBRenderRequestItem(
+                                    camera_name="cam_ipc",
+                                    request=RGBRenderRequest(
+                                        scene_id="scene",
+                                        use_cuda_ipc=True,
+                                        ipc_session_id="ipc",
+                                        image_format=ImageFormat.RGB_UINT8_PLANAR,
+                                        apply_harmonizer=True,
+                                        harmonizer_session_id="nope",
+                                    ),
+                                )
+                            ]
+                        )
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+            mgr.reserve_buffers.assert_not_called()
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_opt_out_item_resets_its_session(self):
+        """An item that names its session without opting in resets that session, as render_rgb does,
+        while an opted-in item in the same batch harmonizes on its own session.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session_out = stub.create_harmonizer_session(Empty()).session_id
+            session_in = stub.create_harmonizer_session(Empty()).session_id
+            state_out = service._harmonizer_sessions[session_out]
+            state_in = service._harmonizer_sessions[session_in]
+            state_out.push(torch.zeros((3, 2, 2)))
+            service._harmonizer_model = mock.Mock(side_effect=lambda pixels, _img_size, _state: pixels)
+            service._harmonizer_ready.set()
+
+            backend = mock.MagicMock()
+            backend.render_rgb_request.return_value = (torch.zeros((2, 2, 3)), (2, 2))
+
+            with mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)):
+                response = stub.batch_render_rgb(
+                    BatchRGBRenderRequest(
+                        items=[
+                            self._rgb_batch_item("cam_out", apply_harmonizer=False, harmonizer_session_id=session_out),
+                            self._rgb_batch_item("cam_in", apply_harmonizer=True, harmonizer_session_id=session_in),
+                        ]
+                    )
+                )
+
+            self.assertEqual([item.success for item in response.items], [True, True])
+            self.assertEqual(len(state_out.history), 0)
+            self.assertFalse(state_out.closed)
+            self._assert_harmonized_with(service._harmonizer_model, [state_in])
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_camera_opt_out_resets_its_session_even_when_the_batch_fails(self):
+        """Resets happen once the batch is accepted, before rendering, so a later failure does not
+        leave stale history behind (render_camera behaves the same).
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session = stub.create_harmonizer_session(Empty()).session_id
+            state = service._harmonizer_sessions[session]
+            state.push(torch.zeros((3, 2, 2)))
+
+            with mock.patch.object(service, "get_backend", side_effect=CacheFullError("cache is full")):
+                with self.assertRaises(grpc.RpcError) as ctx:
+                    stub.batch_render_camera(
+                        BatchCameraRenderRequest(
+                            items=[
+                                self._camera_batch_item(
+                                    "cam",
+                                    image_format=ImageFormat.JPEG,
+                                    image_quality=90,
+                                    harmonizer_session_id=session,
+                                )
+                            ]
+                        )
+                    )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+            self.assertEqual(len(state.history), 0)
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_batch_render_rgb_on_a_non_temporal_server_ignores_session_ids(self):
+        """Without the temporal model, session IDs are ignored as in render_rgb: a repeated one is not
+        an error, and every opted-in item gets the non-temporal Harmonizer.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=False)
+        try:
+            service.harmonizer_enabled = True
+            service._harmonizer_model = mock.Mock(side_effect=lambda pixels, _img_size, _flag: pixels)
+            service._harmonizer_ready.set()
+
+            backend = mock.MagicMock()
+            backend.render_rgb_request.return_value = (torch.zeros((2, 2, 3)), (2, 2))
+
+            with mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)):
+                response = stub.batch_render_rgb(
+                    BatchRGBRenderRequest(
+                        items=[
+                            self._rgb_batch_item("cam_a", apply_harmonizer=True, harmonizer_session_id="ignored"),
+                            self._rgb_batch_item("cam_b", apply_harmonizer=True, harmonizer_session_id="ignored"),
+                        ]
+                    )
+                )
+
+            self.assertEqual([item.success for item in response.items], [True, True])
+            self.assertEqual(
+                service._harmonizer_model.call_args_list,
+                [mock.call(mock.ANY, (2, 2), False), mock.call(mock.ANY, (2, 2), False)],
+            )
+        finally:
+            channel.close()
+            server.stop(0)
+
+    def test_resolve_batch_harmonizer_states_ignores_non_colour_camera_items(self):
+        """Harmonizer only applies to the colour product, so a distance-only item needs no session
+        and does not count towards the once-per-batch rule even if it names one.
+        """
+        server, channel, stub, service = self._start_service(temporal_enabled=True)
+        try:
+            session = stub.create_harmonizer_session(Empty()).session_id
+            state = service._harmonizer_sessions[session]
+            context = mock.Mock()
+
+            states = service._resolve_batch_harmonizer_states(
+                [
+                    self._camera_batch_item("colour", apply_harmonizer=True, harmonizer_session_id=session),
                     BatchCameraRenderRequestItem(
-                        camera_name="cam",
+                        camera_name="distance",
                         request=CameraRenderRequest(
                             scene_id="scene",
-                            render_products=[CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR],
+                            render_products=[CameraRenderProduct.CAMERA_RENDER_PRODUCT_DISTANCE_COLORIZED],
                             apply_harmonizer=True,
+                            harmonizer_session_id=session,
                         ),
-                    )
-                ]
+                    ),
+                ],
+                context,
+                "batch_render_camera",
             )
-            with self.assertRaises(grpc.RpcError) as ctx:
-                stub.batch_render_camera(request)
-            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+
+            self.assertEqual(states, [state, None])
+            context.abort.assert_not_called()
         finally:
             channel.close()
             server.stop(0)
@@ -2364,6 +4189,7 @@ class TestHarmonizerPerRequestControl(unittest.TestCase):
 
 class TestServerConfig(unittest.TestCase):
     def setUp(self):
+        """Create a default GrpcServerConfig and the map build_server_config_map should produce from it."""
         self.server_config = GrpcServerConfig()
         self.expected_server_config_map = {
             "artifact_glob": "null",
@@ -2388,13 +4214,16 @@ class TestServerConfig(unittest.TestCase):
             "max_harmonizer_sessions": "32",
             "ray_chunk_size": "4611686018427387904",
             "egocar_hood_dir": "null",
+            "egocar_hood_cache_size": "32",
             "download_cache_dir": "~/.cache/nurec/downloaded_scenes",
             "download_cache_size": "5",
             "max_workers": "1",
             "enable_editing_actors": "False",
+            "camera_only": "False",
             "cache_size": "10",
             "max_backends_per_scene": "null",
             "cuda_ipc_max_buffer_count": "64",
+            "backend_cache_wait_timeout_s": "120.0",
             "metrics_output_dir": "null",
         }
 
@@ -3261,6 +5090,24 @@ class TestSceneDownloadInterceptor(unittest.TestCase):
         continuation.assert_called_once_with(details)
         self.assertIs(result, unittest.mock.sentinel.handler)
 
+    def test_prefetch_defers_local_registration_to_worker(self):
+        for service in ("nurec.grpc.protos.sensorsim.SensorsimService", LEGACY_SENSORSIM_SERVICE_NAME):
+            with self.subTest(service=service):
+                details = _make_handler_call_details(
+                    method=f"/{service}/prefetch_scene",
+                    invocation_metadata=[
+                        (SCENE_URL_HEADER, "file:///data/scene.usdz"),
+                        (SCENE_ID_HEADER, "scene"),
+                    ],
+                )
+                handler = unittest.mock.sentinel.handler
+                continuation = unittest.mock.Mock(return_value=handler)
+
+                result = self.interceptor.intercept_service(continuation, details)
+
+                self.assertIs(result, handler)
+                self.service._register_local_scene.assert_not_called()
+
     def test_file_uri_calls_register_local_scene(self):
         details = _make_handler_call_details(
             invocation_metadata=[
@@ -3331,18 +5178,35 @@ class TestSceneDownloadInterceptor(unittest.TestCase):
         callback.assert_called_once()
 
     def test_request_scene_id_must_match_metadata_scene_id(self):
-        details = _make_handler_call_details(
-            invocation_metadata=[
-                (SCENE_URL_HEADER, "https://example.com/scene.usdz"),
-                (SCENE_ID_HEADER, "metadata-scene"),
-            ]
-        )
+        for url in (None, "https://example.com/scene.usdz"):
+            with self.subTest(url=url):
+                metadata = [(SCENE_ID_HEADER, "metadata-scene")]
+                if url is not None:
+                    metadata.append((SCENE_URL_HEADER, url))
+                details = _make_handler_call_details(invocation_metadata=metadata)
+                with self.assertRaisesRegex(SceneNotFoundError, "does not match metadata scene"):
+                    SensorSimService._request_scene_cache_key("request-scene", self._context(details))
 
-        with self.assertRaisesRegex(SceneNotFoundError, "does not match metadata scene"):
-            SensorSimService._request_scene_cache_key(
-                "request-scene",
-                self._context(details),
-            )
+    def test_matching_scene_metadata_preserves_the_key(self):
+        for url in (None, "https://example.com/scene.usdz"):
+            with self.subTest(url=url):
+                metadata = [(SCENE_ID_HEADER, "scene")]
+                expected = SceneCacheKey(scene_id="scene")
+                if url is not None:
+                    metadata.append((SCENE_URL_HEADER, url))
+                    expected = SceneCacheKey.from_url("scene", url)
+                details = _make_handler_call_details(invocation_metadata=metadata)
+                self.assertEqual(SensorSimService._request_scene_cache_key("scene", self._context(details)), expected)
+
+    def test_scene_url_requires_nonempty_id_metadata(self):
+        for scene_id in (None, ""):
+            with self.subTest(scene_id=scene_id):
+                metadata = [(SCENE_URL_HEADER, "https://example.com/scene.usdz")]
+                if scene_id is not None:
+                    metadata.append((SCENE_ID_HEADER, scene_id))
+                details = _make_handler_call_details(invocation_metadata=metadata)
+                with self.assertRaisesRegex(ValueError, "Missing required metadata"):
+                    SensorSimService._request_scene_cache_key("scene", self._context(details))
 
     def test_url_less_lookup_rejects_multiple_registrations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3365,7 +5229,7 @@ class TestSceneDownloadInterceptor(unittest.TestCase):
                 with service.get_backend(SceneCacheKey(scene_id="scene")):
                     pass
 
-    def test_startup_artifact_mutation_is_not_loaded_under_the_registered_sha(self):
+    def test_startup_artifact_mutation_is_rejected_before_load(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             scene_path = Path(temp_dir) / "scene.usdz"
             scene_path.write_bytes(_artifact_bytes("scene", b"scene-v1"))
@@ -3376,7 +5240,7 @@ class TestSceneDownloadInterceptor(unittest.TestCase):
                 cache_size=1,
                 server_config=GrpcServerConfig(cache_size=1),
             )
-            scene_path.write_bytes(_artifact_bytes("scene", b"scene-v2"))
+            scene_path.write_bytes(_artifact_bytes("scene", b"expanded-scene-v2"))
 
             with mock.patch.object(Backend, "from_artifact") as from_artifact:
                 with self.assertRaisesRegex(ValueError, "changed after registration"):
@@ -3384,6 +5248,64 @@ class TestSceneDownloadInterceptor(unittest.TestCase):
                         pass
 
             from_artifact.assert_not_called()
+
+    def test_untouched_startup_artifact_is_not_rehashed_on_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "scene.usdz"
+            scene_path.write_bytes(_artifact_bytes("scene", b"scene-v1"))
+            service = SensorSimService(
+                server=None,
+                artifacts_glob=str(scene_path),
+                ray_chunk_size=1,
+                cache_size=1,
+                server_config=GrpcServerConfig(cache_size=1),
+            )
+            registration = service._artifact_registrations[SceneCacheKey(scene_id="scene").key_hash]
+            # Startup hashed the file right after it was written, inside the racy-clean window of
+            # Artifact.footprint_is_current; hash it again as if a minute had passed so the digest is
+            # trusted on the file's stat (ctime cannot be back-dated the way mtime can).
+            registration.artifact.clear_cache()
+            with mock.patch("time.time", return_value=time.time() + 60.0):
+                registration.artifact.sha256_footprint
+            backend = TestRenderGrpcStatusCodes._make_backend(registration.backend_cache_key)
+
+            real_footprint = Artifact.sha256_footprint
+
+            def cached_footprint_only(artifact: Artifact) -> str:
+                # The registration's artifact answers from its cache; a fresh Artifact would read the file.
+                if artifact._sha256_footprint is None:
+                    raise AssertionError("re-hashed")
+                return real_footprint.fget(artifact)
+
+            with (
+                mock.patch.object(Artifact, "sha256_footprint", property(cached_footprint_only)),
+                mock.patch.object(Backend, "from_artifact", return_value=backend) as from_artifact,
+            ):
+                with service.get_backend(SceneCacheKey(scene_id="scene")) as served:
+                    self.assertIs(served, backend)
+
+            from_artifact.assert_called_once()
+
+    def test_startup_artifact_mutation_during_load_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "scene.usdz"
+            scene_path.write_bytes(_artifact_bytes("scene", b"scene-v1"))
+            service = SensorSimService(
+                server=None,
+                artifacts_glob=str(scene_path),
+                ray_chunk_size=1,
+                cache_size=1,
+                server_config=GrpcServerConfig(cache_size=1),
+            )
+
+            def mutate_artifact(*_args, **_kwargs):
+                scene_path.write_bytes(_artifact_bytes("scene", b"expanded-scene-v2"))
+                return mock.MagicMock()
+
+            with mock.patch.object(Backend, "from_artifact", side_effect=mutate_artifact):
+                with self.assertRaisesRegex(ValueError, "changed after registration"):
+                    with service.get_backend(SceneCacheKey(scene_id="scene")):
+                        pass
 
     def test_redownloaded_content_does_not_reuse_backend_from_evicted_disk_entry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3716,6 +5638,42 @@ def _make_torch_camera(logical_id="camera_front_wide_120fov", unique_sensor_idx=
     )
 
 
+def test_torch_camera_preserves_uniform_scale_for_rounded_resolution() -> None:
+    camera_parameters = ncore.data.OpenCVPinholeCameraModelParameters(
+        resolution=np.array([3840, 2160], dtype=np.uint64),
+        focal_length=np.array([3840.0, 2160.0], dtype=np.float32),
+        principal_point=np.array([1920.0, 1080.0], dtype=np.float32),
+        radial_coeffs=np.zeros(6, dtype=np.float32),
+        tangential_coeffs=np.zeros(2, dtype=np.float32),
+        thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+        shutter_type=ncore.data.ShutterType.GLOBAL,
+    )
+    camera = TorchCamera(
+        time_range_us=HalfClosedInterval(1_000_000, 2_000_000),
+        camera_model_parameters=camera_parameters,
+        logical_camera_id="camera_front_wide_120fov",
+        unique_sensor_idx=0,
+        world_to_nurec=FrameConversion(matrix=np.eye(4, dtype=np.float32)),
+        T_camera_rig=torch.eye(4),
+    )
+    request = RGBRenderRequest(
+        resolution_w=1000,
+        resolution_h=1,
+        frame_start_us=1_000_000,
+        frame_end_us=1_000_001,
+    )
+    request.sensor_pose.start_pose.quat.w = 1.0
+    request.sensor_pose.end_pose.quat.w = 1.0
+
+    with mock.patch("nurec.grpc.serve.RayBundle.build") as build:
+        camera.build_ray_bundle(request)
+
+    transformed = build.call_args.kwargs["camera_model_parameters"]
+    np.testing.assert_array_equal(transformed.resolution, [1000, 562])
+    np.testing.assert_allclose(transformed.focal_length, [1000.0, 562.5])
+    np.testing.assert_allclose(transformed.principal_point, [500.0, 281.25])
+
+
 def _make_custom_ftheta_spec(logical_id):
     return CameraSpec(
         logical_id=logical_id,
@@ -3734,6 +5692,52 @@ def _make_custom_ftheta_spec(logical_id):
     )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+def test_global_camera_ray_batch_matches_individual_bundles() -> None:
+    camera = _make_torch_camera(unique_sensor_idx=7)
+    camera.world_to_nurec = FrameConversion(
+        matrix=np.array([[0, -1, 0, 3], [1, 0, 0, -2], [0, 0, 1, 1], [0, 0, 0, 1]], dtype=np.float32)
+    )
+    pose_a = Pose(quat={"w": 1.0})
+    pose_b = Pose(vec={"x": 2.0}, quat={"z": math.sqrt(0.5), "w": math.sqrt(0.5)})
+
+    def request(start_pose: Pose, end_pose: Pose) -> CameraRenderRequest:
+        return CameraRenderRequest(
+            resolution_h=567,
+            resolution_w=320,
+            frame_start_us=1_000_010,
+            frame_end_us=1_000_011,
+            sensor_pose=PosePair(start_pose=start_pose, end_pose=end_pose),
+        )
+
+    requests = [request(pose_a, pose_b), request(pose_b, pose_a)]
+    individual = [camera.build_ray_bundle(item) for item in requests]
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        batched, frame_meta = camera.build_ray_batch(requests, torch.device("cuda"))
+    torch.cuda.current_stream().wait_stream(stream)
+
+    for actual, bundle in zip(frame_meta, individual, strict=True):
+        assert actual.unique_sensor_idx == bundle.frame_meta.unique_sensor_idx
+        assert actual.unique_frame_idx == bundle.frame_meta.unique_frame_idx
+        assert actual.training_frame_idx == bundle.frame_meta.training_frame_idx
+    expected = RenderingData.collate_fn([bundle.rendering_data for bundle in individual], device=torch.device("cuda"))
+    torch.testing.assert_close(batched.rays, expected.rays)
+    torch.testing.assert_close(batched.poses_tquat_startend, expected.poses_tquat_startend)
+    torch.testing.assert_close(batched.timestamps_startend_us, expected.timestamps_startend_us)
+    torch.testing.assert_close(batched.timestamps_startend_us_cpu, expected.timestamps_startend_us_cpu)
+    torch.testing.assert_close(batched.rays_timestamps_us, expected.rays_timestamps_us)
+    assert batched.rays_timestamps_us.stride()[1:3] == (0, 0)
+    assert batched.rays_timestamp_layout == "global"
+    assert all(
+        actual is reference
+        for actual, reference in zip(batched.sensor_model_parameters, expected.sensor_model_parameters)
+    )
+    for name in ("_rays_footprints", "_distance_to_depth_scale", "_rays_is_sky", "ray_flags", "active_tile_mask"):
+        assert getattr(batched, name) is None
+        assert getattr(expected, name) is None
+
+
 def _enum_value(value):
     return value.value if hasattr(value, "value") else value
 
@@ -3745,6 +5749,7 @@ class TestGetCameraFallback(unittest.TestCase):
         """Create a CameraBank without calling __init__ (which requires Artifact), then set cameras."""
         bank = object.__new__(CameraBank)
         bank.cameras = cameras_dict
+        bank._custom_camera = None
         bank._logged_missing_reconstruction_cameras = set()
         bank._logged_missing_reconstruction_cameras_lock = threading.Lock()
         return bank
@@ -3801,6 +5806,21 @@ class TestGetCameraFallback(unittest.TestCase):
         self.assertEqual(result.unique_sensor_idx, 42)
         self._assert_ftheta_camera_matches_spec(result, spec)
         self._assert_ftheta_camera_differs_from_ref(result, ref)
+
+    def test_custom_camera_cache_reuses_only_matching_specs(self):
+        ref = _make_torch_camera("cam_front")
+        bank = self._make_camera_bank_with_cameras({"cam_front": ref})
+        spec = _make_custom_ftheta_spec("cam_front")
+
+        first = bank._get_camera(spec)
+        self.assertIs(bank._get_camera(spec), first)
+
+        changed = CameraSpec()
+        changed.CopyFrom(spec)
+        changed.ftheta_param.principal_point_x += 1.0
+        changed_camera = bank._get_camera(changed)
+        self.assertIsNot(changed_camera, first)
+        self._assert_ftheta_camera_matches_spec(changed_camera, changed)
 
     def test_unknown_camera_with_params_falls_back_to_scene_defaults(self):
         """When logical_id is NOT in the bank but camera_param IS provided,
@@ -3942,13 +5962,12 @@ class TestWaitForGrpcServer(unittest.TestCase):
 
 class TestHarmonizerLoadPending(unittest.TestCase):
     def test_failed_load_reports_serving_and_logs_the_error(self):
-        server, channel, stub, service = _make_service()
         failure = RuntimeError("checkpoint is missing")
 
         def _failing_get(*args, **kwargs):
             raise failure
 
-        try:
+        with _service() as (_, service):
             with mock.patch("nurec.grpc.serve.HarmonizerModelFactory.get", _failing_get):
                 service.set_harmonizer(True, "url", "cache", "harmonizer.pt", (1, 1))
                 service.wait_for_harmonizer_load()
@@ -3964,37 +5983,38 @@ class TestHarmonizerLoadPending(unittest.TestCase):
             self.assertIn("failed to load", "".join(logs.output))
             response = health_servicer.Check(health_pb2.HealthCheckRequest(service=""), None)
             self.assertEqual(response.status, health_pb2.HealthCheckResponse.SERVING)
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_pending_until_the_background_load_finishes(self):
-        server, channel, stub, service = _make_service()
         release = threading.Event()
 
         def _blocking_get(*args, **kwargs):
             release.wait(timeout=30)
             return mock.MagicMock()
 
-        try:
-            self.assertFalse(service.harmonizer_load_pending)
+        with _service() as (_, service):
+            try:
+                self.assertFalse(service.harmonizer_load_pending)
 
-            with mock.patch("nurec.grpc.serve.HarmonizerModelFactory.get", _blocking_get):
-                service.set_harmonizer(True, "url", "cache", "harmonizer.pt", (1, 1))
-                self.assertTrue(service.harmonizer_load_pending)
+                with mock.patch("nurec.grpc.serve.HarmonizerModelFactory.get", _blocking_get):
+                    service.set_harmonizer(True, "url", "cache", "harmonizer.pt", (1, 1))
+                    self.assertTrue(service.harmonizer_load_pending)
+                    release.set()
+                    service.wait_for_harmonizer_load()
+
+                self.assertFalse(service.harmonizer_load_pending)
+            finally:
                 release.set()
-                service.wait_for_harmonizer_load()
-
-            self.assertFalse(service.harmonizer_load_pending)
-        finally:
-            release.set()
-            channel.close()
-            server.stop(0)
 
 
-def _make_service() -> tuple:
-    """Start a throwaway SensorSimService and return (server, channel, stub, service)."""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+@contextlib.contextmanager
+def _service(
+    *,
+    allowed_image_formats: str | None = None,
+    camera_only: bool = False,
+    max_workers: int = 1,
+) -> Iterator[tuple[SensorsimServiceStub, SensorSimService]]:
+    """Run a throwaway SensorSimService."""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     service = SensorSimService(
         server,
         artifacts_glob=None,
@@ -4005,15 +6025,204 @@ def _make_service() -> tuple:
         cache_size=1,
         metrics_output_dir=None,
         enable_editing_actors=False,
-        server_config=GrpcServerConfig(),
+        server_config=GrpcServerConfig(
+            allowed_image_formats=allowed_image_formats,
+            camera_only=camera_only,
+            max_workers=max_workers,
+        ),
     )
     add_SensorsimServiceServicer_to_server(service, server)
     port = server.add_insecure_port("localhost:0")
     server.start()
     channel = grpc.insecure_channel(f"localhost:{port}")
-    grpc.channel_ready_future(channel).result(timeout=5)
-    stub = SensorsimServiceStub(channel)
-    return server, channel, stub, service
+    try:
+        grpc.channel_ready_future(channel).result(timeout=5)
+        stub = SensorsimServiceStub(channel)
+        yield stub, service
+    finally:
+        service.close()
+        channel.close()
+        server.stop(0)
+
+
+def _register_prefetch_scene(service: SensorSimService, scene_key: SceneCacheKey) -> None:
+    artifact = _registered_artifact(Path(f"/scenes/{scene_key.scene_id}.usdz"), scene_key.scene_id)
+    registration = ArtifactRegistration(artifact, False, scene_key)
+    with service._artifact_registry_lock:
+        service._artifact_registrations[scene_key.key_hash] = registration
+
+
+class TestCameraOnly(unittest.TestCase):
+    def test_pattern_lookup_fails_before_scene_loading(self):
+        with _service(camera_only=True) as (stub, service), mock.patch.object(service, "get_backend") as get_backend:
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.get_lidar_firing_pattern(LidarFiringPatternRequest(scene_id="scene"))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            self.assertIn("camera-only", ctx.exception.details())
+            get_backend.assert_not_called()
+
+    def test_lidar_rpc_fails_before_scene_loading(self):
+        with _service(camera_only=True) as (stub, _):
+            self.assertEqual(stub.get_server_config(Empty()).server_config["camera_only"], "True")
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.render_lidar(LidarRenderRequest(scene_id="scene"))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            self.assertIn("camera-only", ctx.exception.details())
+
+
+class TestScenePrefetch(unittest.TestCase):
+    def test_headerless_hint_uses_unique_registered_url_key(self):
+        with _service() as (stub, service):
+            scene_key = SceneCacheKey.from_url("scene", "file:///scenes/scene.usdz")
+            _register_prefetch_scene(service, scene_key)
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.submit.return_value = True
+            stub.prefetch_scene(PrefetchSceneRequest(scene_id="scene"))
+
+            service._scene_prefetch.submit.assert_called_once_with(scene_key)
+
+    def test_mismatched_id_without_url_rejects_hint_before_submission(self):
+        with _service() as (stub, service):
+            _register_prefetch_scene(service, SceneCacheKey(scene_id="scene"))
+            service._scene_prefetch = mock.MagicMock()
+            for metadata_id in ("other", ""):
+                with self.subTest(metadata_id=metadata_id), self.assertRaises(grpc.RpcError) as ctx:
+                    stub.prefetch_scene(
+                        PrefetchSceneRequest(scene_id="scene"), metadata=((SCENE_ID_HEADER, metadata_id),)
+                    )
+                self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+                self.assertIn("does not match metadata scene", ctx.exception.details())
+            service._scene_prefetch.submit.assert_not_called()
+
+    def test_scene_query_validates_metadata_before_loading(self):
+        with _service() as (stub, service), mock.patch.object(service, "get_backend") as get_backend:
+            backend = mock.Mock()
+            backend.get_available_cameras.return_value = AvailableCamerasReturn()
+            get_backend.return_value = contextlib.nullcontext(backend)
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.get_available_cameras(
+                    AvailableCamerasRequest(scene_id="scene"), metadata=((SCENE_ID_HEADER, "other"),)
+                )
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+            self.assertIn("does not match metadata scene", ctx.exception.details())
+            get_backend.assert_not_called()
+            for metadata in ((), ((SCENE_ID_HEADER, "scene"),)):
+                with self.subTest(metadata=metadata):
+                    response = stub.get_available_cameras(AvailableCamerasRequest(scene_id="scene"), metadata=metadata)
+                    self.assertEqual(response, AvailableCamerasReturn())
+
+    def test_unknown_scene_returns_not_found(self):
+        with _service() as (stub, _):
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(PrefetchSceneRequest(scene_id="missing"))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.NOT_FOUND)
+
+    def test_blocking_prefetch_requires_two_workers(self):
+        with _service() as (stub, service):
+            service._scene_prefetch = mock.MagicMock()
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(PrefetchSceneRequest(scene_id="scene", wait_for_capacity=True))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            service._scene_prefetch.submit.assert_not_called()
+
+    def test_blocking_prefetch_respects_server_timeout(self):
+        with _service(max_workers=2) as (stub, service):
+            _register_prefetch_scene(service, SceneCacheKey(scene_id="scene"))
+            service._backend_cache_wait_timeout_s = 0.0
+
+            def submit(_key, *, wait_for_capacity, check_wait) -> None:
+                self.assertTrue(wait_for_capacity)
+                check_wait()
+
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.submit.side_effect = submit
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(PrefetchSceneRequest(scene_id="scene", wait_for_capacity=True))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+
+    def test_prefetch_reports_a_full_pending_queue(self):
+        with _service() as (stub, service):
+            _register_prefetch_scene(service, SceneCacheKey(scene_id="scene"))
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.submit.return_value = False
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(PrefetchSceneRequest(scene_id="scene"))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+
+    def test_remote_prefetch_is_rejected(self):
+        with _service() as (stub, service):
+            service._scene_prefetch = mock.MagicMock()
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(
+                    PrefetchSceneRequest(scene_id="scene"),
+                    metadata=(
+                        (SCENE_ID_HEADER, "scene"),
+                        (SCENE_URL_HEADER, "https://example.test/scene.usdz"),
+                    ),
+                )
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            service._scene_prefetch.submit.assert_not_called()
+
+    def test_headerless_remote_prefetch_is_rejected(self):
+        with _service() as (stub, service):
+            scene_key = SceneCacheKey.from_url("scene", "https://example.test/scene.usdz")
+            _register_prefetch_scene(service, scene_key)
+            service._scene_prefetch = mock.MagicMock()
+
+            with self.assertRaises(grpc.RpcError) as ctx:
+                stub.prefetch_scene(PrefetchSceneRequest(scene_id="scene"))
+
+            self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+            service._scene_prefetch.submit.assert_not_called()
+
+    def test_registration_rejects_file_changed_while_hashing(self):
+        artifact = _registered_artifact(Path("/scenes/scene.usdz"), "scene")
+        with (
+            mock.patch(
+                "nurec.grpc.serve._local_file_fingerprint",
+                side_effect=[(1, 2, 3, 4, 5), (1, 2, 3, 4, 6)],
+            ),
+            self.assertRaisesRegex(ValueError, "changed while it was registered"),
+        ):
+            _register_local_artifact(artifact, SceneCacheKey(scene_id="scene"))
+
+    def test_backend_wait_for_prefetch_respects_cancelled_context(self):
+        with _service() as (_, service):
+            scene_key = SceneCacheKey(scene_id="scene")
+            registration = ArtifactRegistration(
+                _registered_artifact(Path("/scenes/scene.usdz"), "scene"),
+                True,
+                scene_key,
+            )
+            with service._artifact_registry_lock:
+                service._artifact_registrations[scene_key.key_hash] = registration
+
+            def take(_key, *, check_wait):
+                check_wait()
+
+            service._scene_prefetch = mock.MagicMock()
+            service._scene_prefetch.take.side_effect = take
+            selection_lease = mock.MagicMock()
+            selection_lease.release.return_value = []
+            service.scene_cache = mock.MagicMock()
+            service.scene_cache.acquire_scene.return_value = selection_lease
+            context = mock.MagicMock()
+            context.is_active.return_value = False
+            context.time_remaining.return_value = 30.0
+
+            with self.assertRaises(CacheWaitAbortedError) as error:
+                with service.get_backend(scene_key, context):
+                    pass
+
+            self.assertEqual(error.exception.reason, CacheWaitAbortedReason.CANCELLED)
+            selection_lease.release.assert_called_once_with()
 
 
 @contextlib.contextmanager
@@ -4062,11 +6271,126 @@ def _mock_backend_ctx_render_raises(exc: Exception):
     return _ctx
 
 
+class TestRigTrajectoryConversion(unittest.TestCase):
+    @staticmethod
+    def _rig(timestamps, quaternions=None):
+        if quaternions is None:
+            quaternions = [[0, 0, 0, 1]] * len(timestamps)
+        poses = np.broadcast_to(np.eye(4), (len(timestamps), 4, 4)).copy()
+        poses[:, 0, 3] = 3 + np.asarray(timestamps) / 1000
+        from scipy.spatial.transform import Rotation
+
+        poses[:, :3, :3] = Rotation.from_quat(quaternions).as_matrix()
+        return RigTrajectories.RigTrajectory(
+            sequence_id="rig",
+            rig_bbox=None,
+            cameras_frame_timestamps_us={},
+            lidars_frame_timestamps_us={},
+            T_rig_worlds=torch.tensor(poses, dtype=torch.float64),
+            T_rig_world_timestamps_us=torch.tensor(timestamps, dtype=torch.int64),
+        )
+
+    def test_camera_bank_accepts_rig_padding_before_zero(self):
+        rig = self._rig([-1, 0, 1000])
+        rig_trajectories = mock.Mock(rig_trajectories=[rig], camera_calibrations={})
+        with mock.patch("nurec.grpc.serve.RigTrajectories.from_dict", return_value=rig_trajectories):
+            bank = CameraBank(
+                mock.Mock(),
+                FrameConversion(matrix=np.eye(4, dtype=np.float32)),
+                scene_time_range_us=HalfClosedInterval(0, 1001),
+            )
+        self.assertEqual([p.timestamp_us for p in bank.trajectory.poses], [0, 1000])
+        np.testing.assert_allclose([p.pose.vec.x for p in bank.trajectory.poses], [3, 4], atol=1e-5)
+
+    def test_zero_boundary_interpolates_rig_translation_and_rotation(self):
+        rig = self._rig([-1000, 1000], [[0, 0, 0, 1], [0, 0, 2**-0.5, 2**-0.5]])
+        trajectory = _rig_trajectory_to_grpc_trajectory(rig)
+        self.assertEqual([p.timestamp_us for p in trajectory.poses], [0, 1000])
+        pose = trajectory.poses[0].pose
+        self.assertAlmostEqual(pose.vec.x, 3, places=5)
+        self.assertAlmostEqual(pose.quat.z, np.sin(np.pi / 8), places=5)
+        self.assertAlmostEqual(pose.quat.w, np.cos(np.pi / 8), places=5)
+
+    def test_positive_only_rig_is_unchanged(self):
+        trajectory = _rig_trajectory_to_grpc_trajectory(self._rig([100, 1000, 2000]))
+        self.assertEqual([p.timestamp_us for p in trajectory.poses], [100, 1000, 2000])
+        np.testing.assert_allclose([p.pose.vec.x for p in trajectory.poses], [3.1, 4, 5], atol=1e-5)
+
+
 class TestRenderCameraStatusCodes(unittest.TestCase):
+    def test_nonfinite_pose_is_invalid_argument_and_next_valid_request_works(self):
+        camera = TorchCamera(
+            camera_model_parameters=CameraBank._get_camera_model_parameters(
+                CameraSpec(
+                    logical_id="front",
+                    resolution_h=4,
+                    resolution_w=4,
+                    shutter_type=1,
+                    opencv_pinhole_param=OpenCVPinholeCameraParam(
+                        principal_point_x=2,
+                        principal_point_y=2,
+                        focal_length_x=2,
+                        focal_length_y=2,
+                        radial_coeffs=[0] * 6,
+                        tangential_coeffs=[0] * 2,
+                        thin_prism_coeffs=[0] * 4,
+                    ),
+                )
+            ),
+            logical_camera_id="front",
+            unique_sensor_idx=0,
+            time_range_us=HalfClosedInterval(0, 2000),
+            world_to_nurec=FrameConversion(matrix=np.eye(4, dtype=np.float32)),
+            T_camera_rig=torch.eye(4),
+        )
+
+        @contextlib.contextmanager
+        def backend_context(*args, **kwargs):
+            backend = mock.Mock()
+            backend.source_artifact.semantic_class_names = None
+            backend.source_artifact.semantic_class_colors = None
+
+            def render(request, **kwargs):
+                camera.build_ray_bundle(request)
+                return CameraFrame(color_image=torch.zeros(4, 4, 3)), (4, 4), None
+
+            backend.render_camera_request.side_effect = render
+            yield backend
+
+        request = CameraRenderRequest(
+            scene_id="scene",
+            frame_start_us=1000,
+            frame_end_us=1001,
+            resolution_h=4,
+            resolution_w=4,
+            image_format=ImageFormat.PNG,
+        )
+        request.sensor_pose.start_pose.quat.w = request.sensor_pose.end_pose.quat.w = 1
+        with _service() as (stub, service):
+            with mock.patch.object(service, "get_backend", backend_context):
+                for endpoint in ("start_pose", "end_pose"):
+                    for value in (float("nan"), float("inf"), float("-inf")):
+                        pose = getattr(request.sensor_pose, endpoint)
+                        pose.vec.x = value
+                        with self.subTest(endpoint=endpoint, value=value):
+                            with self.assertRaises(grpc.RpcError) as caught:
+                                stub.render_camera(request)
+                            self.assertEqual(caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+                            self.assertIn(
+                                f"Pose component vec.x must be finite; got {value}", caught.exception.details()
+                            )
+                        pose.vec.x = 0
+
+                with (
+                    mock.patch("nurec.grpc.serve.RayBundle.build", return_value=mock.sentinel.bundle),
+                    mock.patch.object(service, "_encode_image_bytes", return_value=b"valid"),
+                ):
+                    response = stub.render_camera(request)
+                self.assertEqual(response.camera_render_outputs[0].image_bytes, b"valid")
+
     def test_temporal_harmonizer_is_ignored_for_non_color_camera_products(self):
-        server, channel, stub, service = _make_service()
-        service.harmonizer_temporal_enabled = True
-        try:
+        with _service() as (stub, service):
+            service.harmonizer_temporal_enabled = True
             backend_ctx = _mock_backend_ctx_with_frame(CameraFrame(distance_image=torch.zeros(4, 4)))
             with mock.patch.object(service, "get_backend", backend_ctx):
                 response = stub.render_camera(
@@ -4083,13 +6407,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                 response.camera_render_outputs[0].render_product,
                 CameraRenderProduct.CAMERA_RENDER_PRODUCT_DISTANCE_COLORIZED,
             )
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_renderer_fails_to_produce_semantics_returns_failed_precondition(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             # The real render path raises MissingRenderOutputError when the model lacks a semantic
             # head; the server must surface that as FAILED_PRECONDITION, not INVALID_ARGUMENT.
             backend_ctx = _mock_backend_ctx_render_raises(
@@ -4107,13 +6427,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
                 self.assertIn("semantic", (ctx.exception.details() or "").lower())
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_renderer_fails_to_produce_distance_returns_failed_precondition(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_render_raises(
                 MissingRenderOutputError(
                     "Distance image requested, but the model or render path did not produce distance output."
@@ -4129,13 +6445,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
                 self.assertIn("distance", (ctx.exception.details() or "").lower())
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_duplicate_products_returns_invalid_argument(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(CameraFrame(color_image=torch.zeros(4, 4, 3)))
             with mock.patch.object(service, "get_backend", backend_ctx):
                 with self.assertRaises(grpc.RpcError) as ctx:
@@ -4150,13 +6462,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
                 self.assertIn("unique", (ctx.exception.details() or "").lower())
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_ego_mask_without_color_returns_invalid_argument(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(CameraFrame(distance_image=torch.zeros(4, 4)))
             with mock.patch.object(service, "get_backend", backend_ctx):
                 with self.assertRaises(grpc.RpcError) as ctx:
@@ -4169,13 +6477,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
                 self.assertIn("color", (ctx.exception.details() or "").lower())
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_ego_mask_with_color_reaches_egocar_selection(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(
                 CameraFrame(color_image=torch.zeros(4, 4, 3), distance_image=torch.zeros(4, 4))
             )
@@ -4198,13 +6502,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
             self.assertEqual(len(response.camera_render_outputs), 2)
             # Ego selection invoked exactly once (only during the COLOR product encoding).
             select_mock.assert_called_once()
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_multi_product_returns_one_output_per_product(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(
                 CameraFrame(color_image=torch.zeros(4, 4, 3), distance_image=torch.zeros(4, 4))
             )
@@ -4228,13 +6528,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                 response.camera_render_outputs[1].render_product,
                 CameraRenderProduct.CAMERA_RENDER_PRODUCT_DISTANCE_COLORIZED,
             )
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_overlay_applied_to_every_output_product(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             backend_ctx = _mock_backend_ctx_with_frame(
                 CameraFrame(
                     color_image=torch.zeros(4, 4, 3),
@@ -4261,13 +6557,9 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                         )
                     )
                 self.assertEqual(overlay_mock.call_count, 3)
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_render_camera_timestamp_out_of_range(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
 
             @contextlib.contextmanager
             def _raise(*args, **kwargs):
@@ -4278,15 +6570,24 @@ class TestRenderCameraStatusCodes(unittest.TestCase):
                 with self.assertRaises(grpc.RpcError) as ctx:
                     stub.render_camera(CameraRenderRequest(scene_id="scene"))
                 self.assertEqual(ctx.exception.code(), grpc.StatusCode.OUT_OF_RANGE)
-        finally:
-            channel.close()
-            server.stop(0)
 
 
 class TestBatchRenderCameraValidation(unittest.TestCase):
+    def test_item_render_does_not_swallow_fatal_worker_error(self):
+        service = _make_service_no_server()
+        item = BatchCameraRenderRequestItem(camera_name="cam", request=CameraRenderRequest(scene_id="scene"))
+        with (
+            mock.patch.object(
+                service,
+                "_camera_render_return_from_request",
+                side_effect=RuntimeError("CUDA error: an illegal memory access was encountered"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "illegal memory access"),
+        ):
+            service._render_single_camera_for_batch_camera(mock.MagicMock(), item)
+
     def test_mismatched_scene_ids_returns_invalid_argument(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             request = BatchCameraRenderRequest(
                 items=[
                     BatchCameraRenderRequestItem(
@@ -4306,22 +6607,14 @@ class TestBatchRenderCameraValidation(unittest.TestCase):
             self.assertIn("scene_id", details)
             self.assertIn("scene_1", details)
             self.assertIn("scene_2", details)
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_empty_batch_returns_empty_response(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             response = stub.batch_render_camera(BatchCameraRenderRequest(items=[]))
             self.assertEqual(len(response.items), 0)
-        finally:
-            channel.close()
-            server.stop(0)
 
     def test_oom_during_item_render_aborts_batch_and_reaches_get_backend_cleanup(self):
-        server, channel, stub, service = _make_service()
-        try:
+        with _service() as (stub, service):
             cleanup_calls = []
 
             @contextlib.contextmanager
@@ -4356,12 +6649,177 @@ class TestBatchRenderCameraValidation(unittest.TestCase):
             # get_backend's OOM cleanup path ran — proof the exception propagated out of the
             # per-item loop instead of being swallowed into a per-item success=False result.
             self.assertEqual(cleanup_calls, ["evicted"])
-        finally:
-            channel.close()
-            server.stop(0)
 
 
-def _make_service_no_server() -> SensorSimService:
+class TestCameraBatchDispatch(unittest.TestCase):
+    @staticmethod
+    def _camera_batch_request(
+        *, track_id: str | None = "car", moving: bool = False, aspect: str | None = None
+    ) -> CameraRenderRequest:
+        pose = Pose(vec={"x": 1.0}, quat={"w": 1.0})
+        end_pose = Pose(vec={"x": 2.0}, quat={"w": 1.0}) if moving else pose
+        dynamic_objects = []
+        if track_id is not None:
+            dynamic_object = DynamicObject(
+                track_id=track_id,
+                pose_pair=PosePair(start_pose=pose, end_pose=end_pose),
+            )
+            if aspect is not None:
+                dynamic_object.aspect_state.CopyFrom(AspectState(aspects=[aspect]))
+            dynamic_objects.append(dynamic_object)
+        return CameraRenderRequest(
+            scene_id="scene",
+            frame_start_us=10,
+            frame_end_us=11,
+            camera_intrinsics=CameraSpec(logical_id="front"),
+            dynamic_objects=dynamic_objects,
+        )
+
+    def test_camera_batch_reports_shared_scene_incompatibility(self):
+        first = self._camera_batch_request()
+        second = self._camera_batch_request()
+        second.sensor_pose.start_pose.vec.x = 4.0
+        self.assertIsNone(_camera_batch_incompatibility([first, second], {"car"}))
+
+        self.assertEqual(
+            _camera_batch_incompatibility([first], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_SINGLE_ITEM,
+        )
+
+        other = self._camera_batch_request()
+        other.scene_id = "other"
+        self.assertEqual(
+            _camera_batch_incompatibility([first, other], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_SCENE_MISMATCH,
+        )
+
+        other = self._camera_batch_request()
+        other.frame_end_us += 1
+        self.assertEqual(
+            _camera_batch_incompatibility([first, other], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_FRAME_INTERVAL_MISMATCH,
+        )
+
+        other = self._camera_batch_request()
+        other.camera_intrinsics.logical_id = "other"
+        self.assertEqual(
+            _camera_batch_incompatibility([first, other], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_INTRINSICS_MISMATCH,
+        )
+
+        moving = self._camera_batch_request(moving=True)
+        self.assertEqual(
+            _camera_batch_incompatibility([first, moving], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH,
+        )
+        different_aspect = self._camera_batch_request(aspect="brake:on")
+        self.assertEqual(
+            _camera_batch_incompatibility([first, different_aspect], {"car"}),
+            _CameraBatchDispatch.SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH,
+        )
+        matching_aspects = [self._camera_batch_request(aspect="brake:on") for _ in range(2)]
+        self.assertIsNone(_camera_batch_incompatibility(matching_aspects, {"car"}))
+        self.assertEqual(
+            _camera_batch_incompatibility([first, second], {"pedestrian"}),
+            _CameraBatchDispatch.SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH,
+        )
+
+        without_overrides = [self._camera_batch_request(track_id=None) for _ in range(2)]
+        self.assertIsNone(_camera_batch_incompatibility(without_overrides, {"car"}))
+
+    def _camera_batch_backend(self, shutter_type, dynamic_actor_ids):
+        renderable_model = mock.create_autospec(RenderableModel, instance=True)
+        renderable_model.device = torch.device("cuda")
+        renderable_model.supports_shared_camera_batch.return_value = True
+        renderable_model.supports_edit_actors.return_value = True
+        renderable_model.dynamic_actor_ids.return_value = dynamic_actor_ids
+        frames = [
+            mock.MagicMock(),
+            mock.MagicMock(),
+        ]
+        renderable_model.render_camera_color_batch.return_value = frames
+        renderable_model.render_camera_color_batch_from_ray_bundles.return_value = frames
+        ray_bundle = mock.MagicMock()
+        camera = mock.MagicMock()
+        camera.camera_model_parameters.shutter_type = shutter_type
+        camera.build_ray_bundle.return_value = ray_bundle
+        camera.build_ray_batch.return_value = (mock.MagicMock(), [mock.MagicMock(), mock.MagicMock()])
+        camera_bank = mock.MagicMock()
+        camera_bank._get_camera.return_value = camera
+        backend = Backend(
+            renderable_model=renderable_model,
+            camera_bank=camera_bank,
+            world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 20),
+            lidar_bank=mock.MagicMock(),
+            asset_bank=mock.MagicMock(),
+            source_artifact=mock.MagicMock(),
+            backend_cache_key=_test_backend_cache_key(),
+        )
+        return backend, camera, renderable_model
+
+    def test_camera_batch_dispatches_by_shutter_and_actor_state(self):
+        cases = (
+            (
+                "global fixed actors",
+                ncore.data.ShutterType.GLOBAL,
+                {"car"},
+                "car",
+                True,
+                _CameraBatchDispatch.NATIVE_BATCHED_RAYS,
+            ),
+            (
+                "rolling static scene",
+                ncore.data.ShutterType.ROLLING_TOP_TO_BOTTOM,
+                set(),
+                None,
+                False,
+                _CameraBatchDispatch.NATIVE_PER_CAMERA_RAYS,
+            ),
+            (
+                "rolling scene actors",
+                ncore.data.ShutterType.ROLLING_TOP_TO_BOTTOM,
+                {"car"},
+                None,
+                False,
+                _CameraBatchDispatch.SEQUENTIAL_ROLLING_ACTORS,
+            ),
+            (
+                "rolling fixed actors",
+                ncore.data.ShutterType.ROLLING_TOP_TO_BOTTOM,
+                {"car"},
+                "car",
+                True,
+                _CameraBatchDispatch.SEQUENTIAL_ROLLING_ACTORS,
+            ),
+        )
+        for name, shutter_type, dynamic_actor_ids, track_id, enable_editing_actors, expected in cases:
+            with self.subTest(name=name):
+                backend, camera, renderable_model = self._camera_batch_backend(shutter_type, dynamic_actor_ids)
+                requests = [self._camera_batch_request(track_id=track_id) for _ in range(2)]
+
+                frames, dispatch = backend.render_camera_batch_shared_scene(
+                    requests,
+                    enable_editing_actors=enable_editing_actors,
+                )
+
+                self.assertEqual(dispatch, expected)
+                if expected == _CameraBatchDispatch.SEQUENTIAL_ROLLING_ACTORS:
+                    self.assertIsNone(frames)
+                else:
+                    self.assertEqual(len(frames or []), 2)
+                if expected == _CameraBatchDispatch.NATIVE_BATCHED_RAYS:
+                    rendering_data, frame_meta = camera.build_ray_batch.return_value
+                    renderable_model.render_camera_color_batch.assert_called_once_with(
+                        rendering_data,
+                        frame_meta,
+                        actors_snapshot=mock.ANY if track_id is not None else None,
+                    )
+                elif expected == _CameraBatchDispatch.NATIVE_PER_CAMERA_RAYS:
+                    renderable_model.render_camera_color_batch_from_ray_bundles.assert_called_once()
+
+
+def _make_service_no_server(*, camera_only: bool = False) -> SensorSimService:
     """Construct a SensorSimService without binding a port — for unit-testing internal helpers."""
     return SensorSimService(
         server=None,
@@ -4373,18 +6831,20 @@ def _make_service_no_server() -> SensorSimService:
         cache_size=1,
         metrics_output_dir=None,
         enable_editing_actors=False,
-        server_config=GrpcServerConfig(),
+        server_config=GrpcServerConfig(camera_only=camera_only),
     )
 
 
 class TestCudaIpcTransport(unittest.TestCase):
-    """Session lifecycle and the render_rgb(use_cuda_ipc=True) branch, with a mocked IpcManager
-    standing in for the native extension (not built in this test environment)."""
+    """Test IPC RPC validation and cleanup with a mocked native manager."""
 
     def _service_with_mock_mgr(self) -> tuple[SensorSimService, mock.MagicMock]:
         service = _make_service_no_server()
         mgr = mock.MagicMock()
         service._get_ipc_mgr = mock.MagicMock(return_value=mgr)
+        mgr.ready_event_handles.return_value = []
+        mgr.runtime_version = 12080
+        mgr.layout.return_value = (3, 2, False)
         # Real _get_ipc_mgr() sets this as a side effect of constructing IpcManager;
         # since that's mocked away here, set it explicitly to match the device the
         # render-path tests' CUDA tensors land on (device "cuda" resolves to the
@@ -4399,7 +6859,7 @@ class TestCudaIpcTransport(unittest.TestCase):
 
         response = service.open_ipc_session(request, mock.MagicMock())
 
-        mgr.open_session.assert_called_once_with(8, 6, 2)
+        mgr.open_session.assert_called_once_with(8, 6, 2, event_ordered=False)
         self.assertEqual(response.session_id, "sess-1")
         self.assertEqual(list(response.cuda_ipc_mem_handles), [b"h0" * 32, b"h1" * 32])
         self.assertEqual(response.buffer_size, 1234)
@@ -4420,6 +6880,343 @@ class TestCudaIpcTransport(unittest.TestCase):
         mgr.close_session.return_value = True
         service.close_ipc_session(ipc_pb2.CloseIpcSessionRequest(session_id="sess-1"), mock.MagicMock())
         self.assertEqual(service._ipc_open_sessions, 0)
+
+    def test_open_event_ordered_session_exports_completion_metadata(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.open_session.return_value = ("session", [b"m" * 64], 18, b"u" * 16, 3, 2)
+        mgr.ready_event_handles.return_value = [b"e" * 64]
+        response = service.open_ipc_session(
+            ipc_pb2.OpenIpcSessionRequest(
+                requested_width=3,
+                requested_height=2,
+                requested_buffer_count=1,
+                completion_mode=ipc_pb2.EVENT_ORDERED,
+            ),
+            mock.MagicMock(),
+        )
+        mgr.open_session.assert_called_once_with(3, 2, 1, event_ordered=True)
+        self.assertEqual(response.completion_mode, ipc_pb2.EVENT_ORDERED)
+        self.assertEqual(list(response.cuda_ipc_ready_event_handles), [b"e" * 64])
+        self.assertEqual(response.cuda_runtime_version, 12080)
+        self.assertTrue(response.linux_boot_id)
+
+    def test_camera_batch_rejects_invalid_layout_before_reserving(self):
+        for field, value in (
+            ("use_cuda_ipc", False),
+            ("ipc_session_id", "other"),
+            ("scene_id", "other"),
+            ("resolution_w", 4),
+        ):
+            with self.subTest(field=field):
+                service, mgr = self._service_with_mock_mgr()
+                request = BatchCameraRenderRequest(
+                    items=[
+                        BatchCameraRenderRequestItem(
+                            camera_name=str(i),
+                            request=CameraRenderRequest(
+                                scene_id="scene",
+                                use_cuda_ipc=True,
+                                ipc_session_id="session",
+                                resolution_h=2,
+                                resolution_w=3,
+                                image_format=ImageFormat.RGB_UINT8_PLANAR,
+                            ),
+                        )
+                        for i in range(2)
+                    ]
+                )
+                setattr(request.items[0].request, field, value)
+                context = mock.MagicMock()
+                context.abort.side_effect = RuntimeError("aborted")
+                with self.assertRaisesRegex(RuntimeError, "aborted"):
+                    service.batch_render_camera(request, context)
+                self.assertEqual(context.abort.call_args.args[0], grpc.StatusCode.INVALID_ARGUMENT)
+                mgr.reserve_buffers.assert_not_called()
+                if field == "resolution_w":
+                    self.assertIn("dimensions", context.abort.call_args.args[1])
+
+    def test_camera_batch_rejects_temporal_history_before_side_effects(self):
+        for fields in (
+            {"apply_harmonizer": True},
+            {"harmonizer_session_id": "history"},
+            {"apply_harmonizer": False, "harmonizer_session_id": "history"},
+            {"harmonizer_session_id": ""},
+        ):
+            with self.subTest(fields=fields):
+                service, mgr = self._service_with_mock_mgr()
+                service.harmonizer_temporal_enabled = True
+                request = BatchCameraRenderRequest(
+                    items=[
+                        BatchCameraRenderRequestItem(
+                            camera_name=str(i),
+                            request=CameraRenderRequest(
+                                scene_id="scene",
+                                use_cuda_ipc=True,
+                                ipc_session_id="session",
+                                resolution_h=2,
+                                resolution_w=3,
+                                image_format=ImageFormat.RGB_UINT8_PLANAR,
+                                **({"released_buffer_id": 3} if i == 0 else fields),
+                            ),
+                        )
+                        for i in range(2)
+                    ]
+                )
+                context = mock.MagicMock()
+                context.abort.side_effect = RuntimeError("aborted")
+                with (
+                    mock.patch.object(service, "get_backend") as get_backend,
+                    mock.patch.object(service, "_resolve_harmonizer_session") as resolve_session,
+                    self.assertRaisesRegex(RuntimeError, "aborted"),
+                ):
+                    service.batch_render_camera(request, context)
+                self.assertEqual(context.abort.call_args.args[0], grpc.StatusCode.FAILED_PRECONDITION)
+                self.assertEqual(mgr.mock_calls, [])
+                get_backend.assert_not_called()
+                resolve_session.assert_not_called()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA IPC packing needs a CUDA device")
+    def test_camera_batch_allows_raw_requests_on_temporal_server(self):
+        service, mgr = self._service_with_mock_mgr()
+        service.harmonizer_temporal_enabled = True
+        mgr.reserve_buffers.return_value = [0, 1]
+        image = torch.rand(2, 3, 3, device="cuda")
+        backend = mock.MagicMock()
+        backend.render_camera_request.return_value = (mock.Mock(color_image=image), None, None)
+        request = BatchCameraRenderRequest(
+            items=[
+                BatchCameraRenderRequestItem(
+                    camera_name=str(i),
+                    request=CameraRenderRequest(
+                        scene_id="scene",
+                        use_cuda_ipc=True,
+                        ipc_session_id="session",
+                        resolution_h=2,
+                        resolution_w=3,
+                        image_format=ImageFormat.RGB_UINT8_PLANAR,
+                        **({"apply_harmonizer": False} if i else {}),
+                    ),
+                )
+                for i in range(2)
+            ]
+        )
+        context = mock.MagicMock()
+        context.abort.side_effect = RuntimeError("aborted")
+        with (
+            mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)),
+            mock.patch.object(service, "_await_harmonizer_model") as load_harmonizer,
+        ):
+            response = service.batch_render_camera(request, context)
+        context.abort.assert_not_called()
+        load_harmonizer.assert_not_called()
+        self.assertEqual([item.success for item in response.items], [True, True])
+        self.assertEqual([item.camera_name for item in response.items], ["0", "1"])
+        self.assertEqual([item.result.camera_render_outputs[0].buffer_id for item in response.items], [0, 1])
+        mgr.write_reserved_buffers.assert_called_once_with(
+            "session", [0, 1], [image.data_ptr()] * 2, [9, 9], 2, 3, torch.cuda.current_stream().cuda_stream
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA IPC packing needs a CUDA device")
+    def test_camera_batch_hint_preserves_fallback_and_oom_behavior(self):
+        image = torch.rand(2, 3, 3, device="cuda")
+        frame = mock.Mock(color_image=image)
+        for error in (None, ValueError("batch unsupported"), torch.cuda.OutOfMemoryError("out of memory")):
+            with self.subTest(error=error):
+                service, mgr = self._service_with_mock_mgr()
+                mgr.reserve_buffers.return_value = [0, 1]
+                backend = mock.MagicMock()
+                backend.render_camera_batch_shared_scene.return_value = (
+                    [frame, frame],
+                    _CameraBatchDispatch.NATIVE_PER_CAMERA_RAYS,
+                )
+                backend.render_camera_batch_shared_scene.side_effect = error
+                backend.render_camera_request.return_value = (frame, None, None)
+                request = BatchCameraRenderRequest(
+                    prefer_camera_batching=True,
+                    items=[
+                        BatchCameraRenderRequestItem(
+                            camera_name=str(i),
+                            request=CameraRenderRequest(
+                                scene_id="scene",
+                                use_cuda_ipc=True,
+                                ipc_session_id="session",
+                                resolution_h=2,
+                                resolution_w=3,
+                                image_format=ImageFormat.RGB_UINT8_PLANAR,
+                            ),
+                        )
+                        for i in range(2)
+                    ],
+                )
+                context = mock.MagicMock()
+                context.abort.side_effect = RuntimeError("aborted")
+                with (
+                    mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)),
+                    mock.patch.object(service, "_apply_color_postprocessing_f32", return_value=image),
+                ):
+                    if isinstance(error, torch.cuda.OutOfMemoryError):
+                        with self.assertRaisesRegex(RuntimeError, "aborted"):
+                            service.batch_render_camera(request, context)
+                        self.assertEqual(context.abort.call_args.args[0], grpc.StatusCode.RESOURCE_EXHAUSTED)
+                        mgr.write_reserved_buffers.assert_not_called()
+                        self.assertEqual(mgr.release_buffer.call_count, 2)
+                    else:
+                        response = service.batch_render_camera(request, context)
+                        self.assertTrue(all(item.success for item in response.items))
+                        mgr.write_reserved_buffers.assert_called_once()
+                        mgr.release_buffer.assert_not_called()
+                backend.render_camera_batch_shared_scene.assert_called_once()
+                self.assertEqual(backend.render_camera_request.call_count, 2 if isinstance(error, ValueError) else 0)
+
+    def test_camera_batch_fatal_shared_scene_error_propagates_without_retry(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.layout.return_value = (3, 2, False)
+        mgr.reserve_buffers.return_value = [0, 1]
+        backend = mock.MagicMock()
+        backend.render_camera_batch_shared_scene.side_effect = RuntimeError(
+            "CUDA error: an illegal memory access was encountered"
+        )
+        request = BatchCameraRenderRequest(
+            prefer_camera_batching=True,
+            items=[
+                BatchCameraRenderRequestItem(
+                    camera_name=str(index),
+                    request=CameraRenderRequest(
+                        scene_id="scene",
+                        use_cuda_ipc=True,
+                        ipc_session_id="session",
+                        resolution_h=2,
+                        resolution_w=3,
+                        image_format=ImageFormat.RGB_UINT8_PLANAR,
+                    ),
+                )
+                for index in range(2)
+            ],
+        )
+        context = mock.MagicMock()
+        stream = mock.MagicMock()
+
+        with (
+            mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)),
+            mock.patch("nurec.grpc.serve.torch.cuda.device", return_value=contextlib.nullcontext()),
+            mock.patch("nurec.grpc.serve.torch.cuda.current_stream", return_value=stream),
+            mock.patch.object(service, "_recover_from_cuda_oom") as recover,
+            self.assertRaisesRegex(RuntimeError, "illegal memory access"),
+        ):
+            service._batch_render_camera_ipc(request, context)
+
+        backend.render_camera_batch_shared_scene.assert_called_once()
+        backend.render_camera_request.assert_not_called()
+        context.abort.assert_not_called()
+        mgr.write_reserved_buffers.assert_not_called()
+        self.assertEqual({call.args[1] for call in mgr.release_buffer.call_args_list}, {0, 1})
+        recover.assert_not_called()
+
+    def test_open_session_reclaims_allocation_if_event_export_fails(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.open_session.return_value = ("session", [b"m" * 64], 18, b"u" * 16, 3, 2)
+        mgr.ready_event_handles.side_effect = RuntimeError("event export failed")
+        context = mock.MagicMock()
+        context.abort.side_effect = RuntimeError("aborted")
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            service.open_ipc_session(
+                ipc_pb2.OpenIpcSessionRequest(requested_width=3, requested_height=2, requested_buffer_count=1),
+                context,
+            )
+        mgr.close_session.assert_called_once_with("session")
+        self.assertEqual(service._ipc_open_sessions, 0)
+        self.assertEqual(service._ipc_reserved_bytes, 0)
+        self.assertEqual(service._ipc_session_bytes, {})
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA IPC packing needs a CUDA device")
+    def test_camera_batch_packs_crops_on_current_stream_and_reclaims_failed_items(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.reserve_buffers.return_value = [0, 1, 2]
+        images = [torch.rand(2, 4, 3, device="cuda"), torch.rand(3, 3, 3, device="cuda")]
+        backend = mock.MagicMock()
+        backend.render_camera_request.side_effect = [
+            (mock.Mock(color_image=images[0]), None, None),
+            ValueError("camera missing"),
+            (mock.Mock(color_image=images[1]), None, None),
+        ]
+        request = BatchCameraRenderRequest(
+            items=[
+                BatchCameraRenderRequestItem(
+                    camera_name=str(i),
+                    request=CameraRenderRequest(
+                        scene_id="scene",
+                        use_cuda_ipc=True,
+                        ipc_session_id="session",
+                        resolution_h=2,
+                        resolution_w=3,
+                        image_format=ImageFormat.RGB_UINT8_PLANAR,
+                        render_products=[CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR],
+                        **({"released_buffer_id": 3} if i == 0 else {}),
+                    ),
+                )
+                for i in range(3)
+            ]
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with (
+            torch.cuda.stream(stream),
+            mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)),
+            mock.patch.object(service, "_apply_color_postprocessing_f32", side_effect=lambda image, *_: image),
+        ):
+            response = service.batch_render_camera(request, mock.MagicMock())
+        self.assertEqual([item.success for item in response.items], [True, False, True])
+        self.assertIn("camera missing", response.items[1].error_message)
+        mgr.reserve_buffers.assert_called_once_with("session", [3], 3)
+        mgr.write_reserved_buffers.assert_called_once_with(
+            "session", [0, 2], [image.data_ptr() for image in images], [12, 9], 2, 3, stream.cuda_stream
+        )
+        mgr.release_buffer.assert_called_once_with("session", 1)
+        stream.synchronize()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA IPC packing needs a CUDA device")
+    def test_camera_batch_failure_reclaims_unpublished_buffers(self):
+        image = torch.rand(2, 3, 3, device="cuda")
+        request = BatchCameraRenderRequest(
+            items=[
+                BatchCameraRenderRequestItem(
+                    camera_name="camera",
+                    request=CameraRenderRequest(
+                        scene_id="scene",
+                        use_cuda_ipc=True,
+                        ipc_session_id="session",
+                        resolution_h=2,
+                        resolution_w=3,
+                        image_format=ImageFormat.RGB_UINT8_PLANAR,
+                        render_products=[CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR],
+                    ),
+                )
+            ]
+        )
+        for stage, status in (("render", grpc.StatusCode.RESOURCE_EXHAUSTED), ("pack", grpc.StatusCode.INTERNAL)):
+            with self.subTest(stage=stage):
+                service, mgr = self._service_with_mock_mgr()
+                mgr.reserve_buffers.return_value = [0]
+                backend = mock.MagicMock()
+                backend.render_camera_request.return_value = (mock.Mock(color_image=image), None, None)
+                if stage == "render":
+                    backend.render_camera_request.side_effect = torch.OutOfMemoryError("render failed")
+                else:
+                    mgr.write_reserved_buffers.side_effect = RuntimeError("pack failed")
+                context = mock.MagicMock()
+                context.abort.side_effect = RuntimeError("aborted")
+                with (
+                    mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)),
+                    mock.patch.object(service, "_apply_color_postprocessing_f32", return_value=image),
+                    self.assertRaisesRegex(RuntimeError, "aborted"),
+                ):
+                    service.batch_render_camera(request, context)
+                mgr.release_buffer.assert_called_once_with("session", 0)
+                context.abort.assert_called_once()
+                self.assertEqual(context.abort.call_args.args[0], status)
+                self.assertIn(f"{stage} failed", context.abort.call_args.args[1])
+                if stage == "render":
+                    mgr.write_reserved_buffers.assert_not_called()
 
     def test_open_ipc_session_aborts_when_transport_unavailable(self):
         # _get_ipc_mgr() isn't stubbed here (unlike _service_with_mock_mgr), so this
@@ -4499,9 +7296,7 @@ class TestCudaIpcTransport(unittest.TestCase):
             )
 
         self.assertEqual(service._ipc_open_sessions, 0)
-        # The byte reservation (8 * 6 * 3 * 2 = 288 bytes) must roll back too, or a run of
-        # failed opens would eventually trip NRE_CUDA_IPC_MAX_TOTAL_BYTES with nothing
-        # actually allocated.
+        # Failed opens must not consume the byte budget.
         self.assertEqual(service._ipc_reserved_bytes, 0)
 
     def test_open_ipc_session_aborts_resource_exhausted_at_max_total_bytes(self):
@@ -4515,7 +7310,7 @@ class TestCudaIpcTransport(unittest.TestCase):
         with mock.patch.dict(os.environ, {"NRE_CUDA_IPC_MAX_TOTAL_BYTES": "100"}):
             with self.assertRaisesRegex(RuntimeError, "aborted"):
                 service.open_ipc_session(
-                    # 8 * 6 * 3 * 2 = 288 bytes, over the 100-byte budget.
+                    # Two buffers require 4 MiB after allocation rounding.
                     ipc_pb2.OpenIpcSessionRequest(requested_width=8, requested_height=6, requested_buffer_count=2),
                     context,
                 )
@@ -4535,8 +7330,8 @@ class TestCudaIpcTransport(unittest.TestCase):
             ipc_pb2.OpenIpcSessionRequest(requested_width=8, requested_height=6, requested_buffer_count=2),
             mock.MagicMock(),
         )
-        self.assertEqual(service._ipc_reserved_bytes, 8 * 6 * 3 * 2)
-        self.assertEqual(service._ipc_session_bytes, {"sess-1": 8 * 6 * 3 * 2})
+        self.assertEqual(service._ipc_reserved_bytes, 4 * 1024**2)
+        self.assertEqual(service._ipc_session_bytes, {"sess-1": 4 * 1024**2})
 
         mgr.close_session.return_value = True
         service.close_ipc_session(ipc_pb2.CloseIpcSessionRequest(session_id="sess-1"), mock.MagicMock())
@@ -4772,30 +7567,6 @@ class TestCudaIpcTransport(unittest.TestCase):
         self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
         self.assertIn("RGB_UINT8_PLANAR", args[1])
 
-    def test_batch_render_camera_rejects_use_cuda_ipc(self):
-        service, _mgr = self._service_with_mock_mgr()
-        request = BatchCameraRenderRequest(
-            items=[
-                BatchCameraRenderRequestItem(
-                    camera_name="cam",
-                    request=CameraRenderRequest(
-                        scene_id="scene",
-                        use_cuda_ipc=True,
-                        ipc_session_id="sess-1",
-                        image_format=ImageFormat.RGB_UINT8_PLANAR,
-                    ),
-                )
-            ]
-        )
-        context = mock.MagicMock()
-        context.abort.side_effect = RuntimeError("aborted")
-        with self.assertRaisesRegex(RuntimeError, "aborted"):
-            service.batch_render_camera(request, context)
-        context.abort.assert_called_once()
-        args, _kwargs = context.abort.call_args
-        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
-        self.assertIn("use_cuda_ipc", args[1])
-
     def _ipc_batch_item(self, camera_name: str, *, released_buffer_id: int | None = None) -> BatchRGBRenderRequestItem:
         request = RGBRenderRequest(
             scene_id="scene",
@@ -4902,6 +7673,23 @@ class TestCudaIpcTransport(unittest.TestCase):
         mgr.release_buffer.assert_called_once_with("sess-1", 3)
         self.assertFalse(result.items[0].success)
 
+    def test_batch_render_rgb_ipc_cleanup_failure_preserves_item_error(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.reserve_buffers.return_value = [3]
+        mgr.release_buffer.side_effect = RuntimeError("release failed")
+        request = BatchRGBRenderRequest(items=[self._ipc_batch_item("cam_0")])
+        with (
+            mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(mock.MagicMock())),
+            mock.patch.object(
+                service, "_render_single_camera_raster_for_batch", side_effect=ValueError("invalid camera")
+            ),
+        ):
+            result = service.batch_render_rgb(request, mock.MagicMock())
+
+        mgr.release_buffer.assert_called_once_with("sess-1", 3)
+        self.assertFalse(result.items[0].success)
+        self.assertEqual(result.items[0].error_message, "INVALID_ARGUMENT: invalid camera")
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA IPC render path needs a CUDA device")
     def test_batch_render_rgb_allows_mixing_ipc_and_encoded_items(self):
         service, mgr = self._service_with_mock_mgr()
@@ -4987,6 +7775,309 @@ class TestCudaIpcTransport(unittest.TestCase):
             {call.args[1] for call in mgr.release_buffer.call_args_list},
             {1, 2},
         )
+
+    def test_batch_render_rgb_ipc_cleanup_failure_preserves_batch_error(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.reserve_buffers.return_value = [1, 2]
+        mgr.release_buffer.side_effect = RuntimeError("release failed")
+        request = BatchRGBRenderRequest(items=[self._ipc_batch_item("cam_0"), self._ipc_batch_item("cam_1")])
+        context = mock.MagicMock()
+        context.abort.side_effect = RuntimeError("aborted")
+        with mock.patch.object(service, "get_backend", side_effect=ValueError("invalid scene")):
+            with self.assertRaisesRegex(RuntimeError, "aborted"):
+                service.batch_render_rgb(request, context)
+
+        context.abort.assert_called_once_with(grpc.StatusCode.INVALID_ARGUMENT, "invalid scene")
+        self.assertEqual(mgr.release_buffer.call_count, 2)
+        self.assertEqual({call.args[1] for call in mgr.release_buffer.call_args_list}, {1, 2})
+
+
+class TestRdmaTransport(unittest.TestCase):
+    """Session lifecycle and the use_rdma render branches, with a mocked RdmaManager standing in
+    for the native extension (only built with --config=rdma, and needing RoCE hardware)."""
+
+    def _service_with_mock_mgr(self) -> tuple[SensorSimService, mock.MagicMock]:
+        service = _make_service_no_server()
+        mgr = mock.MagicMock()
+        mgr.cuda_device = 0
+        service._get_rdma_mgr = mock.MagicMock(return_value=mgr)
+        return service, mgr
+
+    def _abort_args(self, call: Callable[[mock.MagicMock], object]) -> tuple:
+        context = mock.MagicMock()
+        context.abort.side_effect = RuntimeError("aborted")
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            call(context)
+        context.abort.assert_called_once()
+        args, _kwargs = context.abort.call_args
+        return args
+
+    def test_open_rdma_session_returns_server_qp_info_and_counts_the_session(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.open_session.return_value = ("sess-1", b"g" * 16, 3, 42, 7)
+        request = rdma_pb2.OpenRdmaSessionRequest(gid=b"c" * 16, gid_index=1, qp_num=9, psn=5, max_buf_size=1024)
+
+        response = service.open_rdma_session(request, mock.MagicMock())
+
+        mgr.open_session.assert_called_once_with(b"c" * 16, 9, 5, 1024)
+        self.assertEqual(response.session_id, "sess-1")
+        self.assertEqual(response.gid, b"g" * 16)
+        self.assertEqual((response.gid_index, response.qp_num, response.psn), (3, 42, 7))
+        self.assertEqual(service._rdma_open_sessions, 1)
+
+    def test_open_rdma_session_is_unimplemented_without_the_transport(self):
+        # _get_rdma_mgr() isn't stubbed here, so this exercises the real "not built with
+        # --config=rdma" path: not a server error, so not INTERNAL.
+        service = _make_service_no_server()
+        with mock.patch("nurec.grpc.serve._rdma", None):
+            args = self._abort_args(
+                lambda context: service.open_rdma_session(rdma_pb2.OpenRdmaSessionRequest(), context)
+            )
+        self.assertEqual(args[0], grpc.StatusCode.UNIMPLEMENTED)
+        self.assertIn("--config=rdma", args[1])
+        self.assertEqual(service._rdma_open_sessions, 0)
+
+    def test_open_rdma_session_maps_native_argument_errors_to_invalid_argument(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.open_session.side_effect = ValueError("max_buf_size must be > 0")
+        args = self._abort_args(lambda context: service.open_rdma_session(rdma_pb2.OpenRdmaSessionRequest(), context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(service._rdma_open_sessions, 0)
+
+    def test_open_rdma_session_reports_native_setup_failures_as_internal(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.open_session.side_effect = RuntimeError("ibv_reg_mr(GPU staging) failed — check nvidia_peermem")
+        args = self._abort_args(lambda context: service.open_rdma_session(rdma_pb2.OpenRdmaSessionRequest(), context))
+        self.assertEqual(args[0], grpc.StatusCode.INTERNAL)
+        self.assertIn("nvidia_peermem", args[1])
+        self.assertEqual(service._rdma_open_sessions, 0)
+
+    def test_register_receive_buffer_reports_native_errors_in_the_response(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.register_buffer.side_effect = KeyError("session not found: missing")
+        request = rdma_pb2.RegisterReceiveBufferRequest(
+            session_id="missing", remote_addr=0x1000, rkey=11, buffer_size=64, buffer_id=2
+        )
+
+        response = service.register_receive_buffer(request, mock.MagicMock())
+
+        mgr.register_buffer.assert_called_once_with("missing", 0x1000, 11, 64, 2)
+        self.assertFalse(response.success)
+        self.assertEqual(response.error_message, "session not found: missing")
+
+    def test_close_rdma_session_decrements_only_when_a_session_was_removed(self):
+        service, mgr = self._service_with_mock_mgr()
+        service._rdma_open_sessions = 1
+        mgr.close_session.return_value = False
+
+        response = service.close_rdma_session(rdma_pb2.CloseRdmaSessionRequest(session_id="missing"), mock.MagicMock())
+
+        self.assertTrue(response.success)
+        self.assertEqual(service._rdma_open_sessions, 1)  # unchanged: no session was actually closed
+
+        mgr.close_session.return_value = True
+        service.close_rdma_session(rdma_pb2.CloseRdmaSessionRequest(session_id="sess-1"), mock.MagicMock())
+        self.assertEqual(service._rdma_open_sessions, 0)
+
+    def test_close_rdma_session_soft_fails_without_the_transport(self):
+        service = _make_service_no_server()
+        with mock.patch("nurec.grpc.serve._rdma", None):
+            response = service.close_rdma_session(rdma_pb2.CloseRdmaSessionRequest(session_id="s"), mock.MagicMock())
+        self.assertFalse(response.success)
+        self.assertIn("RDMA transport not available", response.error_message)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "RDMA render path needs a CUDA device")
+    def test_render_rgb_rdma_writes_the_aspect_fit_render_into_the_registered_buffer(self):
+        # Unlike CUDA IPC, RDMA has no session-fixed buffer shape to match: a render whose
+        # aspect-fit extent differs from the requested resolution is still delivered, at its own
+        # size, and bytes_written tells the client how much landed.
+        service, mgr = self._service_with_mock_mgr()
+        mgr.rdma_write_render_hwc_f32.return_value = 18
+        raster = torch.zeros(2, 3, 3, dtype=torch.float32, device="cuda")  # renders 3x2, request claims 8x8
+        request = RGBRenderRequest(
+            use_rdma=True,
+            rdma_session_id="sess-1",
+            rdma_buffer_id=5,
+            image_format=ImageFormat.RGB_UINT8_PLANAR,
+            resolution_h=8,
+            resolution_w=8,
+        )
+        backend = mock.MagicMock()
+        backend.render_rgb_request.return_value = (raster, (2, 3))
+        with mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)):
+            response = service.render_rgb(request, mock.MagicMock())
+
+        self.assertEqual(response.bytes_written, 18)
+        self.assertEqual(response.buffer_id, 5)
+        self.assertEqual(response.format, "rgb_uint8_planar")
+        self.assertFalse(response.image_bytes)
+        (session_id, buffer_id, _ptr, height, width), _kwargs = mgr.rdma_write_render_hwc_f32.call_args
+        self.assertEqual((session_id, buffer_id, height, width), ("sess-1", 5, 2, 3))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "RDMA render path needs a CUDA device")
+    def test_render_camera_rdma_writes_into_the_registered_buffer(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.rdma_write_render_hwc_f32.return_value = 18
+        raster = torch.zeros(2, 3, 3, dtype=torch.float32, device="cuda")
+        request = CameraRenderRequest(
+            use_rdma=True,
+            rdma_session_id="sess-1",
+            rdma_buffer_id=5,
+            image_format=ImageFormat.RGB_UINT8_PLANAR,
+        )
+        backend = mock.MagicMock()
+        backend.render_camera_request.return_value = (CameraFrame(color_image=raster), None, None)
+        with mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)):
+            response = service.render_camera(request, mock.MagicMock())
+
+        self.assertEqual(len(response.camera_render_outputs), 1)
+        output = response.camera_render_outputs[0]
+        self.assertEqual(output.bytes_written, 18)
+        self.assertEqual(output.buffer_id, 5)
+        self.assertEqual(output.format, "rgb_uint8_planar")
+        self.assertEqual((output.image_height, output.image_width), (2, 3))
+        self.assertEqual(output.render_product, CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR)
+        self.assertFalse(output.image_bytes)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "RDMA render path needs a CUDA device")
+    def test_render_rgb_rdma_refuses_a_render_off_the_staging_device(self):
+        service, mgr = self._service_with_mock_mgr()
+        mgr.cuda_device = 1
+        backend = mock.MagicMock()
+        backend.render_rgb_request.return_value = (torch.zeros(2, 3, 3, dtype=torch.float32, device="cuda:0"), (2, 3))
+        request = RGBRenderRequest(use_rdma=True, rdma_session_id="sess-1", image_format=ImageFormat.RGB_UINT8_PLANAR)
+        with mock.patch.object(service, "get_backend", return_value=contextlib.nullcontext(backend)):
+            args = self._abort_args(lambda context: service.render_rgb(request, context))
+
+        self.assertEqual(args[0], grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertIn("render output is on CUDA device 0", args[1])
+        mgr.rdma_write_render_hwc_f32.assert_not_called()
+
+    def test_render_rgb_rejects_use_rdma_with_use_cuda_ipc(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = RGBRenderRequest(use_rdma=True, use_cuda_ipc=True, image_format=ImageFormat.RGB_UINT8_PLANAR)
+        args = self._abort_args(lambda context: service.render_rgb(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("mutually exclusive", args[1])
+
+    def test_render_camera_rejects_use_rdma_with_use_cuda_ipc(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = CameraRenderRequest(use_rdma=True, use_cuda_ipc=True, image_format=ImageFormat.RGB_UINT8_PLANAR)
+        args = self._abort_args(lambda context: service.render_camera(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("mutually exclusive", args[1])
+
+    def test_render_rgb_rdma_requires_rgb_uint8_planar_format(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = RGBRenderRequest(use_rdma=True, rdma_session_id="sess-1", image_format=ImageFormat.JPEG)
+        args = self._abort_args(lambda context: service.render_rgb(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("use_rdma=true requires image_format=RGB_UINT8_PLANAR", args[1])
+
+    def test_render_camera_rdma_rejects_bounding_box_overlay(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = CameraRenderRequest(
+            use_rdma=True,
+            rdma_session_id="sess-1",
+            image_format=ImageFormat.RGB_UINT8_PLANAR,
+            overlay_bounding_boxes=OverlayBoundingBoxSource.OVERLAY_BOUNDING_BOX_SOURCE_MODEL,
+        )
+        args = self._abort_args(lambda context: service.render_camera(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("the RDMA path writes directly into the client's registered buffer", args[1])
+
+    def test_batch_render_rgb_rejects_use_rdma(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = BatchRGBRenderRequest(
+            items=[
+                BatchRGBRenderRequestItem(
+                    camera_name="cam",
+                    request=RGBRenderRequest(
+                        scene_id="scene", use_rdma=True, image_format=ImageFormat.RGB_UINT8_PLANAR
+                    ),
+                )
+            ]
+        )
+        args = self._abort_args(lambda context: service.batch_render_rgb(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("batch_render_rgb does not support use_rdma", args[1])
+
+    def test_batch_render_camera_rejects_use_rdma(self):
+        service, _mgr = self._service_with_mock_mgr()
+        request = BatchCameraRenderRequest(
+            items=[
+                BatchCameraRenderRequestItem(
+                    camera_name="cam",
+                    request=CameraRenderRequest(
+                        scene_id="scene", use_rdma=True, image_format=ImageFormat.RGB_UINT8_PLANAR
+                    ),
+                )
+            ]
+        )
+        args = self._abort_args(lambda context: service.batch_render_camera(request, context))
+        self.assertEqual(args[0], grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertIn("batch_render_camera does not support use_rdma", args[1])
+
+    def test_proto_skew_warning_fires_once_while_a_session_is_open(self):
+        service, _mgr = self._service_with_mock_mgr()
+        with self.assertNoLogs("nurec.grpc.serve", level="WARNING"):
+            service._warn_once_on_rdma_proto_skew(RGBRenderRequest(), "render_rgb")  # no session open
+        service._rdma_open_sessions = 1
+        with self.assertNoLogs("nurec.grpc.serve", level="WARNING"):
+            service._warn_once_on_rdma_proto_skew(RGBRenderRequest(use_rdma=True), "render_rgb")
+        with self.assertLogs("nurec.grpc.serve", level="WARNING") as logs:
+            service._warn_once_on_rdma_proto_skew(RGBRenderRequest(), "render_rgb")
+            service._warn_once_on_rdma_proto_skew(CameraRenderRequest(), "render_camera")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("proto version skew", logs.records[0].getMessage())
+
+    def test_rdma_errors_are_classified_by_type(self):
+        class PreconditionError(RuntimeError):
+            pass
+
+        with mock.patch("nurec.grpc.serve._rdma", mock.MagicMock(PreconditionError=PreconditionError)):
+            for exc, status in (
+                (ValueError("max_buf_size must be > 0"), grpc.StatusCode.INVALID_ARGUMENT),
+                (KeyError("session not found: abc"), grpc.StatusCode.NOT_FOUND),
+                (PreconditionError("buffer_id not registered: 3"), grpc.StatusCode.FAILED_PRECONDITION),
+                (RdmaTransportUnavailableError("RDMA transport not available"), grpc.StatusCode.UNIMPLEMENTED),
+                (
+                    RuntimeError("render output is on CUDA device 1, but the RDMA staging buffers are on device 0"),
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                ),
+                # Link/hardware failures stay loud rather than being blamed on the client.
+                (RuntimeError("ibv_poll_cq timed out after 5s waiting for completion"), grpc.StatusCode.UNKNOWN),
+            ):
+                with self.subTest(exc=exc):
+                    self.assertEqual(_classify_render_exception(exc)[0], status)
+
+    def test_frame_dump_writes_the_wire_bytes(self):
+        service = _make_service_no_server()
+        raster = torch.tensor([[[0.5, 0.0, 1.0], [0.25, 0.75, 2.0]]], dtype=torch.float32)
+        request = RGBRenderRequest(
+            use_rdma=True,
+            image_format=ImageFormat.RGB_UINT8_PLANAR,
+            camera_intrinsics=CameraSpec(logical_id="camera_front_tele_30fov"),
+            frame_start_us=1707499198100038,
+        )
+        with tempfile.TemporaryDirectory() as dump_dir:
+            with mock.patch.dict(os.environ, {"NRE_RDMA_FRAME_DUMP_DIR": dump_dir}):
+                service._maybe_dump_rdma_frame(raster, request)
+            (path,) = Path(dump_dir).iterdir()
+            self.assertEqual(path.name, "camera_front_tele_30fov_1707499198100038.bin")
+            # floor(255*x) saturated, then CHW planar -- the RDMA payload's own arithmetic.
+            expected = np.array([[[127, 0, 255], [63, 191, 255]]], dtype=np.uint8).transpose(2, 0, 1)
+            np.testing.assert_array_equal(np.frombuffer(path.read_bytes(), dtype=np.uint8).reshape(3, 1, 2), expected)
+
+    def test_frame_dump_writes_nothing_without_the_env_var(self):
+        service = _make_service_no_server()
+        request = RGBRenderRequest(use_rdma=True, image_format=ImageFormat.RGB_UINT8_PLANAR)
+        with (
+            mock.patch.dict(os.environ, {"NRE_RDMA_FRAME_DUMP_DIR": ""}),
+            mock.patch.object(Path, "write_bytes") as write_bytes,
+        ):
+            service._maybe_dump_rdma_frame(torch.zeros(1, 2, 3), request)
+        write_bytes.assert_not_called()
 
 
 class TestRenderResultToImageAndMappingSemantics(unittest.TestCase):
@@ -5169,6 +8260,25 @@ def _make_actor_tracks_with_one_track(
     return actor_tracks_from_grpc([grpc_track])
 
 
+class TestActorsSnapshot(unittest.TestCase):
+    def test_duplicate_cleaned_track_ids_are_rejected(self):
+        for first_id, second_id in [("actor@a", "actor@b"), ("actor@source", "actor"), ("actor", "actor")]:
+            with self.subTest(first_id=first_id, second_id=second_id):
+                first = DynamicObject(track_id=first_id)
+                first.pose_pair.start_pose.quat.w = 1.0
+                first.pose_pair.end_pose.quat.w = 1.0
+                second = DynamicObject(track_id=second_id)
+                second.pose_pair.start_pose.quat.w = 1.0
+                second.pose_pair.end_pose.quat.w = 1.0
+
+                with self.assertRaises(ValueError) as error:
+                    actors_snapshot_from_render_request(CameraRenderRequest(dynamic_objects=[first, second]))
+                self.assertEqual(
+                    str(error.exception),
+                    f"DynamicObject IDs {first_id!r} and {second_id!r} both normalize to 'actor'",
+                )
+
+
 class TestBackendRenderCameraRequestModelOverlay(unittest.TestCase):
     """Backend.render_camera_request MODEL overlay: bounding-box snapshot must follow request-derived
     actor poses when dynamic_objects are present, not the stale model track poses.
@@ -5198,6 +8308,7 @@ class TestBackendRenderCameraRequestModelOverlay(unittest.TestCase):
             renderable_model=renderable_model,
             camera_bank=camera_bank,
             world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=mock.MagicMock(),
             asset_bank=mock.MagicMock(),
             source_artifact=mock.MagicMock(),
@@ -5312,6 +8423,7 @@ def _make_backend() -> Backend:
         renderable_model=mock.MagicMock(),
         camera_bank=mock.MagicMock(),
         world_to_nurec=mock.MagicMock(),
+        scene_time_range_us=HalfClosedInterval(0, 1),
         lidar_bank=mock.MagicMock(),
         asset_bank=mock.MagicMock(),
         source_artifact=mock.MagicMock(),
@@ -5420,7 +8532,11 @@ class TestBackendFromArtifact(unittest.TestCase):
                     with mock.patch("nurec.grpc.serve.LidarBank"):
                         with mock.patch("nurec.grpc.serve.AssetBank"):
                             load_mock.return_value = mock.MagicMock()
-                            rig_mock.from_dict.return_value.world_to_nurec = mock.MagicMock()
+                            parsed_rig = rig_mock.from_dict.return_value
+                            parsed_rig.world_to_nurec = mock.MagicMock()
+                            rig_trajectory = mock.MagicMock()
+                            rig_trajectory.T_rig_world_timestamps_us = torch.tensor([1_000, 1_199])
+                            parsed_rig.rig_trajectories = [rig_trajectory]
                             Backend.from_artifact(
                                 artifact,
                                 renderer,
@@ -5468,6 +8584,69 @@ class TestBackendFromArtifact(unittest.TestCase):
         self.assertIn("model.renderer.name=3dgut-gsplat", overrides)
         self.assertIn("model.renderer.outputs.camera.enable_extended_features=True", overrides)
         self.assertIn("model.renderer.outputs.camera.enable_distance=True", overrides)
+
+    def test_prepared_backend_stays_on_cpu_until_activation(self):
+        artifact = mock.MagicMock()
+        artifact.semantic_class_names = None
+        renderable = mock.MagicMock()
+        world_to_nurec = mock.MagicMock()
+        with (
+            mock.patch("nurec.grpc.serve.RenderableModel.load_from_artifact", return_value=renderable) as load,
+            mock.patch("nurec.grpc.serve.RigTrajectories") as trajectories,
+            mock.patch("nurec.grpc.serve.CameraBank") as camera_bank,
+            mock.patch("nurec.grpc.serve.LidarBank") as lidar_bank,
+            mock.patch("nurec.grpc.serve.AssetBank"),
+        ):
+            trajectories.from_dict.return_value.world_to_nurec = world_to_nurec
+            trajectories.from_dict.return_value.rig_trajectories = [
+                mock.Mock(T_rig_world_timestamps_us=torch.tensor([100, 200]))
+            ]
+
+            prepared = PreparedBackend.from_artifact(
+                artifact,
+                Backend.RendererType.DEFAULT,
+                1,
+                backend_cache_key=_test_backend_cache_key(),
+            )
+
+        self.assertEqual(load.call_args.kwargs["device"], "cpu")
+        self.assertEqual(prepared.scene_time_range_us, HalfClosedInterval(100, 201))
+        camera_bank.assert_called_once_with(artifact, world_to_nurec, prepared.scene_time_range_us)
+        lidar_bank.assert_called_once_with(artifact, enabled=True)
+        renderable.to.assert_not_called()
+
+    def test_prepared_backend_activates_renderable_model(self):
+        renderable = mock.MagicMock()
+        lidar_bank = mock.MagicMock()
+        prepared = PreparedBackend(
+            renderable_model=renderable,
+            camera_bank=mock.MagicMock(),
+            world_to_nurec=mock.MagicMock(),
+            scene_time_range_us=HalfClosedInterval(100, 201),
+            lidar_bank=lidar_bank,
+            asset_bank=mock.MagicMock(),
+            source_artifact=mock.MagicMock(),
+            backend_cache_key=_test_backend_cache_key(),
+        )
+        with (
+            mock.patch("nurec.grpc.serve.torch.cuda.empty_cache"),
+            mock.patch("nurec.grpc.serve.gc.collect"),
+            mock.patch("nurec.grpc.serve._install_edit_overrides") as install_edit_overrides,
+        ):
+            backend = prepared.activate()
+
+        renderable.to.assert_called_once_with("cuda")
+        install_edit_overrides.assert_called_once_with(backend, prepared.source_artifact)
+        self.assertIs(backend.renderable_model, renderable)
+        self.assertEqual(backend.scene_time_range_us, prepared.scene_time_range_us)
+
+    def test_disabled_lidar_bank_does_not_parse_artifact(self):
+        artifact = mock.MagicMock()
+        with mock.patch("nurec.grpc.serve.RigTrajectories.from_dict") as trajectories:
+            lidar_bank = LidarBank(artifact, enabled=False)
+
+        trajectories.assert_not_called()
+        self.assertIsNone(lidar_bank.get_entry())
 
 
 class TestDownloadSceneToCacheTOCTOU(unittest.TestCase):
@@ -5564,6 +8743,7 @@ class TestResidentBackendRegistration(unittest.TestCase):
             renderable_model=None,  # type: ignore[arg-type]
             camera_bank=None,  # type: ignore[arg-type]
             world_to_nurec=None,  # type: ignore[arg-type]
+            scene_time_range_us=HalfClosedInterval(0, 1),
             lidar_bank=None,  # type: ignore[arg-type]
             asset_bank=None,  # type: ignore[arg-type]
             source_artifact=artifact,
@@ -5614,18 +8794,21 @@ class TestResidentBackendRegistration(unittest.TestCase):
         service = _make_service_no_server()
         artifact = mock.MagicMock()
         artifact.sha256_footprint = "b" * 64
-        artifact.source = "/tmp/whatever.usdz"
+        artifact.source = Path("/tmp/whatever.usdz")
         scene_key = SceneCacheKey(scene_id="normal-scene")
         service._artifact_registrations[scene_key.key_hash] = ArtifactRegistration(
             artifact=artifact, downloaded=False, scene_key=scene_key
         )
 
         rebuilt = self._resident_backend(scene_id="normal-scene", sha="b" * 64)
-        with mock.patch("nurec.grpc.serve.Backend.from_artifact", return_value=rebuilt) as from_artifact:
-            with mock.patch("nurec.grpc.serve.Artifact") as artifact_cls:
-                artifact_cls.return_value.temporary_cache.return_value.__enter__.return_value = artifact
-                with service.get_backend(scene_key) as backend:
-                    self.assertIs(backend, rebuilt)
+        with (
+            mock.patch("nurec.grpc.serve.Backend.from_artifact", return_value=rebuilt) as from_artifact,
+            mock.patch("nurec.grpc.serve.Artifact", return_value=artifact),
+            mock.patch("nurec.grpc.serve._local_file_fingerprint", return_value=(1, 2, 3, 4, 5)),
+        ):
+            artifact.temporary_cache.return_value.__enter__.return_value = artifact
+            with service.get_backend(scene_key) as backend:
+                self.assertIs(backend, rebuilt)
         from_artifact.assert_called_once()
 
 
@@ -5641,3 +8824,38 @@ def test_record_duration_declares_its_timing_method():
     manager.record_duration("grpc.decode.render_rgb_ms", 1.5)
 
     assert collector._metric_metadata["grpc.decode.render_rgb_ms"]["timing_method"] == "wall_clock"
+
+
+class TestLegacyServiceName(unittest.TestCase):
+    """Clients built from the pre-26.10 protos call the service under its old package name."""
+
+    class _Servicer(SensorsimServiceServicer):
+        def get_version(self, request, context):
+            return VersionId(version_id="x")
+
+        def render_rgb(self, request, context):
+            return RGBRenderReturn(image_bytes=b"ok")
+
+    def test_old_and_new_service_names_are_served(self):
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+        add_sensorsim_servicer_to_server(self._Servicer(), server)
+        port = server.add_insecure_port("localhost:0")
+        server.start()
+        try:
+            with grpc.insecure_channel(f"localhost:{port}") as channel:
+                legacy = f"/{LEGACY_SENSORSIM_SERVICE_NAME}"
+                get_version = channel.unary_unary(
+                    f"{legacy}/get_version",
+                    request_serializer=Empty.SerializeToString,
+                    response_deserializer=VersionId.FromString,
+                )
+                render_rgb = channel.unary_unary(
+                    f"{legacy}/render_rgb",
+                    request_serializer=RGBRenderRequest.SerializeToString,
+                    response_deserializer=RGBRenderReturn.FromString,
+                )
+                self.assertEqual(get_version(Empty(), timeout=10).version_id, "x")
+                self.assertEqual(render_rgb(RGBRenderRequest(), timeout=10).image_bytes, b"ok")
+                self.assertEqual(SensorsimServiceStub(channel).get_version(Empty(), timeout=10).version_id, "x")
+        finally:
+            server.stop(None)

@@ -29,6 +29,7 @@ from nurec.instant_nurec.config.dataset import (
 from nurec.instant_nurec.datasets.registry import make as make_dataset
 from nurec.instant_nurec.datasets.registry import register as register_dataset
 from nurec.utils.batch import InstantNuRecDataBatch, RectSubsampled
+from nurec.utils.image_resolution import ImageResolutionTransform
 
 
 logger = logging.getLogger(__name__)
@@ -45,20 +46,13 @@ class CameraSubsampler:
         self.frame_height = config.frame_height
 
     def _compute_pixel_rect(self, original_width: int, original_height: int) -> Tuple[RectSubsampled, Tuple[int, int]]:
-        scale_factor = max(self.frame_width / original_width, self.frame_height / original_height)
-        scaled_w = round(original_width * scale_factor)
-        scaled_h = round(original_height * scale_factor)
-        offset_w = (scaled_w - self.frame_width) // 2
-        offset_h = (scaled_h - self.frame_height) // 2
-        return RectSubsampled(
-            subsample_factor=1.0 / scale_factor,
-            i=offset_w,
-            j=offset_h,
-            width=self.frame_width,
-            height=self.frame_height,
-            original_width=original_width,
-            original_height=original_height,
-        ), (scaled_w, scaled_h)
+        image_transform = ImageResolutionTransform.cover_and_center_crop(
+            (original_width, original_height),
+            (self.frame_width, self.frame_height),
+        )
+        return RectSubsampled.from_image_resolution_transform(
+            image_transform
+        ), image_transform.resized_pre_crop_resolution
 
     def apply_camera_parameters(
         self, camera_parameters: ncore.data.ConcreteCameraModelParametersUnion
@@ -66,11 +60,7 @@ class CameraSubsampler:
         original_width = camera_parameters.resolution[0].item()
         original_height = camera_parameters.resolution[1].item()
         pixel_rect, _ = self._compute_pixel_rect(original_width, original_height)
-        return camera_parameters.transform(
-            image_domain_scale=1.0 / pixel_rect.subsample_factor,
-            image_domain_offset=(pixel_rect.i, pixel_rect.j),
-            new_resolution=(pixel_rect.width, pixel_rect.height),
-        )
+        return pixel_rect.image_transform.apply_to_camera_parameters(camera_parameters)
 
     def apply_depth_data(
         self, depth_data: np.ndarray, mode: Literal["bilinear", "nearest-min"] = "bilinear"
@@ -109,9 +99,7 @@ class CameraSubsampler:
             depth_data_pth = depth_data_pth / (depth_data_mask + 1e-6)
 
         depth_data = depth_data_pth[0, 0].numpy()
-        return depth_data[
-            pixel_rect.j : pixel_rect.j + pixel_rect.height, pixel_rect.i : pixel_rect.i + pixel_rect.width
-        ]
+        return pixel_rect.image_transform.crop_array(depth_data[..., None])[..., 0]
 
     def apply_frame_data(self, frame_data: np.ndarray) -> np.ndarray:
         """
@@ -150,9 +138,7 @@ class CameraSubsampler:
             )
 
         frame_data = frame_data_pth[0].moveaxis(0, -1).numpy().astype(frame_data.dtype)
-        frame_data = frame_data[
-            pixel_rect.j : pixel_rect.j + pixel_rect.height, pixel_rect.i : pixel_rect.i + pixel_rect.width
-        ]
+        frame_data = pixel_rect.image_transform.crop_array(frame_data)
         return frame_data if batch_dim else frame_data[..., 0]
 
     def apply_T_sensor_startend_timestamps(
@@ -172,16 +158,7 @@ class CameraSubsampler:
         original_height = camera_parameters.resolution[1].item()
         pixel_rect, _ = self._compute_pixel_rect(original_width, original_height)
 
-        rect_image_points_lt_rb = 0.5 + pixel_rect.subsample_factor * np.array(
-            [
-                [pixel_rect.i, pixel_rect.j],
-                [
-                    pixel_rect.i + (pixel_rect.width - 1.0 / pixel_rect.subsample_factor),
-                    pixel_rect.j + (pixel_rect.height - 1.0 / pixel_rect.subsample_factor),
-                ],
-            ],
-            dtype=np.float32,
-        )
+        rect_image_points_lt_rb = pixel_rect.image_transform.rect_points_lb()
 
         camera_model = camera_model_from_parameters(camera_parameters, device="cpu", dtype=torch.float32)
         # Compute relative frame times for the cropped region

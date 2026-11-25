@@ -436,7 +436,7 @@ inert custom data; consumers can ignore them safely.
 
 ### Standard USD
 
-- `UsdGeomPoints` or `UsdVol ParticleField3DGaussianSplat`
+- `UsdVol ParticleField3DGaussianSplat`
   primitive carrying the Gaussian payload. Schema selected by
   `--usd-schema`. Documented in `README.md`.
 - `UsdLux DomeLight` for the trained sky environment, when one

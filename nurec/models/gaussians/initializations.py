@@ -8,10 +8,11 @@ import os
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type, cast
 
 import numpy as np
 import point_cloud_utils as pcu
@@ -45,12 +46,14 @@ from nurec.utils.geometry import (
     so3_matrix_to_quat,
     vector_align_rotation,
 )
+from nurec.utils.initialization import current_initialization, load_initialization_ply
 from nurec.utils.io.mesh import Mesh
 from nurec.utils.knn import knn_points
-from nurec.utils.lidar_object_init_points import build_lidar_cone_init_points
+from nurec.utils.lidar_object_init_points import CONE_CLASS_NAME, build_lidar_cone_init_points
 from nurec.utils.misc import sync_objects_or_raise, to_numpy, to_torch, unpack_optional
+from nurec.utils.ncore_utils import SAM3_OBJECT_INSTANCE_METHOD
 from nurec.utils.profiling import ScopedTimer
-from nurec.utils.types import FrameConversion, PointCloud
+from nurec.utils.types import FrameConversion, PointCloud, TrackPointCloud
 from nurec.visualdebugger import get_visualdebugger
 
 
@@ -118,6 +121,7 @@ class BaseInitialization(BaseModel, ABC):
         self.labels_to_ignore = labels_to_ignore
         self.labels_to_use = labels_to_use
         self.gaussian_cuboid_ids: List[torch.Tensor] = []
+        self.prepared_camera_clouds: Future[dict[int, list[TrackPointCloud]]] | None = None
         self.ground_mesh_artifact: Mesh | None = None
         self.ground_mesh_artifact_settings: GroundMeshReconstructionSettings | None = None
 
@@ -139,6 +143,18 @@ class BaseInitialization(BaseModel, ABC):
 
     def initialize_from_datasource(self, datasource: DataSourceSummary, **kwargs) -> None:
         raise NotImplementedError
+
+    def _consume_prepared_camera_clouds(self) -> list[TrackPointCloud]:
+        """Transfer ownership of prepared tensors to the model's current CUDA stream."""
+        assert self.prepared_camera_clouds is not None
+        result = self.prepared_camera_clouds.result().pop(id(self))
+        self.prepared_camera_clouds = None
+        for cloud in result:
+            for field in fields(cloud.point_cloud):
+                value = getattr(cloud.point_cloud, field.name)
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    value.record_stream(torch.cuda.current_stream(value.device))
+        return result
 
     def init_from_positions(
         self,
@@ -320,23 +336,20 @@ class SFMPointCloudInitialization(BaseInitialization):
         if not pcs:
             raise RuntimeError("sfm-point-cloud initialization received no points (color_type='generic-data').")
         point_cloud = PointCloud.collate_fn(pcs, device=self.device)
-        # TODO(tylerz): shall we support the multiple camera sensors?
-        #     (Qi): we should support multiple camera sensors in the future.
         assert isinstance(datasource.datasource, NCOREDataSource), (
             "Only NCOREDataSource is supported for sfm-point-cloud initialization"
         )
-        assert len(datasource.datasource.camera_sensors) == 1, (
-            "Only one camera sensor is currently supported for sfm-point-cloud initialization"
-        )
-        camera_sensor = list(datasource.datasource.camera_sensors.values())[0]
         camera_centers: list[np.ndarray] = []
-        for idx in range(camera_sensor.frames_count):
-            T_sensor_world_end = camera_sensor.get_frames_T_sensor_target(
-                target_node="world",
-                frame_indices=idx,
-                frame_timepoint=ncore.data.FrameTimepoint.END,
-            )  # 4x4
-            camera_centers.append(T_sensor_world_end[:3, 3])
+        for camera_sensor in datasource.datasource.camera_sensors.values():
+            for idx in range(camera_sensor.frames_count):
+                T_sensor_world_end = camera_sensor.get_frames_T_sensor_target(
+                    target_node="world",
+                    frame_indices=idx,
+                    frame_timepoint=ncore.data.FrameTimepoint.END,
+                )  # 4x4
+                camera_centers.append(T_sensor_world_end[:3, 3])
+        if not camera_centers:
+            raise RuntimeError("sfm-point-cloud initialization requires at least one camera sensor")
         camera_positions = torch.tensor(np.stack(camera_centers), device=self.device)
         dist = (
             torch.sqrt(knn_points(point_cloud.xyz_end.unsqueeze(0), camera_positions.unsqueeze(0)).dists)
@@ -432,6 +445,65 @@ class LidarRigTrajInitializationBase(BaseInitialization):
         return point_cloud, ego_c2nurec, sparsity_compensation
 
 
+def _initialization_camera_frusta(summary: DataSourceSummary, far: float, device: torch.device):
+    """Batch the same midpoint-pose frusta used for background initialization."""
+    from ncore.impl.sensors.common import rotmat_to_unitquat, unitquat_slerp, unitquat_to_rotmat
+    from nurec.utils.types import CameraFrustum
+
+    ds = summary.datasource
+    # Preserve datasource overrides used by custom providers.
+    if not isinstance(ds, NCOREDataSource) or type(ds).get_camera_frusta is not NCOREDataSource.get_camera_frusta:
+        return [
+            frustum.to(device)
+            for camera_id in getattr(ds, "camera_ids", [])
+            for frustum, _ in unpack_optional(summary.get_camera_frusta(camera_id=camera_id, far_plane_depth=far))
+        ]
+    out = []
+    for camera_id in ds.camera_ids:
+        sensor = ds.camera_sensors[camera_id]
+        model = ds.camera_models[camera_id]
+        indices = np.asarray(list(ds.camera_frame_ranges[camera_id]), dtype=np.int64)
+        if not len(indices):
+            continue
+        source_poses = sensor.get_frames_T_sensor_target("world", indices, None)
+        poses = torch.from_numpy(ds.world_to_nurec.transform_poses(source_poses).reshape(-1, 2, 4, 4)).double()
+        q0 = rotmat_to_unitquat(poses[:, 0, :3, :3])
+        q1 = rotmat_to_unitquat(poses[:, 1, :3, :3])
+        R = unitquat_to_rotmat(unitquat_slerp(q0, q1, torch.full((len(poses),), 0.5, dtype=torch.float64)))
+        translation = 0.5 * poses[:, 0, :3, 3] + 0.5 * poses[:, 1, :3, 3]
+        w, h = [int(x) for x in model.resolution]
+        pixels = torch.tensor([[0, h], [0, 0], [w, 0], [w, h]], dtype=torch.int32)
+        rays = model.pixels_to_camera_rays(pixels).double()
+        directions = torch.matmul(R[:, None, :, :], rays[None, :, :, None]).squeeze(-1)
+        near_distance = 0.1 / rays[:, 2:3]
+        far_distance = far / rays[:, 2:3]
+        corners = torch.cat(
+            [
+                translation[:, None, :] + directions * near_distance * ds.world_to_nurec.target_scale,
+                translation[:, None, :] + directions * far_distance * ds.world_to_nurec.target_scale,
+            ],
+            dim=1,
+        )
+        out.extend(CameraFrustum.from_batched_corners(corners.float(), device))
+    return out
+
+
+def _points_in_any_frustum(points: torch.Tensor, frusta) -> torch.Tensor:
+    """Union frustum membership in bounded batches, preserving plane arithmetic."""
+    visible = torch.zeros(len(points), dtype=torch.bool, device=points.device)
+    if not frusta:
+        return visible
+    normals = torch.stack([frustum.normals for frustum in frusta])
+    planes = torch.stack([frustum.corners[frustum.planes[:, 0]] for frustum in frusta])
+    for point_start in range(0, len(points), 8192):
+        block = points[point_start : point_start + 8192]
+        for first in range(0, len(frusta), 16):
+            delta = block[None, :, None, :] - planes[first : first + 16, None, :, :]
+            inside = ((delta * normals[first : first + 16, None, :, :]).sum(-1) >= 0).all(-1)
+            visible[point_start : point_start + len(block)] |= inside.any(0)
+    return visible
+
+
 class InitializationMixin(BaseInitialization):
     @abstractmethod
     def get_point_clouds_and_ego_poses(
@@ -465,18 +537,6 @@ class InitializationMixin(BaseInitialization):
             f"[{self.__class__.__name__}] Only NCOREDataSource is supported for this initialization"
         )
 
-        # Get all camera frusta
-        def maybe_read_camera_frusta():
-            return [
-                camera_frustum.to(self.device)
-                for camera_id in datasource.datasource.camera_ids
-                for camera_frustum, _ in unpack_optional(
-                    datasource.get_camera_frusta(camera_id=camera_id, far_plane_depth=far_plane_depth)
-                )
-            ]
-
-        camera_frusta = [camera_frustum.to(self.device) for camera_frustum in maybe_read_camera_frusta()]
-
         # sample random points
         random_pts_list: list[torch.Tensor] = []
         if self.debug_viz:
@@ -509,10 +569,8 @@ class InitializationMixin(BaseInitialization):
             random_pts = torch.cat(random_pts_list, dim=0)
 
             # check visibility using camera frusta
-            visibility_mask = (
-                torch.vstack([camera_frustum.points_in_frustum(random_pts) for camera_frustum in camera_frusta]).sum(0)
-                > 0
-            )
+            camera_frusta = _initialization_camera_frusta(datasource, far_plane_depth, self.device)
+            visibility_mask = _points_in_any_frustum(random_pts, camera_frusta)
 
             random_pts = random_pts[visibility_mask]
             if visualizer is not None:
@@ -808,7 +866,7 @@ class ConstructionBarriersInitialization(BaseInitialization):
         source = datasource.datasource
         if not isinstance(source, NCOREDataSource):
             raise ValueError("Construction-barrier initialization requires an NCOREDataSource")
-        if not {"cone", "pole", "barrier"}.issubset(source.cuboid_tracks_params.excluded_class_names):
+        if not {CONE_CLASS_NAME, "pole", "barrier"}.issubset(source.cuboid_tracks_params.excluded_class_names):
             raise ValueError("NCore barriers must be excluded from the ordinary cuboid-track path")
         self.cuboids = BarrierCuboids.from_ncore(
             source.sequence_loader, source.time_range_us, source.world_to_nurec.matrix
@@ -835,7 +893,7 @@ class LidarConstructionInitialization(BaseInitialization):
         source = datasource.datasource
         if not isinstance(source, NCOREDataSource):
             raise ValueError("LiDAR construction initialization requires an NCOREDataSource")
-        if "cone" not in source.cuboid_tracks_params.excluded_class_names:
+        if CONE_CLASS_NAME not in source.cuboid_tracks_params.excluded_class_names:
             raise ValueError("LiDAR cones must be excluded from the ordinary cuboid-track path")
         aux = source.aux_loader
         if aux is None:
@@ -848,7 +906,7 @@ class LidarConstructionInitialization(BaseInitialization):
             meta = aux.get_object_instance_segmentation_meta(camera_id)
             if "method" not in meta:
                 raise ValueError("Instance-segmentation metadata is missing 'method'")
-            if meta["method"] == "sam3-objects":
+            if meta["method"] == SAM3_OBJECT_INSTANCE_METHOD and CONE_CLASS_NAME in meta.get("thing_classes", []):
                 cone_camera_ids.append(camera_id)
         if not cone_camera_ids:
             raise NoPointsFoundException("No SAM3 cone masks; skipping the cone layer")
@@ -931,20 +989,23 @@ class DynamicTracksInitialization(BaseInitialization):
         gaussian_scales: List[torch.Tensor] = []
         observed_counts: List[int] = []
 
-        track_point_clouds = list(
-            unpack_optional(
-                datasource.get_track_point_clouds(
-                    cuboid_tracks=cuboid_tracks,
-                    cuboid_dim_scale_factor=1.0,
-                    lidar_ids=lidar_ids,
-                    camera_ids=camera_ids,
-                    return_color=True,
-                    step_frame=self.config.get("step_frame", 1),
-                    keep_all_track_poses=self.config.keep_all_track_poses,
-                    device=self.device,
+        if self.prepared_camera_clouds is not None:
+            track_point_clouds = self._consume_prepared_camera_clouds()
+        else:
+            track_point_clouds = list(
+                unpack_optional(
+                    datasource.get_track_point_clouds(
+                        cuboid_tracks=cuboid_tracks,
+                        cuboid_dim_scale_factor=1.0,
+                        lidar_ids=lidar_ids,
+                        camera_ids=camera_ids,
+                        return_color=True,
+                        step_frame=self.config.get("step_frame", 1),
+                        keep_all_track_poses=self.config.keep_all_track_poses,
+                        device=self.device,
+                    )
                 )
             )
-        )
 
         track_id_counts: dict[str, int] = defaultdict(int)
         track_pcs: dict[str, list[PointCloud]] = defaultdict(list)
@@ -1103,7 +1164,7 @@ class AccumulatedPointCloudInitializationBase(BaseInitialization):
     def load_ply_with_segment_id(
         filename: str,
     ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.uint8], Optional[NDArray[np.uint8]]]:
-        ply_data = pcu.load_triangle_mesh(filename).vertex_data
+        ply_data = load_initialization_ply(filename).vertex_data
         ply_metadata = ply_data.custom_attributes
 
         xyz = ply_data.positions
@@ -1146,7 +1207,7 @@ class AccumulatedPointCloudInitializationBase(BaseInitialization):
             )
 
             normal_nurec = None
-            if normal_world is not None:
+            if normal_world is not None and (self.config.get("init_with_normals", False) or self.debug_dir is not None):
                 # Rotate normal from world to NuRec coordinates, multiply from the right with the transpose is equivalent to multiply from the left
                 normal_nurec = normal_world @ datasource.datasource.world_to_nurec.matrix[:3, :3].T
                 normal_nurec = normal_nurec / np.maximum(np.linalg.norm(normal_nurec, axis=1)[..., np.newaxis], 1e-5)
@@ -1162,15 +1223,6 @@ class AccumulatedPointCloudInitializationBase(BaseInitialization):
                 to_torch(segment_id, device=str(self.device), dtype=torch.uint8) if segment_id is not None else None
             )
 
-            # get scales based on distance to ego poses
-            dist_to_ego_positions = (
-                torch.sqrt(knn_points(xyz_e_nurec.unsqueeze(0), ego_c2nurec[:, :3, 3].unsqueeze(0)).dists)
-                .clamp_min(1e-7)
-                .squeeze(0)
-                .squeeze(-1)
-            )
-            scale = dist_to_ego_positions * self.config.get("observation_scale_factor", 0.01)
-
             point_cloud = PointCloud(
                 xyz_start=xyz_e_nurec,
                 xyz_end=xyz_e_nurec,
@@ -1178,7 +1230,7 @@ class AccumulatedPointCloudInitializationBase(BaseInitialization):
                 color=color,
                 normal=normal_nurec,
                 semantic_class_id=segment_id,
-                camera_footprint_scale=scale,
+                camera_footprint_scale=None,
                 sensor_type=["camera"],
             )
 
@@ -1217,6 +1269,18 @@ class AccumulatedPointCloudInitializationBase(BaseInitialization):
                     np.random.choice(point_cloud.n_points, self.config.num_point_cloud_points, replace=False)
                 ).to(self.device)
                 point_cloud = point_cloud[random_idxs]
+
+            # Each nearest-ego distance is independent. Only compute it for
+            # points retained by filtering and sampling, preserving their order.
+            dist_to_ego_positions = (
+                torch.sqrt(knn_points(point_cloud.xyz_end.unsqueeze(0), ego_c2nurec[:, :3, 3].unsqueeze(0)).dists)
+                .clamp_min(1e-7)
+                .squeeze(0)
+                .squeeze(-1)
+            )
+            point_cloud.camera_footprint_scale = dist_to_ego_positions * self.config.get(
+                "observation_scale_factor", 0.01
+            )
 
             return point_cloud, original_n_points
 
@@ -1754,6 +1818,10 @@ class _BevColorGrid:
     colors: NDArray[np.uint8]
 
 
+_FusedMesh = tuple[NDArray[np.float32], NDArray[np.int32], NDArray[np.uint8] | None, _BevColorGrid | None]
+_RoadInitState = tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.uint8] | None]
+
+
 def _build_bev_color_grid_from_vertices(
     vertices: NDArray[np.float32],
     colors: NDArray[np.uint8],
@@ -1779,12 +1847,84 @@ def _build_bev_color_grid_from_vertices(
     )
 
 
+# Peak memory allowed for the dense color lookup; larger inputs take the per-point scan.
+_DENSE_LOOKUP_BYTES = 1 << 30
+
+
+def _dense_lookup_bytes(grid_cells: int, n: int) -> int:
+    """Estimate the dense color lookup's peak memory.
+
+    - The cell lookup table holds one int64 per grid cell.
+    - Each point holds at most about 192 bytes at once: its cell, id, color and found flag,
+      its neighbor-fill state, and the temporaries of one neighbor offset.
+    """
+    return 8 * grid_cells + 192 * n
+
+
 def _lookup_bev_color_grid(
     points: NDArray[np.float32],
     color_grid: _BevColorGrid,
     neighbor_radius_cells: int = 1,
 ) -> tuple[NDArray[np.uint8], NDArray[np.bool_]]:
-    """Look up BEV cell colors for points, falling back to fixed-radius neighboring cells."""
+    """Color each point from its BEV cell, else from nearby cells.
+
+    - A point in a colored cell takes that cell's color.
+    - Otherwise it takes the inverse-squared-distance-weighted mean of colored cells within
+      ``neighbor_radius_cells``, measured to cell centers.
+    - Returns (colors, found); points with no colored cell in range stay black with found=False.
+    """
+    grid = color_grid
+    if neighbor_radius_cells < 0:
+        raise ValueError("neighbor_radius_cells must be non-negative")
+    points = np.asarray(points, dtype=np.float32)
+    cells = grid.cell_indices
+    if not len(cells):
+        return _lookup_bev_color_grid_sparse(points, grid, neighbor_radius_cells)
+    lo = cells.min(axis=0)
+    size = cells.max(axis=0) - lo + 1
+    if _dense_lookup_bytes(int(size[0]) * int(size[1]), len(points)) > _DENSE_LOOKUP_BYTES:
+        return _lookup_bev_color_grid_sparse(points, grid, neighbor_radius_cells)
+    lut = np.full(tuple(size), -1, dtype=np.int64)
+    lut[cells[:, 0] - lo[0], cells[:, 1] - lo[1]] = np.arange(len(cells))
+    q = np.floor((points[:, :2] - grid.bbox_min_xy) / grid.cell_size).astype(np.int64) - lo
+    inside = ((q >= 0) & (q < size)).all(axis=1)
+    ids = np.full(len(q), -1, dtype=np.int64)
+    ids[inside] = lut[q[inside, 0], q[inside, 1]]
+    found = ids >= 0
+    colors = np.zeros((len(q), 3), dtype=np.uint8)
+    colors[found] = grid.colors[ids[found]]
+    if not found.all() and neighbor_radius_cells:
+        missing = np.flatnonzero(~found)
+        missing_q = q[missing]
+        xy = points[missing, :2].astype(np.float64)
+        weighted = np.zeros((len(missing), 3), dtype=np.float64)
+        total = np.zeros(len(missing), dtype=np.float64)
+        # Same neighbor order and float64 sums as the per-point scan, so both paths return identical colors.
+        for dx in range(-neighbor_radius_cells, neighbor_radius_cells + 1):
+            for dy in range(-neighbor_radius_cells, neighbor_radius_cells + 1):
+                neighbors = missing_q + np.array([dx, dy])
+                valid = ((neighbors >= 0) & (neighbors < size)).all(axis=1)
+                hit = np.flatnonzero(valid)
+                neighbor_ids = lut[neighbors[hit, 0], neighbors[hit, 1]]
+                hit = hit[neighbor_ids >= 0]
+                neighbor_ids = neighbor_ids[neighbor_ids >= 0]
+                centers = grid.bbox_min_xy.astype(np.float64) + (neighbors[hit] + lo + 0.5) * grid.cell_size
+                dist2 = np.sum((xy[hit] - centers) ** 2, axis=1)
+                weight = 1.0 / np.maximum(dist2, 1.0e-6)
+                weighted[hit] += grid.colors[neighbor_ids].astype(np.float64) * weight[:, None]
+                total[hit] += weight
+        covered = total > 0
+        colors[missing[covered]] = np.clip(np.rint(weighted[covered] / total[covered, None]), 0, 255).astype(np.uint8)
+        found[missing[covered]] = True
+    return colors, found
+
+
+def _lookup_bev_color_grid_sparse(
+    points: NDArray[np.float32],
+    color_grid: _BevColorGrid,
+    neighbor_radius_cells: int = 1,
+) -> tuple[NDArray[np.uint8], NDArray[np.bool_]]:
+    """Per-point dict scan with memory bounded by the point count."""
     points = np.asarray(points, dtype=np.float32)
     if neighbor_radius_cells < 0:
         raise ValueError(f"neighbor_radius_cells must be non-negative, got {neighbor_radius_cells}")
@@ -2037,6 +2177,16 @@ class CameraGroundMeshRoadInitialization(BaseInitialization):
     and feeding them directly into ``DelaunayElevationMeshingAlgorithm``.
     """
 
+    def preparation_key(self, stage: str, datasource: NCOREDataSource) -> tuple:
+        return (
+            "camera-road",
+            stage,
+            id(datasource),
+            str(self.config),
+            tuple(self.labels_to_use),
+            tuple(self.labels_to_ignore),
+        )
+
     def _load_mesh_from_file(self, mesh_path: str) -> tuple[NDArray, NDArray, NDArray | None]:
         """Load a ground mesh PLY and return (vertices, faces, vertex_colors_or_None).
 
@@ -2059,9 +2209,16 @@ class CameraGroundMeshRoadInitialization(BaseInitialization):
         )
         return vertices, faces, vertex_colors
 
-    def _build_mesh_from_fused_point_cloud(
-        self, ncore_ds: NCOREDataSource
-    ) -> tuple[NDArray[np.float32], NDArray[np.int32], "NDArray[np.uint8] | None", Optional[_BevColorGrid]]:
+    def _build_mesh_from_fused_point_cloud(self, ncore_ds: NCOREDataSource) -> _FusedMesh:
+        resources = current_initialization()
+        future = resources.get(self.preparation_key("mesh", ncore_ds)) if resources is not None else None
+        return (
+            cast(_FusedMesh, future.result())
+            if future is not None
+            else self._compute_mesh_from_fused_point_cloud(ncore_ds)
+        )
+
+    def _compute_mesh_from_fused_point_cloud(self, ncore_ds: NCOREDataSource) -> _FusedMesh:
         """Build a ground mesh from a fused point cloud PLY with segment_id.
 
         Loads the accumulated point cloud, filters road points by semantic class
@@ -2075,7 +2232,7 @@ class CameraGroundMeshRoadInitialization(BaseInitialization):
         point_cloud_path = self.config.point_cloud_path
         log.info(f"[{self.__class__.__name__}] Loading fused point cloud from {point_cloud_path}")
 
-        ply_data = pcu.load_triangle_mesh(point_cloud_path).vertex_data
+        ply_data = load_initialization_ply(point_cloud_path).vertex_data
         ply_metadata = ply_data.custom_attributes
 
         xyz_world = ply_data.positions.astype(np.float32)
@@ -2332,9 +2489,16 @@ class CameraGroundMeshRoadInitialization(BaseInitialization):
         )
         return positions_nurec, normals_nurec, gaussian_colors
 
-    def _build_camera_ground_mesh_init_state(
-        self, ncore_ds: NCOREDataSource
-    ) -> tuple[NDArray[np.float32], NDArray[np.float32], Optional[NDArray[np.uint8]]]:
+    def _build_camera_ground_mesh_init_state(self, ncore_ds: NCOREDataSource) -> _RoadInitState:
+        resources = current_initialization()
+        future = resources.get(self.preparation_key("state", ncore_ds)) if resources is not None else None
+        return (
+            cast(_RoadInitState, future.result())
+            if future is not None
+            else self._compute_camera_ground_mesh_init_state(ncore_ds)
+        )
+
+    def _compute_camera_ground_mesh_init_state(self, ncore_ds: NCOREDataSource) -> _RoadInitState:
         """Build and sample the camera road mesh init state in NuRec space."""
         color_grid = None
         mesh_path = self.config.get("mesh_path", None)

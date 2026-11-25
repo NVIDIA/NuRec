@@ -14,19 +14,23 @@ load("//bazel/pytest:defs.bzl", "pytest_test")
 # Mask2Former TensorRT engines, one http_file per engine (see MODULE.bazel). Grouped
 # here so consumers reference a single target; each lands in runfiles at
 # trt_engine_<key>/file/<engine> (searched by find_network_file_path in estimators.py).
+# TensorRT plans are CPU-architecture-specific; package only the target CPU's plans.
 filegroup(
     name = "mask2former_trt_engines",
-    srcs = [
-        "@trt_engine_5880_x86_64//file",
-        "@trt_engine_a100_x86_64//file",
-        "@trt_engine_a40_x86_64//file",
-        "@trt_engine_a6000_x86_64//file",
-        "@trt_engine_ampereplus_aarch64//file",
-        "@trt_engine_ampereplus_x86_64//file",
-        "@trt_engine_l40_aarch64//file",
-        "@trt_engine_l40_x86_64//file",
-        "@trt_engine_l4_x86_64//file",
-    ],
+    srcs = select({
+        "@platforms//cpu:aarch64": [
+            "@trt_engine_ampereplus_aarch64//file",
+            "@trt_engine_sm103_aarch64//file",
+        ],
+        "@platforms//cpu:x86_64": [
+            "@trt_engine_ampereplus_x86_64//file",
+            "@trt_engine_sm80_x86_64//file",
+            "@trt_engine_sm86_x86_64//file",
+            "@trt_engine_sm89_x86_64//file",
+            "@trt_engine_sm90_x86_64//file",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
@@ -131,6 +135,7 @@ py_library(
         ":pylib_segmentation_presentation",
         ":pylib_trt_engine_selection",
         ":pylib_utils_aux",
+        "//apps/av/aux_gen/mask2former:pylib",
         pip_requirement("nvidia-ncore"),
         pip_requirement("numpy"),
         pip_requirement("pillow"),
@@ -162,6 +167,7 @@ py_library(
     srcs = ["shared_segmentation.py"],
     visibility = [],
     deps = [
+        ":pylib_device_frame",
         ":pylib_device_frame_service",
         ":pylib_segmentation_device_pipeline",
         ":pylib_segmentation_presentation",
@@ -213,7 +219,6 @@ pytest_test(
     name = "ncore_aux_data_test",
     srcs = ["ncore_aux_data_test.py"],
     data = ["@test_data_ncore_v4//:ncore_clipgt_1sec"],
-    tags = ["exclusive"],
     deps = [
         ":pylib",
         ":pylib_depth_estimator",
@@ -222,6 +227,9 @@ pytest_test(
         ":pylib_estimators_aux",
         ":pylib_segmentation_device_pipeline",
         ":pylib_segmentation_presentation",
+        ":pylib_trt_engine_selection",
+        ":segmentation_test_support",
+        "//nurec/utils:pylib_ncore_utils",
         pip_requirement("click"),
         pip_requirement("numpy"),
         pip_requirement("pillow"),
@@ -250,6 +258,7 @@ py_test(
     main = "worker_spawn_test.py",
     deps = [
         ":pylib",
+        ":pylib_device_frame_service",
         ":worker_spawn_test_support",
         "//nurec/ncore_backends:pylib",
         pip_requirement("universal-pathlib"),
@@ -267,7 +276,6 @@ mypy_test(
 pytest_test(
     name = "device_frame_service_test",
     srcs = ["device_frame_service_test.py"],
-    tags = ["exclusive"],
     deps = [
         ":pylib_device_frame",
         ":pylib_device_frame_service",
@@ -276,25 +284,30 @@ pytest_test(
     ],
 )
 
+py_library(
+    name = "segmentation_test_support",
+    testonly = True,
+    srcs = ["segmentation_test_support.py"],
+    deps = [
+        "//nurec/utils:pylib_ncore_utils",
+        pip_requirement("numpy"),
+    ],
+)
+
 pytest_test(
     name = "aux_gen_test",
     timeout = "long",
-    srcs = [
-        "aux_gen_test.py",
-    ],
+    srcs = ["aux_gen_test.py"],
     data = [
         ":ncore_aux_data",
         "@test_data_ncore_v4//:ncore_1sec",
     ],
-    tags = ["exclusive"],
     deps = [
         ":ncore_aux_data",
-        ":pylib_utils_aux",
-        "//nurec/utils:pylib_ncore_utils",
+        ":segmentation_test_support",
         pip_requirement("pytest-grpc"),
         pip_requirement("grpcio"),  # required by pytest-grpc
         pip_requirement("numpy"),
-        pip_requirement("torch"),
         "@rules_python//python/runfiles",
     ],
 )
@@ -303,6 +316,18 @@ pytest_test(
     name = "trt_engine_selection_test",
     srcs = ["trt_engine_selection_test.py"],
     deps = [":pylib_trt_engine_selection"],
+)
+
+pytest_test(
+    name = "mmseg_trt_init_test",
+    srcs = ["mmseg_trt_init_test.py"],
+    deps = [
+        pip_requirement("mmengine"),
+        pip_requirement("tensorrt-cu12"),
+        pip_requirement("tensorrt-cu12-bindings"),
+        pip_requirement("tensorrt-cu12-libs"),
+        "@mmseg_repo//:pylib_aux",
+    ],
 )
 
 pytest_test(

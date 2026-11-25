@@ -346,6 +346,7 @@ class BaseCameraPixelSampler(ABC):
     def fixed_sampled_pixels(
         self,
         *,
+        camera_id: str,
         original_width: int,
         original_height: int,
     ) -> RectSubsampled | None:

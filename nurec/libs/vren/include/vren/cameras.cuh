@@ -579,11 +579,13 @@ public:
     }
 };
 
-template <size_t N_NEWTON_ITERATIONS = 3 /* fixed number of Netwon iteration for polynomial inversion - same as in NCore */>
+// N_NEWTON_ITERATIONS is retained for source compatibility; the solver uses its own limit.
+template <size_t N_NEWTON_ITERATIONS = 3>
 struct OpenCVFisheyeCameraModel : BaseCameraModel<OpenCVFisheyeCameraModel<N_NEWTON_ITERATIONS>> {
     // OpenCV-compatible fisheye camera model (NCore conventions)
 public:
-    using Base = BaseCameraModel<OpenCVFisheyeCameraModel<N_NEWTON_ITERATIONS>>;
+    using Base                                    = BaseCameraModel<OpenCVFisheyeCameraModel<N_NEWTON_ITERATIONS>>;
+    static constexpr size_t MAX_SOLVER_ITERATIONS = 52;
 
     OpenCVFisheyeCameraModel(OpenCVFisheyeCameraModelParameters const& parameters, float min_2d_norm = 1e-6f)
         : Base(parameters)
@@ -594,7 +596,7 @@ public:
         auto const& [k1, k2, k3, k4] = parameters.radial_coeffs;
         forward_poly_odd             = {1.f, k1, k2, k3, k4};
 
-        // eighth-degree differential of forward polynomial 1 + 3*k1*theta^2 + 5*k2*theta^4 + 7*k3*theta^8 + 9*k4*theta^8
+        // eighth-degree differential of forward polynomial 1 + 3*k1*theta^2 + 5*k2*theta^4 + 7*k3*theta^6 + 9*k4*theta^8
         dforward_poly_even = {1, 3 * k1, 5 * k2, 7 * k3, 9 * k4};
 
         // approximate backward poly (mapping normalized distances to angles) *very crudely* by linear interpolation / equidistant angle model (also assuming image-centered principal point)
@@ -608,6 +610,61 @@ public:
     std::array<float, 5> forward_poly_odd;
     std::array<float, 5> dforward_poly_even;
     std::array<float, 2> approx_backward_poly;
+
+    inline __device__ float invert_forward_poly(float radius) const {
+        // The host limits max_angle to the first increasing branch. Keep every
+        // iterate in that bracket; a bad seed must never reach the folded branch.
+        // Invalid/nonconverged inputs return -1, never a non-finite angle.
+        auto lower = 0.f;
+        auto upper = parameters.max_angle;
+        if (!isfinite(radius) || radius < 0.f || !isfinite(upper) || upper <= 0.f)
+            return -1.f;
+        auto const max_radius = eval_poly_odd_horner(forward_poly_odd, upper);
+        if (!isfinite(max_radius) || max_radius <= 0.f || radius >= max_radius)
+            return -1.f;
+
+        auto theta = eval_poly_horner(approx_backward_poly, radius);
+        if (!isfinite(theta) || theta <= lower || theta >= upper)
+            theta = 0.5f * (lower + upper);
+        auto const residual_tolerance = 4e-7f * fmaxf(1.f, radius);
+        auto const derivative_epsilon = 1e-6f;
+        auto previous_step            = upper - lower;
+        auto last_step                = previous_step;
+        for (size_t iteration = 0; iteration < MAX_SOLVER_ITERATIONS; ++iteration) {
+            auto const residual   = eval_poly_odd_horner(forward_poly_odd, theta) - radius;
+            auto const derivative = eval_poly_even_horner(dforward_poly_even, theta);
+            if (!isfinite(residual) || !isfinite(derivative))
+                return -1.f;
+            if (derivative > derivative_epsilon && fabsf(residual) <= residual_tolerance &&
+                fabsf(residual) <= derivative * 1e-6f)
+                return theta;
+
+            if (residual > 0.f)
+                upper = theta;
+            else
+                lower = theta;
+            auto candidate = 0.5f * (lower + upper);
+            if (derivative > derivative_epsilon) {
+                auto const newton_step = residual / derivative;
+                auto const newton      = theta - newton_step;
+                // Compare with the step before last, not the current bracket width.
+                if (isfinite(newton) && newton > lower && newton < upper &&
+                    fabsf(newton_step) <= 0.5f * fabsf(previous_step))
+                    candidate = newton;
+            }
+            if (candidate == theta)
+                break;
+            previous_step = last_step;
+            last_step     = theta - candidate;
+            theta         = candidate;
+        }
+        auto const residual   = eval_poly_odd_horner(forward_poly_odd, theta) - radius;
+        auto const derivative = eval_poly_even_horner(dforward_poly_even, theta);
+        return isfinite(residual) && isfinite(derivative) && derivative > derivative_epsilon &&
+                       fabsf(residual) <= residual_tolerance
+                   ? theta
+                   : -1.f;
+    }
 
     inline __device__ auto camera_ray_to_image_point_impl(float3 const& cam_ray, float margin_factor) const -> typename Base::CameraRayToImagePointReturn {
         // Make sure norm is non-vanishing (norm vanishes for points along the principal-axis)
@@ -643,23 +700,21 @@ public:
         auto const uv = (image_point - float2{parameters.principal_point[0], parameters.principal_point[1]}) / float2{parameters.focal_length[0], parameters.focal_length[1]};
 
         // Compute the radial distance from the principal point
-        auto const delta = length(uv);
-
-        // Evaluate the inverse polynomial to find the angle theta
-        auto const theta = eval_poly_inverse_horner_newton<N_NEWTON_ITERATIONS>(PolynomialProxy<PolynomialType::ODD, 5>{forward_poly_odd},
-                                                                                PolynomialProxy<PolynomialType::EVEN, 5>{dforward_poly_even},
-                                                                                PolynomialProxy<PolynomialType::FULL, 2>{approx_backward_poly},
-                                                                                delta);
-
-        // Compute the camera ray and set the ones at the image center to [0,0,1]
-        if (delta >= min_2d_norm) {
-            // Scale the uv coordinates by the sine of the angle theta
-            auto const scale_factor = sinf(theta) / delta;
-            return make_float3(scale_factor * uv.x, scale_factor * uv.y, cosf(theta));
-        } else {
-            // For points at the image center, return a ray pointing straight ahead
+        // fminf/fmaxf in the stable norm can hide a NaN in one coordinate.
+        if (!isfinite(uv.x) || !isfinite(uv.y))
             return make_float3(0.f, 0.f, 1.f);
-        }
+        auto const delta = numerically_stable_norm2(uv.x, uv.y);
+        if (!isfinite(delta) || delta < min_2d_norm)
+            return make_float3(0.f, 0.f, 1.f);
+
+        auto const theta = invert_forward_poly(delta);
+        // This legacy API has no validity output. A finite optical-axis sentinel
+        // prevents NaN propagation, but callers must still mask invalid pixels.
+        if (theta < 0.f)
+            return make_float3(0.f, 0.f, 1.f);
+
+        auto const scale_factor = sinf(theta) / delta;
+        return make_float3(scale_factor * uv.x, scale_factor * uv.y, cosf(theta));
     }
 };
 

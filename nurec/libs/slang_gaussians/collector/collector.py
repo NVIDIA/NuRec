@@ -39,10 +39,13 @@ Performance:
 ------------
 - Pre-compiled kernels: Instant loading (no compilation overhead)
 - Runtime compilation: ~10-15 seconds per unique compilation
-- Cache persists across collector instances but not across process restarts
+- The in-process cache persists across collector instances. Runtime builds go to
+  ``NUREC_SLANG_JIT_CACHE_DIR`` (default: the system temp directory), where slangtorch
+  reuses them across processes as long as their inputs are unchanged.
 """
 
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -83,6 +86,54 @@ def get_slang_module_path():
     r = runfiles.Create()
     path = r.Rlocation("nurec_repo/nurec/libs/slang_gaussians/collector/collector.slang-module")
     return path
+
+
+@functools.cache
+def _jit_build_inputs_digest() -> str:
+    """Digest of the runtime-compile inputs that slangtorch's rebuild check does not see.
+
+    slangtorch rebuilds a module only when a source file is newer than its recorded build. The
+    generated source merely ``import``s the pre-built ``collector.slang-module``, and the extension
+    built from it is bound to one torch build (version and CUDA), so neither of those appears in
+    that check. The digest is folded into the generated file's name so each (module, torch) pair
+    gets its own source file and slangtorch build directory in ``NUREC_SLANG_JIT_CACHE_DIR``.
+    Computed once per process: the module is a fixed build output and torch cannot change.
+    """
+    import torch
+
+    digest = hashlib.sha256()
+    with open(get_slang_module_path(), "rb") as f:
+        digest.update(f.read())
+    digest.update(f"{torch.__version__}|{torch.version.cuda}".encode())
+    return digest.hexdigest()
+
+
+def get_jit_cache_dir() -> str:
+    """Directory for runtime-generated Slang sources and slangtorch's build directories.
+
+    ``NUREC_SLANG_JIT_CACHE_DIR`` relocates it from the system temp directory; a persistent
+    location turns a runtime compile into a one-time cost per deployment.
+    """
+    cache_dir = os.environ.get("NUREC_SLANG_JIT_CACHE_DIR") or tempfile.gettempdir()
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def write_if_changed(path: str, content: str) -> None:
+    """Write ``content`` to ``path`` unless the file already holds it.
+
+    slangtorch decides whether to rebuild from the source file's mtime, so rewriting identical
+    code would discard a cached build. Opening in append mode creates the file without
+    truncating what another process may be compiling; the exclusive lock (released with the
+    file) serializes concurrent processes generating the same file.
+    """
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        if f.read() != content:
+            f.seek(0)
+            f.truncate()
+            f.write(content)
 
 
 _cached_kernels: Dict[CollectorConfiguration, CollectorKernel] = {}
@@ -213,15 +264,12 @@ def get_slang_kernels(configurations: List[Any]) -> List[CollectorKernel]:
         if len(to_build) > 0:
             kernel_code = generate_collector_code(to_build)
 
-            # Using hashlib, because hash() is not deterministic across sessions.
-            code_hash = hashlib.sha256(kernel_code.code.encode()).hexdigest()[:8]
-            slang_file_path = os.path.join(tempfile.gettempdir(), f"collector_{code_hash}.slang")
-            with open(slang_file_path, "w") as tf:
-                try:
-                    fcntl.flock(tf.fileno(), fcntl.LOCK_EX)
-                    tf.write(kernel_code.code)
-                finally:
-                    fcntl.flock(tf.fileno(), fcntl.LOCK_UN)
+            # Using hashlib, because hash() is not deterministic across sessions. The build-input
+            # digest makes the file name (and slangtorch's build directory) specific to the pre-built
+            # module and torch build the kernels are compiled against.
+            code_hash = hashlib.sha256((kernel_code.code + _jit_build_inputs_digest()).encode()).hexdigest()[:8]
+            slang_file_path = os.path.join(get_jit_cache_dir(), f"collector_{code_hash}.slang")
+            write_if_changed(slang_file_path, kernel_code.code)
 
             logger.info(f"Loading slang module: {slang_file_path} for configurations: {to_build}")
 

@@ -220,6 +220,10 @@ class ArtifactConfig(BaseConfigSchema):
             default=True,
             description="Enable/disable measuring and saving a firing pattern for each lidar that has no parametric sensor model. Serving replays the pattern to synthesise the unit's rays; an artifact exported without one cannot render those lidars at all.",
         )
+        include_modeled_lidars: bool = Field(
+            default=False,
+            description="Opt in to exporting native firing patterns for lidars with parametric intrinsics. Their stored templates then take precedence during serving and use angle filtering. Disabled by default until modeled-sensor parity is established.",
+        )
 
     firing_patterns: FiringPatternsConfig = Field(
         default_factory=FiringPatternsConfig, description="Artifact export settings for lidar firing patterns."

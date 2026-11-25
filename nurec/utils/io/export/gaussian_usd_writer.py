@@ -5,14 +5,13 @@
 USD Gaussian prim writers for exporting Gaussian splatting data.
 
 Provides a schema-agnostic interface for writing Gaussian splatting data to USD.
-This abstraction allows switching between different USD schemas (UsdGeomPoints,
-ParticleField3DGaussianSplat) without changing the export logic.
+This abstraction keeps the export logic independent of the USD schema used to
+author the Gaussians.
 
 Writers handle the creation and population of USD prims with Gaussian attributes
 including positions, rotations, scales, opacities, and appearance data.
 
 Supported schemas:
-- GaussianGeomPointsWriter: Legacy UsdGeomPoints schema with custom primvars
 - GaussianLightFieldWriter: OpenUSD UsdVol ParticleField3DGaussianSplat schema
 
 The NuRec volume export flavor is selected through the same CLI enum but
@@ -47,7 +46,6 @@ log = logging.getLogger(__name__)
 class GaussianUSDSchemaType(str, Enum):
     """Available USD schemas for Gaussian representation."""
 
-    GEOM_POINTS = "geompoints"
     LIGHT_FIELD = "lightfield"
     NREND_VOLUME = "nrendvol"
 
@@ -78,6 +76,12 @@ class GaussianUSDWriter(ABC):
         node_layer_name: Optional node layer name for composite models
         content_root_path: Root path for content in USD stage
     """
+
+    # Both SH coefficient precisions the ParticleField schema defines. A prim may carry either or both.
+    _SH_COEFFS_ATTR_NAMES = (
+        "radiance:sphericalHarmonicsCoefficients",
+        "radiance:sphericalHarmonicsCoefficientsh",
+    )
 
     def __init__(
         self,
@@ -258,330 +262,43 @@ class GaussianUSDWriter(ABC):
         """
         pass
 
-    def apply_color_space_to_prim(self, prim: Usd.Prim) -> None:
-        """Apply ColorSpaceAPI and set color space based on linear_srgb flag.
+    def apply_color_space_to_sh_attributes(self, prim: Usd.Prim) -> None:
+        """Author ``colorSpace`` metadata on every SH coefficients attribute of the prim.
+
+        Mirrors the OpenUSD ParticleField proposal, where the color space applies to the RGB
+        reconstructed from the SH coefficients and is set on the coefficients attributes (both
+        precisions share one value).
 
         According to USD color space conventions:
         - lin_rec709_scene: Linear Rec.709 color space (for post-processed/linear RGB data)
         - srgb_rec709_display: sRGB Rec.709 color space (for gamma-encoded data)
 
         Args:
-            prim: USD prim to apply color space to
+            prim: Particle field prim whose SH coefficients attributes are annotated
         """
         if not self.capabilities.has_spherical_harmonics:
             return
 
         color_space = "lin_rec709_scene" if self.linear_srgb else "srgb_rec709_display"
-        color_space_api = Usd.ColorSpaceAPI.Apply(prim)
-        color_space_api.CreateColorSpaceNameAttr().Set(color_space)
+        for attr_name in self._SH_COEFFS_ATTR_NAMES:
+            attr = prim.GetAttribute(attr_name)
+            # IsAuthored skips schema-declared attributes the writer did not create.
+            if attr and attr.IsAuthored():
+                attr.SetColorSpace(color_space)
 
 
 # =============================================================================
-# GeomPoints Writer (Legacy Schema)
+# Constants
 # =============================================================================
 
 
 USD_LOOKS_PATH = "/World/Looks"
-USD_GAUSSIAN_MATERIAL_PATH = USD_LOOKS_PATH + "/GaussianEmissive"
-USD_GAUSSIAN_SHADER_PATH = USD_GAUSSIAN_MATERIAL_PATH + "/Shader"
-GAUSSIAN_MATERIAL_MDL_FILE = "GaussianEmissive.mdl"
-GAUSSIAN_MATERIAL_NAME = "GaussianEmissive"
 
-# ParticleField material constants (for LightField schema)
+# ParticleField material constants
 USD_PARTICLEFIELD_MATERIAL_PATH = USD_LOOKS_PATH + "/ParticleFieldEmissive"
 USD_PARTICLEFIELD_SHADER_PATH = USD_PARTICLEFIELD_MATERIAL_PATH + "/Shader"
 PARTICLEFIELD_MATERIAL_MDL_FILE = "ParticleFieldEmissive.mdl"
 PARTICLEFIELD_MATERIAL_NAME = "ParticleFieldEmissive"
-
-SH_C0_COEFFICIENT = 0.28209479177387814
-
-DEFAULT_GAUSSIAN_COLOR = 0.5
-DEFAULT_GAUSSIAN_WIDTH = 1.0
-DEFAULT_GAUSSIAN_TYPE = 1
-
-
-class GaussianGeomPointsWriter(GaussianUSDWriter):
-    """USD Gaussian writer using UsdGeomPoints schema."""
-
-    def __init__(
-        self,
-        stage: Usd.Stage,
-        capabilities: ModelCapabilities,
-        track_id: str,
-        track_index: int,
-        node_layer_name: Optional[str] = None,
-        content_root_path: str = "/World",
-        linear_srgb: bool = False,
-        has_post_processing: bool = False,
-    ) -> None:
-        super().__init__(
-            stage,
-            capabilities,
-            track_id,
-            track_index,
-            node_layer_name,
-            content_root_path,
-            linear_srgb,
-            has_post_processing,
-        )
-        self.points_prim: Optional[UsdGeom.Points] = None
-        self.primvars_api: Optional[UsdGeom.PrimvarsAPI] = None
-        self.type_primvar: Optional[UsdGeom.Primvar] = None
-        self.scale_primvars: List[UsdGeom.Primvar] = []
-        self.rot_primvars: List[UsdGeom.Primvar] = []
-        self.opacity_primvar: Optional[UsdGeom.Primvar] = None
-        self.shadow_primvar: Optional[UsdGeom.Primvar] = None
-        self.f_dc_primvars: List[UsdGeom.Primvar] = []
-        self.f_rest_primvars: List[UsdGeom.Primvar] = []
-        self.display_color_primvar: Optional[UsdGeom.Primvar] = None
-        self._transform_op: Optional[UsdGeom.XformOp] = None
-
-    def create_prim(
-        self,
-        num_gaussians: int,
-        track_transforms: Optional[Dict[float, Gf.Matrix4d]] = None,
-    ) -> Usd.Prim:
-        self._reset_animated_state()
-        cleaned_track_id = DataSourceSummary._clean_track_id_str(self.track_id)
-        safe_track_id = sanitize_usd_path(cleaned_track_id)
-        track_path = f"{self.content_root_path}/track_{self.track_index:05d}_{safe_track_id}"
-        if self.node_layer_name:
-            safe_node_layer = sanitize_usd_path(self.node_layer_name)
-            points_name = f"{safe_node_layer}_{safe_track_id}_points"
-        else:
-            points_name = f"{safe_track_id}_points"
-        points_path = f"{track_path}/{points_name}"
-        self.track_xform = UsdGeom.Xform.Define(self.stage, track_path)
-        # Create transform op for animated track transforms
-        if self.track_xform is not None:
-            self._transform_op = self.track_xform.AddTransformOp()
-            # If transforms provided upfront, write them now
-            if track_transforms is not None:
-                for time_code, transform_matrix in track_transforms.items():
-                    self._transform_op.Set(transform_matrix, time_code)
-        self.points_prim = UsdGeom.Points.Define(self.stage, points_path)
-        self.prim = self.points_prim.GetPrim()
-        self._create_and_bind_material()
-        self.primvars_api = UsdGeom.PrimvarsAPI(self.prim)
-        self._create_primvars()
-        self.apply_color_space_to_prim(self.prim)
-        return self.prim
-
-    def write_track_transform(self, time_code: float, transform: Gf.Matrix4d) -> None:
-        """Write a track transform at a specific time code."""
-        if self._transform_op is not None:
-            self._transform_op.Set(transform, time_code)
-
-    def _create_and_bind_material(self):
-        material_prim = self._create_gaussian_material()
-        material = UsdShade.Material(material_prim)
-        binding_api = UsdShade.MaterialBindingAPI(self.prim)
-        binding_api.Bind(material, bindingStrength=UsdShade.Tokens.weakerThanDescendants)
-
-    def _create_gaussian_material(self) -> Usd.Prim:
-        looks_prim = self.stage.GetPrimAtPath(USD_LOOKS_PATH)
-        if not looks_prim.IsValid():
-            looks_prim = self.stage.DefinePrim(USD_LOOKS_PATH, "Scope")
-        material_prim = self.stage.DefinePrim(USD_GAUSSIAN_MATERIAL_PATH, "Material")
-        shader_prim = self.stage.DefinePrim(USD_GAUSSIAN_SHADER_PATH, "Shader")
-        shader_prim.CreateAttribute(
-            "info:implementationSource", Sdf.ValueTypeNames.Token, custom=False, variability=Sdf.VariabilityUniform
-        ).Set("sourceAsset")
-        shader_prim.CreateAttribute(
-            "info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset, custom=False, variability=Sdf.VariabilityUniform
-        ).Set(Sdf.AssetPath(GAUSSIAN_MATERIAL_MDL_FILE))
-        shader_prim.CreateAttribute(
-            "info:mdl:sourceAsset:subIdentifier",
-            Sdf.ValueTypeNames.Token,
-            custom=False,
-            variability=Sdf.VariabilityUniform,
-        ).Set(GAUSSIAN_MATERIAL_NAME)
-        # Configure MDL shader parameters when post-processing is enabled
-        # Post-processing handles color correction, so disable MDL's built-in correction
-        if self.has_post_processing:
-            shader_prim.CreateAttribute("inputs:apply_srgb_linear", Sdf.ValueTypeNames.Bool).Set(False)
-            shader_prim.CreateAttribute("inputs:apply_inverse_tonemap", Sdf.ValueTypeNames.Bool).Set(False)
-        outputs_out = shader_prim.CreateAttribute("outputs:out", Sdf.ValueTypeNames.Token)
-        outputs_out.SetMetadata("renderType", "material")
-        material = UsdShade.Material(material_prim)
-        shader = UsdShade.Shader(shader_prim)
-        for output_name in ["mdl:displacement", "mdl:surface", "mdl:volume"]:
-            output = material.CreateOutput(output_name, Sdf.ValueTypeNames.Token)
-            output.ConnectToSource(shader.GetOutput("out"))
-        return material_prim
-
-    def _create_primvars(self) -> None:
-        primvars_api: UsdGeom.PrimvarsAPI = unpack_optional(self.primvars_api, msg="primvars_api must be initialized")
-        self.type_primvar = primvars_api.CreatePrimvar("type", Sdf.ValueTypeNames.Int, UsdGeom.Tokens.constant)
-        for i in range(3):
-            scale_primvar = primvars_api.CreatePrimvar(
-                f"scale_{i}", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
-            )
-            self.scale_primvars.append(scale_primvar)
-        for i in range(4):
-            rot_primvar = primvars_api.CreatePrimvar(f"rot_{i}", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
-            self.rot_primvars.append(rot_primvar)
-        self.opacity_primvar = primvars_api.CreatePrimvar(
-            "opacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
-        )
-        if self.capabilities.has_spherical_harmonics:
-            for i in range(3):
-                f_dc_primvar = primvars_api.CreatePrimvar(
-                    f"f_dc_{i}", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
-                )
-                self.f_dc_primvars.append(f_dc_primvar)
-            self.display_color_primvar = primvars_api.CreatePrimvar(
-                "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
-            )
-        else:
-            self.display_color_primvar = primvars_api.CreatePrimvar(
-                "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
-            )
-
-    def write_static_attributes(
-        self,
-        attributes: GaussianAttributes,
-        gaussian_indices: torch.Tensor,
-        do_not_cast_shadows: bool,
-        force_sh_0: bool,
-    ) -> None:
-        points_prim: UsdGeom.Points = unpack_optional(self.points_prim, msg="create_prim must be called first")
-        primvars_api: UsdGeom.PrimvarsAPI = unpack_optional(self.primvars_api, msg="create_prim must be called first")
-        type_primvar: UsdGeom.Primvar = unpack_optional(self.type_primvar, msg="create_prim must be called first")
-        opacity_primvar: UsdGeom.Primvar = unpack_optional(self.opacity_primvar, msg="create_prim must be called first")
-        np_indices = gaussian_indices.cpu().numpy()
-        num_gaussians = len(np_indices)
-        uniform_widths = np.full(num_gaussians, DEFAULT_GAUSSIAN_WIDTH, dtype=np.float32)
-        points_prim.GetWidthsAttr().Set(Vt.FloatArray.FromNumpy(uniform_widths))
-        type_primvar.Set(DEFAULT_GAUSSIAN_TYPE)
-        # Use np_indices to filter densities
-        densities_filtered = attributes.densities[np_indices]
-        opacity_primvar.Set(Vt.FloatArray.FromNumpy(densities_filtered.flatten()))
-        if do_not_cast_shadows:
-            self.shadow_primvar = primvars_api.CreatePrimvar(
-                "doNotCastShadows", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant
-            )
-            self.shadow_primvar.Set(True)
-        if self.capabilities.has_spherical_harmonics and not force_sh_0:
-            specular_coeffs = attributes.specular_coefficients
-            if specular_coeffs is not None and specular_coeffs.size > 0:
-                track_specular = specular_coeffs[np_indices]
-                if track_specular.size > 0:
-                    num_coeffs = track_specular.shape[-1] if track_specular.ndim > 1 else 0
-                    if not self.f_rest_primvars:
-                        for i in range(num_coeffs):
-                            f_rest_primvar = primvars_api.CreatePrimvar(
-                                f"f_rest_{i}", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
-                            )
-                            self.f_rest_primvars.append(f_rest_primvar)
-                    num_sh_coeffs = track_specular.shape[-1] // 3
-                    track_specular_reshaped = track_specular.reshape((num_gaussians, num_sh_coeffs, 3))
-                    track_specular_channel_major = (
-                        track_specular_reshaped.transpose(2, 1, 0).reshape((num_sh_coeffs * 3, num_gaussians)).T
-                    )
-                    for i in range(len(self.f_rest_primvars)):
-                        coeff_data = track_specular_channel_major[:, i]
-                        self.f_rest_primvars[i].Set(Vt.FloatArray.FromNumpy(coeff_data))
-
-    def write_animated_attributes(
-        self,
-        attributes: GaussianAttributes,
-        gaussian_indices: torch.Tensor,
-        time_code: float,
-        animate_positions: bool,
-        animate_rotations: bool,
-        animate_scales: bool,
-        animate_albedo: bool,
-    ) -> None:
-        points_prim: UsdGeom.Points = unpack_optional(self.points_prim, msg="create_prim must be called first")
-        display_color_primvar: UsdGeom.Primvar = unpack_optional(
-            self.display_color_primvar, msg="create_prim must be called first"
-        )
-        # Filter attributes by gaussian_indices
-        np_indices = gaussian_indices.cpu().numpy()
-        positions_data = attributes.positions[np_indices]
-        rotations_data = attributes.rotations[np_indices]
-        scales_data = attributes.scales[np_indices]
-        if animate_positions:
-            points_prim.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(positions_data), time_code)
-        if animate_scales:
-            for i in range(3):
-                self.scale_primvars[i].Set(Vt.FloatArray.FromNumpy(scales_data[:, i]), time_code)
-        if animate_rotations:
-            for i in range(4):
-                self.rot_primvars[i].Set(Vt.FloatArray.FromNumpy(rotations_data[:, i]), time_code)
-        if self.capabilities.has_spherical_harmonics and animate_albedo and attributes.albedo_coefficients is not None:
-            albedo = attributes.albedo_coefficients[np_indices]
-            for i in range(3):
-                self._set_nearest_appearance_time_sample(
-                    f"f_dc_{i}",
-                    self.f_dc_primvars[i],
-                    Vt.FloatArray.FromNumpy(albedo[:, i]),
-                    time_code,
-                )
-            # Apply SH decode only if radiance_sph_O0 is False (coefficients need C0*x+0.5 transform)
-            if self.capabilities.radiance_sph_O0:
-                display_colors = np.maximum(0.0, albedo)
-            else:
-                display_colors = np.maximum(0.0, albedo * SH_C0_COEFFICIENT + DEFAULT_GAUSSIAN_COLOR)
-            self._set_nearest_appearance_time_sample(
-                "display_color",
-                display_color_primvar,
-                Vt.Vec3fArray.FromNumpy(display_colors.astype(np.float32)),
-                time_code,
-            )
-
-    def write_first_frame_attributes(
-        self,
-        attributes: GaussianAttributes,
-        gaussian_indices: torch.Tensor,
-    ) -> None:
-        points_prim: UsdGeom.Points = unpack_optional(self.points_prim, msg="create_prim must be called first")
-        display_color_primvar: UsdGeom.Primvar = unpack_optional(
-            self.display_color_primvar, msg="create_prim must be called first"
-        )
-        np_indices = gaussian_indices.cpu().numpy()
-        num_gaussians = len(np_indices)
-        # Filter attributes by gaussian_indices
-        positions_data = attributes.positions[np_indices]
-        rotations_data = attributes.rotations[np_indices]
-        scales_data = attributes.scales[np_indices]
-        points_prim.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(positions_data))
-        for i in range(3):
-            self.scale_primvars[i].Set(Vt.FloatArray.FromNumpy(scales_data[:, i]))
-        for i in range(4):
-            self.rot_primvars[i].Set(Vt.FloatArray.FromNumpy(rotations_data[:, i]))
-        if self.capabilities.has_spherical_harmonics and attributes.albedo_coefficients is not None:
-            albedo = attributes.albedo_coefficients[np_indices]
-            for i in range(3):
-                self.f_dc_primvars[i].Set(Vt.FloatArray.FromNumpy(albedo[:, i]))
-            # Apply SH decode only if radiance_sph_O0 is False (coefficients need C0*x+0.5 transform)
-            if self.capabilities.radiance_sph_O0:
-                display_colors = np.maximum(0.0, albedo)
-            else:
-                display_colors = np.maximum(0.0, albedo * SH_C0_COEFFICIENT + DEFAULT_GAUSSIAN_COLOR)
-            display_color_primvar.Set(Vt.Vec3fArray.FromNumpy(display_colors.astype(np.float32)))
-        else:
-            default_colors = np.full((num_gaussians, 3), DEFAULT_GAUSSIAN_COLOR, dtype=np.float32)
-            display_color_primvar.Set(Vt.Vec3fArray.FromNumpy(default_colors))
-
-    def finalize(self, all_positions: List[np.ndarray]) -> None:
-        points_prim: UsdGeom.Points = unpack_optional(self.points_prim, msg="create_prim must be called first")
-        if all_positions:
-            all_positions_combined = np.vstack(all_positions)
-            min_bounds = np.min(all_positions_combined, axis=0)
-            max_bounds = np.max(all_positions_combined, axis=0)
-            extent_range = Vt.Vec3fArray(
-                [
-                    Gf.Vec3f(float(min_bounds[0]), float(min_bounds[1]), float(min_bounds[2])),
-                    Gf.Vec3f(float(max_bounds[0]), float(max_bounds[1]), float(max_bounds[2])),
-                ]
-            )
-            points_prim.GetExtentAttr().Set(extent_range)
-
-    def set_documentation(self, doc: str) -> None:
-        prim: Usd.Prim = unpack_optional(self.prim, msg="create_prim must be called first")
-        prim.SetDocumentation(doc)
 
 
 # =============================================================================
@@ -630,6 +347,7 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
         self.opacities_attr: Optional[Usd.Attribute] = None
         self.sh_coeffs_attr: Optional[Usd.Attribute] = None
         self.sh_degree_attr: Optional[Usd.Attribute] = None
+        self.lidar_extra_signal_primvar: Optional[UsdGeom.Primvar] = None
         self._transform_op: Optional[UsdGeom.XformOp] = None
         self._schema: Optional[UsdVol.ParticleField3DGaussianSplat] = None
         self.projection_mode_hint = projection_mode_hint
@@ -643,6 +361,7 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
         track_transforms: Optional[Dict[float, Gf.Matrix4d]] = None,
     ) -> Usd.Prim:
         self._reset_animated_state()
+        self.lidar_extra_signal_primvar = None
         cleaned_track_id = DataSourceSummary._clean_track_id_str(self.track_id)
         safe_track_id = sanitize_usd_path(cleaned_track_id)
         track_path = f"{self.content_root_path}/track_{self.track_index:05d}_{safe_track_id}"
@@ -673,7 +392,7 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
         self._create_and_bind_material()
         self._create_attributes()
         self._set_rendering_hints()
-        self.apply_color_space_to_prim(self.prim)
+        self.apply_color_space_to_sh_attributes(self.prim)
         return self.prim
 
     def write_track_transform(self, time_code: float, transform: Gf.Matrix4d) -> None:
@@ -807,7 +526,7 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
         """Set rendering hints (same names/types as ParticleField3DGaussianSplat).
 
         projectionModeHint: 'perspective' or 'tangential'
-        sortingModeHint: 'zDepth' or 'cameraDistance'
+        sortingModeHint: 'zDepth', 'cameraDistance' or 'rayDistance'
         For ellipsoid we use the schema; for surflet we create attributes on the prim so
         downstream can read them the same way.
         """
@@ -839,6 +558,12 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
         opacities_attr: Usd.Attribute = unpack_optional(self.opacities_attr, msg="create_prim must be called first")
         np_indices = gaussian_indices.cpu().numpy()
         num_gaussians = len(np_indices)
+
+        primvars_api = UsdGeom.PrimvarsAPI(self.prim)
+        if attributes.lidar_intensity is not None or attributes.lidar_raydrop_logits is not None:
+            self.lidar_extra_signal_primvar = primvars_api.CreatePrimvar(
+                "lidarExtraSignals", Sdf.ValueTypeNames.Float3Array, UsdGeom.Tokens.vertex
+            )
         # Filter densities by gaussian_indices
         densities_filtered = attributes.densities[np_indices]
         densities_clamped = np.clip(densities_filtered, 0.0, 1.0).flatten()
@@ -878,6 +603,23 @@ class GaussianLightFieldWriter(GaussianUSDWriter):
                 else:
                     self.sh_coeffs_attr.Set(Vt.Vec3fArray.FromNumpy(all_coeffs_flat.astype(np.float32)))
                 self.sh_coeffs_attr.SetMetadata("elementSize", num_sh_coeffs)
+
+        # Packed as [intensity, raydrop_logit_0, raydrop_logit_1].
+        if self.lidar_extra_signal_primvar is not None:
+            lidar_extra_signal = np.zeros((num_gaussians, 3), dtype=np.float32)
+            if attributes.lidar_intensity is not None:
+                intensity = np.asarray(attributes.lidar_intensity, dtype=np.float32)
+                lidar_extra_signal[:, 0] = intensity.reshape(-1)[np_indices]
+            if attributes.lidar_raydrop_logits is not None:
+                raydrop_logits = np.asarray(attributes.lidar_raydrop_logits, dtype=np.float32)
+                raydrop_logits = raydrop_logits.reshape(raydrop_logits.shape[0], -1)
+                if raydrop_logits.shape[1] > 2:
+                    raise ValueError(
+                        "Lidar raydrop logits must have at most 2 channels for the float3 primvar, "
+                        f"got {raydrop_logits.shape}"
+                    )
+                lidar_extra_signal[:, 1 : 1 + raydrop_logits.shape[1]] = raydrop_logits[np_indices]
+            self.lidar_extra_signal_primvar.Set(Vt.Vec3fArray.FromNumpy(lidar_extra_signal))
 
     def _prepare_scales_for_export(self, scales_data: np.ndarray) -> np.ndarray:
         """Prepare scales for export, handling surflet kernel (z-component ignored).
@@ -1044,7 +786,7 @@ def create_gaussian_writer(
         track_index: Track ordering index
         node_layer_name: Optional node layer name
         content_root_path: Root path for content
-        sorting_mode_hint: LightField sorting hint ("zDepth" or "cameraDistance", per UsdVol schema)
+        sorting_mode_hint: LightField sorting hint ("zDepth", "cameraDistance" or "rayDistance")
         half_precision: Use half for both geometry and features (backward compat)
         half_geometry: Half for positions/orientations/scales (overrides half_precision for geometry)
         half_features: Half for opacities and SH (overrides half_precision for features)
@@ -1057,18 +799,7 @@ def create_gaussian_writer(
     Raises:
         ValueError: If schema_type is not recognized
     """
-    if schema_type == GaussianUSDSchemaType.GEOM_POINTS:
-        return GaussianGeomPointsWriter(
-            stage=stage,
-            capabilities=capabilities,
-            track_id=track_id,
-            track_index=track_index,
-            node_layer_name=node_layer_name,
-            content_root_path=content_root_path,
-            linear_srgb=linear_srgb,
-            has_post_processing=has_post_processing,
-        )
-    elif schema_type == GaussianUSDSchemaType.LIGHT_FIELD:
+    if schema_type == GaussianUSDSchemaType.LIGHT_FIELD:
         return GaussianLightFieldWriter(
             stage=stage,
             capabilities=capabilities,

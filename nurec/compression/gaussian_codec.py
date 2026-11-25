@@ -40,9 +40,10 @@ class _Level(typing.NamedTuple):
 
 
 # Bump this when key names, sidecars, SH layout, or quantizers change.
-# unpack rejects any other value.
 _FORMAT_KEY = "compact_format"
 FORMAT_VALUE = "nurec.gaussians.compact/v1"
+# The package rename left the v1 layout unchanged.
+_ACCEPTED_FORMAT_VALUES = frozenset({FORMAT_VALUE, "nre.gaussians.compact/v1"})
 
 _METADATA_SKIPPED_TENSORS = "_skipped_tensors"
 _METADATA_NON_TENSOR_STATE = "_non_tensor_state"
@@ -135,6 +136,7 @@ _PER_GAUSSIAN_TENSOR_NAMES = (
     | _DROPPED_SIGNAL_TENSOR_NAMES
     | {
         "gaussian_cuboid_ids",
+        "deformation_table.global_row_ids",
     }
 )
 
@@ -237,10 +239,8 @@ def unpack(
             if reconstructed keys collide.
     """
     got = metadata.get(_FORMAT_KEY)
-    if got != FORMAT_VALUE:
-        raise ValueError(
-            f"unsupported compact format: {got!r}, expected {FORMAT_VALUE!r}",
-        )
+    if got not in _ACCEPTED_FORMAT_VALUES:
+        raise ValueError(f"unsupported compact format: {got!r}")
 
     tensors = dict(tensors)
 
@@ -288,16 +288,11 @@ def _pack(
     if not 0.0 <= opacity_threshold < 1.0:
         raise ValueError(f"opacity_threshold must be in [0, 1), got {opacity_threshold}")
 
+    _validate_deformation_tables(state_dict)
     tensors, skipped_tensors, non_tensor_state = _strip_state_dict(
         state_dict,
         preserve_extra_signal_tensors=preserve_extra_signal_tensors,
     )
-    table_keys = sorted(key for key in (*tensors, *skipped_tensors, *non_tensor_state) if ".deformation_table." in key)
-    if table_keys:
-        raise ValueError(
-            "compact Gaussian export does not support interpolated deformation tables; "
-            f"found table state such as {table_keys[0]!r}"
-        )
     _validate_layer_contract(tensors, skipped_tensors)
     kept_bytes = sum(t.nbytes for t in tensors.values())
 
@@ -524,6 +519,9 @@ def _validate_layer_contract(
                 if not key.startswith(dotted) or tensor.ndim < 1 or tensor.shape[0] != n:
                     continue
                 leaf = key.removeprefix(dotted)
+                # Object counts can coincide with Gaussian counts.
+                if leaf == "aabb_extent":
+                    continue
                 if "." not in leaf and leaf not in _PER_GAUSSIAN_TENSOR_NAMES:
                     raise ValueError(
                         f"{key!r} looks row-aligned with {pos_key!r}; add it to the per-Gaussian tensor set"
@@ -531,6 +529,82 @@ def _validate_layer_contract(
 
         if saw_known_key and pos_shape is None:
             raise ValueError(f"malformed input: {prefix!r} has layer tensors but no {pos_key!r}")
+
+
+def _validate_deformation_tables(state_dict: dict[str, typing.Any]) -> None:
+    """Check frame-major table topology before changing Gaussian rows."""
+    prefixes = {key.split(".deformation_table.")[0] for key in state_dict if ".deformation_table." in key}
+    for prefix in prefixes:
+        table = prefix + ".deformation_table."
+        positions = state_dict.get(prefix + ".positions")
+        if prefix.removeprefix(_MODEL_PREFIX) not in _LAYER_PREFIXES or not isinstance(positions, torch.Tensor):
+            raise ValueError(f"{table}: missing supported Gaussian layer")
+        n = len(positions)
+        names = ("global_row_ids", "storage.row_start_columns", "storage.row_end_columns", "storage.row_group_ids")
+        vectors = []
+        for name in names:
+            value = state_dict.get(table + name)
+            if not isinstance(value, torch.Tensor) or value.dtype != torch.int64 or value.shape != (n,):
+                raise ValueError(f"{table + name}: expected {n} int64 rows")
+            vectors.append(value)
+        ids, starts, ends, groups = vectors
+        if not torch.equal(ids.sort().values, torch.arange(n, device=ids.device)):
+            raise ValueError(f"{table}: global_row_ids must be a permutation of Gaussian rows")
+        cuboid_ids = state_dict.get(prefix + ".gaussian_cuboid_ids")
+        if not isinstance(cuboid_ids, torch.Tensor) or not torch.equal(groups[ids], cuboid_ids):
+            raise ValueError(f"{table}: row groups do not match Gaussian actor IDs")
+        if bool(((starts < 0) | (ends < starts) | (groups < 0)).any()):
+            raise ValueError(f"{table}: invalid row lifetimes or actor IDs")
+
+        # Difference counts avoid scanning every stable row for each column.
+        counts = torch.bincount(starts, minlength=int(ends.max()) + 2 if n else 1)
+        counts -= torch.bincount(ends + 1, minlength=len(counts))
+        counts = counts.cumsum(0)
+        expected = {table + name for name in names}
+        for column, count in enumerate(counts.tolist()):
+            if not count:
+                continue
+            key = f"{table}storage.columns.{column}.values"
+            values = state_dict.get(key)
+            if (
+                not isinstance(values, torch.Tensor)
+                or values.shape != (count, 7)
+                or values.dtype not in (torch.float16, torch.float32)
+            ):
+                raise ValueError(f"{key}: expected {count} rows of seven floating-point offsets")
+            expected.add(key)
+        actual = {key for key in state_dict if key.startswith(table)}
+        if actual != expected:
+            raise ValueError(f"{table}: unsupported table state: {sorted(actual - expected)}")
+
+
+def _cull_deformation_table(tensors: dict[str, torch.Tensor], prefix: str, keep: torch.Tensor) -> None:
+    """Filter stable storage rows without changing surviving motion values."""
+    table = prefix + ".deformation_table."
+    id_key = table + "global_row_ids"
+    if id_key not in tensors:
+        return
+    ids = tensors[id_key]
+    stable_keep = torch.empty_like(keep)
+    stable_keep[ids] = keep
+    starts = tensors[table + "storage.row_start_columns"]
+    ends = tensors[table + "storage.row_end_columns"]
+    columns = table + "storage.columns."
+    for key in list(tensors):
+        if not key.startswith(columns):
+            continue
+        column = int(key.removeprefix(columns).split(".")[0])
+        active = (starts <= column) & (column <= ends)
+        values = tensors[key][stable_keep[active]]
+        if len(values):
+            tensors[key] = values
+        else:
+            del tensors[key]
+    for name in ("row_start_columns", "row_end_columns", "row_group_ids"):
+        key = table + "storage." + name
+        tensors[key] = tensors[key][stable_keep]
+    # Gaussian-row filtering and Morton sorting below also permute this map.
+    tensors[id_key] = (stable_keep.long().cumsum(0) - 1)[ids]
 
 
 def _state_shape(
@@ -594,12 +668,14 @@ def _cull_opacity(
     if n_after == n_before:
         return 0
 
+    _cull_deformation_table(tensors, prefix, keep)
     for key in _per_gaussian_tensor_keys(tensors, prefix, n_before):
         tensors[key] = tensors[key][keep]
 
-    # Skipped tensors with the layer row count are assumed Gaussian-row-aligned.
+    # Only Gaussian-row tensors follow the opacity mask, not per-track metadata.
     for key, (shape, _) in skipped_tensors.items():
-        if key.startswith(prefix + ".") and shape and shape[0] == n_before:
+        name = key.removeprefix(prefix + ".")
+        if (name in _PER_GAUSSIAN_TENSOR_NAMES or name in _SKIP_PATTERNS) and shape and shape[0] == n_before:
             shape[0] = n_after
 
     culled = n_before - n_after
@@ -686,14 +762,13 @@ def _drop_empty_layer(
     skipped_tensors: dict[str, list],
     prefix: str,
 ) -> None:
-    """Stash a fully culled layer so codecs never see zero rows."""
+    """Stash empty Gaussian tensors while preserving per-track state."""
     positions = tensors.get(f"{prefix}.positions")
     if positions is None or positions.shape[0] > 0:
         return
 
-    dotted = prefix + "."
     moved = 0
-    for key in [k for k in tensors if k.startswith(dotted)]:
+    for key in _per_gaussian_tensor_keys(tensors, prefix, 0):
         t = tensors.pop(key)
         skipped_tensors[key] = [list(t.shape), _dtype_str(t.dtype)]
         moved += 1

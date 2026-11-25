@@ -1,13 +1,61 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for the PerSensor resolver helpers (base_schema)."""
 
+from typing import Any
+
 import pytest
 
 from omegaconf import OmegaConf
+from pydantic import BaseModel, ValidationError
 
-from nurec.config.base_schema import resolve_per_sensor, validate_per_sensor_coverage
+from nurec.config.base_schema import BaseConfigSchema, resolve_per_sensor, validate_per_sensor_coverage
+
+
+def test_schema_defaults_preserve_untyped_omegaconf_children():
+    class Child(BaseConfigSchema):
+        enabled: bool = True
+        options: Any
+
+    class Parent(BaseConfigSchema):
+        child: Child
+        missing_default: int = 7
+
+    value = OmegaConf.create({"child": {"options": {"name": "example", "weights": [1, 2]}}})
+    OmegaConf.set_readonly(value, True)
+    result = Parent.model_validate(value)
+    assert result.missing_default == 7
+    assert result.child.enabled is True
+    assert result.child.options is value.child.options
+    assert result.child.options.name == "example"
+    assert OmegaConf.is_readonly(value)
+
+
+@pytest.mark.parametrize("unresolved", ["???", "${missing.path}"])
+def test_schema_ignores_unresolved_extra_fields(unresolved):
+    class Config(BaseConfigSchema):
+        enabled: bool = True
+
+    value = OmegaConf.create({"unused": unresolved})
+    OmegaConf.set_readonly(value, True)
+    assert Config.model_validate(value).enabled
+    assert OmegaConf.is_readonly(value)
+
+
+def test_schema_missing_required_field_preserves_pydantic_validation():
+    class Legacy(BaseModel):
+        count: int
+
+    class Config(BaseConfigSchema):
+        count: int
+
+    value = OmegaConf.create({"count": "???"})
+    with pytest.raises(ValidationError) as legacy:
+        Legacy.model_validate(value)
+    with pytest.raises(ValidationError) as optimized:
+        Config.model_validate(value)
+    assert optimized.value.errors() == legacy.value.errors()
 
 
 def test_resolve_scalar_broadcasts():

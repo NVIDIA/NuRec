@@ -6,6 +6,8 @@
 # Supply dataset.path and out_dir at runtime.
 defaults:
   - /apps/prod/Hyperion-8.1/car2sim_lidarfree
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_4
+  - override /image_resolution/camera@_global_.dataset.n_val_image_resolution: relative_4
   - override /logger: tensorboard
   - _self_
 
@@ -22,14 +24,9 @@ dataset:
     - camera_cross_left_120fov
     - camera_cross_right_120fov
     - camera_front_tele_30fov
-  samplers:
-    batch_sampler:
-      camera_pixel_sampler:
-        subsample: 4
   cuboid_tracks_params:
     track_label_sources: [AUTOLABEL]
   val_camera_ids: [camera_front_wide_120fov]
-  n_val_image_subsample: 4
 
 trainer:
   max_epochs: 1

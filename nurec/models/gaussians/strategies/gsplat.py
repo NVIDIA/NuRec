@@ -1,30 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+import copy
 import logging
 
 from collections.abc import Callable
+from typing import Any, cast
 
 import torch
 
+from gsplat.scene import Scene
+from gsplat.strategy import DefaultStrategy
 from torch import nn
 from tqdm import tqdm
 
 from nurec.config.model import DensifyConfig, GsplatStrategyConfig, PruneConfig
-from nurec.libs.slang_gaussians.interface import gsplat_strategy as gsplat_slang_strategy  # type: ignore
+from nurec.models.base import BaseModel
 from nurec.models.gaussians.gaussians_model import BaseGaussianModel
 from nurec.models.gaussians.strategies.base import BaseGaussianStrategy
 from nurec.models.nn_extensions import TypedModuleDict
 from nurec.utils.batch import DataAndRenderingBatch, RenderingData
 from nurec.utils.cuda_rng import get_cuda_generator
-from nurec.utils.geometry import quat_to_so3_matrix
 from nurec.utils.trainer import TrainerConfig, adjust_step_for_world_size
 
 
 log = logging.getLogger(__name__)
 
 
-_TopologyMutation = tuple[DensifyConfig | PruneConfig, Callable[[str, BaseGaussianModel], None]]
+_TopologyMutation = tuple[DensifyConfig | PruneConfig, Callable[[str, BaseGaussianModel, int], None]]
+
+
+class _LayerScene(Scene[object]):
+    """Identify an NRE layer; row metadata is carried by the parameter bridge."""
+
+    def put(self, name: str, component: object) -> None:
+        raise NotImplementedError("NRE owns layer components")
+
+    def get(self, component: str) -> object:
+        raise KeyError(component)
 
 
 class GSplatStrategy(BaseGaussianStrategy):
@@ -32,6 +47,10 @@ class GSplatStrategy(BaseGaussianStrategy):
     Implementation of the strategy for densifying and pruning proposed in the 3D Gaussian Splatting paper.
 
     See: https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/
+
+    Shared gsplat operations own selection and row updates; NRE owns schedules
+    and publication. Growth uses strict > gradient
+    thresholds and requires an opacity reset cap strictly between 0 and 1.
 
     Note that we leverage the positions gradients in 3D instead of the view-space position gradients.
     We therefore rescale the gradient by the distance to the camera as described in the 3D Gaussian Ray Tracing paper.
@@ -81,6 +100,24 @@ class GSplatStrategy(BaseGaussianStrategy):
             self.densify_grad_norm_denom[layer_id] = nn.UninitializedParameter(requires_grad=False)
 
         self.config = self.config.model_copy(deep=True)
+        densify = self.config.densify
+        self._gsplat_default = DefaultStrategy(
+            gradient_mode="3d",
+            exclude_layer_ids=tuple(self.config.exclude_layer_ids),
+            clone_grad_threshold=densify.clone_grad_threshold if densify else None,
+            split_grad_threshold=densify.split_grad_threshold if densify else None,
+            split_n_gaussians=densify.split_n_gaussians if densify else 2,
+            grow_scale3d=densify.relative_size_threshold if densify else 0.01,
+            prune_nan_opacity=True,
+            prune_opa=self.config.prune.density_threshold if self.config.prune else 0.01,
+            reset_opa_cap=self.config.reset_density.new_max_density if self.config.reset_density else None,
+            prune_scale3d=float("inf"),
+        )
+        for layer_id, model in gaussians_nodes.items():
+            if layer_id in self.config.exclude_layer_ids:
+                continue
+            if model.config.density_activation != "sigmoid" or model.config.scale_activation != "exp":
+                raise ValueError("GSplatStrategy requires sigmoid density and exponential scale activation")
         if self.config.densify is not None:
             self.config.densify.start_iteration = adjust_step_for_world_size(
                 trainer_config, self.config.densify.start_iteration
@@ -147,11 +184,11 @@ class GSplatStrategy(BaseGaussianStrategy):
         step: int,
     ) -> None:
         """
-        Hook that's called after the loss.backward and before the system.optimizer.step:
+        Called at training batch end, after backward and the optimizer step:
             - enables us to tap into `gaussian_model.positions.grad`
             - we need the current batch to determine the distance from the camera to the Gaussians that are hit
 
-        Uses GPU-accelerated Slang kernel for efficient gradient accumulation.
+        Accumulate distance-scaled 3D gradients through the public gsplat API.
         """
         # rays is shaped (b == 1, rows, cols, 6)
         rays_ori = rendering_data.rays.squeeze(0).reshape(-1, 6)[:, :3]
@@ -159,14 +196,17 @@ class GSplatStrategy(BaseGaussianStrategy):
         params_grad = positions_param.grad
         assert params_grad is not None
 
-        # Use Slang kernel for GPU-accelerated gradient buffer update
-        # Note: we pass the first ray origin assuming all rays in a batch come from a similar origin
-        gsplat_slang_strategy.update_gradient_buffers(
+        from gsplat.strategy import update
+
+        # Rebind views each time: publication and checkpoint loads replace buffers.
+        update(
+            self._gsplat_default,
+            params={"means": cast(nn.Parameter, positions_param)},
+            state=self._gsplat_state(layer_id),
+            scene=_LayerScene(layer_id),
+            position_gradients=params_grad,
             positions=positions,
-            params_grad=params_grad,
-            ray_origin=rays_ori[0],
-            grad_norm_accum=self.densify_grad_norm_accum[layer_id],
-            grad_norm_denom=self.densify_grad_norm_denom[layer_id],
+            reference_origin=rays_ori[0],
         )
 
     def _update_step_train_batch_end_impl(
@@ -179,11 +219,7 @@ class GSplatStrategy(BaseGaussianStrategy):
         **kwargs,
     ) -> None:
         """Here we perform all the Gaussians-specific updates"""
-        assert self.config.densify is not None
-        assert self.config.prune is not None
-        assert self.config.reset_density is not None
-
-        do_densify = global_step < self.config.densify.end_iteration
+        do_densify = self.config.densify is not None and global_step < self.config.densify.end_iteration
         if do_densify:
             assert batch.rendering is not None
 
@@ -198,12 +234,13 @@ class GSplatStrategy(BaseGaussianStrategy):
             offset = 0
 
         for layer_id, gaussian_model in gaussians_nodes.items():
+            gaussian_model.raise_if_publication_failed()
             if do_densify:
                 count = gaussian_model.get_num_gaussians()
                 current_offset = offset
                 offset += count
 
-            if layer_id in self.config.exclude_layer_ids:
+            if self._layer_is_excluded(layer_id):
                 continue
 
             # Update the gradient buffers
@@ -218,10 +255,10 @@ class GSplatStrategy(BaseGaussianStrategy):
 
             for config, operation in self._topology_mutation_ops():
                 if self._is_topology_mutation_due(global_step, config):
-                    operation(layer_id, gaussian_model)
+                    operation(layer_id, gaussian_model, global_step)
 
             # Reset the Gaussian density
-            if self._check_step_condition(
+            if self.config.reset_density is not None and self._check_step_condition(
                 step=global_step,
                 start=self.config.reset_density.start_iteration,
                 end=self.config.reset_density.end_iteration,
@@ -230,207 +267,174 @@ class GSplatStrategy(BaseGaussianStrategy):
                 self.reset_density(layer_id, gaussian_model)
                 self.last_reset_epoch = epoch
 
+    def _layer_is_excluded(self, layer_id: str) -> bool:
+        return layer_id in self.config.exclude_layer_ids
+
+    def _gsplat_state(self, layer_id: str, scene_scale: float = 1.0, *, stage: bool = False) -> dict[str, Any]:
+        state = self._gsplat_default.initialize_state(scene_scale=scene_scale)
+        for key, buffers in (("grad2d", self.densify_grad_norm_accum), ("count", self.densify_grad_norm_denom)):
+            old = buffers[layer_id]
+            if not isinstance(old, nn.UninitializedParameter):
+                value = old.view(-1)
+                state[key] = value.clone() if stage else value
+        return state
+
+    def _publish_gsplat_history(self, layer_id: str, state: dict[str, Any]) -> None:
+        for key, buffers in (("grad2d", self.densify_grad_norm_accum), ("count", self.densify_grad_norm_denom)):
+            value = state[key]
+            if value is not None:
+                old = buffers[layer_id]
+                replacement = nn.Parameter(value.reshape(-1, 1), requires_grad=False)
+                if BaseModel.is_sharded(old):
+                    BaseModel.mark_as_sharded(replacement)
+                buffers[layer_id] = replacement
+
+    def _run_gsplat_operation(
+        self,
+        model: BaseGaussianModel,
+        operation: Callable[[dict[str, nn.Parameter], dict[str, torch.optim.Optimizer]], object],
+        names: list[str] | None = None,
+        *,
+        history: tuple[str, dict[str, Any]] | None = None,
+    ) -> object:
+        """Stage per-field optimizer views, then install through NRE's existing updater.
+
+        Views isolate gsplat's one-group-per-field convention from NRE's grouped
+        optimizers. Tensor values are shared read-only; replacement state dicts and
+        parameter groups are private until the operation succeeds.
+        """
+        model.raise_if_publication_failed()
+        aliases = {"positions": "means", "rotations": "quats", "densities": "opacities"}
+        params: dict[str, nn.Parameter] = {}
+        optimizers: dict[str, torch.optim.Optimizer] = {}
+        for entry in model.optimizers:
+            optimizer = entry["optimizer"]
+            for group in optimizer.param_groups:
+                if "name" not in group:
+                    continue
+                name = group["name"].split(".")[-1]
+                if names is not None and name not in names:
+                    continue
+                alias = aliases.get(name, name)
+                if len(group["params"]) != 1 or alias in params:
+                    raise ValueError("gsplat integration requires one unique parameter per named group")
+                parameter = group["params"][0]
+                params[alias] = parameter
+                view = copy.copy(optimizer)
+                view.param_groups = [dict(group)]
+                view.state = copy.copy(optimizer.state)
+                # Adapt only row-shaped state and Adam's step to the gsplat ops
+                # layout. Other scalar/non-tensor bookkeeping stays untouched.
+                view.state[parameter] = {
+                    key: value
+                    for key, value in optimizer.state.get(parameter, {}).items()
+                    if key == "step" or (isinstance(value, torch.Tensor) and value.ndim > 0)
+                }
+                optimizers[alias] = view
+        for name, buffer in model.get_additional_buffers().items():
+            if names is None or name in names:
+                alias = aliases.get(name, name)
+                if alias in params:
+                    raise ValueError(f"buffer duplicates optimizer parameter {name}")
+                params[alias] = nn.Parameter(buffer, requires_grad=False)
+
+        if names is None:
+            missing = {"means", "quats", "scales", "opacities"} - params.keys()
+            if missing:
+                raise ValueError(f"gsplat bridge requires named geometry parameters or row buffers: {sorted(missing)}")
+        count = model.get_num_gaussians()
+        if any(parameter.ndim == 0 or parameter.shape[0] != count for parameter in params.values()):
+            raise ValueError("gsplat integration requires Gaussian-row-aligned parameters and buffers")
+
+        for optimizer in optimizers.values():
+            for key, value in optimizer.state[optimizer.param_groups[0]["params"][0]].items():
+                if key != "step" and value.shape[0] != count:
+                    raise ValueError("gsplat optimizer state must be Gaussian-row-aligned")
+        originals = dict(params)
+        result = operation(params, optimizers)
+
+        def update_param(name: str, old: torch.Tensor) -> torch.Tensor:
+            replacement = params[aliases.get(name, name)]
+            replacement.requires_grad_(old.requires_grad)
+            return replacement if isinstance(old, nn.Parameter) else replacement.detach()
+
+        def update_state(name: str, key: str, old: torch.Tensor) -> torch.Tensor:
+            alias = aliases.get(name, name)
+            return optimizers[alias].state[params[alias]][key]
+
+        try:
+            if any(params[name] is not old for name, old in originals.items()):
+                self._update_param_with_optimizer(model, update_param, update_state, names=names)
+                model._reinstall_grad_hooks()
+            if history is not None:
+                self._publish_gsplat_history(*history)
+        except Exception:
+            # Reuse the model guard already checked by composite checkpoints.
+            model.mark_publication_failed()
+            raise
+        return result
+
     def reset_density(self, layer_id: str, gaussian_model: BaseGaussianModel) -> None:
         """Periodically reset densities"""
         assert self.config.reset_density is not None
         tqdm.write(f"{layer_id}: Resetting densities")
+        strategy = self._gsplat_default
+        from gsplat.strategy import reset_opacity
 
-        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            assert name == "densities", "wrong paramaeter passed to update_param_fn"
-            assert self.config.reset_density is not None
-            densities = torch.clamp(
-                param,
-                max=gaussian_model.density_activation_inv(
-                    torch.tensor(self.config.reset_density.new_max_density)
-                ).item(),
-            )
-            return torch.nn.Parameter(densities)
+        self._run_gsplat_operation(
+            gaussian_model,
+            lambda params, optimizers: reset_opacity(strategy, params, optimizers, {}, scene=_LayerScene(layer_id)),
+            names=["densities"],
+        )
 
-        def update_optimizer_fn(name: str, key: str, v: torch.Tensor) -> torch.Tensor:
-            return torch.zeros_like(v)
-
-        # update the parameters and the state in the optimizers
-        self._update_param_with_optimizer(gaussian_model, update_param_fn, update_optimizer_fn, names=["densities"])
-
-    def densify_gaussians(self, layer_id: str, gaussian_model: BaseGaussianModel) -> None:
+    def densify_gaussians(self, layer_id: str, gaussian_model: BaseGaussianModel, step: int = 0) -> None:
         """Densify gaussians based on the gradient buffers: `densify_grad_norm_accum` and `densify_grad_norm_denom`"""
 
         assert gaussian_model.get_positions().requires_grad, (
             "Trying to perform split and clone but the positions are not being optimized"
         )
-        densify_grad_norm = self.densify_grad_norm_accum[layer_id] / self.densify_grad_norm_denom[layer_id]
-        densify_grad_norm[densify_grad_norm.isnan()] = 0.0
+        strategy = self._gsplat_default
+        from gsplat.strategy import densify
 
-        self.clone_gaussians(layer_id, gaussian_model, densify_grad_norm.squeeze(-1))
-        self.split_gaussians(layer_id, gaussian_model, densify_grad_norm.squeeze(-1))
-
-    def clone_gaussians(
-        self, layer_id: str, gaussian_model: BaseGaussianModel, densify_grad_norm: torch.Tensor
-    ) -> None:
-        """Cloning logic and calls densify postfix"""
-        assert self.config.densify is not None
-        assert densify_grad_norm is not None, "Positional gradients must be available in order to clone the Gaussians"
-
-        # Extract points that satisfy the gradient condition
-        mask = torch.where(densify_grad_norm >= self.config.densify.clone_grad_threshold, True, False)
-
-        # If the gaussians are larger they shouldn't be cloned, but rather split
-        mask = torch.logical_and(
-            mask,
-            torch.max(gaussian_model.get_scales(), dim=1).values
-            <= self.config.densify.relative_size_threshold * gaussian_model.scene_extent,
+        gaussian_model.validate_external_gaussian_topology_edit("gsplat densification")
+        state = self._gsplat_state(layer_id, gaussian_model.scene_extent, stage=True)
+        result = self._run_gsplat_operation(
+            gaussian_model,
+            lambda params, optimizers: densify(
+                strategy,
+                params,
+                optimizers,
+                state,
+                step,
+                scene=_LayerScene(layer_id),
+                generator=get_cuda_generator(gaussian_model.device) if gaussian_model.device.type == "cuda" else None,
+                reset_history=True,
+            ),
+            history=(layer_id, state),
         )
-
-        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            param_new = torch.cat([param, param[mask]])
-            return torch.nn.Parameter(param_new) if isinstance(param, torch.nn.Parameter) else param_new
-
-        def update_optimizer_fn(name: str, key: str, v: torch.Tensor) -> torch.Tensor:
-            return torch.cat([v, torch.zeros((int(mask.sum()), *v.shape[1:]), device=gaussian_model.device)])
-
-        self._update_param_with_optimizer(gaussian_model, update_param_fn, update_optimizer_fn)
-        self.reset_densification_buffers(layer_id, gaussian_model)
-
-        # stats
         if self.config.print_stats:
-            n_before = mask.shape[0]
-            n_clone = mask.sum()
-            tqdm.write(f"{layer_id}: Cloned {n_clone} / {n_before} ({n_clone / n_before * 100:.2f}%) gaussians")
+            tqdm.write(f"{layer_id}: gsplat densification: {result}")
 
-    def split_gaussians(
-        self, layer_id: str, gaussian_model: BaseGaussianModel, densify_grad_norm: torch.Tensor
-    ) -> None:
-        """Splitting logic and calls densify postfix"""
-        assert self.config.densify is not None
-        densify_config = self.config.densify
-        n_init_points = gaussian_model.get_positions().shape[0]
-
-        # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
-
-        # Here we already have the cloned points in the gaussian_model.positions so only take the points up to size of the initial grad
-        padded_grad[: densify_grad_norm.shape[0]] = densify_grad_norm.squeeze(-1)
-        mask = torch.where(padded_grad >= densify_config.split_grad_threshold, True, False)
-        mask = torch.logical_and(
-            mask,
-            torch.max(gaussian_model.get_scales(), dim=1).values
-            > densify_config.relative_size_threshold * gaussian_model.scene_extent,
-        )
-
-        stds = gaussian_model.get_scales()[mask].repeat(densify_config.split_n_gaussians, 1)
-        means = torch.zeros((stds.size(0), 3), device="cuda")
-        # Sample via the process-wide CUDA Generator (see `nurec/utils/cuda_rng.py`)
-        # so the densify hot path does not advance the CUDA default generator's
-        # Philox offset -- that advance is incompatible with `torch.cuda.graph(...)`
-        # capture. Compose as `randn(generator=) * std + mean` rather than
-        # `torch.normal(mean, std, generator=)`: the per-element-mean/std form
-        # of torch.normal is not stream-capture-safe in PyTorch 2.7.0+cu128
-        # (the version pinned by deps/python/requirements_3_11_x86_64.in:11)
-        # and raises "CUDA error: operation not permitted when stream is
-        # capturing" inside `torch.cuda.graph`. Reproducible directly via the
-        # call below with `mean` and `std` as same-shape tensors -- the
-        # internal cuda backend hits a path with a not-yet-stream-capturable
-        # op. The composition uses only `torch.randn`, which IS capture-clean
-        # (pinned by the contract test
-        # `cuda_rng_test::test_per_element_normal_via_randn_under_torch_cuda_graph`).
-        # If a future PyTorch upgrade fixes the upstream `torch.normal`
-        # behavior, this branch can revert to a direct `torch.normal` call.
-        samples = (
-            torch.randn(
-                stds.shape,
-                generator=get_cuda_generator(stds.device),
-                device=stds.device,
-                dtype=stds.dtype,
-            )
-            * stds
-            + means
-        )
-        rots = quat_to_so3_matrix(gaussian_model.rotations[mask]).repeat(densify_config.split_n_gaussians, 1, 1)
-        offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
-
-        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            repeats = [densify_config.split_n_gaussians] + [1] * (param.dim() - 1)
-            if name == "positions":
-                p_split = param[mask].repeat(repeats) + offsets  # [2N, 3]
-            elif name == "scales":
-                p_split = gaussian_model.scale_activation_inv(
-                    gaussian_model.scale_activation(param[mask].repeat(repeats))
-                    / (0.8 * densify_config.split_n_gaussians)
-                )
-            else:
-                p_split = param[mask].repeat(repeats)
-
-            p_new = torch.cat([param[~mask], p_split])
-            if isinstance(param, torch.nn.Parameter):
-                p_new = torch.nn.Parameter(p_new)
-            return p_new
-
-        def update_optimizer_fn(name: str, key: str, v: torch.Tensor) -> torch.Tensor:
-            v_split = torch.zeros(
-                (densify_config.split_n_gaussians * int(mask.sum()), *v.shape[1:]), device=gaussian_model.device
-            )
-            return torch.cat([v[~mask], v_split])
-
-        self._update_param_with_optimizer(gaussian_model, update_param_fn, update_optimizer_fn)
-
-        self.reset_densification_buffers(layer_id, gaussian_model)
-
-        if self.config.print_stats:
-            n_before = mask.shape[0]
-            n_split = mask.sum()
-            tqdm.write(f"{layer_id}: Splitted {n_split} / {n_before} ({n_split / n_before * 100:.2f}%) gaussians")
-
-    def prune_gaussians_opacity(self, layer_id: str, gaussian_model: BaseGaussianModel) -> None:
+    def prune_gaussians_opacity(self, layer_id: str, gaussian_model: BaseGaussianModel, step: int = 0) -> None:
         """Pruning based on opacity logic"""
         assert self.config.prune is not None
-        valid_mask = gaussian_model.get_densities().squeeze(-1) >= self.config.prune.density_threshold
+        strategy = self._gsplat_default
+        from gsplat.strategy import prune
 
+        gaussian_model.validate_external_gaussian_topology_edit("gsplat pruning")
+        state = self._gsplat_state(layer_id, gaussian_model.scene_extent, stage=True)
+        result = self._run_gsplat_operation(
+            gaussian_model,
+            lambda params, optimizers: prune(strategy, params, optimizers, state, step, scene=_LayerScene(layer_id)),
+            history=(layer_id, state),
+        )
         if self.config.print_stats:
-            n_before = valid_mask.shape[0]
-            n_prune = n_before - valid_mask.sum()
-            tqdm.write(f"{layer_id}: Density-pruned {n_prune} / {n_before} ({n_prune / n_before * 100:.2f}%) gaussians")
-
-        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            return torch.nn.Parameter(param[valid_mask]) if isinstance(param, torch.nn.Parameter) else param[valid_mask]
-
-        def update_optimizer_fn(name: str, key: str, v: torch.Tensor) -> torch.Tensor:
-            return v[valid_mask]
-
-        self._update_param_with_optimizer(gaussian_model, update_param_fn, update_optimizer_fn)
-        self.prune_densification_buffers(layer_id, valid_mask)
+            tqdm.write(f"{layer_id}: Pruned {result} gaussians")
 
     @torch.no_grad()
     def permute_gaussian_rows(self, orders: dict[str, torch.Tensor]) -> None:
         self._permute_layer_buffers(self.densify_grad_norm_accum, orders)
         self._permute_layer_buffers(self.densify_grad_norm_denom, orders)
-
-    def reset_densification_buffers(self, layer_id: str, gaussian_model: BaseGaussianModel) -> None:
-        self.densify_grad_norm_accum[layer_id] = nn.Parameter(
-            torch.zeros(
-                (gaussian_model.get_positions().shape[0], 1),
-                device=gaussian_model.device,
-                dtype=self.densify_grad_norm_accum[layer_id].dtype,
-            ),
-            requires_grad=False,
-        )
-
-        self.densify_grad_norm_denom[layer_id] = nn.Parameter(
-            torch.zeros(
-                (gaussian_model.get_positions().shape[0], 1),
-                device=gaussian_model.device,
-                dtype=self.densify_grad_norm_denom[layer_id].dtype,
-            ),
-            requires_grad=False,
-        )
-
-    def prune_densification_buffers(self, layer_id: str, valid_mask: torch.Tensor) -> None:
-        # Update non-optimizable buffers
-        self.densify_grad_norm_accum[layer_id] = nn.Parameter(
-            self.densify_grad_norm_accum[layer_id][valid_mask], requires_grad=False
-        )
-        self.densify_grad_norm_denom[layer_id] = nn.Parameter(
-            self.densify_grad_norm_denom[layer_id][valid_mask], requires_grad=False
-        )
 
 
 BaseGaussianStrategy.register_to_gaussian_strategy_factory("gsplat", GSplatStrategy)

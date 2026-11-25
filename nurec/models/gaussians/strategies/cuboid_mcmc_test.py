@@ -12,13 +12,23 @@ import torch
 
 from gsplat.strategy import MCMCOperation, perturb_positions, sample_mcmc_relocation
 
+from nurec.config.model import TamingGSMCMCStrategyConfig
 from nurec.models.base import BaseModel
 from nurec.models.gaussians.construction_barriers_model import ConstructionBarriersGaussianModel
 from nurec.models.gaussians.gaussians_model import BaseGaussianModel
-from nurec.models.gaussians.strategies.cuboid_mcmc import cuboid_topology, growth_allocations
-from nurec.models.gaussians.strategies.mcmc import MCMCStrategy
+from nurec.models.gaussians.strategies.cuboid_mcmc import (
+    _apply_and_publish,
+    _batched_topology_plan,
+    cuboid_topology,
+    growth_allocations,
+)
+from nurec.models.gaussians.strategies.mcmc import MCMCStrategy, TamingGSMCMCStrategy
 from nurec.models.gaussians.strategies.selected_gaussian_nodes import SelectedGaussianNodes
 from nurec.models.nn_extensions import TypedModuleDict
+
+
+# gsplat's stable relocation formula can differ slightly from NRE's binomial sum.
+_RELOCATION_RTOL = 1e-5
 
 
 def test_equal_growth_shares_respect_layer_budget():
@@ -53,6 +63,82 @@ def test_ineligible_cuboids_do_not_starve_live_growth_or_transfer_their_quota():
         growth_allocations(counts, 300, eligible=[True])
     with pytest.raises(ValueError, match="eligibility"):
         growth_allocations(counts, 300, eligible=[True, True, 1])
+
+
+@pytest.fixture
+def cuda():
+    """Provide CUDA relocation helpers with device placement and no-grad shared by tests."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from nurec.libs import cuboid_relocation
+
+    with torch.device("cuda"), torch.no_grad():
+        yield cuboid_relocation
+
+
+@pytest.mark.parametrize("counts", [[1], [1, 2, 1], [20, 31, 19], [256] * 120, [1, 257, 1027]])
+@pytest.mark.parametrize("operation", [MCMCOperation.RELOCATION, MCMCOperation.ADDITION])
+@pytest.mark.parametrize("mode", ["mixed", "all_dead", "one_live", "zero", "alive"])
+def test_cuda_topology_matches_cdf_oracle_and_rng(cuda, counts, mode, operation):
+    """Check shuffled plans, suppressed tracks, native corrections and repeatable batched RNG."""
+    count = sum(counts)
+    rng = torch.Generator(device="cuda").manual_seed(1997)
+    order = torch.cat([rows.sort().values for rows in torch.randperm(count, generator=rng).split(counts)])
+    opacities, scales = torch.rand(count, generator=rng), torch.rand(count, 3, generator=rng) + 0.1
+    dead = torch.arange(count) % 4 == 0 if mode == "mixed" else torch.full((count,), mode != "alive")
+    if mode in ("all_dead", "zero"):
+        opacities.fill_(0.001 if mode == "all_dead" else 0)
+    if mode in ("one_live", "zero"):
+        dead[torch.stack([rows[0] for rows in order.split(counts)])] = False
+    elif mode == "mixed":
+        dead[order[: sum(counts[:2])]] = True
+        opacities[order[counts[0] : sum(counts[:2])]] = 0
+    kwargs = dict(
+        binoms=torch.tensor(
+            [[math.comb(n, k) if k <= n else 0 for k in range(51)] for n in range(51)], dtype=torch.float32
+        ),
+        min_opacity=0.005,
+    )
+    inputs = (order, opacities, scales, dead)
+    before = tuple(value.clone() for value in inputs)
+    keep, tracks = torch.ones_like(dead), []
+    cap = max(counts) * len(counts) * 2
+    additions = growth_allocations(counts, cap, eligible=[bool((~dead[rows]).any()) for rows in order.split(counts)])
+    for rows, addition in zip(order.split(counts), additions):
+        targets, candidates = rows[dead[rows]], rows[~dead[rows]]
+        if operation == MCMCOperation.ADDITION:
+            targets = rows.new_empty(addition)
+        if targets.numel() and opacities[candidates].any():
+            tracks.append((targets, candidates))
+            if operation == MCMCOperation.RELOCATION:
+                keep[targets] = False
+    for seed in (0, 31, 1234) * 2:
+        rng.manual_seed(seed)
+        expected_rng = torch.Generator(device="cuda").manual_seed(seed)
+        draws = torch.rand(sum(len(targets) for targets, _ in tracks), dtype=torch.float64, generator=expected_rng)
+        actual = _batched_topology_plan(
+            order, counts, opacities, scales, dead, generator=rng, operation=operation, cap=cap, **kwargs
+        )
+        torch.testing.assert_close(inputs, before, rtol=0, atol=0)
+        assert torch.equal(rng.get_state(), expected_rng.get_state())
+        if not tracks:
+            assert actual is None
+            continue
+        assert actual is not None and torch.equal(actual.keep, keep)
+        references = []
+        for (targets, candidates), uniforms in zip(tracks, draws.split([len(rows) for rows, _ in tracks])):
+            cdf = opacities[candidates].double().cumsum(0)
+            with patch("torch.multinomial", return_value=torch.searchsorted(cdf, uniforms * cdf[-1], right=True)):
+                references.append(
+                    sample_mcmc_relocation(opacities, scales, len(targets), candidate_indices=candidates, **kwargs)
+                )
+        for value, field in zip(
+            (actual.source_indices, actual.revised_opacities, actual.revised_scales),
+            ("sampled_indices", "revised_opacities", "revised_scales"),
+        ):
+            rtol = _RELOCATION_RTOL if value.is_floating_point() else 0
+            expected = torch.cat([getattr(ref, field) for ref in references])
+            torch.testing.assert_close(value, expected, rtol=rtol, atol=0)
 
 
 def _rotation(angle, device):
@@ -143,9 +229,10 @@ def _topology_kwargs(model, visibility):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Native MCMC requires CUDA")
-def test_rotated_rejection_matches_native_rigid_rule_and_random_sequence():
+@pytest.mark.parametrize("count", [20, 1001])
+def test_rotated_rejection_matches_native_rigid_rule_and_random_sequence(count):
     """Expanded cuboid rejection matches rigid constraints without changing random draws."""
-    model = _Model([20] * 3)
+    model = _Model([count] * 3)
     centers, rotations, dimensions = _geometry(model)
     native_rule = inspect.unwrap(perturb_positions).__globals__["_constrain_mcmc_perturbation"]
     generator = torch.Generator(device=model.device).manual_seed(1234)
@@ -189,6 +276,48 @@ def test_rotated_rejection_matches_native_rigid_rule_and_random_sequence():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Native MCMC requires CUDA")
+@pytest.mark.parametrize("threshold", [None, 0, 100])
+@pytest.mark.parametrize("relocation", [False, True])
+def test_proxy_visibility_is_preserved_without_enabling_cuboid_death(threshold, relocation):
+    model = _Model([20] * 3)
+    with torch.no_grad():
+        model.densities.fill_(0.5)
+    visibility = torch.nn.ParameterDict(
+        {
+            "barriers": torch.nn.Parameter(
+                torch.full((60,), 101, device=model.device, dtype=torch.int32), requires_grad=False
+            )
+        }
+    )
+    selected = SelectedGaussianNodes(TypedModuleDict({"barriers": model}), [])
+    strategy = TamingGSMCMCStrategy.__new__(TamingGSMCMCStrategy)
+    torch.nn.Module.__init__(strategy)
+    strategy.config = TamingGSMCMCStrategyConfig.model_validate(
+        {
+            "name": "taminggs_mcmc",
+            "independent_layer_max_n_gaussians": {"barriers": 256000},
+            "opacity_threshold": 0.005,
+            "print_stats": False,
+            "relocate": {"max_invisible_steps": threshold},
+            "add": {"taminggs": {"visibility_weight": 5.0}},
+        }
+    )
+    strategy.invisible_steps = visibility
+    strategy.binoms = _topology_kwargs(model, visibility)["binoms"]
+    with torch.no_grad():
+        changed = strategy._cuboid_topology(selected, relocation=relocation)
+    expected_added = 3 if not relocation and threshold in (None, 0) else 0
+    assert changed == expected_added
+    assert model.get_num_gaussians() == 60 + expected_added
+    assert visibility["barriers"].shape == (60 + expected_added,)
+    if expected_added:
+        assert torch.all(visibility["barriers"][-expected_added:] == 0)
+        assert torch.any(visibility["barriers"][:60] == 101)
+    else:
+        assert torch.all(visibility["barriers"] == 101)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native MCMC requires CUDA")
 def test_track_local_topology_preserves_identity_optimizer_and_visibility_alignment():
     """Relocation and growth preserve each track and publish all row-aligned state together."""
     model = _Model([20] * 3)
@@ -210,7 +339,17 @@ def test_track_local_topology_preserves_identity_optimizer_and_visibility_alignm
     selected = SelectedGaussianNodes(TypedModuleDict({"barriers": model}), [])
     kwargs = _topology_kwargs(model, visibility)
     weak_densities = model.densities[model.barrier_object_id == 23].detach().clone()
-    assert cuboid_topology(selected, operation=MCMCOperation.RELOCATION, **kwargs) == 34
+    before = (model.densities.detach().sigmoid().flatten(), model.scales.detach().exp())
+    with patch("nurec.models.gaussians.strategies.cuboid_mcmc._apply_and_publish", wraps=_apply_and_publish) as publish:
+        assert cuboid_topology(selected, operation=MCMCOperation.RELOCATION, **kwargs) == 34
+    plan = publish.call_args.args[3]
+    for original, actual, revised in zip(
+        before,
+        (model.densities.sigmoid().flatten(), model.scales.exp()),
+        (plan.revised_opacities, plan.revised_scales),
+    ):
+        original[plan.source_indices] = revised
+        torch.testing.assert_close(actual, torch.cat((original[plan.keep], revised)))
     assert torch.unique(model.barrier_object_id, return_counts=True)[1].tolist() == [20] * 3
     torch.testing.assert_close(model.positions, _geometry(model)[0])
     assert torch.all(model.features[:, 0, 0] == model.barrier_object_id)
@@ -265,15 +404,8 @@ def test_topology_never_revives_cuboids_without_live_donors(operation, all_weak)
     selected = SelectedGaussianNodes(TypedModuleDict({"barriers": model}), [])
     kwargs = _topology_kwargs(model, visibility)
     rng_before = kwargs["generator"].get_state().clone()
-    with patch(
-        "nurec.models.gaussians.strategies.cuboid_mcmc.sample_mcmc_relocation", wraps=sample_mcmc_relocation
-    ) as sampler:
-        changed = cuboid_topology(selected, operation=operation, **kwargs)
+    changed = cuboid_topology(selected, operation=operation, **kwargs)
     assert changed == (0 if all_weak else (17 if operation == MCMCOperation.RELOCATION else 3))
-    assert sampler.call_count == (0 if all_weak else 1)
-    for call in sampler.call_args_list:
-        assert torch.all(call.kwargs["opacities"] >= kwargs["min_opacity"])
-        assert call.kwargs["opacities"].numel() == 3
     expected_counts = [20, 20, 23 if not all_weak and operation == MCMCOperation.ADDITION else 20]
     assert torch.unique(model.barrier_object_id, return_counts=True)[1].tolist() == expected_counts
     untouched = model.barrier_object_id != 101 if not all_weak else torch.ones_like(model.barrier_object_id).bool()
@@ -286,3 +418,95 @@ def test_topology_never_revives_cuboids_without_live_donors(operation, all_weak)
             assert torch.equal(optimizer.state[parameter][key][untouched], moment)
     if all_weak:
         assert torch.equal(kwargs["generator"].get_state(), rng_before)
+
+
+def test_cuda_sampling_distribution_chunks_and_rng(cuda):
+    """Cover unequal totals, zero weights, empty/chunked tracks and no-draw RNG."""
+    weights = torch.tensor([0, 1, 3, 0] + [0] * 1025 + [1, 0, 1e-30, 3e-30, 0])
+    rows, counts = torch.arange(weights.numel()), [4, 0, 1027, 3]
+    rng = torch.Generator(device="cuda").manual_seed(42)
+    state = rng.get_state()
+    assert cuda.sample_tracks(rows, weights, counts, [(0, 0)] * 4, rng).numel() == 0
+    assert torch.equal(rng.get_state(), state)
+    sources = cuda.sample_tracks(rows, weights, counts, [(200000, 1), (0, 0), (513, 1), (200000, 1)], rng)
+    first, chunked, last = sources.split([200000, 513, 200000])
+    assert (first < 4).all() and (chunked == 1029).all() and (last >= 1031).all()
+    assert (weights[sources] > 0).all()
+    # More than five standard deviations from the expected 25% frequency.
+    for sampled, first_positive in [(first, 1), (last, 1031)]:
+        assert abs((sampled == first_positive).float().mean().item() - 0.25) < 0.005
+
+
+def test_cuda_binding_endpoints_and_validation(cuda):
+    """Empty/invalid CDF inputs and rounded endpoints must not admit zero-weight donors."""
+    weights, offsets = torch.empty(0), torch.zeros(1, dtype=torch.int64)
+    cdf = weights.double()
+    cuda._cuda.track_cdf(weights, offsets, cdf)
+    with pytest.raises(RuntimeError, match="dtype"):
+        cuda._cuda.track_cdf(weights.double(), offsets, cdf)
+    with pytest.raises(RuntimeError, match="lengths"):
+        cuda._cuda.track_cdf(weights, offsets, torch.empty(1, dtype=torch.float64))
+    sources = torch.empty(2, dtype=torch.int64)
+    cuda._cuda.sample_tracks(
+        torch.arange(4),
+        torch.tensor([0.0, 1.0, 1.0, 1.0], dtype=torch.float64),
+        torch.tensor([0, 4]),
+        torch.tensor([0, 2]),
+        torch.tensor([0.0, 1.0], dtype=torch.float64),
+        sources,
+    )
+    assert (sources == 1).all()
+    # Malformed empty-track draws must not read the CDF or overwrite outputs.
+    cuda._cuda.sample_tracks(
+        torch.empty(0, dtype=torch.int64),
+        cdf,
+        torch.tensor([0, 0]),
+        torch.tensor([0, 2]),
+        torch.zeros(2, dtype=torch.float64),
+        sources,
+    )
+    assert (sources == 1).all()
+
+
+@pytest.mark.parametrize("ratio_cap", [1, 3, 51])
+@pytest.mark.parametrize("min_opacity", [0.005, 1e-36, 2.0**-23])
+def test_cuda_correction_strides_and_graph_replay(cuda, ratio_cap, min_opacity):
+    """Correction matches gsplat and captures without host readbacks on a side stream."""
+    from gsplat.relocation import compute_relocation
+
+    # Use a complete, strided permutation and repeated donors beyond the ratio cap.
+    order = torch.tensor([2, 9, 0, 9, 1, 9])[::2]
+    opacities = torch.tensor([0.0, 9, 0.5, 9, 1.0, 9])[::2]
+    scales = torch.arange(1, 19, dtype=torch.float32).reshape(3, 6)[:, ::2]
+    sources = torch.tensor([0] + [2] * ratio_cap)
+    dead = torch.tensor([False, True, False])
+    sorted_dead, group, metadata = cuda.prepare_tracks(order, [3], opacities, dead)
+    binoms = (
+        torch.tensor(
+            [[math.comb(n, k) if k <= n else 0 for k in range(ratio_cap)] for n in range(ratio_cap)],
+            dtype=torch.float32,
+        )
+        .T.contiguous()
+        .T
+    )
+    expected = compute_relocation(
+        opacities[sources],
+        scales[sources],
+        torch.tensor([2] + [ratio_cap] * ratio_cap),
+        binoms.contiguous(),
+        min_opacity,
+    )
+    args = (order, sorted_dead, group, metadata, sources, opacities, scales, binoms, min_opacity)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cuda.correct_relocation(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = cuda.correct_relocation(*args)
+    for _ in range(2):
+        graph.replay()
+        torch.testing.assert_close(actual[0], ~dead, rtol=0, atol=0)
+        torch.testing.assert_close(actual[1:], expected, rtol=_RELOCATION_RTOL, atol=0)
+    assert torch.all(torch.isfinite(actual[2]) & (actual[2] > 0))

@@ -1,0 +1,96 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Shared H10 Car2Sim recipe for model-free, real-ray lidar training.
+#
+# H10 owns the public entry points and sensor topology. Until H10-specific tuning is
+# available, this recipe deliberately reuses platform-independent Hyperion-8.1 option
+# values. Sensor selection is supplied only by the Hyperion-10 entry points.
+
+defaults:
+  # Base recipe and production features.
+  - /apps/AV/_base_3dgut_dynamic_road_semantic.yaml
+  - /apps/prod/options/artifact: default
+  - /apps/prod/options/harmonizer/3dgut: disabled
+  - /apps/prod/options/mesh: disabled
+  - /apps/prod/options/ground: enabled
+
+  # Sampling and calibration.
+  - /apps/prod/options/subsampling/3dgut: batch_sampler_2
+  - /apps/prod/Hyperion-8.1/options/validation: default
+  - /apps/prod/options/calib: enabled
+  - /apps/prod/Hyperion-8.1/options/lidar_calibration: disabled
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_track_calibration: direct
+  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "30000"
+  - /apps/prod/Hyperion-8.1/options/lidar_rays_per_train_sample: "2048"
+  - /apps/prod/Hyperion-8.1/options/cuboid_track_label_sources: autolabel
+  - /apps/prod/Hyperion-8.1/options/visible_track_split: pedestrians_5s
+
+  # Layer initialization and temporal appearance.
+  - /apps/prod/Hyperion-8.1/options/background_init: instant_nurec_ply
+  - /apps/prod/Hyperion-8.1/options/background_init_points: "850000"
+  - /apps/prod/Hyperion-8.1/options/road_init: lidar_ground_mesh
+  - /apps/prod/Hyperion-8.1/options/road_init_points: "400000"
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_init_points: "300000"
+  - /apps/prod/Hyperion-8.1/options/dynamic_deformables_init_points: "300000"
+  - /apps/prod/options/temporal_appearance@model.layers.dynamic_rigids: fourier_features_dim_20
+  - /apps/prod/options/temporal_appearance@model.layers.background: fourier_features_dim_5
+
+  # Training strategy and optimizers.
+  - /apps/AV/module_mixins/_mcmc_mixin.yaml
+  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "2000000"
+  - /apps/prod/Hyperion-8.1/options/mcmc_schedule: densify_20000_to_35000
+  - /apps/prod/Hyperion-8.1/options/mcmc_excluded_layers: road
+  - /apps/prod/Hyperion-8.1/options/gaussian_optimizer: selective_adam
+  - /apps/prod/Hyperion-8.1/options/road_optimizer: geometry_lrs_1e-6_1e-4
+  - /apps/prod/Hyperion-8.1/options/background_optimizer: instant_nurec_position_lr_5.06e-5_albedo_lr_2.5e-4
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_fourier_freeze: "10000"
+  - /apps/prod/Hyperion-8.1/options/dynamic_rigids_optimizer: position_lr_4e-5
+
+  # Losses and lidar rendering.
+  - /apps/prod/Hyperion-8.1/options/renderer_culling: lidar_200m_camera_1000m
+  - /apps/prod/Hyperion-8.1/options/active_tile_mask: camera_invalid_only
+  - /apps/prod/Hyperion-8.1/options/lidar_loss_weight: "5e-2"
+  - /apps/prod/Hyperion-8.1/options/background_in_track_loss: person_vehicle_bce_1e-1
+  - /apps/prod/Hyperion-8.1/options/lidar_rendering: intensity_raydrop
+  - /apps/prod/Hyperion-8.1/options/lidar_attribute_loss_weights: intensity_1_raydrop_1e-1
+  - /apps/prod/Hyperion-8.1/options/lidar_return_filter: raydrop_threshold_65e-2
+  - /apps/prod/Hyperion-8.1/options/lidar_point_cloud_filter: distance_error_2e-2
+
+  # Validation, artifacts, checkpointing, and runtime behavior.
+  - /apps/prod/Hyperion-8.1/options/validation_renders: isolated_road_background
+  - /apps/prod/Hyperion-8.1/options/checkpoint_interval: end_of_training
+  - /apps/prod/Hyperion-8.1/options/ground_mesh_artifact: uncolored
+  - /apps/prod/Hyperion-8.1/options/runtime_gc: usage_7e-1_every_10_steps
+
+  # Config-group overrides inherited from the base recipe.
+  - override /model/gaussians/strategy@model.strategy: mcmc
+  - override /model/post_processing@model.post_processing.b: ppisp
+  - override /model/post_processing@model.post_processing.c: null
+  - override /logger: dummy
+
+  - _self_
+
+dataset:
+  lidar_ray_mode: unstructured
+  use_real_lidar_rays: true
+  lidar_unstructured_raydrop_virtual_rays: aggregate_lattice
+  # ET30X has no structured NCore lidar model. Keep the FOV with the H10 sensor
+  # recipe so both the firing lattice and render tiling use the bounds exercised
+  # by the established ET30X 30k training run.
+  lidar_unstructured_fov_vert_deg:
+    lidar_hesai_roof_et30x: [-11.0, 11.0]
+  lidar_unstructured_fov_horiz_deg:
+    lidar_hesai_roof_et30x: [-55.0, 55.0]
+
+model:
+  renderer:
+    lidar_unstructured: true
+
+system:
+  test:
+    lidar:
+      # The range-view neighbor filter is undefined for an unstructured return list.
+      floating_point_filter:
+        enabled: false

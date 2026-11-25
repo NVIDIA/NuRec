@@ -5,41 +5,15 @@ import ast
 import logging
 import operator
 
-from typing import List, Type
-
 import torch
 
 from torch.nn import functional as F
 
-from nurec.instant_nurec.models.base import BaseInstantNuRec
 from nurec.models.base import BaseModel
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
 from nurec.models.gaussians.gaussians_model import RigidGaussianModel
-from nurec.models.post_processing import (
-    BilateralGridT,
-)
 from nurec.utils.batch import CameraFrameLabels, LidarFrameLabels
 from nurec.utils.types import GaussiansCompositeReturn, RayFlags
-
-
-def _get_bilateral_grids(
-    model: BaseModel | BaseInstantNuRec, bilateral_grid_class: Type[BilateralGridT]
-) -> List[BilateralGridT]:
-    grids: List[BilateralGridT] = []
-    match model:
-        # Match any model that supports post processing model
-        case GaussiansComposite():
-            for pp in model.post_processings:
-                # Test if post-processing module belongs to requested class.
-                if isinstance(pp, bilateral_grid_class):
-                    grids.append(pp)
-        case BaseInstantNuRec():
-            # instant_nurec uses different mechanism for post-processing, hence returning empty list.
-            pass
-        case _:
-            raise RuntimeError(f"{_get_bilateral_grids.__qualname__} got unsupported model type {type(model)}")
-
-    return grids
 
 
 def _get_out_of_bound_gaussian_nodes(model: BaseModel) -> list[RigidGaussianModel]:
@@ -90,9 +64,8 @@ def get_rendered_visibility_mask(
     sourcing the union from ``frustum_visibility`` instead — as ``_frustum_visibility_union``
     below already does for the MCMC counters — is the one-line lever that flips that choice.
     """
-    visibility = torch.ones(element_count, device=device, dtype=dtype)
     if not visibility_filter:
-        return visibility
+        return torch.ones(element_count, device=device, dtype=dtype)
 
     visibility_sources: list[torch.Tensor] = []
     rendered_cam = results.rendered_cam
@@ -167,6 +140,11 @@ def _maybe_update_mcmc_visibility_counters(
 ) -> None:
     if not isinstance(model, GaussiansComposite):
         return
+    # The system-owned packet is the authoritative per-sample visibility. It
+    # may still be unlaunched while losses run; consuming the owner-local loss
+    # mask here would bypass the DDP union and latch an incomplete sample mask.
+    if results.mcmc_visibility_union is not None:
+        return
     strategy = getattr(model, "gaussians_strategy", None)
     update_fn = getattr(strategy, "update_visibility_counters", None)
     if update_fn is None:
@@ -222,46 +200,6 @@ def torch_ssim(
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
     return ssim_map
-
-
-def fused_ssim_loss_map(
-    pred_bhwc: torch.Tensor,
-    gt_bhwc: torch.Tensor,
-    flags_bhw1: torch.Tensor,
-    inv_n_valid: float,
-    *,
-    channel: int,
-    fused_ssim_loss: torch.nn.Module | None = None,
-) -> torch.Tensor:
-    """Compute per-pixel SSIM loss terms matching ``loss_fns.ssim``.
-
-    Routes through the caller-owned ``gsplat.losses.FusedSSIMLosses``. Gsplat uses its
-    fused CUDA kernel for the standard 11x11 case when available and falls back internally for
-    other positive odd window sizes. GT gradients are rejected by design: SSIM targets are
-    supervision data, not learnable model outputs.
-
-    Args:
-        flags_bhw1: ``RayFlags`` bitmask, int32 ``[B, H, W, 1]``. Validity (``INVALID`` bit unset)
-            is read directly from this tensor on the CUDA path; no intermediary bool mask tensor
-            is ever materialized.
-    """
-    if inv_n_valid <= 0.0:
-        return pred_bhwc[..., :1].mul(0.0)
-    if pred_bhwc.shape[-1] != channel:
-        raise ValueError(f"channel ({channel}) must match pred_bhwc.shape[-1] ({pred_bhwc.shape[-1]})")
-    if gt_bhwc.requires_grad:
-        raise ValueError("SSIM ground-truth targets must not require gradients")
-    if fused_ssim_loss is None:
-        raise ValueError("fused_ssim_loss is required for the gsplat SSIM path")
-
-    # FusedSSIMLosses reads the RayFlags-compatible bitmask directly and owns its CUDA/PyTorch
-    # dispatch, including the non-11x11 fallback.
-    return fused_ssim_loss(
-        flags_bhw1,
-        pred_bhwc,
-        gt_bhwc,
-        inv_n_valid,
-    )
 
 
 def get_mask_semantic(rays_meta: LidarFrameLabels | CameraFrameLabels, semantic_expr: str) -> torch.Tensor:

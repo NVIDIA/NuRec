@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from omegaconf import OmegaConf
 
-from nurec.config.parse import parse_typed_config, parse_untyped_config
+from nurec.config.parse import _separate_legacy_resolution_overrides, parse_typed_config, parse_untyped_config
 
 
 def write_yaml_config(config_data: dict, file_path: str | Path) -> None:
@@ -223,6 +223,96 @@ class TestConfigParsing(unittest.TestCase):
         # Also verify that other base config values are loaded correctly
         self.assertEqual(config.mode, "trainval")  # from base.yaml
         self.assertEqual(config.out_dir, ".")  # from ncore_ds.yaml
+
+    def test_legacy_resolution_cli_extraction_keeps_unrelated_overrides(self):
+        canonical, legacy = _separate_legacy_resolution_overrides(
+            ["out_dir=/tmp/run", "+fixed_camera_render.subsample=3"]
+        )
+        self.assertEqual(canonical, ["out_dir=/tmp/run"])
+        self.assertEqual(legacy, {"fixed_camera_render.subsample": 3})
+
+    def test_legacy_resolution_cli_extraction_rejects_invalid_values_and_duplicates(self):
+        for overrides in (
+            ["fixed_camera_render.subsample"],
+            ["fixed_camera_render.subsample=abc"],
+            ["fixed_camera_render.subsample=2", "fixed_camera_render.subsample=3"],
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "integer override"):
+                _separate_legacy_resolution_overrides(overrides)
+
+    def test_legacy_resolution_cli_extraction_rejects_canonical_overrides(self):
+        canonical_path = "fixed_camera_render.resolution"
+        for override in (
+            f"{canonical_path}={{mode:relative,subsample:2}}",
+            f"{canonical_path}.subsample=2",
+            f"image_resolution/fixed_render@{canonical_path}=relative_2",
+            f"image_resolution/fixed_render@_global_.{canonical_path}=relative_2",
+        ):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "cannot be combined"):
+                _separate_legacy_resolution_overrides(["fixed_camera_render.subsample=3", override])
+
+    def test_legacy_resolution_cli_override_requires_relative_mode(self):
+        config_file = self.temp_path / "absolute_resolution.yaml"
+        write_yaml_config(
+            {"fixed_camera_render": {"resolution": {"mode": "absolute", "width": 4}}},
+            config_file,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a relative"):
+            parse_untyped_config(
+                config_name=str(config_file),
+                hydra_args=["fixed_camera_render.subsample=2"],
+            )
+
+    def test_legacy_resolution_cli_override_requires_an_existing_setting(self):
+        config_file = self.temp_path / "unrelated.yaml"
+        write_yaml_config({"unrelated": True}, config_file)
+
+        with self.assertRaisesRegex(ValueError, "requires a relative"):
+            parse_untyped_config(
+                config_name=str(config_file),
+                hydra_args=["fixed_camera_render.subsample=2"],
+            )
+
+    def test_legacy_resolution_cli_override_replaces_relative_default(self):
+        config_file = self.temp_path / "relative_resolution.yaml"
+        write_yaml_config(
+            {"fixed_camera_render": {"resolution": {"mode": "relative", "subsample": 2}}},
+            config_file,
+        )
+
+        with self.assertLogs("nurec.config.image_resolution", level="WARNING"):
+            config = parse_untyped_config(
+                config_name=str(config_file),
+                hydra_args=["fixed_camera_render.subsample=3"],
+            )
+        self.assertEqual(config.fixed_camera_render.resolution.subsample, 3)
+
+    def test_legacy_resolution_cli_override_updates_legacy_only_yaml(self):
+        config_file = self.temp_path / "legacy_only_resolution.yaml"
+        write_yaml_config({"dataset": {"n_val_image_subsample": 2}}, config_file)
+
+        with self.assertLogs("nurec.config.image_resolution", level="WARNING"):
+            config = parse_untyped_config(
+                config_name=str(config_file),
+                hydra_args=["dataset.n_val_image_subsample=3"],
+            )
+        self.assertEqual(config.dataset.n_val_image_subsample, 3)
+
+    def test_legacy_resolution_cli_override_stays_above_yaml_legacy_scalar(self):
+        config_file = self.temp_path / "mixed_resolution.yaml"
+        write_yaml_config(
+            {"dataset": {"n_val_image_subsample": 2, "n_val_image_resolution": {"mode": "relative", "subsample": 4}}},
+            config_file,
+        )
+
+        with self.assertLogs("nurec.config.image_resolution", level="WARNING"):
+            config = parse_untyped_config(
+                config_name=str(config_file),
+                hydra_args=["dataset.n_val_image_subsample=3"],
+            )
+        self.assertEqual(config.dataset.n_val_image_subsample, 3)
+        self.assertEqual(config.dataset.n_val_image_resolution.subsample, 3)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from nurec.render import PoseRange, RenderableModel
 from nurec.render.render import LidarFrame, LidarRayBundle
 from nurec.utils.cudaeventtimer import CudaEventTimer
 from nurec.utils.geometry import se3_matrix_to_tquat
+from nurec.utils.io.export.render_frame_pipeline import FramePipelineRecorder
 from nurec.utils.io.export.render_helpers import select_frame_indices, validate_sensor_output_names
 from nurec.utils.io.export.render_lidar_ply import save_lidar_ply
 from nurec.utils.io.export.render_nsight import NsightCapture
@@ -68,7 +69,12 @@ def render_lidar_frames(
     frame_index: str = "all",
     nsight_capture: NsightCapture | None = None,
 ) -> None:
-    """Use the selected trajectory's first calibrated LiDAR at its native ray grid."""
+    """Render the first calibrated LiDAR with one sample per metric and measured repetition.
+
+    Fixed sensor setup is reusable and untimed. Each frame-wall sample includes pose preparation,
+    one measured call and its GPU waits, and enabled synchronous PLY exports;
+    warmups, timing reports/logs, and final extrema/manifest writes are excluded.
+    """
     if not rigs.rig_trajectories:
         raise ValueError("Artifact contains no rig trajectories")
     trajectory = rigs.rig_trajectories[0]
@@ -100,7 +106,7 @@ def render_lidar_frames(
     if save_outputs and save_modes:
         extra_dir.mkdir(parents=True, exist_ok=True)
     if metrics_collector is not None:
-        for metric in ("render_time_ms", "cuda_ms"):
+        for metric in ("render_time_ms", "cuda_ms", "frame_wall_ms"):
             metrics_collector.set_metric_metadata(metric, lidar_id=lidar_id, ray_grid=[columns, rows])
     log.info("LiDAR %s: %dx%d native rays, %d available frames", lidar_id, columns, rows, len(timestamps))
 
@@ -117,6 +123,13 @@ def render_lidar_frames(
     extra_timestamps: list[dict[str, str | int | float]] = []
     cuda_timer = CudaEventTimer("nurec.render.lidar.forward")
     nsight_capture = nsight_capture or NsightCapture(None)
+    pipeline = FramePipelineRecorder(
+        enabled=report,
+        range_factory=torch.cuda.nvtx.range,
+        collector=metrics_collector,
+        sequence_id=trajectory.sequence_id or "",
+        is_lidar=True,
+    )
 
     def save_sample(
         sample: LidarRenderSample, selection: str = "", *, extra: bool = False, copy_from: Path | None = None
@@ -173,64 +186,141 @@ def render_lidar_frames(
         lidar_model = LidarModelBundle(parameters)
         neighbor_source = renderable.default_lidar_neighbor_source()
         for frame in frame_indices:
-            start, end = map(int, timestamps[frame])
-            if start < 0:
-                start = end  # Negative starts denote instantaneous scans in older artifacts.
-            poses = interpolator.interpolate_to_timestamps(np.asarray([start, end], dtype=np.int64))
-            lidar_to_world = PoseRange(
-                se3_matrix_to_tquat(np.asarray(poses[0] @ sensor_to_rig, dtype=np.float32)),
-                se3_matrix_to_tquat(np.asarray(poses[1] @ sensor_to_rig, dtype=np.float32)),
-                start,
-                end,
-            )
-            unique_frame_idx = None if offsets is None else int(offsets[unique_id]) + frame
-
-            def render_frame() -> LidarFrame:
-                """Include native uploads, GPU ray generation, rendering and final filtering."""
-                ray_bundle = LidarRayBundle.build(
-                    lidar_model=lidar_model,
-                    lidar_to_world=lidar_to_world,
-                    world_to_nurec=rigs.world_to_nurec,
-                    unique_sensor_idx=calibration.unique_sensor_idx,
-                    unique_frame_idx=unique_frame_idx,
-                )
-                try:
-                    return renderable.render_lidar_frame_from_ray_bundle(ray_bundle, neighbor_source=neighbor_source)
-                except TypeError as error:
-                    if "Lidar rendering does not support models" not in str(error):
-                        raise
-                    raise ValueError("This artifact model does not support LiDAR rendering in NuRec") from error
-
-            # Index each frame while keeping this sensor's capture active.
             with nsight_capture.frame(lidar_id, frame, lidar=True):
-                if frame == frame_indices.start:
-                    for warmup_iteration in range(1, warmup_frames + 1):
-                        # Match measured event boundaries without publishing warmup samples.
-                        with cuda_timer(
-                            renderable.device,
-                            label=f"nurec.render.lidar.warmup(frame={frame}, iteration={warmup_iteration})",
-                            record_sample=False,
-                        ):
-                            warmup = render_frame()
-                        del warmup
+                for iteration in range(1, iterations + 1):
+                    render_complete = False
+                    # Reporting follows timer exit, including early skips when exports are disabled.
+                    try:
+                        with pipeline.measure(lidar_id, frame, iteration=iteration) as pipeline_timing:
+                            start, end = map(int, timestamps[frame])
+                            if start < 0:
+                                start = end  # Negative starts denote instantaneous scans in older artifacts.
+                            poses = interpolator.interpolate_to_timestamps(np.asarray([start, end], dtype=np.int64))
+                            lidar_to_world = PoseRange(
+                                se3_matrix_to_tquat(np.asarray(poses[0] @ sensor_to_rig, dtype=np.float32)),
+                                se3_matrix_to_tquat(np.asarray(poses[1] @ sensor_to_rig, dtype=np.float32)),
+                                start,
+                                end,
+                            )
+                            unique_frame_idx = None if offsets is None else int(offsets[unique_id]) + frame
 
-                # The frame range contains measured iterations only, after warm-up finishes.
-                with torch.cuda.nvtx.range(f"nurec.render.lidar.frame(lidar={lidar_id}, frame={frame})"):
-                    for iteration in range(1, iterations + 1):
-                        if report:
-                            with cuda_timer(renderable.device):
-                                start_time = time.perf_counter()
-                                rendered = render_frame()
-                                render_time_ms = (time.perf_counter() - start_time) * 1000
-                        else:
-                            with cuda_timer(renderable.device, record_sample=record_sample):
-                                rendered = render_frame()
-                        if not record_sample:
-                            del rendered
-                            continue
-                        cuda_ms = cuda_timer.milliseconds[-1]
-                        cuda_valid = cuda_timer.valid[-1]
-                        if metrics_collector is not None:
+                            def render_frame(lidar_to_world: PoseRange = lidar_to_world) -> LidarFrame:
+                                """Reuse this scan's prepared poses; include native uploads, rays, rendering and filtering."""
+                                ray_bundle = LidarRayBundle.build(
+                                    lidar_model=lidar_model,
+                                    lidar_to_world=lidar_to_world,
+                                    world_to_nurec=rigs.world_to_nurec,
+                                    unique_sensor_idx=calibration.unique_sensor_idx,
+                                    unique_frame_idx=unique_frame_idx,
+                                )
+                                try:
+                                    return renderable.render_lidar_frame_from_ray_bundle(
+                                        ray_bundle, neighbor_source=neighbor_source
+                                    )
+                                except TypeError as error:
+                                    if "Lidar rendering does not support models" not in str(error):
+                                        raise
+                                    raise ValueError(
+                                        "This artifact model does not support LiDAR rendering in NuRec"
+                                    ) from error
+
+                            if iteration == 1 and frame == frame_indices.start and warmup_frames > 0:
+                                with pipeline_timing.warmup():
+                                    for warmup_iteration in range(1, warmup_frames + 1):
+                                        # Match measured event boundaries without publishing warmup samples.
+                                        with cuda_timer(
+                                            renderable.device,
+                                            label=f"nurec.render.lidar.warmup(frame={frame}, iteration={warmup_iteration})",
+                                            record_sample=False,
+                                        ):
+                                            warmup = render_frame()
+                                        del warmup
+                            with torch.cuda.nvtx.range(f"nurec.render.lidar.frame(lidar={lidar_id}, frame={frame})"):
+                                if report:
+                                    with cuda_timer(renderable.device):
+                                        start_time = time.perf_counter()
+                                        rendered = render_frame()
+                                        render_time_ms = (time.perf_counter() - start_time) * 1000
+                                else:
+                                    with cuda_timer(renderable.device, record_sample=record_sample):
+                                        rendered = render_frame()
+                                if not record_sample:
+                                    del rendered, render_frame, lidar_to_world, poses
+                                    continue
+                                cuda_ms = cuda_timer.milliseconds[-1]
+                                cuda_valid = cuda_timer.valid[-1]
+                                render_complete = True
+                                if not save_outputs:
+                                    del rendered, render_frame, lidar_to_world, poses
+                                    continue
+                                sample = LidarRenderSample(
+                                    rendered, frame, iteration, cuda_ms, start, end, valid=cuda_valid
+                                )
+                                is_minimum = (
+                                    cuda_valid
+                                    and "min" in save_modes
+                                    and (minimum is None or cuda_ms < minimum.cuda_ms)
+                                )
+                                is_maximum = (
+                                    cuda_valid
+                                    and "max" in save_modes
+                                    and (maximum is None or cuda_ms > maximum.cuda_ms)
+                                )
+                                if is_minimum or is_maximum:
+                                    # Reuse a pinned snapshot only when the other extremum does not retain it.
+                                    previous = minimum if is_minimum else maximum
+                                    if minimum is maximum:
+                                        previous = None
+                                    selection = ",".join(
+                                        mode
+                                        for mode, improved in (("min", is_minimum), ("max", is_maximum))
+                                        if improved
+                                    )
+                                    with torch.cuda.nvtx.range(
+                                        f"nurec.render.lidar_copy(selection={selection}, frame={frame}, iteration={iteration})"
+                                    ):
+                                        tensors: dict[str, torch.Tensor | None] = {}
+                                        for name in ("point_positions", "point_intensities"):
+                                            source = getattr(rendered, name)
+                                            destination = None if previous is None else getattr(previous.rendered, name)
+                                            if source is None:
+                                                tensors[name] = None
+                                                continue
+                                            if (
+                                                destination is None
+                                                or destination.shape != source.shape
+                                                or destination.dtype != source.dtype
+                                            ):
+                                                destination = torch.empty_like(source, device="cpu", pin_memory=True)
+                                            # Blocking copies finish outside both rendering clocks.
+                                            destination.copy_(source)
+                                            tensors[name] = destination
+                                        positions = tensors["point_positions"]
+                                        assert positions is not None
+                                        snapshot = replace(
+                                            rendered,
+                                            point_positions=positions,
+                                            point_intensities=tensors["point_intensities"],
+                                        )
+                                    retained = replace(sample, rendered=snapshot)
+                                    if is_minimum:
+                                        minimum = retained
+                                    if is_maximum:
+                                        maximum = retained
+                                    del previous
+                                # A timing extremum already has a complete CPU snapshot.
+                                saved_sample = retained if is_minimum or is_maximum else sample
+                                canonical_path = save_sample(saved_sample) if iteration == iterations else None
+                                if (
+                                    "all-iterations" in save_modes
+                                    or "last-iteration" in save_modes
+                                    and iteration == iterations
+                                ):
+                                    save_sample(saved_sample, extra=True, copy_from=canonical_path)
+                                del sample, saved_sample, rendered
+                            del render_frame, lidar_to_world, poses
+                    finally:
+                        if render_complete and metrics_collector is not None:
                             metrics_collector.record_frame(
                                 sequence_id=trajectory.sequence_id or "",
                                 sensor_id=lidar_id,
@@ -250,60 +340,6 @@ def render_lidar_frames(
                                 cuda_ms,
                                 cuda_valid,
                             )
-                        if not save_outputs:
-                            del rendered
-                            continue
-                        sample = LidarRenderSample(rendered, frame, iteration, cuda_ms, start, end, valid=cuda_valid)
-                        is_minimum = (
-                            cuda_valid and "min" in save_modes and (minimum is None or cuda_ms < minimum.cuda_ms)
-                        )
-                        is_maximum = (
-                            cuda_valid and "max" in save_modes and (maximum is None or cuda_ms > maximum.cuda_ms)
-                        )
-                        if is_minimum or is_maximum:
-                            # Reuse a pinned snapshot only when the other extremum does not retain it.
-                            previous = minimum if is_minimum else maximum
-                            if minimum is maximum:
-                                previous = None
-                            selection = ",".join(
-                                mode for mode, improved in (("min", is_minimum), ("max", is_maximum)) if improved
-                            )
-                            with torch.cuda.nvtx.range(
-                                f"nurec.render.lidar_copy(selection={selection}, frame={frame}, iteration={iteration})"
-                            ):
-                                tensors: dict[str, torch.Tensor | None] = {}
-                                for name in ("point_positions", "point_intensities"):
-                                    source = getattr(rendered, name)
-                                    destination = None if previous is None else getattr(previous.rendered, name)
-                                    if source is None:
-                                        tensors[name] = None
-                                        continue
-                                    if (
-                                        destination is None
-                                        or destination.shape != source.shape
-                                        or destination.dtype != source.dtype
-                                    ):
-                                        destination = torch.empty_like(source, device="cpu", pin_memory=True)
-                                    # Blocking copies finish outside both rendering clocks.
-                                    destination.copy_(source)
-                                    tensors[name] = destination
-                                positions = tensors["point_positions"]
-                                assert positions is not None
-                                snapshot = replace(
-                                    rendered, point_positions=positions, point_intensities=tensors["point_intensities"]
-                                )
-                            retained = replace(sample, rendered=snapshot)
-                            if is_minimum:
-                                minimum = retained
-                            if is_maximum:
-                                maximum = retained
-                            del previous
-                        # A timing extremum already has a complete CPU snapshot.
-                        saved_sample = retained if is_minimum or is_maximum else sample
-                        canonical_path = save_sample(saved_sample) if iteration == iterations else None
-                        if "all-iterations" in save_modes or "last-iteration" in save_modes and iteration == iterations:
-                            save_sample(saved_sample, extra=True, copy_from=canonical_path)
-                        del sample, saved_sample, rendered
 
         if minimum is not None:
             save_sample(minimum, "min", extra=True)

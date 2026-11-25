@@ -13,6 +13,17 @@ from numpy.typing import NDArray
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceFrameContext:
+    """Frame identity and resolved label selection supplied with each processing call."""
+
+    worker_id: int
+    request_id: int
+    camera_id: str
+    timestamp_us: int
+    active_label_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceFrameOutputSpec:
     """Describe one output produced by a device-frame processor.
 
@@ -108,7 +119,8 @@ class DeviceFrameProcessor(Protocol):
         outputs: Mapping[str, torch.Tensor],
         processor_inputs: Mapping[str, torch.Tensor],
         stream: torch.cuda.Stream,
-    ) -> None:
+        frame: DeviceFrameContext,
+    ) -> Mapping[str, torch.Tensor] | None:
         """Enqueue device processing into caller-owned outputs.
 
         Args:
@@ -121,9 +133,10 @@ class DeviceFrameProcessor(Protocol):
                 Each retains the shape and dtype of its static shared input
                 and remains valid for the service lifetime.
             stream: CUDA stream owning processing and output writes.
+            frame: Frame identity for processors with scheduling or per-frame exports.
 
         Returns:
-            None. Work is enqueued into ``stream``.
+            Optional variable-size device outputs. Work is enqueued into ``stream``.
 
         Raises:
             ValueError: If an input or output violates the processor contract.
@@ -141,6 +154,7 @@ def process_device_frame_from_host(
     device: torch.device,
     processor_inputs: Mapping[str, NDArray[Any] | torch.Tensor] | None = None,
     stream: torch.cuda.Stream | None = None,
+    frame: DeviceFrameContext,
 ) -> dict[str, NDArray[Any]]:
     """Run one device-frame processor from host RGB input.
 
@@ -155,6 +169,7 @@ def process_device_frame_from_host(
             processor-input name.
         stream: Optional CUDA stream. The current stream on ``device`` is used
             by default.
+        frame: Explicit identity and active label IDs forwarded to the processor.
 
     Returns:
         Host-owned NumPy outputs keyed by the processor's semantic output
@@ -189,12 +204,15 @@ def process_device_frame_from_host(
         for name, value in (processor_inputs or {}).items()
     }
     processing_stream = stream or torch.cuda.current_stream(device=device)
-    processor.process_device(
+    variable_outputs = processor.process_device(
         image_bgr_nchw,
         outputs=outputs,
         processor_inputs=inputs_device,
         stream=processing_stream,
+        frame=frame,
     )
+    if variable_outputs:
+        outputs.update(variable_outputs)
     processing_stream.synchronize()
     return {name: output.cpu().numpy().copy() for name, output in outputs.items()}
 

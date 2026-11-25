@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nurec.datamodules.base import SODataModule
+from torch.utils.data import Dataset
+
+from nurec.datamodules.base import ForkSafeDataLoader, SODataModule
 
 
 def _datamodule() -> SODataModule:
@@ -122,3 +124,23 @@ def test_missing_saved_rank_training_loader_generator_state_raises():
         datamodule.load_state_dict(
             {"train_loader_generator_states": [saved_state], "train_loader_generator_rank_count": 2}
         )
+
+
+class _EinsumDataset(Dataset):
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return torch.einsum("ij,nj->ni", torch.eye(3), torch.randn(2048, 3))
+
+
+def test_fork_safe_dataloader_workers_run_cpu_matmul_after_parent_used_openmp():
+    # Regression test for past DGX Spark failure: a worker forked from a process whose OpenMP pool is warm used to
+    # hang in its first einsum.
+    a = torch.randn(512, 512)
+    for _ in range(5):
+        (a @ a).sum()
+
+    loader = ForkSafeDataLoader(_EinsumDataset(), num_workers=2, timeout=60)
+
+    assert [batch.shape for batch in loader] == [(1, 2048, 3)] * 4

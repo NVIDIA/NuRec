@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import logging
 import os
 
-from typing import Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Optional, Sequence
 
 import flow_vis
 import imageio
@@ -13,12 +15,14 @@ import numpy as np
 import torch
 
 from einops import rearrange
-from lightning_fabric.loggers.logger import Logger
 from matplotlib import cm
 from PIL import Image, ImageDraw, ImageFont
-from pytorch_lightning.loggers.logger import DummyLogger
-from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-from pytorch_lightning.loggers.wandb import WandbLogger
+
+
+if TYPE_CHECKING:
+    # Lightning loggers are only dispatched on inside log_image(); the image helpers in this module are
+    # also used by inference processes that must not import Lightning.
+    from lightning_fabric.loggers.logger import Logger
 
 
 logger = logging.getLogger(__name__)
@@ -288,6 +292,9 @@ def log_image(
         caption (str): Name/tag for the image
         step (Optional[int]): Current training step
     """
+    from pytorch_lightning.loggers.logger import DummyLogger
+    from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
+    from pytorch_lightning.loggers.wandb import WandbLogger
 
     if isinstance(image, np.ndarray):
         image = torch.from_numpy(image.copy())

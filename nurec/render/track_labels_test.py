@@ -8,10 +8,6 @@ a real distortion-free OpenCV pinhole camera, and a fake GaussiansComposite-like
 (SimpleNamespace). The pose-interpolation / tquat / label-mapping / intrinsics tests patch
 ``overlay_labeled_boxes`` to capture what the labeler would draw; the projection smoke tests
 run the full real drawing path through ncore's camera model.
-
-The only piece stubbed out is ``CuboidTracks.Ops.subset_from_indices``: the real op is backed
-by a CUDA-only packed kernel (``linstep_interleave_cu``), so ``_labeler_from`` swaps in a
-functionally equivalent CPU reimplementation for the duration of ``from_model``.
 """
 
 import unittest
@@ -103,32 +99,9 @@ def _model_with_layer(layer_id: str, cuboid_tracks: CuboidTracks) -> SimpleNames
     return SimpleNamespace(gaussians_nodes={layer_id: SimpleNamespace(cuboid_tracks=cuboid_tracks)})
 
 
-def _cpu_subset_from_indices(cuboid_tracks: CuboidTracks, indices: Sequence[int]) -> CuboidTracks:
-    """CPU stand-in for CuboidTracks.Ops.subset_from_indices (the real op needs a CUDA kernel).
-
-    Rebuilds the selected tracks from the packed representation via Factory.from_numpy,
-    producing the same single-track CuboidTracks the real op would.
-    """
-    idx = [int(i) for i in indices]
-    poses = tquat_to_se3_matrix(cuboid_tracks.tracks_poses.data.detach().cpu(), unbatch=False).numpy()
-    timestamps = cuboid_tracks.tracks_timestamps_us.detach().cpu().numpy()
-    packinfo = cuboid_tracks.tracks_packinfo.detach().cpu().numpy()
-    starts_counts = [(int(packinfo[i, 0]), int(packinfo[i, 1])) for i in idx]
-    return CuboidTracks.Factory.from_numpy(
-        tracks_id=[cuboid_tracks.tracks_id[i] for i in idx],
-        tracks_poses=[poses[s : s + n].astype(np.float32) for s, n in starts_counts],
-        tracks_timestamps_us=[timestamps[s : s + n].astype(np.int64) for s, n in starts_counts],
-        tracks_label_class=[cuboid_tracks.tracks_label_class[i] for i in idx],
-        tracks_flags=[TrackFlags(int(cuboid_tracks.tracks_flags[i].item())) for i in idx],
-        cuboids_dims=[cuboid_tracks.cuboids_dims[i].detach().cpu().numpy() for i in idx],
-        device=_CPU,
-    )
-
-
 def _labeler_from(model: object, **kwargs: object) -> TrackLabeler:
     kwargs.setdefault("layer_id", _LAYER)
-    with patch.object(CuboidTracks.Ops, "subset_from_indices", side_effect=_cpu_subset_from_indices):
-        labeler = TrackLabeler.from_model(model, **kwargs)  # type: ignore[arg-type]
+    labeler = TrackLabeler.from_model(model, **kwargs)  # type: ignore[arg-type]
     assert labeler is not None, "from_model unexpectedly returned None for a populated layer"
     return labeler
 

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+
+add:
+  taminggs:
+    current_gradient_weight: 50.0
+    gradient_ema_weight: 10.0
+    opacity_weight: 100.0
+    scale_weight: 25.0
+    visibility_weight: 5.0
+    normalization_clip: 10.0
+    minimum_source_weight: 1.0e-6

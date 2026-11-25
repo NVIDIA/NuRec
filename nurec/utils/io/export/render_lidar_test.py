@@ -12,6 +12,7 @@ import sys
 
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,7 @@ from ncore.impl.common.transformations import PoseInterpolator
 from nurec.render.render import LidarFrame, LidarRayBundle
 from nurec.utils.geometry import tquat_to_se3_matrix
 from nurec.utils.io.export import render_lidar
+from nurec.utils.io.export.render_frame_pipeline import FramePipelineRecorder
 from nurec.utils.types import FrameConversion, RigTrajectories
 
 
@@ -34,6 +36,8 @@ from nurec.utils.types import FrameConversion, RigTrajectories
 def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Use reusable CPU output buffers to expose incorrect snapshot lifetimes."""
     state = SimpleNamespace(
+        wall_ns=0,
+        pipeline_ranges=[],
         active=False,
         record_sample=False,
         report=True,
@@ -113,7 +117,9 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             assert not state.active
 
         def interpolate_to_timestamps(self, timestamps: np.ndarray) -> np.ndarray:
+            """Prepare scan poses outside render-call clocks and charge their frame-pipeline cost."""
             assert not state.active
+            state.wall_ns += 2_000_000
             state.poses.append(timestamps.copy())
             poses = np.tile(np.eye(4), (2, 1, 1))
             poses[:, 0, 3] = timestamps
@@ -134,6 +140,7 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         measured = state.frame_range is not None
         if not measured:
             assert not state.record_sample, "Warmup renders must not publish timing samples"
+        state.wall_ns += 10_000_000 if measured else 100_000_000
         state.calls.append(measured)
         state.events.append("render")
         if state.error is not None:
@@ -170,6 +177,11 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     @contextmanager
     def copy_range(label: str):
+        """Track pipeline, measured-render and copy scopes without mixing their lifetimes."""
+        if label.startswith("nurec.render.frame_pipeline_"):
+            state.pipeline_ranges.append(label)
+            yield
+            return
         if label.startswith("nurec.render.lidar.frame("):
             before = len(state.calls)
             assert not state.active and state.frame_range is None
@@ -243,6 +255,9 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 break
         return original_copy(tensor, source, non_blocking=non_blocking)
 
+    monkeypatch.setattr(
+        render_lidar, "FramePipelineRecorder", partial(render_lidar.FramePipelineRecorder, clock=lambda: state.wall_ns)
+    )
     monkeypatch.setattr(render_lidar, "CudaEventTimer", Timer)
     monkeypatch.setattr(render_lidar, "PoseInterpolator", Interpolator)
     monkeypatch.setattr(render_lidar, "LidarModelBundle", model_bundle)
@@ -384,6 +399,7 @@ def read_ply(path: Path) -> tuple[str, np.ndarray]:
 
 
 def test_warmup_stride_grid_and_paired_clocks(harness: SimpleNamespace) -> None:
+    """Preserve scan selection, warmup calls and paired CUDA/API samples alongside frame-wall samples."""
     harness.run(warmup_frames=2)
     assert harness.state.calls == [False, False, True, True, True, True]
     assert harness.state.warmup_ranges == [
@@ -403,18 +419,19 @@ def test_warmup_stride_grid_and_paired_clocks(harness: SimpleNamespace) -> None:
         ("nurec.render.lidar.warmup(frame=0, iteration=2)", False),
         *[(None, True)] * 4,
     ]
-    np.testing.assert_array_equal(harness.state.poses, [[10, 10], [21, 30]])
+    np.testing.assert_array_equal(harness.state.poses, [[10, 10], [10, 10], [21, 30], [21, 30]])
     pose = harness.state.builds[-1]["lidar_to_world"]
     assert pose.start_pose_tquat_sensor_world[0].item() == 23
     assert pose.end_pose_tquat_sensor_world[0].item() == 32
-    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list]
+    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]
     assert [(row["frame"], row["iteration"]) for row in records] == [(0, 1), (0, 2), (2, 1), (2, 2)]
     assert [row["cuda_ms"] for row in records] == [4.0, 1.0, 6.0, 3.0]
     assert [row["render_time_ms"] for row in records] == pytest.approx([10.0] * 4)
     assert all(row["sensor_id"] == "lidar_front" and row["sequence_id"] == "sequence" for row in records)
     assert all(row["is_lidar"] is True for row in records)
     for call in harness.metrics.set_metric_metadata.call_args_list:
-        assert call.kwargs == {"lidar_id": "lidar_front", "ray_grid": [3, 2]}
+        if "lidar_id" in call.kwargs:
+            assert call.kwargs == {"lidar_id": "lidar_front", "ray_grid": [3, 2]}
     manifest = json.loads((harness.sensor_dir / "timestamps.json").read_text())
     assert [row["file_name"] for row in manifest] == ["000000.ply", "000001.ply"]
     assert [row["source_frame_idx"] for row in manifest] == [0, 2]
@@ -423,6 +440,75 @@ def test_warmup_stride_grid_and_paired_clocks(harness: SimpleNamespace) -> None:
         _, vertices = read_ply(harness.sensor_dir / row["file_name"])
         np.testing.assert_array_equal(vertices[:, :3], np.full((2, 3), value))
     assert not harness.extra_dir.exists()
+
+
+def test_frame_wall_excludes_warmup_and_preserves_lidar_identity(harness: SimpleNamespace) -> None:
+    """Match per-repetition identities and retain pose preparation while excluding warm-up work."""
+    harness.run(save_modes={"none"}, warmup_frames=2)
+    samples = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "frame_wall_ms" in call.kwargs]
+    assert [sample["frame_wall_ms"] for sample in samples] == [12.0] * 4
+    assert [(sample["frame"], sample["iteration"]) for sample in samples] == [(0, 1), (0, 2), (2, 1), (2, 2)]
+    assert all(sample["is_lidar"] for sample in samples)
+    assert all(sample["sensor_id"] == "lidar_front" and sample["sequence_id"] == "sequence" for sample in samples)
+    assert not (harness.root / "frame_pipeline_metrics.json").exists()
+    assert "synchronize" not in harness.state.events
+
+
+def test_frame_wall_includes_synchronous_ply_exports(harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Count enabled per-frame PLY writes but exclude deferred final extrema exports."""
+    original = render_lidar.save_ply
+
+    def save_with_cost(*args: Any, **kwargs: Any) -> None:
+        """Charge a synchronous PLY export without changing the point cloud or file output."""
+        harness.state.wall_ns += 4_000_000
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(render_lidar, "save_ply", save_with_cost)
+    harness.run(save_modes={"min", "max"})
+    samples = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "frame_wall_ms" in call.kwargs]
+    assert [sample["frame_wall_ms"] for sample in samples] == [12.0, 16.0, 12.0, 16.0]
+    # Only final repetitions write primary PLYs; deferred min/max writes occur after all samples.
+    assert harness.state.wall_ns == 64_000_000
+
+
+@pytest.mark.parametrize("save_modes", [{"none"}, set()])
+def test_reporting_cost_is_outside_frame_wall(
+    harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, save_modes: set[str]
+) -> None:
+    """Exclude metric insertion and slow timing logs with and without synchronous output saving."""
+
+    def record_frame(**sample: Any) -> None:
+        """Charge metric collection after the render and frame-pipeline scopes have closed."""
+        assert harness.state.frame_range is None
+        harness.state.wall_ns += 200_000_000
+
+    def report_log(message: str, *args: Any, **kwargs: Any) -> None:
+        """Charge timing logs after measurement while leaving ordinary setup logs uncharged."""
+        if "render_time_ms=" in message:
+            assert harness.state.frame_range is None
+            harness.state.wall_ns += 100_000_000
+
+    harness.metrics.record_frame.side_effect = record_frame
+    monkeypatch.setattr(render_lidar.log, "info", report_log)
+    harness.run(save_modes=save_modes, warmup_frames=2)
+    samples = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "frame_wall_ms" in call.kwargs]
+    assert [sample["frame_wall_ms"] for sample in samples] == [12.0] * 4
+    rendered = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "render_time_ms" in call.kwargs]
+    assert [(row["frame"], row["iteration"]) for row in rendered] == [(0, 1), (0, 2), (2, 1), (2, 2)]
+
+
+def test_frame_wall_no_report_never_reads_clock(harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retain measured NVTX identities without wall samples or sidecar output when reporting is disabled."""
+
+    def forbidden_clock() -> int:
+        """Reject any wall-clock read from a disabled recorder."""
+        raise AssertionError("Wall timing must stay disabled")
+
+    monkeypatch.setattr(render_lidar, "FramePipelineRecorder", partial(FramePipelineRecorder, clock=forbidden_clock))
+    harness.run(report=False, save_modes={"none"}, warmup_frames=1)
+    assert any("lidar=lidar_front" in label for label in harness.state.pipeline_ranges)
+    assert not (harness.root / "frame_pipeline_metrics.json").exists()
+    harness.metrics.record_frame.assert_not_called()
 
 
 @pytest.mark.parametrize("save_mode", ["all-iterations", "last-iteration"])
@@ -440,6 +526,7 @@ def test_invalid_timings_preserve_metrics_and_clouds_but_cannot_select_extrema(
     cuda_values: tuple[float | None, ...],
     expected_valid: list[tuple[int, int, float]],
 ) -> None:
+    """Retain invalid CUDA samples and clouds while keeping whole-frame wall samples separate."""
     harness.run(cuda_values=cuda_values, save_modes={save_mode, "min", "max"})
 
     assert harness.state.calls == [True] * 4
@@ -448,7 +535,7 @@ def test_invalid_timings_preserve_metrics_and_clouds_but_cannot_select_extrema(
         (frame, iteration, 0.0 if value is None else value, value is not None)
         for (frame, iteration), value in zip(identities, cuda_values, strict=True)
     ]
-    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list]
+    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]
     assert [
         (row["frame"], row["iteration"], row["cuda_ms"], row["metric_validity"]["cuda_ms"]) for row in records
     ] == expected
@@ -485,6 +572,7 @@ def test_custom_lidar_only_trajectory_passes_interpolated_poses_and_calibration_
     harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, frame_offset: int | None
 ) -> None:
     # Use the native CPU interpolator; a rotated rig makes the extrinsic composition order observable.
+    """Pass custom LiDAR poses and calibration unchanged while recording both timing scopes."""
     monkeypatch.setattr(render_lidar, "PoseInterpolator", PoseInterpolator)
     rig_poses = torch.tensor(
         [
@@ -525,7 +613,9 @@ def test_custom_lidar_only_trajectory_passes_interpolated_poses_and_calibration_
     for tquat, x in ((pose.start_pose_tquat_sensor_world, 2.5), (pose.end_pose_tquat_sensor_world, 5.5)):
         expected = torch.tensor([[0, 1, 0, x], [-1, 0, 0, 12], [0, 0, 1, 1.5], [0, 0, 0, 1]], dtype=torch.float32)
         torch.testing.assert_close(tquat_to_se3_matrix(tquat), expected)
-    assert harness.metrics.record_frame.call_args.kwargs["sequence_id"] == "custom-sequence"
+    assert [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs][-1][
+        "sequence_id"
+    ] == "custom-sequence"
 
 
 @pytest.mark.parametrize(
@@ -624,11 +714,12 @@ def test_ordinary_cloud_copy_ranges_include_frame_and_iteration_identity(harness
 
 @pytest.mark.parametrize("ordinary", ["last-iteration", "all-iterations"])
 def test_combined_saves_download_each_native_cloud_once(harness: SimpleNamespace, ordinary: str) -> None:
+    """Avoid duplicate cloud downloads while recording render-call and invocation metrics."""
     harness.run(save_modes={ordinary, "min", "max"})
     assert harness.state.native_downloads == [
         (call, name) for call in (1, 2, 3, 4) for name in ("point_positions", "point_intensities")
     ]
-    assert harness.metrics.record_frame.call_count == 4
+    assert len([call for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]) == 4
     expected = [(0, 2, 2), (2, 2, 4)] if ordinary == "last-iteration" else [(0, 1, 1), (0, 2, 2), (2, 1, 3), (2, 2, 4)]
     for frame, iteration, value in expected:
         _, vertices = read_ply(harness.extra_dir / f"render-3x2-frame-{frame}-iteration-{iteration}.ply")
@@ -685,6 +776,7 @@ def test_ties_keep_first_and_missing_offsets_stay_optional(harness: SimpleNamesp
     ],
 )
 def test_zero_warmup_one_capture_and_legacy_names(harness: SimpleNamespace, naming: str, expected: str) -> None:
+    """Preserve one selected scan and its naming with separate call and invocation samples."""
     harness.run(
         save_modes={"last-iteration"},
         iterations=1,
@@ -694,7 +786,7 @@ def test_zero_warmup_one_capture_and_legacy_names(harness: SimpleNamespace, nami
     )
     assert harness.state.calls == [True]
     assert not harness.state.warmup_ranges
-    assert len(harness.metrics.record_frame.call_args_list) == 1
+    assert len(harness.metrics.record_frame.call_args_list) == 2
     assert (harness.sensor_dir / expected).is_file()
     assert (harness.extra_dir / "render-3x2-frame-0-iteration-1.ply").read_bytes() == (
         harness.sensor_dir / expected
@@ -706,6 +798,7 @@ def test_zero_warmup_one_capture_and_legacy_names(harness: SimpleNamespace, nami
 def test_save_none_keeps_timings_and_captures_without_output_copies_or_files(
     harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, nsight: bool
 ) -> None:
+    """Keep timing reports and captures while omitting point-cloud transfers and exports."""
     save_ply = Mock()
     monkeypatch.setattr(render_lidar, "save_ply", save_ply)
     harness.run(
@@ -719,7 +812,7 @@ def test_save_none_keeps_timings_and_captures_without_output_copies_or_files(
     assert harness.state.calls == [False, False, True, True, True, True]
     assert len(harness.state.warmup_ranges) == 2
     assert all(build["timed"] for build in harness.state.builds)
-    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list]
+    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]
     assert [(row["frame"], row["iteration"], row["cuda_ms"]) for row in records] == [
         (1, 1, 4.0),
         (1, 2, 1.0),
@@ -736,7 +829,7 @@ def test_save_none_keeps_timings_and_captures_without_output_copies_or_files(
     assert not harness.state.pinned_copies
     # The capture fixture and metrics mock do not write files; render products and
     # timestamp manifests must not create anything themselves in this mode.
-    assert list(harness.root.rglob("*")) == []
+    assert not list(harness.root.rglob("*"))
 
 
 def test_no_report_no_save_preserves_timed_capture_without_reporting_or_samples(
@@ -801,6 +894,7 @@ def test_no_report_preserves_saved_timing_metadata_and_actual_extrema(
 
 
 def test_contiguous_primary_indices_are_independent_of_extra_clouds(harness: SimpleNamespace) -> None:
+    """Keep primary point-cloud numbering independent of extra saves and timing records."""
     harness.run(save_modes={"all-iterations", "min", "max"}, frame_naming="contiguous-output-index")
 
     canonical = json.loads((harness.sensor_dir / "timestamps.json").read_text())
@@ -821,10 +915,11 @@ def test_contiguous_primary_indices_are_independent_of_extra_clouds(harness: Sim
         ("000001.ply", "render-3x2-frame-2-iteration-2.ply"),
     ):
         assert (harness.sensor_dir / primary).read_bytes() == (harness.extra_dir / extra).read_bytes()
-    assert harness.metrics.record_frame.call_count == 4
+    assert len([call for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]) == 4
 
 
 def test_invalid_last_iteration_still_saves_canonical_cloud_without_extras(harness: SimpleNamespace) -> None:
+    """Save the final cloud even when its CUDA timer is invalid; retain independent wall samples."""
     harness.run(cuda_values=(1.0, None, 2.0, None))
     canonical = json.loads((harness.sensor_dir / "timestamps.json").read_text())
     assert [row["file_name"] for row in canonical] == ["000000.ply", "000001.ply"]
@@ -833,7 +928,7 @@ def test_invalid_last_iteration_still_saves_canonical_cloud_without_extras(harne
         _, vertices = read_ply(harness.sensor_dir / row["file_name"])
         np.testing.assert_array_equal(vertices[:, :3], np.full((2, 3), value))
     assert not harness.extra_dir.exists()
-    assert harness.metrics.record_frame.call_count == 4
+    assert len([call for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]) == 4
 
 
 @pytest.mark.parametrize("empty", [False, True])
@@ -849,6 +944,7 @@ def test_ply_without_intensity_preserves_xyz(tmp_path: Path, monkeypatch: pytest
 
 
 def test_sensor_output_name_is_sanitized_without_changing_metric_identity(harness: SimpleNamespace) -> None:
+    """Sanitize output paths while preserving the original sensor identity in metrics."""
     harness.calibration.logical_sensor_name = "lidar/front"
 
     harness.run(frame_index="0", iterations=1, save_modes={"last-iteration"}, cuda_values=(3.0,))
@@ -858,7 +954,9 @@ def test_sensor_output_name_is_sanitized_without_changing_metric_identity(harnes
         assert len(list(sensor_dir.glob("*.ply"))) == 1
         assert (sensor_dir / "timestamps.json").is_file()
         assert {path.name for path in (harness.root / subdir).iterdir()} == {"lidar_front"}
-    assert harness.metrics.record_frame.call_args.kwargs["sensor_id"] == "lidar/front"
+    assert [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs][-1][
+        "sensor_id"
+    ] == "lidar/front"
 
 
 @pytest.mark.parametrize("sensor_name", ["", ".", ".."])
@@ -932,11 +1030,12 @@ def test_other_native_errors_are_preserved(harness: SimpleNamespace) -> None:
 
 
 def test_nonzero_single_frame_ignores_stride_and_saves_its_index(harness: SimpleNamespace) -> None:
+    """Retain an explicitly selected scan index in output and render-call metrics."""
     harness.run(frame_index="2", frame_step=100, iterations=1, save_modes={"last-iteration"}, cuda_values=(3.0,))
     assert harness.state.calls == [True]
     assert [build["unique_frame_idx"] for build in harness.state.builds] == [102]
     np.testing.assert_array_equal(harness.state.poses, [[21, 30]])
-    record = harness.metrics.record_frame.call_args.kwargs
+    record = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs][-1]
     assert (record["frame"], record["iteration"]) == (2, 1)
     manifest = json.loads((harness.sensor_dir / "timestamps.json").read_text())
     assert len(manifest) == 1
@@ -947,6 +1046,7 @@ def test_nonzero_single_frame_ignores_stride_and_saves_its_index(harness: Simple
 
 
 def test_nonzero_range_anchors_stride_and_warmup_to_first_selected_frame(harness: SimpleNamespace) -> None:
+    """Anchor stride and warmups to the selected range while preserving per-call metrics."""
     harness.trajectory.lidars_frame_timestamps_us["lidar@sequence"] = torch.tensor(
         [[0, 10], [11, 20], [21, 30], [31, 40], [41, 50]]
     )
@@ -962,11 +1062,11 @@ def test_nonzero_range_anchors_stride_and_warmup_to_first_selected_frame(harness
         "nurec.render.lidar.warmup(frame=1, iteration=1)",
         "nurec.render.lidar.warmup(frame=1, iteration=2)",
     ]
-    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list]
+    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]
     assert [(row["frame"], row["iteration"]) for row in records] == [(1, 1), (1, 2), (3, 1), (3, 2)]
     assert harness.state.events[:8] == ["start", "build", "render", "stop"] * 2
     assert "synchronize" not in harness.state.events
-    np.testing.assert_array_equal(harness.state.poses, [[11, 20], [31, 40]])
+    np.testing.assert_array_equal(harness.state.poses, [[11, 20], [11, 20], [31, 40], [31, 40]])
     manifest = json.loads((harness.sensor_dir / "timestamps.json").read_text())
     assert [entry["source_frame_idx"] for entry in manifest] == [1, 3]
     assert [entry["file_name"] for entry in manifest] == ["000000.ply", "000001.ply"]
@@ -994,6 +1094,7 @@ def test_invalid_selection_fails_before_sensor_initialization(harness: SimpleNam
 def test_nsight_sensor_capture_contains_all_iterations_and_final_exports(
     harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, save: bool, warmup_frames: int
 ) -> None:
+    """Keep one sensor capture and per-frame capture identity across per-repetition timing samples."""
     original_save = render_lidar.save_ply
 
     def save_cloud(rendered: LidarFrame, path: Path, *, copy_label: str = "nurec.render.lidar_copy") -> None:
@@ -1029,11 +1130,13 @@ def test_nsight_sensor_capture_contains_all_iterations_and_final_exports(
     assert harness.state.capture_completed == [True, True]
     assert events.count("start") == events.count("stop") == warmup_frames + 4
     assert harness.state.frame_ranges == [
-        ("nurec.render.lidar.frame(lidar=lidar_front, frame=1)", warmup_frames, [True, True]),
-        ("nurec.render.lidar.frame(lidar=lidar_front, frame=2)", warmup_frames + 2, [True, True]),
+        ("nurec.render.lidar.frame(lidar=lidar_front, frame=1)", warmup_frames, [True]),
+        ("nurec.render.lidar.frame(lidar=lidar_front, frame=1)", warmup_frames + 1, [True]),
+        ("nurec.render.lidar.frame(lidar=lidar_front, frame=2)", warmup_frames + 2, [True]),
+        ("nurec.render.lidar.frame(lidar=lidar_front, frame=2)", warmup_frames + 3, [True]),
     ]
     assert len(harness.state.warmup_ranges) == warmup_frames
-    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list]
+    records = [call.kwargs for call in harness.metrics.record_frame.call_args_list if "cuda_ms" in call.kwargs]
     assert [(row["frame"], row["iteration"]) for row in records] == [(1, 1), (1, 2), (2, 1), (2, 2)]
     expected_saves = 4 if save else 2
     assert events.count("save") == expected_saves
@@ -1043,6 +1146,7 @@ def test_nsight_sensor_capture_contains_all_iterations_and_final_exports(
 
 
 def test_nsight_frame_capture_handles_zero_warmup_and_one_selected_iteration(harness: SimpleNamespace) -> None:
+    """Keep a single scan capture with distinct render-call and frame-wall samples."""
     harness.run(frame_index="2", frame_step=100, iterations=1, cuda_values=(3.0,), nsight_capture=harness.capture)
     assert harness.state.captured == [("lidar_front", 2, True, 0, 1)]
     assert harness.state.calls == [True]
@@ -1050,7 +1154,7 @@ def test_nsight_frame_capture_handles_zero_warmup_and_one_selected_iteration(har
     assert not harness.state.warmup_ranges
     assert "synchronize" not in harness.state.events
     assert not harness.capture.active
-    assert harness.metrics.record_frame.call_count == 1
+    assert harness.metrics.record_frame.call_count == 2
 
 
 @pytest.mark.parametrize("warmup_frames", [0, 1])

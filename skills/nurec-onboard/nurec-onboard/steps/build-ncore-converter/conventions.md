@@ -235,7 +235,7 @@ NCore's writer interprets stored `direction` as "unit-norm ray direction in sens
 coordinates", and `T_lidar_rig` as the sensor-to-rig transform of that **same** sensor
 frame. V4 compat reconstructs sensor-frame points as `xyz_m = direction * distance`
 (verified in `SequenceLoaderV4.RayBundleSensor.get_frame_point_cloud` in
-[`compat.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/compat.py));
+[`compat.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/compat.py));
 downstream rig/world use then depends on `T_lidar_rig` being the sensor-to-rig
 transform for that same sensor frame (for example,
 `xyz_rig = T_lidar_rig.R @ xyz_m + T_lidar_rig.t`). "Sensor frame" here means the
@@ -734,7 +734,7 @@ helper is not practical.
 3. Collapse duplicate azimuths from dual-return / near-field run patterns so the resulting
    array satisfies NCore's strict monotonicity in `spinning_direction` (verified at
    `RowOffsetStructuredSpinningLidarModelParameters.__post_init__` in
-   [`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)).
+   [`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)).
    The collapsed length is the real `n_columns` -- the unique-azimuth count per rotation,
    not the raw column count. For example, on a 128-beam sensor with mixed 2x/4x dual-return
    run patterns this might be ~1700 unique azimuths instead of ~3600 raw columns; on a
@@ -778,28 +778,28 @@ LiDAR. The model's `column_azimuths_rad` now matches the sensor's actual firing 
 evaluates `azimuth(row, col) = column_azimuths_rad[col] + row_azimuth_offsets_rad[row]`
 unconditionally (verified at
 `RowOffsetStructuredSpinningLidar.elements_to_sensor_angles` in
-[`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/sensors/lidar.py)
+[`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/sensors/lidar.py)
 and the row-offset spinning model examples in
-[`sensor_models.rst`](https://github.com/NVIDIA/ncore/blob/v19.8.0/docs/data/sensor_models.rst)),
+[`sensor_models.rst`](https://github.com/NVIDIA/ncore/blob/v19.8.5/docs/data/sensor_models.rst)),
 and its FOV assertion `_init_angles_to_columns_map` validates the `n_rows × n_columns`
 grid against parameter-derived FOV at every `(row, col)` cell (verified at
 `RowOffsetStructuredSpinningLidar._init_angles_to_columns_map` in
-[`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/sensors/lidar.py)).
+[`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/sensors/lidar.py)).
 Δ is always added; there is no conditional path. NCore's stated canonical target sensor
 for non-zero Δ is **Hesai P128** (verified at
 the Hesai P128 entries in
-[`sensor_models.rst`](https://github.com/NVIDIA/ncore/blob/v19.8.0/docs/data/sensor_models.rst)
+[`sensor_models.rst`](https://github.com/NVIDIA/ncore/blob/v19.8.5/docs/data/sensor_models.rst)
 and the `RowOffsetStructuredSpinningLidarModelParameters` docstring in
-[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)).
+[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)).
 
 NCore's writer requires only that the stored `direction` is `float32`, shape `[N, 3]`,
 unit-norm to `1e-4` (verified at
 `LidarSensorComponent.Writer.store_frame` in
-[`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/components.py));
+[`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/components.py));
 it does **not** require stored direction to match `elements_to_sensor_rays(model_element)`
 at any tolerance. Stored direction is the source of truth for point-cloud reconstruction
 (`xyz_m = direction × distance` in `SequenceLoaderV4.RayBundleSensor.get_frame_point_cloud`
-in [`compat.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/compat.py));
+in [`compat.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/compat.py));
 `column_azimuths_rad` is consulted only for shutter-time / model-element paths.
 `xyz_m` lives in the **same sensor frame** that `T_lidar_rig` is sensor-to-rig of
 (see "Spinning LiDAR model-frame choice" above): under Option A this is the
@@ -876,7 +876,7 @@ schedule, or native-resolution encode-in-column parameters that fail the model c
   along `spinning_direction` strictly increasing, no wrap at the start element; verified
   at
   `RowOffsetStructuredSpinningLidarModelParameters.__post_init__` in
-  [`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)):
+  [`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)):
   - CCW (`spinning_direction = +1`):
     `column_azimuths_rad = (np.arange(n_columns) * step) % (2*np.pi)`.
   - CW (`spinning_direction = -1`):
@@ -984,7 +984,7 @@ derivation depends on the raw data format.
 **Recommendation: always store XYZ-derived direction (Case 2 / Case 3 below).**
 NCore's writer accepts any unit-norm direction (verified at
 `LidarSensorComponent.Writer.store_frame` in
-[`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/components.py));
+[`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/components.py));
 the choice is a converter-quality matter, not an NCore-required check.
 
 **Case 1 — polar range image, model-derived direction (preserved for completeness only).**
@@ -1042,7 +1042,7 @@ For dtype / shape details, see NCore data-formats spec. Converter-relevant const
   model FOV defined by `(row_elevations_rad, column_azimuths_rad, row_azimuth_offsets_rad)`
   -- NCore asserts this strictly per `(row, col)` cell (verified at
   `RowOffsetStructuredSpinningLidar._init_angles_to_columns_map` in
-  [`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/sensors/lidar.py)).
+  [`lidar.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/sensors/lidar.py)).
   Calibrated per-beam elevation tables are nominal; real measurements scatter slightly past
   the table extremes due to sensor noise and low-precision storage formats. A small
   fraction of rays (empirically O(0.1-1%)) will be flagged. Drop these rays before write;
@@ -1092,7 +1092,7 @@ For dtype / shape details, see NCore data-formats spec. Converter-relevant const
 > in the sequence interval and that every stored per-ray `timestamp_us` falls
 > inside the stored frame window; see `BaseSensorComponentWriter._store_base_frame`
 > and `LidarSensorComponent.Writer.store_frame` in
-> [`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/components.py).
+> [`components.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/components.py).
 
 The NCore V4 writer asserts per-ray `timestamp_us` falls inside the frame's
 `[frame_timestamps_us[0], frame_timestamps_us[1]]` window. When per-ray timestamps are
@@ -1248,7 +1248,7 @@ for the canonical equations):
 For OpenCV fisheye parameters, `OpenCVFisheyeCameraModelParameters` lives in
 `ncore.data`. Use keyword arguments when computing `max_angle`; see the
 public NCore
-[`OpenCVFisheyeCameraModelParameters.compute_max_angle()` implementation](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)
+[`OpenCVFisheyeCameraModelParameters.compute_max_angle()` implementation](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)
 for the authoritative signature:
 
 ```python
@@ -1305,7 +1305,7 @@ For `OpenCVFisheyeCameraModelParameters`, convert that pixel bound into an incid
 rather than sampling out to `max_angle`, which is the angle to the farthest image _corner_ and
 so puts probes outside the frame along the short axis. NCore's
 `compute_max_angle_with_monotonicity(fw_poly_coeffs, max_radius)` in
-[`util.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/util.py) inverts the
+[`util.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/util.py) inverts the
 forward Kannala-Brandt polynomial (coefficients `[0, 1, 0, k1, 0, k2, 0, k3, 0, k4]`) and
 returns the smaller of the requested-radius angle and the angle at which the polynomial stops
 increasing. Pass the focal-normalized inscribed radius,
@@ -1529,14 +1529,14 @@ object classes. Record in `critical_parameter_justifications` under
 `centroid` coordinates live in. NCore's data contract enforces this: `BBox3.centroid` is
 defined as living "in the frame of reference"
 (`BBox3.centroid` in
-[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)),
+[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)),
 and `CuboidTrackObservation.transform()` calls
 `pose_graph.evaluate_poses(reference_frame_id, anchor_frame_id, …)`
 (`CuboidTrackObservation.transform` in
-[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py))
+[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py))
 — the frame ID **must** be a registered node in the pose graph or the transform fails
 (`PoseGraphInterpolator.evaluate_poses` in
-[`transformations.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/common/transformations.py)
+[`transformations.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/common/transformations.py)
 raises on unknown nodes or missing paths).
 
 If the converter rebases the world (Z shift, re-anchor at frame 0, axis swap, merge of
@@ -1558,7 +1558,7 @@ coordinates are still authored in `world` (or vice versa) produces two visible s
 NCore source is agnostic about which `dim` axis is length / width / height and about the
 `rot=(0,0,0)` "forward" direction
 (`BBox3.dim` and `BBox3.rot` in
-[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/types.py)
+[`types.py`](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/types.py)
 only says `dim` is "extents in the local frame" and `rot` is "XYZ Euler angles orienting
 the local bounding-box frame to the frame of reference"). The forward-axis flip and Z
 mismatch are reference-frame issues, not local-frame convention bugs — fix them by

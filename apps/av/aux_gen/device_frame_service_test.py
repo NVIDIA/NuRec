@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import multiprocessing
 import queue
 import threading
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ import pytest
 import torch
 
 from apps.av.aux_gen.device_frame import (
+    DeviceFrameContext,
     DeviceFrameOutputSpec,
     DeviceFramePipeline,
     DeviceFrameProcessorMetadata,
@@ -24,6 +27,7 @@ from apps.av.aux_gen.device_frame_service import (
     DeviceFrameSharedArrayDescriptor,
     DeviceFrameSharedBuffers,
     DeviceFrameSharedMemorySlot,
+    DeviceFrameStopSignal,
     SharedDeviceFrameClient,
     _run_device_frame_processors,
     _schedule_cuda_pipeline_stages,
@@ -37,6 +41,7 @@ CAMERA_MASK_INPUT = "test_auxiliary_input"
 SEMANTIC_LABELS_OUTPUT = "test_labels"
 SEMANTIC_LOGITS_OUTPUT = "test_logits"
 SAM2_MASK_OUTPUT = "test_mask"
+_TEST_WAIT_TIMEOUT_SECONDS = 5.0
 
 
 def _output_specs(
@@ -119,7 +124,7 @@ class _FakeEstimator:
     def output_specs(self, resolution: tuple[int, int]) -> tuple[DeviceFrameOutputSpec, ...]:
         return _output_specs(resolution, logits=self.estimate_logits)
 
-    def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream) -> None:
+    def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame) -> None:
         raise NotImplementedError
 
 
@@ -200,16 +205,18 @@ def test_shared_memory_attach_closes_each_successful_partial_attachment() -> Non
     input_shared_memory.unlink.assert_not_called()
 
 
-def test_shared_device_frame_client_submits_and_resolves_only_active_outputs() -> None:
+@pytest.mark.parametrize("instance_count", [0, 2])
+def test_shared_device_frame_client_submits_and_resolves_only_active_outputs(instance_count) -> None:
     buffers = DeviceFrameSharedBuffers.create((4, 3), _output_specs((4, 3), sam2=True))
     camera_mask = DeviceFrameSharedArray.create(
         CAMERA_MASK_INPUT,
         np.array([[True, False, True, False]] * 3, dtype=np.bool_),
     )
+    masks = DeviceFrameSharedArray.create("instances", np.ones((instance_count, 3, 4), dtype=np.bool_))
     slot_queue: queue.Queue = queue.Queue(maxsize=1)
     request_queue: queue.Queue = queue.Queue(maxsize=1)
     result_queue: queue.Queue = queue.Queue(maxsize=1)
-    stop_event = threading.Event()
+    stop_event = DeviceFrameStopSignal.create(multiprocessing.get_context("spawn"))
     slot_queue.put(buffers.slot)
     client = SharedDeviceFrameClient(
         worker_id=2,
@@ -226,11 +233,13 @@ def test_shared_device_frame_client_submits_and_resolves_only_active_outputs() -
             image,
             frozenset({MASK2FORMER_PROCESSOR}),
             (camera_mask.descriptor,),
+            frame=DeviceFrameContext(2, 7, "front", 42, (1, 7)),
         )
         assert pending is not None
         request = request_queue.get_nowait()
         assert request.worker_id == 2
         assert request.request_id == 7
+        assert request.frame == DeviceFrameContext(2, 7, "front", 42, (1, 7))
         assert request.processor_inputs == (camera_mask.descriptor,)
         np.testing.assert_array_equal(buffers.input_buffer, image)
 
@@ -241,18 +250,24 @@ def test_shared_device_frame_client_submits_and_resolves_only_active_outputs() -
                 request_id=7,
                 error=None,
                 output_names=(SEMANTIC_LABELS_OUTPUT,),
+                variable_outputs=(masks.descriptor,),
             )
         )
         resolved = client.resolve(pending, include_input=True)
 
-        assert set(resolved.outputs) == {SEMANTIC_LABELS_OUTPUT}
+        assert set(resolved.outputs) == {SEMANTIC_LABELS_OUTPUT, "instances"}
+        assert resolved.outputs["instances"].shape == (instance_count, 3, 4)
+        masks.array.fill(False)
+        assert resolved.outputs["instances"].all()  # Host owns copies after slot reuse.
         np.testing.assert_array_equal(resolved.outputs[SEMANTIC_LABELS_OUTPUT], np.full((3, 4), 5, dtype=np.uint8))
         assert resolved.input_image is not None
         np.testing.assert_array_equal(resolved.input_image, image)
         assert slot_queue.get_nowait() == buffers.slot
     finally:
         client.close()
+        stop_event.close()
         camera_mask.close()
+        masks.close()
         buffers.close()
 
 
@@ -284,7 +299,7 @@ def test_shared_device_frame_client_returns_slot_on_resolve_error(
     slot_queue: queue.Queue = queue.Queue(maxsize=1)
     request_queue: queue.Queue = queue.Queue(maxsize=1)
     result_queue: queue.Queue = queue.Queue()
-    stop_event = threading.Event()
+    stop_event = DeviceFrameStopSignal.create(multiprocessing.get_context("spawn"))
     slot_queue.put(buffers.slot)
     client = SharedDeviceFrameClient(
         worker_id=2,
@@ -295,7 +310,12 @@ def test_shared_device_frame_client_returns_slot_on_resolve_error(
     )
 
     try:
-        pending = client.submit(7, np.zeros((3, 4, 3), dtype=np.uint8), frozenset({MASK2FORMER_PROCESSOR}))
+        pending = client.submit(
+            7,
+            np.zeros((3, 4, 3), dtype=np.uint8),
+            frozenset({MASK2FORMER_PROCESSOR}),
+            frame=DeviceFrameContext(2, 7, "", 0, ()),
+        )
         assert pending is not None
         for result in results:
             result_queue.put(result)
@@ -307,7 +327,55 @@ def test_shared_device_frame_client_returns_slot_on_resolve_error(
         assert slot_queue.empty()
     finally:
         client.close()
+        stop_event.close()
         buffers.close()
+
+
+def test_client_shutdown_wakes_completion_waiters():
+    ctx = multiprocessing.get_context("spawn")
+    slots, results = ctx.Queue(), ctx.Queue()
+    stop = DeviceFrameStopSignal.create(ctx)
+    client = SharedDeviceFrameClient(
+        worker_id=0, slot_queue=slots, request_queue=MagicMock(), result_queue=results, stop_event=stop
+    )
+    entered = threading.Event()
+
+    def wait(readers):
+        entered.set()
+        return multiprocessing.connection.wait(readers)
+
+    # Free capacity must not wake a completion-only drain.
+    slots.put("returned slot")
+    assert slots._reader.poll(_TEST_WAIT_TIMEOUT_SECONDS)
+    assert client.wait_for_capacity() is None
+    try:
+        with (
+            ThreadPoolExecutor(max_workers=1) as executor,
+            patch("apps.av.aux_gen.device_frame_service.wait_for_connections", side_effect=wait),
+        ):
+            try:
+                future = executor.submit(client._receive_result)
+                assert entered.wait(_TEST_WAIT_TIMEOUT_SECONDS)
+                stop.set()
+                with pytest.raises(RuntimeError, match="service failed"):
+                    future.result(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
+                assert stop.is_set()
+                # Preserve a diagnostic arriving after shutdown; the signal stays readable.
+                results.put(DeviceFrameResult(request_id=9, error="device broke"))
+                with pytest.raises(RuntimeError, match="device broke"):
+                    client._receive_result()
+                stop.set()
+                with pytest.raises(RuntimeError, match="service failed"):
+                    client._receive_result()
+                assert not client._completed_results
+                assert slots.get(timeout=_TEST_WAIT_TIMEOUT_SECONDS) == "returned slot" and slots.empty()
+            finally:
+                stop.set()
+    finally:
+        stop.close()
+        for channel in (slots, results):
+            channel.close()
+            channel.join_thread()
 
 
 def test_cuda_pipeline_stages_have_explicit_dependencies_without_synchronizing() -> None:
@@ -410,9 +478,13 @@ def test_device_frame_processors_compose_in_order_with_declared_outputs() -> Non
             del resolution
             return (DeviceFrameOutputSpec(self._output_name, (3, 4), torch.uint8),)
 
-        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream) -> None:
+        def process_device(
+            self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame
+        ) -> dict[str, torch.Tensor]:
+            assert frame == DeviceFrameContext(0, 1, "front", 42, (7,))
             operations.append(self.name)
             assert outputs[self._output_name] is not None
+            return {self.name + "_instances": torch.zeros((0, 3, 4), dtype=torch.bool)}
 
     request = DeviceFrameRequest(
         worker_id=0,
@@ -423,7 +495,9 @@ def test_device_frame_processors_compose_in_order_with_declared_outputs() -> Non
             outputs=(),
         ),
         enabled_processors=frozenset({"first", "second"}),
+        frame=DeviceFrameContext(0, 1, "front", 42, (7,)),
     )
+    variable: dict[str, torch.Tensor] = {}
     output_names = _run_device_frame_processors(
         processor_directory(
             FakeProcessor("first", "first_output"),
@@ -435,8 +509,11 @@ def test_device_frame_processors_compose_in_order_with_declared_outputs() -> Non
         {"first_output": MagicMock(), "second_output": MagicMock()},
         {},
         MagicMock(),
+        variable,
     )
 
+    assert set(variable) == {"first_instances", "second_instances"}
+    assert all(t.shape == (0, 3, 4) and t.dtype == torch.bool for t in variable.values())
     assert operations == ["first", "second"]
     assert output_names == ("first_output", "second_output")
 
@@ -452,7 +529,7 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
             width, height = self.resolution
             return (1, 3, height, width), torch.uint8
 
-        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream):
+        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame):
             semantic_seg_out = outputs[SEMANTIC_LABELS_OUTPUT]
             semantic_seg_logits_out = outputs.get(SEMANTIC_LOGITS_OUTPUT)
             ego_mask = processor_inputs.get(CAMERA_MASK_INPUT)
@@ -486,7 +563,7 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
             width, height = resolution
             return (DeviceFrameOutputSpec(SAM2_MASK_OUTPUT, (height, width), torch.uint8),)
 
-        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream):
+        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame):
             nonlocal sam2_request_count
             del processor_inputs, stream
             assert image_bgr_nchw.device.type == "cuda"
@@ -529,9 +606,11 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
             "allowed_resolutions": frozenset({(4, 3), (2, 2)}),
         },
     )
+    no_sleep = patch("time.sleep", side_effect=AssertionError("Unexpected sleep"))
+    no_sleep.start()
     try:
         service_thread.start()
-        ready = ready_queue.get(timeout=5.0)
+        ready = ready_queue.get(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
         assert ready.device_id == 0
         assert ready.error is None
 
@@ -543,9 +622,10 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
                 request_id=-1,
                 slot=first_buffers.slot,
                 enabled_processors=frozenset({SAM2_PROCESSOR}),
+                frame=DeviceFrameContext(0, -1, "", 0, ()),
             )
         )
-        assert result_queues[0].get(timeout=5.0).request_id == -1
+        assert result_queues[0].get(timeout=_TEST_WAIT_TIMEOUT_SECONDS).request_id == -1
         np.testing.assert_array_equal(
             first_buffers.output_buffers[SAM2_MASK_OUTPUT],
             np.full((3, 4), 7, dtype=np.uint8),
@@ -559,11 +639,12 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
                     request_id=0,
                     slot=buffers.slot,
                     enabled_processors=frozenset({MASK2FORMER_PROCESSOR}),
+                    frame=DeviceFrameContext(worker_id, 0, "", 0, ()),
                 )
             )
 
         for worker_id, buffers in enumerate(shared_buffers):
-            result = result_queues[worker_id].get(timeout=5.0)
+            result = result_queues[worker_id].get(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
             assert result.error is None
             width, height = buffers.slot.resolution
             np.testing.assert_array_equal(
@@ -580,16 +661,18 @@ def test_gpu_service_pipelines_mixed_resolutions_and_reuses_worker_slots() -> No
                 request_id=1,
                 slot=first_buffers.slot,
                 enabled_processors=frozenset({MASK2FORMER_PROCESSOR}),
+                frame=DeviceFrameContext(0, 1, "", 0, ()),
             )
         )
-        assert result_queues[0].get(timeout=5.0).request_id == 1
+        assert result_queues[0].get(timeout=_TEST_WAIT_TIMEOUT_SECONDS).request_id == 1
         np.testing.assert_array_equal(
             first_buffers.output_buffers[SAM2_MASK_OUTPUT],
             np.full((3, 4), 7, dtype=np.uint8),
         )
     finally:
         request_queue.put(None)
-        service_thread.join(timeout=5.0)
+        service_thread.join(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
+        no_sleep.stop()
         for buffers in shared_buffers:
             buffers.close()
 
@@ -607,7 +690,7 @@ def test_gpu_service_reuses_global_slot_across_camera_workers() -> None:
             width, height = self.resolution
             return (1, 3, height, width), torch.uint8
 
-        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream):
+        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame):
             semantic_seg_out = outputs[SEMANTIC_LABELS_OUTPUT]
             semantic_seg_logits_out = outputs.get(SEMANTIC_LOGITS_OUTPUT)
             ego_mask = processor_inputs.get(CAMERA_MASK_INPUT)
@@ -617,6 +700,9 @@ def test_gpu_service_reuses_global_slot_across_camera_workers() -> None:
             assert ego_mask.device.type == "cuda"
             assert ego_mask.dtype == torch.bool
             semantic_seg_out.fill_(int(ego_mask[0, 0]))
+            return {
+                "instances": torch.ones((2 * frame.worker_id, 2, 2), dtype=torch.bool, device=image_bgr_nchw.device)
+            }
 
     request_queue: queue.Queue = queue.Queue(maxsize=1)
     result_queues: list[queue.Queue] = [queue.Queue(maxsize=1), queue.Queue(maxsize=1)]
@@ -646,18 +732,31 @@ def test_gpu_service_reuses_global_slot_across_camera_workers() -> None:
     )
     try:
         service_thread.start()
-        assert ready_queue.get(timeout=5).error is None
-        for worker_id in range(2):
+        assert ready_queue.get(timeout=_TEST_WAIT_TIMEOUT_SECONDS).error is None
+        previous = None
+        for request_id, worker_id in enumerate((0, 1, 0)):
             request_queue.put(
                 DeviceFrameRequest(
                     worker_id=worker_id,
-                    request_id=worker_id,
+                    request_id=request_id,
                     slot=shared_buffers.slot,
                     enabled_processors=frozenset({MASK2FORMER_PROCESSOR}),
                     processor_inputs=(camera_masks[worker_id].descriptor,),
+                    frame=DeviceFrameContext(worker_id, request_id, "", 0, ()),
                 )
             )
-            assert result_queues[worker_id].get(timeout=5).error is None
+            result = result_queues[worker_id].get(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
+            assert result.error is None
+            (descriptor,) = result.variable_outputs
+            array = DeviceFrameSharedArray.attach(descriptor)
+            try:
+                np.testing.assert_array_equal(array.array, np.ones((2 * worker_id, 2, 2), dtype=bool))
+            finally:
+                array.close()
+            if previous is not None:
+                with pytest.raises(FileNotFoundError):
+                    DeviceFrameSharedArray.attach(previous)
+            previous = descriptor
             np.testing.assert_array_equal(
                 shared_buffers.output_buffers[SEMANTIC_LABELS_OUTPUT],
                 np.full((2, 2), worker_id, dtype=np.uint8),
@@ -671,6 +770,8 @@ def test_gpu_service_reuses_global_slot_across_camera_workers() -> None:
 
     assert not service_thread.is_alive()
     assert not stop_event.is_set()
+    with pytest.raises(FileNotFoundError):
+        DeviceFrameSharedArray.attach(descriptor)
 
 
 @pytest.mark.parametrize(
@@ -692,7 +793,7 @@ def test_gpu_services_dynamically_share_one_request_queue(service_device_ids: tu
             width, height = self.resolution
             return (1, 3, height, width), torch.uint8
 
-        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream):
+        def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame):
             semantic_seg_out = outputs[SEMANTIC_LABELS_OUTPUT]
             semantic_seg_logits_out = outputs.get(SEMANTIC_LOGITS_OUTPUT)
             ego_mask = processor_inputs.get(CAMERA_MASK_INPUT)
@@ -746,6 +847,7 @@ def test_gpu_services_dynamically_share_one_request_queue(service_device_ids: tu
                     request_id=request_id,
                     slot=buffers.slot,
                     enabled_processors=frozenset({MASK2FORMER_PROCESSOR}),
+                    frame=DeviceFrameContext(0, request_id, "", 0, ()),
                 )
             )
         completed_request_ids = {result_queues[0].get(timeout=30).request_id for _ in shared_buffers}
@@ -805,9 +907,10 @@ def test_gpu_service_propagates_inference_errors() -> None:
                 request_id=0,
                 slot=shared_buffers.slot,
                 enabled_processors=frozenset({MASK2FORMER_PROCESSOR}),
+                frame=DeviceFrameContext(0, 0, "", 0, ()),
             )
         )
-        result = result_queue.get(timeout=5.0)
+        result = result_queue.get(timeout=_TEST_WAIT_TIMEOUT_SECONDS)
         assert result.error is not None
         assert "inference boom" in result.error
         service_thread.join(timeout=1.0)

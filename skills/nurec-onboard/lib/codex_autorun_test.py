@@ -386,7 +386,7 @@ class CodexLauncherIntegrationTest(LauncherTestBase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         base = "ghcr.io/nvidia/nurec/nurec_dev_deps:test-release"
         self.assertIn(f"pull {base}", docker_log.read_text())
-        self.assertIn(f"--build-arg BASE_IMAGE={base} -t nurec_dev:onboard-", docker_log.read_text())
+        self.assertIn(f"--build-arg NUREC_DEV_DEPS_IMAGE={base} -t nurec_dev:onboard-", docker_log.read_text())
         self.assertIn(f"NuRec source/image pair: {self.nre_root} / {base}", result.stdout)
         self.assertIn("NuRec development image is built: nurec_dev:onboard-", result.stdout)
 

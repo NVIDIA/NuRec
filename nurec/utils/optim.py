@@ -12,7 +12,6 @@ import math
 from collections import OrderedDict
 from typing import Callable, NotRequired, Optional, Required, Type, TypedDict
 
-import apex
 import lietorch as lt
 import numpy as np
 import torch
@@ -263,8 +262,15 @@ class SelectiveAdam(_GsplatSelectiveAdam):
         return super().step(closure)
 
 
+def _fused_adam(params, **kwargs) -> Optimizer:
+    """Construct apex's FusedAdam, importing apex only when an optimizer is actually built."""
+    import apex
+
+    return apex.optimizers.FusedAdam(params, **kwargs)
+
+
 optim_fns: dict[str, Callable] = {
-    "fused_adam": apex.optimizers.FusedAdam,
+    "fused_adam": _fused_adam,
     "selective_adam": SelectiveAdam,
     "adam": torch.optim.Adam,
     "adamw": torch.optim.AdamW,

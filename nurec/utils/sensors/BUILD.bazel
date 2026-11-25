@@ -33,7 +33,20 @@ py_library(
         pip_requirement("nvidia-ncore"),
         "//nurec/libs/sensors:pose_calib_kernels",
         "//nurec/utils:pylib_geometry",
+        "//nurec/utils:pylib_image_resolution",
         "//nurec/utils:pylib_torch_compile",
+    ],
+)
+
+pytest_test(
+    name = "ncore_sensors_converters_test",
+    srcs = ["ncore_sensors_converters_test.py"],
+    deps = [
+        ":pylib_ncore_sensors_converters",
+        "//nurec/libs/sensors:camera_kernels",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
     ],
 )
 

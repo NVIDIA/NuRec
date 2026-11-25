@@ -459,8 +459,10 @@ def test_system_factory_preserves_full_lightning_checkpoint_loading(monkeypatch:
 
     class _System:
         @classmethod
-        def load_from_checkpoint(cls, path: str, *, strict: bool, config: InstantNuRecConfig) -> object:
-            events.append((path, strict, config))
+        def load_from_checkpoint(
+            cls, path: str, *, strict: bool, config: InstantNuRecConfig, weights_only: bool
+        ) -> object:
+            events.append((path, strict, config, weights_only))
             return loaded_system
 
     def unexpected_state_dict_load(*_args: object, **_kwargs: object) -> None:
@@ -472,7 +474,7 @@ def test_system_factory_preserves_full_lightning_checkpoint_loading(monkeypatch:
     system = systems_module.make("base-instant_nurec-system", config, load_from_checkpoint=checkpoint_path)
 
     assert system is loaded_system
-    assert events == [(checkpoint_path, True, config)]
+    assert events == [(checkpoint_path, True, config, False)]
 
 
 def test_lightning_predict_step_delegates_existing_forward_to_shared_core(monkeypatch: pytest.MonkeyPatch) -> None:

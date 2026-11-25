@@ -15,6 +15,7 @@ defaults:
   - /apps/prod/options/calib: enabled
   # Enable MCMC strategy
   - /apps/AV/module_mixins/_mcmc_mixin.yaml
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_1
   - override /model/gaussians/renderer@model.renderer: 3dgut4rt_gsplat
   - override /model/gaussians/strategy@model.strategy: mcmc
   # robotics initialization
@@ -51,11 +52,6 @@ dataset:
   # No lidar for robotics
   lidar_ids: []
   n_train_sample_lidar_rays: 0
-  samplers:
-    batch_sampler:
-      camera_pixel_sampler:
-        subsample: 1
-
 checkpoint:
   every_n_train_steps: ${mul:${trainer.max_epochs},${dataset.n_samples_per_epoch}}
 

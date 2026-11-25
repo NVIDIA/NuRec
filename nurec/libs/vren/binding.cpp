@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 #include "utils.h"
@@ -151,6 +151,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("max_track_n_poses"),
           py::arg("max_intersections_per_ray"),
           py::arg("with_intersections_ts"));
+    m.def("camera_track_intervals", &camera_track_intervals_cu,
+          py::arg("pixels"),
+          py::arg("rays"),
+          py::arg("poses"),
+          py::arg("timestamps"),
+          py::arg("relative_times"),
+          py::arg("packinfo"),
+          py::arg("track_poses"),
+          py::arg("track_times"),
+          py::arg("dims"),
+          py::arg("width"),
+          py::arg("height"),
+          py::arg("shutter"),
+          py::arg("max_poses"),
+          py::arg("max_hits"));
 
     // General types
     py::class_<RollingShutterParameters>(m, "RollingShutterParameters")

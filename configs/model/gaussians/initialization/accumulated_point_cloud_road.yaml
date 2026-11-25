@@ -14,7 +14,7 @@ far_radius_factor: 20 # Multiplies the extent of the scene to get the radius of 
 
 observation_scale_factor: 0.01 # Used only for the scale of the random far points
 
-default_density: ${eval:'0.5 if ("${model.strategy.name}"=="mcmc") else 0.99'}
+default_density: ${eval:'0.5 if ("${model.strategy.name}" in ["mcmc", "taminggs_mcmc"]) else 0.99'}
 default_scale: [0.1, 0.1, 0.001]
 
 project_to_z_offset: false # If true, the z value (in ego space) of each Gaussian is adjusted by adding the `z_offset` of its nearest ego position; if false, the z value remains unchanged.

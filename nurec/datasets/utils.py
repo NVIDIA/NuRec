@@ -12,13 +12,12 @@ import struct
 
 from collections import defaultdict
 from functools import lru_cache
-from typing import Generator, List, Optional, Protocol, Tuple, TypeVar, Union, runtime_checkable
+from typing import TYPE_CHECKING, Generator, List, Optional, Protocol, Tuple, TypeVar, Union, runtime_checkable
 
 import cv2
 import lietorch as lt
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 import torch
 import torchvision
 import tqdm
@@ -49,6 +48,7 @@ from nurec.utils.geometry import (
     se3_matrix_to_se3,
     se3_matrix_to_tquat,
 )
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.misc import (
     assert_default_device_on_local_rank,
     set_default_device,
@@ -60,6 +60,10 @@ from nurec.utils.misc import (
 from nurec.utils.morph import MorphOp
 from nurec.utils.types import AABB3D, CuboidTracksData, HalfClosedInterval, PointCloud, TracksData
 from nurec.visualdebugger import get_visualdebugger
+
+
+if TYPE_CHECKING:
+    import pandas as pd  # annotations only; compute_cuboid_df imports it when it builds the frame
 
 
 Tensor = TypeVar("Tensor", np.ndarray, torch.Tensor)
@@ -259,9 +263,6 @@ def get_sampled_pixels(
     Also returns a flag indicating whether the rays should be sampled at half-pixel offsets
     """
 
-    # Get full resolution
-    image_width, image_height = camera_resolution
-
     # extract pixel indices to sample rays / image signals from
     match sampler_sampled_pixels:
         case np.ndarray():
@@ -270,44 +271,13 @@ def get_sampled_pixels(
 
             # Always stick to rays associated with centers pixel
             halfpixoffset_rays = False
-        case RectSubsampled(
-            subsample_factor=subsample_factor,
-            i=i,
-            j=j,
-            width=width,
-            height=height,
-        ):
+        case RectSubsampled():
             # Constructing camera batch for a structured rectangular pixel region
-            n_subsample = int(subsample_factor)
-            # Assert that subsample_factor is integer
-            assert n_subsample == subsample_factor, (
-                f"Subsample factor {subsample_factor} in the sampler_sampled_pixels must be an integer for now."
+            image_transform = sampler_sampled_pixels.image_transform
+            assert image_transform.source_resolution == camera_resolution, (
+                "Sampled-pixel source resolution does not match the camera resolution"
             )
-
-            # Subsample pixels from all pixels according to the subsample factor
-            frame_all_pixels_subsampled = camera_all_pixels.reshape(image_height, image_width, 2)[
-                ::n_subsample, ::n_subsample
-            ]
-
-            # Offset the subsampled pixel coordinates to minimize the correlation errors of downsampled
-            # pixel domains relative to the full pixel domain. This is to bound the correspondence of subsampled
-            # pixel centers relative to corresponding full image pixel centers to 0.5px (even subsample factors)
-            # or 0px (odd subsample factors) [see visualizations in original MR]
-            #
-            # The _remaining_ 0.5px offset is accounted for ray sampling below.
-            pixels_subsampled_offset = (n_subsample - 1) // 2
-
-            # Select the pixels according to ROI, applying offset
-            pixels = (
-                frame_all_pixels_subsampled[j : (j + height), i : (i + width)].reshape(-1, 2) + pixels_subsampled_offset
-            )
-
-            # If we guarantee that the image is contiguous _and_ the subsample factor is _even_, we need to
-            # select rays at half-pixel offsets to be consistent with the centers of the downsampled pixels.
-            # If subsampling the factor is odd, the subselected pixels are aligned to the image-point
-            # centers of the downsampled pixels, so default rays from original pixel centers are used in
-            # that case also
-            halfpixoffset_rays = n_subsample % 2 == 0
+            pixels, halfpixoffset_rays = image_transform.sample_integer_stride_pixel_grid(camera_all_pixels)
         case _:
             raise ValueError(f"Unexpected sampled pixels type {type(sampler_sampled_pixels)}")
 
@@ -540,6 +510,8 @@ def compute_cuboid_df(
         disable=tqdm_disabled,
     ):
         cuboid_dicts.append(observation.to_dict() if serialize_observation else vars(observation))
+
+    import pandas as pd  # the only runtime pandas use in this module
 
     if len(cuboid_dicts):
         # load all observations into dataframe, deducing dynamic types from structure
@@ -1003,6 +975,112 @@ def classify_dynamic_cuboid_tracks(
     return cuboidtracks_all, cuboidtracks_dynamic
 
 
+def _camera_visible_intervals_batched(
+    cuboidtracks: CuboidTracks,
+    camera_sensors: dict[str, ncore.data.CameraSensorProtocol],
+    camera_models: dict[str, ncore.sensors.CameraModel],
+    camera_frame_ranges: dict[str, range],
+    cameras_all_pixels: dict[str, np.ndarray],
+    cameras_all_rays: dict[str, np.ndarray],
+    valid_pixels_cuboid_tracks_params: ValidPixelsCuboidTrackConfig | None,
+    subsample: int,
+    max_intersections_per_ray: int,
+) -> list[np.ndarray]:
+    """Reduce ray hits on the GPU and copy only per-frame track intervals."""
+    from nurec.libs.vren.interface import vren
+
+    tracks = cuboidtracks
+    bounds = (
+        tracks.tracks_timestamps_us[
+            torch.stack(
+                (tracks.tracks_packinfo[:, 0], tracks.tracks_packinfo[:, 0] + tracks.tracks_packinfo[:, 1] - 1), -1
+            ).long()
+        ]
+        .cpu()
+        .numpy()
+    )
+    padding = (
+        valid_pixels_cuboid_tracks_params.track_padding_m
+        if valid_pixels_cuboid_tracks_params is not None
+        else [0.0, 0.0, 0.0]
+    )
+    dims = tracks.cuboids_dims + torch.tensor(padding, device=tracks.device, dtype=torch.float32)
+    per_track: list[list[list[int]]] = [[] for _ in range(tracks.n_tracks)]
+    for camera_id, frame_range in camera_frame_ranges.items():
+        sensor = camera_sensors[camera_id]
+        model = camera_models[camera_id]
+        width, height = map(int, model.resolution.tolist())
+        pixels = torch.as_tensor(
+            cameras_all_pixels[camera_id].reshape(height, width, 2)[::subsample, ::subsample].reshape(-1, 2),
+            device=tracks.device,
+        ).contiguous()
+        rays = torch.as_tensor(
+            cameras_all_rays[camera_id][::subsample, ::subsample].reshape(-1, 3), device=tracks.device
+        ).contiguous()
+        relative = (
+            model.image_points_relative_frame_times(model.pixels_to_image_points(pixels.cpu()))
+            .to(tracks.device)
+            .contiguous()
+        )
+        idx = np.asarray(list(frame_range))
+        if not len(idx):
+            continue
+        poses = np.stack(
+            [
+                sensor.get_frames_T_sensor_target("world", idx, tp)
+                for tp in (ncore.data.FrameTimepoint.START, ncore.data.FrameTimepoint.END)
+            ],
+            1,
+        ).astype(np.float32)
+        poses = se3_matrix_to_tquat(poses).reshape(len(idx), 2, 7).to(tracks.device).contiguous()
+        times = np.array(
+            [
+                [
+                    sensor.get_frame_timestamp_us(int(i), tp)
+                    for tp in (ncore.data.FrameTimepoint.START, ncore.data.FrameTimepoint.END)
+                ]
+                for i in idx
+            ],
+            dtype=np.int64,
+        )
+        timestamps = torch.tensor(times, device=tracks.device)
+        outputs = []
+        for start in range(0, len(idx), 16):
+            outputs.append(
+                vren.camera_track_intervals(
+                    pixels,
+                    rays,
+                    poses[start : start + 16],
+                    timestamps[start : start + 16],
+                    relative,
+                    tracks.tracks_packinfo,
+                    tracks.tracks_poses.data,
+                    tracks.tracks_timestamps_us,
+                    dims,
+                    width=width // subsample,
+                    height=height // subsample,
+                    shutter=model.shutter_type.value,
+                    max_poses=tracks.max_track_n_poses,
+                    max_hits=max_intersections_per_ray,
+                )
+            )
+        frame_intervals = torch.cat(outputs).cpu().numpy()
+        for track in range(tracks.n_tracks):
+            hits = frame_intervals[:, track]
+            hits = hits[(hits[:, 0] != np.iinfo(np.int64).max) & (hits[:, 1] >= 0)]
+            per_track[track].extend(np.clip(hits, *bounds[track]).tolist())
+    merged = []
+    for values in per_track:
+        result: list[list[int]] = []
+        for low, high in sorted(values):
+            if result and low <= result[-1][1] + 1:
+                result[-1][1] = max(high, result[-1][1])
+            else:
+                result.append([low, high])
+        merged.append(np.asarray(result, dtype=np.int64).reshape(-1, 2))
+    return merged
+
+
 def compute_camera_visible_intervals_cuboid_tracks(
     cuboidtracks: CuboidTracks,
     camera_sensors: dict[str, ncore.data.CameraSensorProtocol],
@@ -1030,6 +1108,28 @@ def compute_camera_visible_intervals_cuboid_tracks(
     if cuboidtracks.n_tracks == 0:
         return []
 
+    # The compact GPU reduction matches the per-frame path only under these conditions.
+    if (
+        # This path uses the tracks in place.
+        cuboidtracks.device.type == "cuda"
+        # No hit is truncated from the per-ray hit list.
+        and cuboidtracks.n_tracks <= max_intersections_per_ray
+        # Per-pixel masks and track labels need the full hit table.
+        and cameras_frame_valid_pixels_masks is None
+        and cameras_frame_track_idxs is None
+    ):
+        return _camera_visible_intervals_batched(
+            cuboidtracks,
+            camera_sensors,
+            camera_models,
+            camera_frame_ranges,
+            cameras_all_pixels,
+            cameras_all_rays,
+            valid_pixels_cuboid_tracks_params=valid_pixels_cuboid_tracks_params,
+            subsample=subsample,
+            max_intersections_per_ray=max_intersections_per_ray,
+        )
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
         cuboids_dims_padding_cuda = torch.tensor(
             (
@@ -1055,7 +1155,11 @@ def compute_camera_visible_intervals_cuboid_tracks(
 
             orig_width = int(camera_model.resolution[0].item())
             orig_height = int(camera_model.resolution[1].item())
-            width, height = orig_width // subsample, orig_height // subsample
+            width, height = ImageResolutionTransform.from_subsample(
+                (orig_width, orig_height),
+                float(subsample),
+                rounding="floor",
+            ).resized_pre_crop_resolution
 
             # Optional: per-frame valid pixel masks for this camera
             frame_valid_pixels_masks = (
@@ -1155,7 +1259,13 @@ def compute_camera_visible_intervals_cuboid_tracks(
                     hits_cnt = ray_rolling_shutter_intersection_result.intersections_cnt
                     intersections_tracks_idx = ray_rolling_shutter_intersection_result.intersections_tracks_idx
 
-                    intersections_tracks_idx_np = intersections_tracks_idx.to("cpu", non_blocking=True).numpy()
+                    # Only the optional per-pixel track labels consume this table.
+                    # Visibility intervals need just the small per-track reductions below.
+                    intersections_tracks_idx_np = (
+                        intersections_tracks_idx.to("cpu", non_blocking=True).numpy()
+                        if frame_valid_pixel_mask is not None and frame_track_idxs is not None
+                        else None
+                    )
 
                     hitmask_np = (
                         (hits_cnt.reshape(frame_valid_pixel_mask.shape) > 0).to("cpu", non_blocking=True).numpy()
@@ -1221,6 +1331,7 @@ def compute_camera_visible_intervals_cuboid_tracks(
                         frame_valid_pixels_masks[camera_frame_idx] = PackedMask(frame_valid_pixel_mask)
 
                         if frame_track_idxs is not None:
+                            assert intersections_tracks_idx_np is not None
                             frame_track_idxs[camera_frame_idx][hitmask_np] = intersections_tracks_idx_np[
                                 hitmask_np.flatten()
                             ][:, 0]
@@ -1592,26 +1703,27 @@ def compute_point_cloud_inside_tracks_mask(
         check_indices = torch.where(restrict_mask)[0]
         points_xyz = point_cloud.xyz_end[check_indices]
 
-    labels = []
-    for i, (start_idx, n_poses) in enumerate(cuboidtracks_dynamic.tracks_packinfo):
-        track_timestamps_us = cuboidtracks_dynamic.tracks_timestamps_us[start_idx : start_idx + n_poses]
-        object_dim = cuboidtracks_dynamic.cuboids_dims[i]
-        in_time_range_idxs = torch.logical_and(
-            track_timestamps_us >= time_range_us.start,
-            track_timestamps_us < time_range_us.end,
-        )
-        track_poses_in_time_range = cuboidtracks_dynamic.tracks_poses[start_idx : start_idx + n_poses][
-            in_time_range_idxs
-        ].vec()
+    if points_xyz.numel() == 0:
+        return inside_tracks_mask
+
+    # Move track metadata to host once; per-pose conversions would sync the device for every pose.
+    packinfo = cuboidtracks_dynamic.tracks_packinfo.cpu().numpy()
+    timestamps = cuboidtracks_dynamic.tracks_timestamps_us.cpu().numpy()
+    poses = cuboidtracks_dynamic.tracks_poses.vec()
+    centroids = poses[:, :3].cpu().numpy().astype(float)
+    rotations = quat_to_euler(poses[:, 3:]).cpu().numpy().astype(float)
+    dimensions = cuboidtracks_dynamic.cuboids_dims.cpu().numpy().astype(float)
+    labels: list[ncore.data.BBox3] = []
+    for i, (start_idx, n_poses) in enumerate(packinfo):
+        track_times = timestamps[start_idx : start_idx + n_poses]
+        selected = np.flatnonzero((track_times >= time_range_us.start) & (track_times < time_range_us.end))
         labels.extend(
-            [
-                ncore.data.BBox3(
-                    centroid=tuple(track_pose[:3].cpu().numpy().astype(float)),
-                    dim=tuple(object_dim.cpu().numpy().astype(float)),
-                    rot=tuple(quat_to_euler(track_pose[3:]).cpu().numpy().astype(float)),
-                )
-                for track_pose in track_poses_in_time_range
-            ]
+            ncore.data.BBox3(
+                centroid=tuple(centroids[start_idx + pose_idx]),
+                dim=tuple(dimensions[i]),
+                rot=tuple(rotations[start_idx + pose_idx]),
+            )
+            for pose_idx in selected
         )
 
     for start_idx in tqdm.tqdm(

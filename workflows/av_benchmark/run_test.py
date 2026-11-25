@@ -175,6 +175,21 @@ def test_manifest_reports_only_the_phases_that_ran(tmp_path: Path, monkeypatch: 
     assert [t["task"] for t in manifest["tasks"]] == ["convert"]
 
 
+def test_launcher_replaces_the_runfiles_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    spec = {"name": "s", "tasks": [{"name": "train", "binary": "nurec", "args": ["a"]}]}
+    monkeypatch.setattr(run_module, "_binary_path", lambda binary: pytest.fail("runfiles binary resolved"))
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_module.subprocess, "run", fake_run)
+
+    assert run_workflow(spec, {}, tmp_path, launchers={"nurec": ["docker", "run", "img"]}) == 0
+    assert calls == [["docker", "run", "img", "a"]]
+
+
 def test_shipped_spec_makes_only_the_network_tasks_optional():
     """CI must run everything except the clip download and the reference map, which need a token and network."""
     spec = load_spec(Path("workflows/av_benchmark/specs/av_benchmark_7cam.yaml"))

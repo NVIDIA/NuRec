@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - override /image_resolution/camera@_global_.dataset.n_val_image_resolution: relative_4
+
+
 dataset:
   valid_measurements_method: EGO
-  n_val_image_subsample: 4
   val_camera_frame_step: 3
 
   camera_ids:

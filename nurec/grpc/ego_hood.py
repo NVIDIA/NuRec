@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
 from dataclasses import dataclass, field
-from typing import Optional, Self
+from typing import Callable, Optional, Self
 
 import imageio.v2 as iio
 import torch
@@ -27,75 +28,30 @@ from nurec.grpc.protos.sensorsim_pb2 import (
 logger = logging.getLogger("nurec.grpc.serve")
 
 
-@dataclass
+@dataclass(frozen=True)
 class EgocarHood:
     """
-    Holds an image of the egocar hood (visible in video but not in NuRec renders)
-    along with a segmentation mask to paste it in at the end of view generation.
+    Describes an image of the egocar hood (visible in video but not in NuRec renders)
+    that is pasted over the rendered view at the end of view generation.
 
-    Since most renders are at the same resolution and the resizing operator is somewhat
-    expensive, we cache the most recently used resolution of the mask to provide
-    a fast path in the usual case.
+    Only the file location is recorded, so a bank with thousands of hoods costs nothing
+    until a hood is used. `EgocarRigBank.overlay_on_image` decodes and caches the image.
     """
 
     camera_logical_id: str
     rig_id: str
-    _hood_rgba: torch.Tensor  # C H W, RGBA, floating point in [0, 1]
-    _resize_cache: torch.Tensor  # C H W, RGBA, floating point in [0, 1]
+    path: str
 
-    @classmethod
-    def load_from_file(cls, camera_logical_id: str, rig_id: str, path: str) -> Self:
+    def load(self) -> torch.Tensor:
         """
-        Loads an egocar hood from a file.
+        Reads the hood as a (4, H, W) float tensor in [0, 1].
 
         Assumes an RGBA image which is transparent outside of the car hood.
-
-        Args:
-            camera_logical_id: The logical ID of the camera (used as metadata)
-            rig_id: The ID of the rig (used as metadata)
-            path: The path to an RGBA png file
-
-        Returns:
-            An egocar hood object.
         """
-        hood_rgba = iio.imread(path)
-        assert hood_rgba.shape[-1] == 4, f"Image at {path} is not RGBA"
-
-        hood_torch = torch.from_numpy(hood_rgba)
-
-        hood_f32 = rearrange(hood_torch, "h w c -> c h w").float() / 255.0
-        return cls(camera_logical_id=camera_logical_id, rig_id=rig_id, _hood_rgba=hood_f32, _resize_cache=hood_f32)
-
-    def __post_init__(self):
-        assert self._hood_rgba.ndim == 3
-        assert self._hood_rgba.shape[0] == 4
-
-    def overlay_on_image(self, rendered_image: torch.Tensor) -> torch.Tensor:
-        """
-        Overlay the egocar hood on a rendered image.
-
-        Args:
-            rendered_image: (C, H, W), RGB, floating point in [0, 1]
-
-        Returns:
-            (C, H, W), RGB, floating point in [0, 1]
-        """
-        if rendered_image.shape[0:2] != self._resize_cache.shape[1:3]:
-            logger.info(
-                f"EgocarHood: resize cache miss (need {rendered_image.shape}, have {self._resize_cache.shape})."
-            )
-            self._resize_cache = resize(
-                self._hood_rgba,
-                list(rendered_image.shape[0:2]),
-                interpolation=InterpolationMode.BILINEAR,
-            )
-
-        self._resize_cache = self._resize_cache.to(rendered_image.device)
-
-        hood = rearrange(self._resize_cache[:3], "c h w -> h w c")
-        mask = self._resize_cache[3].unsqueeze(-1)  # (h, w, 1)
-
-        return rendered_image * (1 - mask) + hood * mask
+        hood_rgba = iio.imread(self.path)
+        if hood_rgba.ndim != 3 or hood_rgba.shape[-1] != 4:
+            raise ValueError(f"Egocar hood {self.path} is not an RGBA image (shape {hood_rgba.shape})")
+        return rearrange(torch.from_numpy(hood_rgba), "h w c -> c h w").float() / 255.0
 
     @property
     def metadata(self) -> AvailableEgoMasksReturn.EgoMaskMetadata:
@@ -117,8 +73,8 @@ class EgocarRig:
         return self._hoods.get(camera_logical_id, None)
 
     @classmethod
-    def load_from_dir(cls, rig_id: str, path: str) -> Self:
-        """Loads all ego hood images from <path>/<camera_logical_id>.png"""
+    def from_dir(cls, rig_id: str, path: str) -> Self:
+        """Lists all ego hood images at <path>/<camera_logical_id>.png without decoding them."""
         SUFFIX = ".png"
 
         hoods = {}
@@ -127,7 +83,7 @@ class EgocarRig:
             if not filename.endswith(SUFFIX) or not os.path.isfile(hood_path):
                 continue
             camera_logical_id = filename.removesuffix(SUFFIX)
-            hoods[camera_logical_id] = EgocarHood.load_from_file(camera_logical_id, rig_id, hood_path)
+            hoods[camera_logical_id] = EgocarHood(camera_logical_id, rig_id, hood_path)
 
         return cls(rig_id, hoods)
 
@@ -142,26 +98,42 @@ class EgocarRig:
 class EgocarRigBank:
     """
     Holds EgocarRigs corresponding to different rig configurations.
+
+    Listing a bank is a directory walk; the images stay on disk. `overlay_on_image`
+    decodes a hood on first use and keeps it, resized and on the render device, in a
+    least-recently-used cache of at most `cache_size` entries keyed by hood, render size
+    and device. Memory therefore follows the hoods in active use, not the size of the
+    bank. A cached 1920x1080 hood is 33 MB of float32.
     """
 
     _rigs: dict[str, EgocarRig]
+    cache_size: int = 32
+    _resized_hood: Callable[[EgocarHood, tuple[int, int], torch.device], torch.Tensor] = field(
+        init=False,
+        repr=False,
+    )
     _logged_mask_selection_keys: set[tuple[str, str, str, bool]] = field(
         default_factory=set,
         init=False,
         repr=False,
     )
 
+    def __post_init__(self):
+        assert self.cache_size >= 1, f"cache_size must be positive, got {self.cache_size}"
+        # A per-bank cache; lru_cache is thread-safe, and concurrent misses on one key only duplicate work.
+        self._resized_hood = functools.lru_cache(maxsize=self.cache_size)(self._load_resized_hood)
+
     @classmethod
-    def load_from_dir(cls, path: str) -> Self:
-        """Loads all egocar rigs from <path>/<rig_id>/<camera_logical_id>.png"""
+    def from_dir(cls, path: str, cache_size: int = 32) -> Self:
+        """Lists all egocar rigs from <path>/<rig_id>/<camera_logical_id>.png without decoding them."""
         rigs = {}
         for rig_id in sorted(os.listdir(path)):
             rig_path = os.path.join(path, rig_id)
             if not os.path.isdir(rig_path):
                 continue
-            rigs[rig_id] = EgocarRig.load_from_dir(rig_id, rig_path)
+            rigs[rig_id] = EgocarRig.from_dir(rig_id, rig_path)
 
-        return cls(rigs)
+        return cls(rigs, cache_size=cache_size)
 
     @classmethod
     def empty(cls) -> Self:
@@ -172,6 +144,32 @@ class EgocarRigBank:
 
     def available_metadata(self) -> list[AvailableEgoMasksReturn.EgoMaskMetadata]:
         return [metadata for rig in self._rigs.values() for metadata in rig.available_metadata()]
+
+    @staticmethod
+    def _load_resized_hood(hood: EgocarHood, size: tuple[int, int], device: torch.device) -> torch.Tensor:
+        logger.info(f"EgocarHood: decoding {hood.path} at {size} on {device}.")
+        hood_rgba = hood.load()
+        if hood_rgba.shape[1:3] != size:
+            hood_rgba = resize(hood_rgba, list(size), interpolation=InterpolationMode.BILINEAR)
+        return hood_rgba.to(device)
+
+    def overlay_on_image(self, hood: EgocarHood, rendered_image: torch.Tensor) -> torch.Tensor:
+        """
+        Overlay the egocar hood on a rendered image.
+
+        Args:
+            hood: A hood from this bank, usually from `select_from_request`.
+            rendered_image: (H, W, C), RGB, floating point in [0, 1]
+
+        Returns:
+            (H, W, C), RGB, floating point in [0, 1]
+        """
+        height, width = rendered_image.shape[0:2]
+        hood_rgba = self._resized_hood(hood, (height, width), rendered_image.device)
+        hood_rgb = rearrange(hood_rgba[:3], "c h w -> h w c")
+        mask = hood_rgba[3].unsqueeze(-1)  # (h, w, 1)
+
+        return rendered_image * (1 - mask) + hood_rgb * mask
 
     def _log_mask_selection_once(self, request: RGBRenderRequest, hood: Optional[EgocarHood]) -> None:
         render_camera_logical_id = request.camera_intrinsics.logical_id or request.ego_mask_id.camera_logical_id

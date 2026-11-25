@@ -51,6 +51,8 @@ py_binary(
     srcs = ["run.py"],
     data = ["//configs"],
     main = "run.py",
+    # Collect the build-time compiled bytecode into the runfiles, see //:run.
+    pyc_collection = "include_pyc",
     visibility = [],
     deps = [":pylib"],
 )

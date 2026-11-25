@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@rules_python//python:defs.bzl", "py_binary")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 load(":defs.bzl", "cuda_compat_tar")
 
@@ -26,4 +27,20 @@ pytest_test(
     srcs = ["compat_tar_test.py"],
     data = [":compat_tar"],
     mypy = False,
+)
+
+py_binary(
+    name = "extract_deb_data",
+    srcs = ["extract_deb_data.py"],
+    main = "extract_deb_data.py",
+    visibility = ["//visibility:private"],
+)
+
+pytest_test(
+    name = "extract_deb_data_test",
+    size = "small",
+    srcs = [
+        "extract_deb_data.py",
+        "extract_deb_data_test.py",
+    ],
 )

@@ -14,9 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Union, cast
 
-import kornia
 import torch
-import torchvision.transforms as T
 
 from einops import rearrange
 from torch import nn
@@ -47,6 +45,9 @@ def color_transfer(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns:
     - Color transferred image as a tensor.
     """
+    # Harmonizer-only dependency, imported on use so the render server starts without it.
+    import kornia
+
     # Convert images from BGR to L*a*b* color space
     source_lab = kornia.color.rgb_to_lab(source.permute(2, 0, 1)).permute(1, 2, 0)
     target_lab = kornia.color.rgb_to_lab(target.permute(2, 0, 1)).permute(1, 2, 0)
@@ -242,6 +243,7 @@ class BaseHarmonizerModel(nn.Module):
         img: torch.Tensor, img_size: torch.Size, model_resolution: torch.Size
     ) -> tuple[torch.Tensor, torch.dtype]:
         """preprocess input tensors to correspond to pre-defined resolution, rescale to [-1,1]"""
+        import torchvision.transforms as T
 
         # Check if input is fp16 and convert to bf16 if needed (SANA model does not support fp16)
         img_dtype = img.dtype
@@ -264,6 +266,8 @@ class BaseHarmonizerModel(nn.Module):
 
     @staticmethod
     def _postprocess_output(img: torch.Tensor, img_size: torch.Size, img_dtype: torch.dtype) -> torch.Tensor:
+        import torchvision.transforms as T
+
         if img.dtype == torch.bfloat16 and img_dtype != torch.bfloat16:
             img = img.to(img_dtype)
         if img_size != torch.Size(img.shape[-2:]):

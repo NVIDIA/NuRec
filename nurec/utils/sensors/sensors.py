@@ -28,6 +28,7 @@ from nurec.utils.geometry import (
     rotation_6d_to_matrix,
     so3_matrix_to_quat,
 )
+from nurec.utils.image_resolution import ImageResolutionTransform, Scale2D
 from nurec.utils.misc import unpack_optional
 from nurec.utils.torch_compile import TorchCompile
 
@@ -37,35 +38,63 @@ ConcreteCameraModelsUnion: TypeAlias = Union[FThetaCameraModel, OpenCVFisheyeCam
 
 @dataclass(kw_only=True, slots=True)
 class RectSubsampledBase:
-    """
-    Subsampled rectangular pixel region with offset i/j and dimension height/width.
+    """A sensor rectangle with one resolved resize/crop geometry.
 
-    Note that the offset i/j and dimension height/width are relative to the scaled pixel domain. I.e., subsampling is applied first, then cropping.
-
-    The fields are:
-    - original_width: The original width of the sensor. [int]
-    - original_height: The original height of the sensor. [int]
-    - width: The width of the pixel region. [int]
-    - height: The height of the pixel region. [int]
-    - i: Optional. The offset in the x-direction. Default is 0. [int]
-    - j: Optional. The offset in the y-direction. Default is 0. [int]
-    - subsample_factor: Optional. The amount of isotropic subsampling. The larger the value is, the smaller the sampled region will be. 1 means no subsampling. Default is 1. [float]
+    Relative factors are accepted only by the construction helper. Runtime
+    consumers see dimensions, crop offsets and scale from the same transform.
     """
 
-    original_width: int
-    original_height: int
-    width: int
-    height: int
-    i: int = 0
-    j: int = 0
-    subsample_factor: float = 1.0
+    image_transform: ImageResolutionTransform
 
-    def __post_init__(self):
-        assert self.subsample_factor > 0.0, "Invalid subsample_factor value"
-        assert self.i >= 0, "Invalid i value"
-        assert self.j >= 0, "Invalid j value"
-        assert self.width > 0, "Invalid width value"
-        assert self.height > 0, "Invalid height value"
+    @classmethod
+    def from_subsample(
+        cls,
+        *,
+        original_width: int,
+        original_height: int,
+        width: int,
+        height: int,
+        i: int = 0,
+        j: int = 0,
+        subsample_factor: Scale2D = 1.0,
+    ) -> Self:
+        """Resolve relative geometry once, at the rectangle's construction."""
+        return cls(
+            image_transform=ImageResolutionTransform.from_subsample(
+                (original_width, original_height),
+                subsample_factor,
+                output_resolution=(width, height),
+                image_domain_offset=(i, j),
+            )
+        )
+
+    @property
+    def original_width(self) -> int:
+        return self.image_transform.source_resolution[0]
+
+    @property
+    def original_height(self) -> int:
+        return self.image_transform.source_resolution[1]
+
+    @property
+    def width(self) -> int:
+        return self.image_transform.output_resolution[0]
+
+    @property
+    def height(self) -> int:
+        return self.image_transform.output_resolution[1]
+
+    @property
+    def i(self) -> int:
+        return self.image_transform.image_domain_offset[0]
+
+    @property
+    def j(self) -> int:
+        return self.image_transform.image_domain_offset[1]
+
+    @property
+    def subsample_factor(self) -> Scale2D:
+        return self.image_transform.subsample_factor
 
 
 @dataclass(kw_only=True, slots=True)
@@ -81,17 +110,7 @@ class RectSubsampledSensor(RectSubsampledBase):
     _covers_full_height: bool = field(init=False, repr=False)
 
     def __post_init__(self):
-        RectSubsampledBase.__post_init__(self)
-        self.rect_points_lb = 0.5 + self.subsample_factor * torch.tensor(
-            [
-                [self.i, self.j],
-                [
-                    self.i + (self.width - 1.0 / self.subsample_factor),
-                    self.j + (self.height - 1.0 / self.subsample_factor),
-                ],
-            ],
-            dtype=torch.float32,
-        )
+        self.rect_points_lb = torch.from_numpy(self.image_transform.rect_points_lb())
         self.resolution = torch.tensor([self.original_width, self.original_height], dtype=torch.float32)
 
         # Keep CPU copies of the rect_points_lb and resolution tensors

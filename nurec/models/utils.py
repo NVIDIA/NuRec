@@ -1,16 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import contextlib
 import dataclasses
 
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
-from pytorch_lightning.plugins.precision.amp import MixedPrecision
 from torch import nn
-from torch.cuda.amp.grad_scaler import GradScaler
 
 from nurec.config.model import ModelConfig
 from nurec.models.base import BaseModel
@@ -190,33 +187,3 @@ def get_activation(activation_name: str, inverse: bool = False) -> nn.Module:
             return SkipActivation(inverse=inverse)
         case _:
             raise ValueError(f"activation function {activation_name} not supported.")
-
-
-class MixedPrecisionNoCastPlugin(MixedPrecision):
-    """
-    This plugin uses the behavior of the original `MixedPrecision`, 
-    but only uses the grad scaler and skip the global autocasting to half precision.
-    Local half-precision casting is still possible when this plugin is enabled.
-    
-    Global autocasting to half is bad because:
-    - We would never know which module breaks or misbehaves in half precision. \
-        There will always be unknown unpredictable omission. \
-    - When we add new modules, global autocasting make it difficult to debug, \
-        while some existing modules must use grad scaler.
-    So instead, we should disable autocast globally, and only enable it locally in known modules.
-    
-    Known issues on half precision (where you should not use half):
-    - For rays, poses and coordinates, half precision introduce very large errors. We should at least use float.
-    - Some of the pytorch module is not autocast-safe (e.g. bce, exp, ...)
-    - ... TBA
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        # Use a smaller value of `init_scale` then the default `2**16==65536`
-        kwargs["scaler"] = GradScaler(init_scale=128.0)
-        super().__init__(*args, **kwargs)
-
-    @contextlib.contextmanager
-    def forward_context(self) -> Generator[None, None, None]:
-        """Skip the global autocast in the original plugin."""
-        yield

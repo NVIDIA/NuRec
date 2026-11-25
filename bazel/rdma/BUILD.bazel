@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_pkg//:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+# libibverbs, its providers and libnl at the paths the .debs install them, for run
+# images built with --config=rdma: the base image ships without them, and
+# _nre_rdma.so links libibverbs.so.1. Files come from @ibverbs, which unpacks the
+# pinned .debs inside Bazel (see defs.bzl).
+pkg_files(
+    name = "runtime_libs_files",
+    srcs = ["@ibverbs//:runtime_libs"],
+    strip_prefix = strip_prefix.from_root(),
+)
+
+pkg_tar(
+    name = "runtime_libs_tar",
+    srcs = [":runtime_libs_files"],
+    compressor = "@pigz//:pigz",
+    compressor_args = "-n",
+    extension = "tar.gz",
+    visibility = [
+        "//:__pkg__",
+    ],
+)

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library")
@@ -10,20 +11,59 @@ DEFAULT_VISIBILITY = ["//:core_package_group"]
 
 package(default_visibility = DEFAULT_VISIBILITY)
 
+exports_files(["runtime.BUILD.bazel"])
+
+bool_flag(
+    name = "cuda_12_9",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "with_cuda_12_9",
+    flag_values = {":cuda_12_9": "true"},
+)
+
+alias(
+    name = "runtime_12_9",
+    actual = select({
+        "@platforms//cpu:x86_64": "@ipc_cudart_12_9_x86_64//:runtime",
+        "@platforms//cpu:aarch64": "@ipc_cudart_12_9_sbsa//:runtime",
+    }),
+)
+
+alias(
+    name = "client_runtime_12_9",
+    testonly = True,
+    actual = select({
+        "@platforms//cpu:x86_64": "@ipc_cudart_12_9_x86_64//:lib/libcudart.so.12",
+        "@platforms//cpu:aarch64": "@ipc_cudart_12_9_sbsa//:lib/libcudart.so.12",
+    }),
+)
+
 # pybind11 module: exposes IpcManager to Python. Loaded as
 # `nurec.libs.cuda_ipc_transport._nre_cuda_ipc` by serve.py. Reuses
 # //nurec/libs/render_pack:render_pack_cuda for the fused HWC-f32 -> CHW-u8 pack
 # kernel rather than duplicating it.
 cc_binary(
     name = "_nre_cuda_ipc.so",
-    srcs = ["cuda_ipc_module.cpp"],
+    srcs = [
+        "cuda_ipc_module.cpp",
+        "//nurec/libs/render_pack:ipc_pack_objects",
+        "//nurec/libs/render_pack:render_pack.h",
+    ],
     linkshared = True,
     deps = [
-        "//nurec/libs/render_pack:render_pack_cuda",
         "@numpyeigen_pybind11//:pybind11",
-        "@rules_cuda//cuda:runtime",
         "@rules_python//python/cc:current_py_cc_headers",
-    ],
+    ] + select({
+        ":with_cuda_12_9": [
+            ":runtime_12_9",
+            "@cuda//:cccl_headers",
+            "@cuda//:cudart_headers",
+            "@cuda//:nvcc_headers",
+        ],
+        "//conditions:default": ["@rules_cuda//cuda:runtime"],
+    }),
 )
 
 py_library(
@@ -41,12 +81,35 @@ py_library(
     data = [":_nre_cuda_ipc.so"],
 )
 
+genrule(
+    name = "runtime_test_config",
+    testonly = True,
+    srcs = select({
+        ":with_cuda_12_9": [":client_runtime_12_9"],
+        "//conditions:default": [],
+    }),
+    outs = ["runtime_test_config.txt"],
+    cmd = select({
+        ":with_cuda_12_9": "printf '12090\\n%s\\n' '$(rlocationpath :client_runtime_12_9)' > $@",
+        "//conditions:default": "echo 12080 > $@",
+    }),
+)
+
 pytest_test(
     name = "cuda_ipc_transport_test",
+    size = "medium",
     srcs = ["cuda_ipc_transport_test.py"],
+    data = [":runtime_test_config"] + select({
+        ":with_cuda_12_9": [":client_runtime_12_9"],
+        "//conditions:default": [],
+    }),
+    env = {
+        "NRE_IPC_RUNTIME_CONFIG": "$(rlocationpath :runtime_test_config)",
+    },
     tags = ["gpu"],
     deps = [
         ":testlib",
+        "@rules_python//python/runfiles",
         pip_requirement("torch"),
     ],
 )

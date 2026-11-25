@@ -1,5 +1,5 @@
 Modified by NVIDIA CORPORATION & AFFILIATES, 2026 (statement of changes, Apache-2.0
-section 4(b)): this patch changes transformer_engine/pytorch/softmax.py of TransformerEngine 1.11.
+section 4(b)): this patch changes transformer_engine/pytorch/softmax.py of TransformerEngine 1.12.
 
 --- a/transformer_engine/pytorch/softmax.py
 +++ b/transformer_engine/pytorch/softmax.py

@@ -181,6 +181,8 @@ py_binary(
     ],
     data = NUREC_TOOLS_DATA,
     main = "entrypoint.py",
+    # Collect the build-time compiled bytecode into the runfiles, see //:run.
+    pyc_collection = "include_pyc",
     visibility = [
         # Add visibility for the AV Benchmark workflow
         "//workflows/av_benchmark:__pkg__",

@@ -12,6 +12,17 @@ DEFAULT_VISIBILITY = ["//:core_package_group"]
 
 package(default_visibility = DEFAULT_VISIBILITY)
 
+pytest_test(
+    name = "fisheye_inverse_test",
+    srcs = ["fisheye_inverse_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)
+
 cc_library(
     name = "vren_headers",
     hdrs = [
@@ -108,6 +119,7 @@ py_library(
     visibility = DEFAULT_VISIBILITY + ["//:aux_package_group"],
     deps = [
         ":pylib_cc",
+        "//nurec/libs:fisheye_domain",
         pip_requirement("torch"),
         pip_requirement("nvidia-ncore"),
         pip_requirement("numpy"),
@@ -117,7 +129,8 @@ py_library(
 
 py_package(
     name = "pkg",
-    packages = ["nurec/libs/vren"],
+    # Include the shared host domain adapter alongside the VREN sources.
+    packages = ["nurec/libs"],
     deps = [":pylib"],
 )
 
@@ -129,7 +142,7 @@ py_wheel(
     requires = [
         "torch>=2.7",
         "numpy",
-        "ncore>=0.16.8",
+        "nvidia-ncore==19.8.5",
         "numba",
     ],
     version = "0.1.4",
@@ -154,7 +167,6 @@ pytest_test(
     data = [
         "@test_data_ncore_v4//:ncore_1sec",
     ],
-    tags = ["exclusive"],  # test can potentially timeout (in particular on CI when competing for resources) -> execute in isolation
     deps = [
         ":pylib",
         pip_requirement("torch"),

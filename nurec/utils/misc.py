@@ -26,9 +26,14 @@ from typing import (
 
 import numpy.typing as npt
 import torch
+import torch.distributed.nn  # not loaded by `import torch`; evenly_divisible_all_gather uses its functional API
 import torch.nn.functional as F
 
-from pytorch_lightning.utilities.rank_zero import (  # noqa: F401  # rank_zero_info re-exported
+
+# These are the very objects PyTorch Lightning re-exports as pytorch_lightning.utilities.rank_zero
+# and updates from its strategies; taking them from lightning_utilities keeps that shared state
+# without importing Lightning (and torchmetrics/transformers behind it) into inference processes.
+from lightning_utilities.core.rank_zero import (  # noqa: F401  # rank_zero_info re-exported
     rank_zero_info,
     rank_zero_only,
 )

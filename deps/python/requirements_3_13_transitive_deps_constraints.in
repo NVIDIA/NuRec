@@ -16,9 +16,11 @@
 # retired once the resolve forces the version anyway, or once the package has left the
 # lock.
 
-aiohttp>=3.14.3  # CVE-2026-50269: CRLF injection via improper validation in payload.py
+aiohttp>=3.14.4  # security fix found by the container scan
 anyio>=4.14.2  # GHSA-82r6-8w77-94w6 (Critical), via httpx
 cbor2>=5.9.0  # CWE-674 / CVE-2026-26209; restricts a transitive NCore dependency
+certifi>=2026.10.18  # security fix found by the container scan, via requests and httpx
 fonttools>=4.63.0  # CVE-2025-66034 (High, 8.6), found by the Black Duck dependency scan
+fsspec>=2026.6.0  # security fix found by the container scan, via s3fs and torch
 idna>=3.7  # was idna==3.7, relaxed by the pin-to-minimum batch in d0baf05e3f
 python-dateutil>=2.9.0.post0  # upgraded in 00567f9e56

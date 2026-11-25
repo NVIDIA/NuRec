@@ -24,6 +24,13 @@ py_library(
 )
 
 py_library(
+    name = "fatal_worker",
+    srcs = ["fatal_worker.py"],
+    visibility = DEFAULT_VISIBILITY,
+    deps = [pip_requirement("grpcio")],
+)
+
+py_library(
     name = "pylib",
     srcs = [
         "client_wait.py",
@@ -33,6 +40,7 @@ py_library(
         "model_owner.py",
         "nvjpeg_batch_encoder.py",
         "scene_cache.py",
+        "scene_prefetch.py",
         "serve.py",
         "trajectory.py",
     ],
@@ -45,17 +53,23 @@ py_library(
     ],
     deps = [
         ":cache_keys",
+        ":fatal_worker",
         ":pylib_pose",  # nurec.grpc.pose — serve.py re-exports the pose helpers
         "//apps/viewer:pylib",
         "//nurec/artifact:pylib",
+        "//nurec/libs/sensors:camera_kernels",
+        "//nurec/libs/vren:pylib",
         "//nurec/asset_edits:pylib",  # asset-edits runtime installed by serve.py
         "//nurec/datasets:pylib",
         "//nurec/grpc/protos:grpc_pb2",
+        "//nurec/lidar/firing_patterns:io",
+        "//nurec/lidar/firing_patterns:templates",
         "//nurec/models/gaussians:pylib",
         "//nurec/render:pylib",
         "//nurec/systems:pylib",
         "//nurec/utils:pylib",
         "//nurec/utils:pylib_cli",
+        "//nurec/utils:pylib_image_resolution",
         "//nurec/utils:pylib_ncore_types",
         "//nurec/utils/debug:pylib",
         pip_requirement("pytorch_lightning"),
@@ -77,7 +91,13 @@ py_library(
         # it under try/except, so the server degrades gracefully if IpcManager
         # somehow fails to import despite always being a build dependency.
         "//nurec/libs/cuda_ipc_transport:pylib",
-    ],
+    ] + select({
+        # RDMA transport (cross-node delivery over RoCEv2), opt-in with --config=rdma.
+        # serve.py imports it under try/except, so without it the RDMA RPCs report the
+        # transport as unavailable.
+        "//bazel/conditions:rdma": ["//nurec/libs/rdma_transport:pylib"],
+        "//conditions:default": [],
+    }),
 )
 
 # Focused SE3 <-> gRPC pose conversion helpers (nurec.grpc.pose). Split out of the monolithic
@@ -109,6 +129,7 @@ py_library(
         "//:__pkg__",
     ],
     deps = [
+        ":fatal_worker",
         ":pylib",
         # Direct deps for multiproc_serve.py's top-level imports. These resolved only transitively through
         # :pylib before, so they would break silently if :pylib ever stopped re-exporting them.
@@ -154,12 +175,21 @@ cc_binary(
 )
 
 pytest_test(
+    name = "fatal_worker_test",
+    size = "small",
+    srcs = ["fatal_worker_test.py"],
+    deps = [":fatal_worker"],
+)
+
+pytest_test(
     name = "serve_test",
     srcs = [
         "backend_cache_test.py",
         "downloader_test.py",
         "ego_hood_test.py",
         "scene_cache_test.py",
+        "scene_prefetch_render_test.py",
+        "scene_prefetch_test.py",
         "serve_asset_edits_test.py",
         "serve_test.py",
     ],
@@ -168,13 +198,51 @@ pytest_test(
     ],
     deps = [
         ":cache_keys",
+        ":fatal_worker",
         ":pylib",
         "//nurec/artifact:pylib",  # serve_asset_edits_test imports nurec.artifact directly
         "//nurec/asset_edits:pylib",  # serve_asset_edits_test imports nurec.asset_edits directly
         "//nurec/grpc/protos:grpc_pb2",
+        "//nurec/lidar/firing_patterns:schema",
         pip_requirement("grpcio-health-checking"),  # serve_test.py imports grpc_health.v1 directly
         pip_requirement("imageio"),
         pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "oom_residency_test",
+    srcs = ["oom_residency_test.py"],
+    deps = [
+        ":cache_keys",
+        ":pylib",
+        ":pylib_multiproc",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "fatal_worker_health_test",
+    size = "small",
+    srcs = ["fatal_worker_health_test.py"],
+    deps = [
+        ":fatal_worker",
+        pip_requirement("grpcio"),
+        pip_requirement("grpcio-health-checking"),
+    ],
+)
+
+pytest_test(
+    name = "fatal_worker_serving_test",
+    srcs = ["fatal_worker_serving_test.py"],
+    deps = [
+        ":cache_keys",
+        ":fatal_worker",
+        ":pylib",
+        ":pylib_multiproc",
+        "//nurec/grpc/protos:grpc_pb2",
+        pip_requirement("grpcio"),
+        pip_requirement("grpcio-health-checking"),
     ],
 )
 
@@ -236,6 +304,10 @@ pytest_test(
         ":pylib_multiproc",  # nurec.grpc.multiproc_serve (single compile owner)
         "//nurec/config:pylib",  # from nurec.config.model import RendererBackend
         "//nurec/grpc/protos:grpc_pb2",  # from nurec.grpc.protos import ...
+        "//nurec/models:pylib_nn_extensions",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_gaussians_composite",
+        "//nurec/models/gaussians/strategies:pylib",
         pip_requirement("click"),  # from click.testing import CliRunner
         pip_requirement("grpcio"),
         pip_requirement("numpy"),
@@ -272,7 +344,6 @@ py_test(
     timeout = "long",
     srcs = ["nvjpeg_batch_encoder_concurrency_test.py"],
     main = "nvjpeg_batch_encoder_concurrency_test.py",
-    tags = ["exclusive"],
     deps = [
         ":pylib",
         pip_requirement("torch"),

@@ -7,8 +7,9 @@ import copy
 import logging
 import os
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Self, Tuple, cast
 
 import lietorch
@@ -38,13 +39,14 @@ from nurec.libs.vren.interface import (  # type: ignore
 from nurec.libs.vren.lidars import (  # type: ignore
     elements_to_world_rays_shutter_pose,
 )
+from nurec.lidar.firing_patterns.templates import LidarFiringPatternTemplate
 from nurec.models.calib import FreePoseCalib
 from nurec.models.composite import CompositeModel
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
 from nurec.models.gaussians.renderers import BaseGaussianRenderer
 from nurec.models.gaussians.utils import Asset, make_ppisp_crf_inverse_rgb_post_processing
 from nurec.render.actors import ActorsSnapshot, ActorTracks
-from nurec.render.lidar_firing_pattern import LidarFiringPattern, build_unstructured_tiling
+from nurec.render.lidar_tiling import build_unstructured_tiling
 from nurec.render.utils import frame_transform_poses, transform_intrinsics_to_resolution
 from nurec.utils.batch import (
     CameraFrameLabels,
@@ -89,6 +91,10 @@ class MissingRenderOutputError(ValueError):
     distinguish model capability (e.g. the gRPC server) can catch this specifically and surface an
     actionable ``FAILED_PRECONDITION`` instead of a generic ``INVALID_ARGUMENT``.
     """
+
+
+class CpuPreparationUnsupportedError(ValueError):
+    """Raised when an artifact cannot be prepared as a CPU-resident render model."""
 
 
 @dataclass
@@ -180,6 +186,49 @@ class LidarFrame:
             assert self.point_intensities.shape[0] == self.point_positions.shape[0], (
                 "Intensity tensor does not have the same number of points as point positions tensor"
             )
+
+
+@dataclass
+class LidarRayFrame:
+    """A simulated lidar frame with one entry per emitted ray, in bundle order.
+
+    Rays without returns remain present, so index ``i`` identifies the same emission
+    across frames selecting the same firing-pattern ID. Distances are uncompensated;
+    a consumer can combine them with the pattern and poses for motion compensation.
+    ``LidarFrame`` is the compacted, compensated point-cloud representation.
+
+    Args:
+        ray_distances: Float32 tensor of shape ``(n_rays,)`` with distance along each
+            ray in NuRec units. Values are undefined where ``ray_valid`` is false.
+        ray_valid: Boolean tensor of shape ``(n_rays,)`` indicating which rays
+            pass the render's raydrop, opacity, and distance filters.
+        ray_intensities: Optional float32 tensor of shape ``(n_rays,)`` with returned
+            intensities. Values are undefined where ``ray_valid`` is false.
+
+    Raises:
+        AssertionError: If distances are not one-dimensional, or validity and
+            supplied intensity tensors do not have matching shapes.
+    """
+
+    ray_distances: torch.Tensor
+    ray_valid: torch.Tensor
+    ray_intensities: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        n = self.ray_distances.shape
+        assert len(n) == 1, "Ray distance tensor does not have 1 dimension"
+        assert self.ray_valid.shape == n, "Validity tensor does not have one entry per ray"
+        if self.ray_intensities is not None:
+            assert self.ray_intensities.shape == n, "Intensity tensor does not have one entry per ray"
+
+    @property
+    def n_rays(self) -> int:
+        """Count emitted rays, including entries without valid returns.
+
+        Returns:
+            The number of entries in the distance tensor.
+        """
+        return int(self.ray_distances.shape[0])
 
 
 @dataclass
@@ -352,6 +401,15 @@ def _crop_to_sweep(lidar_to_world: PoseRange, sweep_us: int) -> PoseRange:
     requested_us = lidar_to_world.end_timestamp_us - lidar_to_world.start_timestamp_us
     start = lidar_to_world.start_pose_tquat_sensor_world.reshape(7)
     end = lidar_to_world.end_pose_tquat_sensor_world.reshape(7)
+    if requested_us == 0:
+        # A flash pattern legitimately emits every ray at frame start. There is no interval
+        # over which to interpolate, so both endpoints are exactly that starting pose.
+        return PoseRange(
+            start_pose_tquat_sensor_world=start,
+            end_pose_tquat_sensor_world=start,
+            start_timestamp_us=lidar_to_world.start_timestamp_us,
+            end_timestamp_us=lidar_to_world.start_timestamp_us,
+        )
     elapsed = torch.tensor([sweep_us / requested_us], dtype=start.dtype, device=start.device)
     sweep_end = torch.cat(
         [
@@ -369,7 +427,17 @@ def _crop_to_sweep(lidar_to_world: PoseRange, sweep_us: int) -> PoseRange:
 
 @dataclass
 class LidarRayBundle:
-    """Rays sampled for a single lidar frame."""
+    """Rays sampled for a single lidar frame.
+
+    Args:
+        rendering_data: Ray origins, directions, poses, timestamps, and optional
+            unstructured tiling consumed by the renderer.
+        frame_meta: Sensor and frame indices used to select learned scene parameters.
+        T_nurec_sensor_end: ``(4, 4)`` transform from NuRec coordinates to sensor
+            coordinates at the end of the bundle's pose interval.
+        model_elements: Sensor-grid element indices for modeled rays, or an empty
+            tensor for model-free rays that have no parametric grid.
+    """
 
     rendering_data: RenderingData
     frame_meta: FrameMeta
@@ -381,7 +449,8 @@ class LidarRayBundle:
     @classmethod
     def build_model_free(
         cls,
-        firing_pattern: LidarFiringPattern,
+        firing_pattern_template: LidarFiringPatternTemplate,
+        frame_period_us: int,
         lidar_to_world: PoseRange,
         world_to_nurec: FrameConversion,
         unique_sensor_idx: Optional[int] = None,
@@ -393,11 +462,36 @@ class LidarRayBundle:
         Where :meth:`build` synthesises an ``(n_rows, n_columns)`` grid from the model, the
         rays here are the pattern's measured directions as an ``(N, 1)`` list, each placed at
         its own firing instant so the sweep stays rolling-shutter correct.
+
+        Args:
+            firing_pattern_template: Validated sensor-frame directions and firing
+                offsets for the selected phase, preserving recorded ray order.
+            frame_period_us: Physical frame period in microseconds, used to validate
+                the supplied pose interval against the template's firing span.
+            lidar_to_world: Sensor poses and start/end timestamps for the requested
+                frame. The interval must cover all firings and stay within 105% of the period.
+            world_to_nurec: Coordinate and scale conversion from world space into NuRec space.
+            unique_sensor_idx: Optional calibrated sensor index; ``None`` becomes -1.
+            unique_frame_idx: Optional dataset frame index; ``None`` becomes -1.
+            training_frame_idx: Optional training-frame index; ``None`` becomes -1.
+
+        Returns:
+            A CUDA ray bundle with one ray per template entry, interpolated poses at
+            firing times, and unstructured tiling. The pose interval is cropped to the
+            last firing, with the end transform updated to that time.
+
+        Raises:
+            ValueError: If the pose interval does not fit the firing schedule or the
+                template's field of view cannot be represented by unstructured tiling.
+            RuntimeError: If required CUDA tensor operations cannot run.
         """
         # The render is CUDA-only, so the rays are built where they will be consumed.
         device = torch.device("cuda")
-        firing_pattern.check_window(lidar_to_world.end_timestamp_us - lidar_to_world.start_timestamp_us)
-        lidar_to_world = _crop_to_sweep(lidar_to_world, firing_pattern.span_us)
+        firing_pattern_template.check_window(
+            lidar_to_world.end_timestamp_us - lidar_to_world.start_timestamp_us,
+            frame_period_us,
+        )
+        lidar_to_world = _crop_to_sweep(lidar_to_world, firing_pattern_template.span_us)
         frame_start_us = lidar_to_world.start_timestamp_us
         frame_end_us = lidar_to_world.end_timestamp_us
 
@@ -414,15 +508,17 @@ class LidarRayBundle:
         T_sensor_nurec = tquat_to_se3_matrix(tquat_sensor_nurec)  # (2, 4, 4)
         T_nurec_sensor_end = se3_matrix_inverse(T_sensor_nurec[1])
 
-        ray_timestamps_us = torch.from_numpy(firing_pattern.ray_timestamps_us(frame_start_us)).to(device=device)
-        n_rays = firing_pattern.n_rays
+        ray_timestamps_us = torch.from_numpy(firing_pattern_template.ray_timestamps_us(frame_start_us)).to(
+            device=device
+        )
+        n_rays = firing_pattern_template.n_rays
 
         # Fraction of the frame elapsed at each firing, which places that ray's origin along
         # the sensor's path through the frame.
         duration_us = max(frame_end_us - frame_start_us, 1)
         alpha = ((ray_timestamps_us - frame_start_us).to(torch.float32) / float(duration_us)).clamp(0.0, 1.0)
 
-        directions_sensor = torch.from_numpy(firing_pattern.directions_sensor).to(device=device)
+        directions_sensor = torch.from_numpy(firing_pattern_template.directions_sensor).to(device=device)
         # Use the shared rigid-pose interpolation: linear translation plus quaternion SLERP.
         # This preserves a valid rotation at every firing, including large rotations.
         interpolated_poses = interpolate_se3_poses(T_sensor_nurec[0], T_sensor_nurec[1], alpha)
@@ -430,7 +526,7 @@ class LidarRayBundle:
         origins = interpolated_poses[:, :3, 3]
         rays = torch.cat([origins, directions_nurec], dim=1)  # (N, 6)
 
-        tiling = build_unstructured_tiling(firing_pattern, frame_start_us, device)
+        tiling = build_unstructured_tiling(firing_pattern_template, frame_start_us, device)
 
         timestamps_startend_us = (frame_start_us, frame_end_us)
         rendering_data = RenderingData(
@@ -452,8 +548,8 @@ class LidarRayBundle:
             frame_meta=frame_meta,
             T_nurec_sensor_end=T_nurec_sensor_end,
             # Model elements index a sensor grid, which a model-free frame has none of. Their
-            # only consumer is the range-view floating-point filter, which refuses these
-            # frames for that reason; the angle source needs no grid and reads none of this.
+            # floating-point filter uses template angles for these frames and reads none
+            # of this placeholder grid.
             model_elements=torch.zeros((n_rays, 2), dtype=torch.int32, device=device),
         )
 
@@ -566,12 +662,15 @@ class RenderableModel:
 
     # Default camera inference emits only RGB; semantic and distance renders
     # opt back in via config_overrides (later entries win the merge). Lidar
-    # gates keep their defaults because lidar inference reads intensity,
-    # raydrop, and distance. See nurec/render/README.md.
+    # feature and distance gates keep their defaults because lidar inference
+    # reads intensity, raydrop, and distance. Normals have no inference consumer
+    # on either sensor, so both normal gates default off. See nurec/render/README.md.
     _INFERENCE_DEFAULT_OVERRIDES: ClassVar[Tuple[str, ...]] = (
         "model.renderer.outputs.camera.enable_extended_features=False",
         "model.renderer.outputs.camera.enable_sensor_features=False",
         "model.renderer.outputs.camera.enable_distance=False",
+        "model.renderer.outputs.camera.enable_normals=False",
+        "model.renderer.outputs.lidar.enable_normals=False",
     )
     _RENDERER_NAME_KEY: ClassVar[str] = "model.renderer.name"
     _LIDAR_OUTPUT_SIGNAL_GATES: ClassVar[Tuple[Tuple[str, str], ...]] = (
@@ -634,19 +733,27 @@ class RenderableModel:
         tracks_timestamp_ray_stride: int = 1,
         *,
         before_model_load: Callable[[], None] | None = None,
+        device: torch.device | str = "cuda",
     ) -> Self:
-        """Load a model from an artifact with the requested configuration overrides.
+        """Load and upgrade an artifact for inference.
 
-        If supplied, ``before_model_load`` runs after configuration upgrades, overrides,
-        and CUDA environment setup, immediately before model loading.
+        ``device`` defaults to CUDA. CPU loading supports Gaussian artifacts only
+        and never falls back to CUDA. Loading sets ``CUDA_DEVICE_ORDER`` and may
+        extend ``PYTORCH_CUDA_ALLOC_CONF``. Raise
+        ``CpuPreparationUnsupportedError`` when CPU preparation is unsupported.
+        If supplied, ``before_model_load`` runs after configuration upgrades,
+        overrides, and CUDA environment setup, immediately before model loading.
         """
-        orig_untyped_config = OmegaConf.create(artifact.parsed_config)
+        target_device = torch.device(device)
+        with ScopedTimer("load_from_artifact/parsed_config"):
+            orig_untyped_config = OmegaConf.create(artifact.parsed_config)
 
         # An explicit renderer override (`--renderer gsplat`, or the gRPC GSplat backend) picks the
         # renderer the artifact is actually rendered with, so it has to be visible to the upgraders:
         # they refuse to migrate configs whose trained renderer has no automatic migration path, and
         # naming a supported renderer is the documented manual recovery for exactly that case.
-        untyped_config = upgrade_config(cls._with_renderer_override(orig_untyped_config, config_overrides))
+        with ScopedTimer("load_from_artifact/upgrade_config"):
+            untyped_config = upgrade_config(cls._with_renderer_override(orig_untyped_config, config_overrides))
 
         # Ray-stride is applied here (not by the caller) so it can be scoped to the track
         # layers actually present in this artifact -- emitting it for an absent layer would
@@ -709,26 +816,24 @@ class RenderableModel:
         compact_camera_extra_signals_missing = cls._compact_signal_tensor_missing(
             artifact, compact_preserved_extra_signal_tensors, "camera_extra_signal"
         )
+        if compact_camera_extra_signals_missing:
+            OmegaConf.update(untyped_config, "model.renderer.outputs.camera.enable_sensor_features", False)
 
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        # If set, configure torch's default allocation block size - appending to any existing key:value configs.
-        if (
-            "max_split_size_mb" in untyped_config.system
-            and (split_size := untyped_config.system.max_split_size_mb) is not None
-        ):
-            new_entry = f"max_split_size_mb:{split_size}"
-            conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_entry if conf is None else ",".join([conf, new_entry])
+        split_size = OmegaConf.select(untyped_config, "system.max_split_size_mb", default=None)
+        cls._configure_cuda_environment(split_size)
 
         if before_model_load is not None:
             before_model_load()
 
-        model: GaussiansComposite | BaseInstantNuRecPrimitive = cls._load_model_and_upgrade(
-            untyped_config, artifact, orig_untyped_config
-        )
+        with ScopedTimer("load_from_artifact/load_model_and_upgrade"):
+            model: GaussiansComposite | BaseInstantNuRecPrimitive = cls._load_model_and_upgrade(
+                untyped_config, artifact, orig_untyped_config, target_device
+            )
 
-        world_to_nurec = RigTrajectories.from_dict(artifact.rig_trajectories).world_to_nurec
-        track_split_resolver = TrackSplitResolver(artifact.track_split_metadata)
+        with ScopedTimer("load_from_artifact/rig_trajectories"):
+            world_to_nurec = RigTrajectories.from_dict(artifact.rig_trajectories).world_to_nurec
+        with ScopedTimer("load_from_artifact/track_split"):
+            track_split_resolver = TrackSplitResolver(artifact.track_split_metadata)
 
         return cls(
             model,
@@ -748,6 +853,15 @@ class RenderableModel:
             compact_camera_extra_signals_missing,
         )
 
+    @staticmethod
+    def _configure_cuda_environment(max_split_size_mb: Optional[int]) -> None:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        if max_split_size_mb is None:
+            return
+        new_entry = f"max_split_size_mb:{max_split_size_mb}"
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_entry if conf is None else ",".join([conf, new_entry])
+
     @classmethod
     def _with_renderer_override(cls, untyped_config: DictConfig, config_overrides: Tuple[str, ...]) -> DictConfig:
         """Return `untyped_config` with any `model.renderer.name` override from `config_overrides` applied.
@@ -764,7 +878,10 @@ class RenderableModel:
         )
         if renderer_name is None:
             return untyped_config
-        if OmegaConf.select(untyped_config, cls._RENDERER_NAME_KEY, default=None) is None:
+        current_renderer = OmegaConf.select(untyped_config, cls._RENDERER_NAME_KEY, default=None)
+        if current_renderer is None:
+            return untyped_config
+        if current_renderer == renderer_name and not OmegaConf.is_interpolation(untyped_config.model.renderer, "name"):
             return untyped_config
         overridden = copy.deepcopy(untyped_config)
         OmegaConf.update(overridden, cls._RENDERER_NAME_KEY, renderer_name)
@@ -804,61 +921,119 @@ class RenderableModel:
 
     @classmethod
     def _load_model_and_upgrade(
-        cls, untyped_config: DictConfig, artifact: Artifact, orig_untyped_config: DictConfig
+        cls,
+        untyped_config: DictConfig,
+        artifact: Artifact,
+        orig_untyped_config: DictConfig,
+        device: torch.device,
     ) -> GaussiansComposite | BaseInstantNuRecPrimitive:
         match untyped_config.model.name:
             case "gaussians_primitive" | "gaussians-composite":
-                return cls._load_model_gaussians_composite_and_upgrade(untyped_config, artifact, orig_untyped_config)
+                return cls._load_model_gaussians_composite_and_upgrade(
+                    untyped_config,
+                    artifact,
+                    orig_untyped_config,
+                    device,
+                )
             case "celsius" | "kelvin":
+                if device.type == "cpu":
+                    raise CpuPreparationUnsupportedError("Instant NuRec artifacts do not support CPU scene preparation")
                 return cls._load_model_instant_nurec_and_upgrade(untyped_config, artifact, orig_untyped_config)
             case _:
                 raise TypeError(f"Unsupported model name '{untyped_config.model.name}'")
 
     @classmethod
     def _load_model_gaussians_composite_and_upgrade(
-        cls, untyped_config: DictConfig, artifact: Artifact, orig_untyped_config: DictConfig
+        cls,
+        untyped_config: DictConfig,
+        artifact: Artifact,
+        orig_untyped_config: DictConfig,
+        device: torch.device,
     ) -> GaussiansComposite:
-        model_config = ModelConfig.model_validate(untyped_config.model)
+        # The checkpoint depends on nothing below: its read, deserialization and host-to-device copies
+        # run on a worker thread while the config is validated, the datasource summary decoded and
+        # the empty model built. Leaving the pool joins the worker, also when the build fails.
+        # torch's current CUDA device is per thread: resolve the caller's here so a compact checkpoint
+        # is materialized on it, not on the worker's default device.
+        checkpoint_device = device
+        if device.type == "cuda" and device.index is None and torch.cuda.is_available():
+            checkpoint_device = torch.device("cuda", torch.cuda.current_device())
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-load") as pool:
+            checkpoint_future = pool.submit(cls._load_gaussian_checkpoint, artifact, checkpoint_device)
 
-        # Log which renderer will be used
-        renderer_name = model_config.renderer.name
-        log.info(f"Using renderer: {renderer_name}")
+            with ScopedTimer("load_model/validate_configs"):
+                model_config = ModelConfig.model_validate(untyped_config.model)
+                trainer_config = TrainerConfig.model_validate(untyped_config.trainer)
 
-        datasource_summary = DataSourceSummary.from_dict(
-            artifact.datasource_summary,
-            infer_missing=True,  # For better backward-compatibility.
-            track_split_metadata=artifact.track_split_metadata,
-        )
-        trainer_config = TrainerConfig.model_validate(untyped_config.trainer)
-        model = GaussiansComposite(
-            model_config, trainer_config, datasource=datasource_summary, init_from_datasource=False
-        )
+            # Log which renderer will be used
+            renderer_name = model_config.renderer.name
+            log.info(f"Using renderer: {renderer_name}")
 
-        checkpoint = cls._load_gaussian_checkpoint(artifact)
+            with ScopedTimer("load_model/DataSourceSummary"):
+                datasource_summary = DataSourceSummary.from_dict(
+                    artifact.datasource_summary,
+                    infer_missing=True,  # For better backward-compatibility.
+                    track_split_metadata=artifact.track_split_metadata,
+                    device=device if device.type == "cpu" else None,
+                )
+            with ScopedTimer("load_model/GaussiansComposite.__init__"):
+                model = GaussiansComposite(
+                    model_config, trainer_config, datasource=datasource_summary, init_from_datasource=False
+                )
+
+            # What is left of the checkpoint load once the model is built: the part the overlap did
+            # not hide.
+            with ScopedTimer("load_model/load_checkpoint"):
+                checkpoint = checkpoint_future.result()
         model_state_dict = {
             k.removeprefix("model."): v for k, v in checkpoint["state_dict"].items() if k.startswith("model.")
         }
         # Upgrade the state_dict to the current version of the software, should the artifact be from an earlier version.
-        upgraded_model_state_dict = upgrade_model(
-            model_state_dict, orig_untyped_config, datasource_summary=datasource_summary
-        )
+        with ScopedTimer("load_model/upgrade_model"):
+            upgraded_model_state_dict = upgrade_model(
+                model_state_dict, orig_untyped_config, datasource_summary=datasource_summary
+            )
 
-        model.load_state_dict(upgraded_model_state_dict, assign=not checkpoint.get("load_in_place", True))
-        model.to("cuda")
+        with ScopedTimer("load_model/load_state_dict"):
+            model.load_state_dict(upgraded_model_state_dict, assign=not checkpoint.get("load_in_place", True))
+        # Module.to copies with non_blocking=False; a device-wide synchronize here would stall concurrent renders.
+        with ScopedTimer(f"load_model/to_{device.type}"):
+            model.to_device(device)
         model.eval()
+        if device.type == "cpu" and (
+            any(tensor.device.type != "cpu" for tensor in (*model.parameters(), *model.buffers()))
+            or any(track_device.type != "cpu" for track_device in model.cuboid_track_devices())
+        ):
+            raise CpuPreparationUnsupportedError("CPU scene preparation retained non-CPU model tensors")
+        # Scene size next to the load timings, so a slow load can be read against what it loaded.
+        n_gaussians = sum(node.get_num_gaussians() for node in model.gaussians_nodes.values())
+        n_params = sum(p.numel() for p in model.parameters())
+        param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        log.info(f"Loaded model: n_gaussians={n_gaussians} n_params={n_params} param_bytes={param_bytes}")
 
         return model
 
     @staticmethod
-    def _load_gaussian_checkpoint(artifact: Artifact) -> dict[str, Any]:
-        """Load a Gaussian checkpoint from normal or compact USDZ."""
+    def _load_gaussian_checkpoint(artifact: Artifact, device: torch.device | str) -> dict[str, Any]:
+        """Load a Gaussian checkpoint from normal or compact USDZ.
+
+        Map standard checkpoints to CPU for CPU preparation. Materialize compact
+        checkpoints on ``device``; resolve CUDA indices before calling from a worker.
+        """
+        device = torch.device(device)
         if artifact.is_compact:
-            if not torch.cuda.is_available():
+            if device.type == "cuda" and not torch.cuda.is_available():
                 raise RuntimeError("compact USDZ rendering requires CUDA")
-            # The Gaussian render path materializes models on CUDA below; unpack
-            # compact tensors there directly instead of staging dense CPU tensors.
-            return compact_usdz.load_compact_checkpoint(artifact.source, device="cuda")
-        return torch.load(artifact.checkpoint, weights_only=False)
+            return compact_usdz.load_compact_checkpoint(artifact.source, device=device)
+        map_location = "cpu" if device.type == "cpu" else None
+        # The member's CRC-32 is checked on open, as zipfile would (torch's reader does not); torch.load
+        # then reads each tensor straight out of the usdz member (see Artifact.open_checkpoint).
+        with ScopedTimer("load_checkpoint/verify_crc"):
+            checkpoint_file = artifact.open_checkpoint()
+        with checkpoint_file, ScopedTimer("load_checkpoint/torch_load"):
+            return torch.load(  # NOSONAR - NuRec checkpoint, needs full unpickle
+                checkpoint_file, weights_only=False, map_location=map_location
+            )
 
     @classmethod
     def _load_model_instant_nurec_and_upgrade(
@@ -897,6 +1072,13 @@ class RenderableModel:
         if isinstance(self._model, BaseInstantNuRecPrimitive):
             return self._model.device()
         return next(iter(self._model.parameters())).device
+
+    def to(self, device: torch.device | str) -> Self:
+        """Move a Gaussian render model to ``device``."""
+        if not isinstance(self._model, GaussiansComposite):
+            raise CpuPreparationUnsupportedError("Instant NuRec artifacts do not support deferred CUDA activation")
+        self._model.to_device(device)
+        return self
 
     @property
     def autocast(self):
@@ -975,6 +1157,14 @@ class RenderableModel:
             and isinstance(self._model.cuboid_tracks, CuboidTracks)
             and self._world_to_nurec is not None
         )
+
+    def supports_shared_camera_batch(self) -> bool:
+        return isinstance(self._model, GaussiansComposite) and self._model.supports_shared_camera_batch()
+
+    def dynamic_actor_ids(self) -> set[str]:
+        if not isinstance(self._model, GaussiansComposite):
+            return set()
+        return set(self._track_split_resolver.external_track_ids(self._model.dynamic_track_ids()))
 
     def _to_parent_facing_cuboid_tracks(self, cuboid_tracks: CuboidTracks) -> CuboidTracks:
         if not self._track_split_resolver.has_splits:
@@ -1220,8 +1410,20 @@ class RenderableModel:
                 edited_cuboid_tracks = actor_edited_cuboid_tracks
 
         with self.autocast, torch.no_grad(), ScopedTimer("RenderableModel._render_volume_from_ray_bundle"):
-            # Copy all tensors with the ray bundle to GPU
-            ray_bundle = cast(RayBundle, tree_map(ray_bundle, to_float_device(self.device)))
+            # Track preparation reads the CPU timestamps; do not upload them.
+            to_device = to_float_device(self.device)
+            rendering = ray_bundle.rendering_data
+            ray_bundle = RayBundle(
+                rendering_data=replace(
+                    rendering,
+                    **{
+                        item.name: tree_map(getattr(rendering, item.name), to_device)
+                        for item in fields(rendering)
+                        if item.name != "timestamps_startend_us_cpu"
+                    },
+                ),
+                frame_meta=tree_map(ray_bundle.frame_meta, to_device),
+            )
 
             # Call the model. Different models behave slightly differently.
             # TODO: replace model type branching with an abstract base class like CameraRenderable
@@ -1342,6 +1544,100 @@ class RenderableModel:
             semantic_image=semantic_image_int64,
         )
 
+    def render_camera_color_batch_from_ray_bundles(
+        self,
+        ray_bundles: List[RayBundle],
+        actors_snapshot: Optional[ActorsSnapshot],
+    ) -> List[CameraFrame]:
+        """Render compatible ray bundles in order; return [] for an empty list.
+
+        See ``render_camera_color_batch`` for input constraints and errors.
+        """
+        if not ray_bundles:
+            return []
+        with ScopedTimer("RenderableModel/render_camera_color_batch/collate"):
+            rendering_data = RenderingData.collate_fn(
+                [bundle.rendering_data for bundle in ray_bundles], device=self.device
+            )
+        return self.render_camera_color_batch(
+            rendering_data,
+            [bundle.frame_meta for bundle in ray_bundles],
+            actors_snapshot,
+        )
+
+    def render_camera_color_batch(
+        self,
+        rendering_data: RenderingData,
+        frame_meta: List[FrameMeta],
+        actors_snapshot: Optional[ActorsSnapshot],
+    ) -> List[CameraFrame]:
+        """Render compatible camera views from one Gaussian scene, for inference only.
+
+        Views must share a frame interval and camera-intrinsics object. Supply one
+        metadata entry per view, in order. Actor overrides apply to every view.
+        Use this path for rolling shutter only when the scene has no dynamic actors;
+        matching pose overrides are not sufficient. Use sequential rendering
+        otherwise.
+
+        Returns:
+            One color frame per view, in order, or [] for an empty batch.
+
+        Raises:
+            TypeError: The model does not support shared-scene camera rendering.
+            ValueError: Metadata, intervals, or intrinsics are incompatible, or
+                multi-view post-processing receives subsampled frames.
+            RuntimeError: The renderer returns an unexpected RGB shape.
+        """
+        if rendering_data.b == 0:
+            return []
+        if not self.supports_shared_camera_batch():
+            raise TypeError(f"Model {type(self._model).__name__} does not support shared camera batching")
+        if len(frame_meta) != rendering_data.b:
+            raise ValueError(f"Expected {rendering_data.b} camera metadata entries, got {len(frame_meta)}")
+
+        timestamps = rendering_data.timestamps_startend_us_cpu
+        if not torch.equal(timestamps, timestamps[:1].expand_as(timestamps)):
+            raise ValueError("Shared-scene camera views must use the same frame interval")
+
+        edited_cuboid_tracks = None
+        if actors_snapshot is not None:
+            frame_start_us, frame_end_us = (int(value) for value in timestamps[0].tolist())
+            edited_cuboid_tracks = self._edit_actors(actors_snapshot, frame_start_us, frame_end_us)
+
+        with self.autocast, torch.no_grad(), ScopedTimer("RenderableModel/render_camera_color_batch"):
+            batch = DataAndRenderingBatch(
+                data=DataBatch(
+                    camera=DataBatch.Camera(
+                        meta=frame_meta,
+                        labels=CameraFrameLabels(),
+                    )
+                ),
+                rendering=RenderingBatch(camera=rendering_data),
+            )
+            model = cast(GaussiansComposite, self._model)
+            rendered: GaussiansRenderReturn = unpack_optional(
+                model(
+                    batch=batch,
+                    enable_calib=False,
+                    enable_pp=True,
+                    edited_cuboid_tracks=edited_cuboid_tracks,
+                    shared_camera_scene=True,
+                ).rendered_cam
+            )
+            rgb: torch.Tensor = unpack_optional(rendered.rgb)
+            height, width = rendering_data.h, rendering_data.w
+            expected_shape = (rendering_data.b * height * width, 3)
+            if rgb.shape != expected_shape:
+                raise RuntimeError(f"Expected batched RGB shape {expected_shape}, got {tuple(rgb.shape)}")
+            return [
+                CameraFrame(
+                    color_image=rgb[index * height * width : (index + 1) * height * width]
+                    .view(height, width, 3)
+                    .float()
+                )
+                for index in range(rendering_data.b)
+            ]
+
     def render_camera_frame(
         self,
         camera_intrinsics: ConcreteCameraModelParametersUnion,
@@ -1454,7 +1750,7 @@ class RenderableModel:
         """
         return self._lidar_rendering_settings.lidar_post_filter_neighbor_source
 
-    def render_lidar_frame_from_ray_bundle(
+    def _render_lidar_rays(
         self,
         ray_bundle: LidarRayBundle,
         raydrop_threshold: Optional[float] = None,
@@ -1468,8 +1764,13 @@ class RenderableModel:
         frame_start_us: int = 0,
         frame_end_us: int = 0,
         lidar_stream: Optional[torch.cuda.Stream] = None,
-    ) -> LidarFrame:
-        """Render a model given a ray bundle generated from a single lidar view and return a LidarFrame.
+    ) -> tuple[LidarRayFrame, torch.Tensor]:
+        """Render one lidar view and return its rays, before any compaction or compensation.
+
+        Shared by the two public entry points: the point-cloud form keeps only the rays that
+        returned and moves them into end-of-spin space, while the per-ray form reports every
+        emitted ray as it was measured. Both need exactly the work up to ``keep_mask``, so it
+        lives here rather than being written twice.
 
         Args:
             ray_bundle: The lidar ray bundle to render.
@@ -1486,7 +1787,8 @@ class RenderableModel:
                 grid) or "angle" (sensor-agnostic; for model-free / unstructured lidar). Not
                 Optional -- callers pass a concrete value (the gRPC service seeds it from the
                 artifact-config default via `default_lidar_neighbor_source()`); falls back to
-                "rangeview" only if omitted.
+                "rangeview" only if omitted. Bundles with stored firing-pattern tiling
+                always use "angle" because they have no parametric sensor grid.
             elevation_resolution_deg: Angle source only. Elevation row spacing in degrees;
                 None = auto-estimate (falls back to the artifact config default).
             azimuth_max_gap_deg: Angle source only. Max azimuth neighbour gap in degrees;
@@ -1500,7 +1802,8 @@ class RenderableModel:
                 composite-owned stream.
 
         Returns:
-            LidarFrame containing the rendered point cloud.
+            The frame's per-ray distances, intensities and validity, along with the ``(N, 6)``
+            NuRec-space ray origins/directions they were measured along, on the render device.
         """
         if self._compact_lidar_extra_signal_tensors_missing:
             names = ", ".join(self._compact_lidar_extra_signal_tensors_missing)
@@ -1534,7 +1837,10 @@ class RenderableModel:
         assert neighbor_source in ("rangeview", "angle"), (
             f"neighbor_source must be 'rangeview' or 'angle', got {neighbor_source!r}"
         )
-        effective_neighbor_source = neighbor_source
+        # Native templates have no parametric range-view grid, even when their sensor
+        # also has model intrinsics. Keep existing filter-enabled configs usable.
+        has_template = ray_bundle.rendering_data.unstructured_lidar_tiling is not None
+        effective_neighbor_source = "angle" if has_template else neighbor_source
         effective_elevation_resolution_deg = (
             elevation_resolution_deg
             if elevation_resolution_deg is not None
@@ -1558,10 +1864,10 @@ class RenderableModel:
             ray_bundle, edited_cuboid_tracks=edited_cuboid_tracks, lidar_stream=lidar_stream
         )
 
+        rays = ray_bundle.rendering_data.rays.reshape(-1, 6)
+
         rendered = unpack_optional(model_return.rendered_lidar)
         dist = unpack_optional(rendered.distance)
-        rays = ray_bundle.rendering_data.rays.reshape(-1, 6)
-        xyz_end = torch.addcmul(rays[:, 0:3], rays[:, 3:6], dist.unsqueeze(1))
 
         if rendered.extra_ray_signals is not None and rendered.extra_ray_signals.intensity is not None:
             intensity = rendered.extra_ray_signals.intensity.squeeze()
@@ -1585,9 +1891,13 @@ class RenderableModel:
         # unstructured lidar, which has no range-view grid).
         if effective_enable_distance_filter:
             if effective_neighbor_source == "angle":
-                # Sensor-frame ray directions (NuRec-frame directions rotated by T_nurec_sensor_end),
-                # matching the validation path's `ray_direction_sensor`.
-                ray_direction_sensor = (ray_bundle.T_nurec_sensor_end[:3, :3] @ rays[:, 3:6].T).T
+                tiling = ray_bundle.rendering_data.unstructured_lidar_tiling
+                if tiling is not None:
+                    # Each world ray includes its own firing pose. Undoing only the end
+                    # pose would mix platform motion into the filter's sensor angles.
+                    ray_direction_sensor = tiling.directions
+                else:
+                    ray_direction_sensor = (ray_bundle.T_nurec_sensor_end[:3, :3] @ rays[:, 3:6].T).T
                 filter_mask = angle_gradient_filter(
                     rendered,
                     ray_direction_sensor,
@@ -1614,10 +1924,94 @@ class RenderableModel:
                 )
             keep_mask &= ~filter_mask
 
-        xyz_end = xyz_end[keep_mask]
+        frame = LidarRayFrame(
+            ray_distances=dist.reshape(-1).contiguous(),
+            ray_valid=keep_mask.reshape(-1).contiguous(),
+            ray_intensities=None if intensity is None else intensity.reshape(-1).contiguous(),
+        )
+        return frame, rays
+
+    def render_lidar_frame_from_ray_bundle(
+        self,
+        ray_bundle: LidarRayBundle,
+        raydrop_threshold: Optional[float] = None,
+        opacity_threshold: Optional[float] = None,
+        enable_distance_filter: Optional[bool] = None,
+        distance_filter_threshold: Optional[float] = None,
+        neighbor_source: str = "rangeview",
+        elevation_resolution_deg: Optional[float] = None,
+        azimuth_max_gap_deg: Optional[float] = None,
+        actors_snapshot: Optional[ActorsSnapshot] = None,
+        frame_start_us: int = 0,
+        frame_end_us: int = 0,
+        lidar_stream: Optional[torch.cuda.Stream] = None,
+    ) -> LidarFrame:
+        """Render a model given a ray bundle generated from a single lidar view and return a LidarFrame.
+
+        Keeps the rays that returned and expresses them in the lidar frame at the end of the
+        sweep, i.e. motion-compensated. See :meth:`render_lidar_ray_frame_from_ray_bundle`
+        for the uncompensated per-ray form. Threshold arguments are documented on
+        :meth:`_render_lidar_rays`.
+
+        Args:
+            ray_bundle: The lidar ray bundle to render.
+            raydrop_threshold: Override for raydrop probability threshold [0-1].
+                Rays with raydrop > threshold are dropped. If None, uses artifact config default.
+            opacity_threshold: Override for opacity threshold [0-1].
+                Rays with opacity <= threshold are dropped. Set to 0.0 to disable (matching validation).
+                If None, uses artifact config default.
+            enable_distance_filter: Override to enable/disable distance-based edge filtering.
+                If None, uses artifact config default.
+            distance_filter_threshold: Override for distance filter threshold [0-1].
+                Higher = fewer points filtered. If None, uses artifact config default.
+            neighbor_source: Floating-point filter neighbour source: "rangeview" (structured 2D
+                grid) or "angle" (sensor-agnostic; for model-free / unstructured lidar). Not
+                Optional -- callers pass a concrete value (the gRPC service seeds it from the
+                artifact-config default via `default_lidar_neighbor_source()`); falls back to
+                "rangeview" only if omitted. Bundles with stored firing-pattern tiling
+                always use "angle" because they have no parametric sensor grid.
+            elevation_resolution_deg: Angle source only. Elevation row spacing in degrees;
+                None = auto-estimate (falls back to the artifact config default).
+            azimuth_max_gap_deg: Angle source only. Max azimuth neighbour gap in degrees;
+                None = auto (falls back to the artifact config default).
+            actors_snapshot: Optional ActorsSnapshot containing the actors ids and poses
+            frame_start_us: start timestamp (in microseconds) of the frame captured
+            frame_end_us: end timestamp (in microseconds) of the frame captured
+            lidar_stream: Optional CUDA stream to run the lidar collect+render on. When
+                provided (e.g. a per-request stream owned by the serving Backend), the
+                composite uses it instead of its own; when None it falls back to the
+                composite-owned stream.
+
+        Returns:
+            LidarFrame containing the rendered point cloud.
+
+        Raises:
+            ValueError: If required lidar signal tensors are absent, range-view filtering
+                has neither a sensor grid nor template tiling, or angle filtering cannot
+                infer separable elevation rows without an explicit resolution.
+            AssertionError: If ``neighbor_source`` is neither ``rangeview`` nor ``angle``.
+            RuntimeError: If GPU rendering or tensor operations fail.
+        """
+        frame, rays = self._render_lidar_rays(
+            ray_bundle,
+            raydrop_threshold=raydrop_threshold,
+            opacity_threshold=opacity_threshold,
+            enable_distance_filter=enable_distance_filter,
+            distance_filter_threshold=distance_filter_threshold,
+            neighbor_source=neighbor_source,
+            elevation_resolution_deg=elevation_resolution_deg,
+            azimuth_max_gap_deg=azimuth_max_gap_deg,
+            actors_snapshot=actors_snapshot,
+            frame_start_us=frame_start_us,
+            frame_end_us=frame_end_us,
+            lidar_stream=lidar_stream,
+        )
+
+        valid = frame.ray_valid
+        xyz_end = torch.addcmul(rays[:, 0:3], rays[:, 3:6], frame.ray_distances.unsqueeze(1))[valid]
+        intensity = frame.ray_intensities
         if intensity is not None:
-            intensity = intensity[keep_mask]
-            intensity = intensity.contiguous()
+            intensity = intensity[valid].contiguous()
 
         pc_nurec = xyz_end.contiguous().unsqueeze(0)  # (1, n, 3)
 
@@ -1626,3 +2020,88 @@ class RenderableModel:
         pc_sensor = transform_point_cloud(pc_nurec, T_nurec_sensor_end).squeeze(0)  # (n, 3)
 
         return LidarFrame(point_positions=pc_sensor, point_intensities=intensity)
+
+    def render_lidar_ray_frame_from_ray_bundle(
+        self,
+        ray_bundle: LidarRayBundle,
+        raydrop_threshold: Optional[float] = None,
+        opacity_threshold: Optional[float] = None,
+        enable_distance_filter: Optional[bool] = None,
+        distance_filter_threshold: Optional[float] = None,
+        neighbor_source: str = "rangeview",
+        elevation_resolution_deg: Optional[float] = None,
+        azimuth_max_gap_deg: Optional[float] = None,
+        actors_snapshot: Optional[ActorsSnapshot] = None,
+        frame_start_us: int = 0,
+        frame_end_us: int = 0,
+        lidar_stream: Optional[torch.cuda.Stream] = None,
+    ) -> LidarRayFrame:
+        """Render one lidar view and report every emitted ray, uncompensated.
+
+        Unlike :meth:`render_lidar_frame_from_ray_bundle`, nothing is dropped and nothing is
+        moved into end-of-spin space: entry ``i`` is the ray the bundle emitted at index
+        ``i`` whether or not it returned, so a consumer can line the frames up against the
+        sensor's own firing order and apply its own motion compensation. ``ray_distances`` are
+        along the bundle's ray directions, which is what makes that possible -- a compensated
+        point cloud has already folded the pose in and cannot be undone.
+
+        Distances are in NuRec units. That equals metres only for an unscaled world->NuRec
+        conversion; the caller owns that conversion and is the one that can check it.
+
+        Threshold arguments are documented on :meth:`_render_lidar_rays`.
+
+        Args:
+            ray_bundle: The lidar ray bundle to render.
+            raydrop_threshold: Override for raydrop probability threshold [0-1].
+                Rays with raydrop > threshold are dropped. If None, uses artifact config default.
+            opacity_threshold: Override for opacity threshold [0-1].
+                Rays with opacity <= threshold are dropped. Set to 0.0 to disable (matching validation).
+                If None, uses artifact config default.
+            enable_distance_filter: Override to enable/disable distance-based edge filtering.
+                If None, uses artifact config default.
+            distance_filter_threshold: Override for distance filter threshold [0-1].
+                Higher = fewer points filtered. If None, uses artifact config default.
+            neighbor_source: Floating-point filter neighbour source: "rangeview" (structured 2D
+                grid) or "angle" (sensor-agnostic; for model-free / unstructured lidar). Not
+                Optional -- callers pass a concrete value (the gRPC service seeds it from the
+                artifact-config default via `default_lidar_neighbor_source()`); falls back to
+                "rangeview" only if omitted. Bundles with stored firing-pattern tiling
+                always use "angle" because they have no parametric sensor grid.
+            elevation_resolution_deg: Angle source only. Elevation row spacing in degrees;
+                None = auto-estimate (falls back to the artifact config default).
+            azimuth_max_gap_deg: Angle source only. Max azimuth neighbour gap in degrees;
+                None = auto (falls back to the artifact config default).
+            actors_snapshot: Optional ActorsSnapshot containing the actors ids and poses
+            frame_start_us: start timestamp (in microseconds) of the frame captured
+            frame_end_us: end timestamp (in microseconds) of the frame captured
+            lidar_stream: Optional CUDA stream to run the lidar collect+render on. When
+                provided (e.g. a per-request stream owned by the serving Backend), the
+                composite uses it instead of its own; when None it falls back to the
+                composite-owned stream.
+
+        Returns:
+            LidarRayFrame with one entry per emitted ray.
+
+        Raises:
+            ValueError: If required lidar signal tensors are absent, range-view filtering
+                has neither a sensor grid nor template tiling, or angle filtering cannot
+                infer separable elevation rows without an explicit resolution.
+            AssertionError: If ``neighbor_source`` is neither ``rangeview`` nor ``angle``.
+            RuntimeError: If GPU rendering or tensor operations fail.
+        """
+        frame, _ = self._render_lidar_rays(
+            ray_bundle,
+            raydrop_threshold=raydrop_threshold,
+            opacity_threshold=opacity_threshold,
+            enable_distance_filter=enable_distance_filter,
+            distance_filter_threshold=distance_filter_threshold,
+            neighbor_source=neighbor_source,
+            elevation_resolution_deg=elevation_resolution_deg,
+            azimuth_max_gap_deg=azimuth_max_gap_deg,
+            actors_snapshot=actors_snapshot,
+            frame_start_us=frame_start_us,
+            frame_end_us=frame_end_us,
+            lidar_stream=lidar_stream,
+        )
+
+        return frame

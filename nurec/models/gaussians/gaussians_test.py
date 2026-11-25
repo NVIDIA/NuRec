@@ -22,14 +22,19 @@ from nurec.config.trainer import TrainerConfig
 from nurec.datasets.track_split import TrackSplitChild, TrackSplitMetadata
 from nurec.datasets.tracks import CuboidTracks, TrackFlags
 from nurec.models.composite import LayerTrackIds
-from nurec.models.gaussians.collect import DirectTracksCalibData, LayerDataRigid
+from nurec.models.gaussians.collect import (
+    DirectTracksCalibData,
+    LayerDataRigid,
+    TracksTimestampsEstimationData,
+    TracksTimestampsGlobalData,
+)
 from nurec.models.gaussians.gaussians_model import (
     DeformableGaussianModel,
     RigidGaussianModel,
     compute_stable_merging_indices,
 )
 from nurec.models.gaussians.utils import RGB2SH, SH2RGB, make_ppisp_crf_inverse_rgb_post_processing, ppisp_crf_inverse
-from nurec.models.tracks_calib import BaseTracksCalib, DirectTracksCalib, SkipTracksCalib
+from nurec.models.tracks_calib import BaseTracksCalib, DirectTracksCalib, SkipTracksCalib, StaticTracksCalib
 from nurec.utils.batch import RenderingData
 
 
@@ -188,6 +193,7 @@ class TestGaussiansModel(unittest.TestCase):
                 collector=SimpleNamespace(interpolate_tracks_poses=interpolate_tracks_poses),
                 get_frame_timestamp=RigidGaussianModel.get_frame_timestamp,
                 nearest_neighbor_track_for_lidar=False,
+                training=False,
                 _split_boundary_track_indices=torch.tensor([0, 1], dtype=torch.int64),
                 _split_internal_start_timestamps_us=torch.tensor(
                     [torch.iinfo(torch.int64).min, boundary_us], dtype=torch.int64
@@ -399,18 +405,19 @@ class TestGaussiansModel(unittest.TestCase):
         class FakeLidarModelParameters:
             pass
 
-        def make_rendering_data(sensor_model):
+        def make_rendering_data(sensor_model, ray_timestamps=None):
             timestamps = torch.tensor([[1000, 1600]], dtype=torch.int64)
+            height, width = ray_timestamps.shape[1:3] if ray_timestamps is not None else (1, 1)
             return RenderingData(
-                rays=torch.zeros(1, 1, 1, 6),
+                rays=torch.zeros(1, height, width, 6),
                 sensor_model_parameters=[sensor_model],
                 poses_tquat_startend=torch.zeros(1, 2, 7),
                 timestamps_startend_us=timestamps,
                 timestamps_startend_us_cpu=timestamps.cpu(),
-                rays_timestamps_us=None,
+                rays_timestamps_us=ray_timestamps,
             )
 
-        def captured_metadata(is_training_batch: bool, sensor_model) -> tuple[torch.Tensor, int]:
+        def captured_metadata(is_training_batch: bool, sensor_model, ray_timestamps=None):
             captured_tracks_interpolation_data = []
 
             def interpolate_tracks_poses(tracks_interpolation_data):
@@ -431,11 +438,14 @@ class TestGaussiansModel(unittest.TestCase):
                     get_frame_timestamp=RigidGaussianModel.get_frame_timestamp,
                     nearest_neighbor_track_for_lidar=True,
                     _split_boundary_track_indices=torch.empty(0, dtype=torch.int64),
+                    tracks_timestamp_estimation_ray_stride=1,
+                    training=False,
+                    config=SimpleNamespace(tracks_timestamp_interpolation_cache=False),
                 ),
             )
             RigidGaussianModel._get_interpolated_poses(
                 model,
-                rendering_data=make_rendering_data(sensor_model),
+                rendering_data=make_rendering_data(sensor_model, ray_timestamps),
                 frustum_cull=None,
                 tracks_poses=torch.zeros(4, 7),
                 tracks_timestamps=torch.tensor([1000, 1100, 1150, 2150], dtype=torch.int64),
@@ -444,8 +454,7 @@ class TestGaussiansModel(unittest.TestCase):
                 max_positive_timestamp_gap_us=torch.tensor([100, 1000], dtype=torch.int64),
                 is_training_batch=is_training_batch,
             )
-            interpolation_data = captured_tracks_interpolation_data[-1]
-            return interpolation_data.max_positive_timestamp_gap_us, interpolation_data.frame_exposure_us
+            return captured_tracks_interpolation_data[-1]
 
         with patch.object(
             gaussians_model,
@@ -457,9 +466,28 @@ class TestGaussiansModel(unittest.TestCase):
                 (True, object()),
                 (False, FakeLidarModelParameters()),
             ):
-                cadence, exposure = captured_metadata(is_training_batch, sensor_model)
-                torch.testing.assert_close(cadence, torch.tensor([100, 1000], dtype=torch.int64))
-                self.assertEqual(exposure, 600)
+                interpolation_data = captured_metadata(is_training_batch, sensor_model)
+                torch.testing.assert_close(
+                    interpolation_data.max_positive_timestamp_gap_us,
+                    torch.tensor([100, 1000], dtype=torch.int64),
+                )
+                self.assertEqual(interpolation_data.frame_exposure_us, 600)
+
+        global_camera = SimpleNamespace(shutter_type=gaussians_model.ShutterType.GLOBAL)
+        interpolation_data = captured_metadata(
+            False,
+            global_camera,
+            torch.full((1, 1, 1, 1), 1300, dtype=torch.int64),
+        )
+        self.assertIsInstance(interpolation_data.timestamps_data, TracksTimestampsGlobalData)
+        self.assertEqual(interpolation_data.timestamps_data.timestamp, 1000)
+        training_data = captured_metadata(True, global_camera)
+        self.assertEqual(training_data.timestamps_data.timestamp, 1300)
+
+        broadcast_timestamps = torch.tensor([[[[1000]]]], dtype=torch.int64).expand(1, 2, 2, 1)
+        self.assertFalse(broadcast_timestamps.is_contiguous())
+        interpolation_data = captured_metadata(True, global_camera, broadcast_timestamps)
+        self.assertIsInstance(interpolation_data.timestamps_data, TracksTimestampsEstimationData)
 
     def test_split_boundary_mask_prevents_tolerance_overlap(self):
         """A synthetic split boundary has one owner even while both children clamp to it."""
@@ -528,6 +556,7 @@ class TestGaussiansModel(unittest.TestCase):
                 collector=SimpleNamespace(interpolate_tracks_poses=interpolate_tracks_poses),
                 get_frame_timestamp=RigidGaussianModel.get_frame_timestamp,
                 nearest_neighbor_track_for_lidar=False,
+                training=False,
                 _split_boundary_track_indices=split_boundary_policy[0],
                 _split_internal_start_timestamps_us=split_boundary_policy[1],
                 _split_internal_end_timestamps_us=split_boundary_policy[2],
@@ -535,13 +564,19 @@ class TestGaussiansModel(unittest.TestCase):
         )
 
         def interpolate_at(
-            timestamp_us: int, is_training_batch: bool
+            timestamp_us: int,
+            is_training_batch: bool,
+            *,
+            global_shutter: bool = False,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             frame_start_us = timestamp_us - exposure_us // 2
             timestamps = torch.tensor([[frame_start_us, frame_start_us + exposure_us]], dtype=torch.int64)
+            sensor_model = (
+                SimpleNamespace(shutter_type=gaussians_model.ShutterType.GLOBAL) if global_shutter else object()
+            )
             rendering_data = RenderingData(
                 rays=torch.zeros(1, 1, 1, 6),
-                sensor_model_parameters=cast(Any, [object()]),
+                sensor_model_parameters=cast(Any, [sensor_model]),
                 poses_tquat_startend=torch.zeros(1, 2, 7),
                 timestamps_startend_us=timestamps,
                 timestamps_startend_us_cpu=timestamps.cpu(),
@@ -559,6 +594,16 @@ class TestGaussiansModel(unittest.TestCase):
                 is_training_batch=is_training_batch,
             )
             return raw_masks[-1], final_mask, resolved_timestamps
+
+        # Global-shutter inference uses frame start for split ownership.
+        raw_mask, final_mask, resolved_timestamps = interpolate_at(
+            boundary_us + exposure_us // 2,
+            False,
+            global_shutter=True,
+        )
+        self.assertEqual(raw_mask.tolist(), [True, True])
+        self.assertEqual(final_mask.tolist(), [False, True])
+        torch.testing.assert_close(resolved_timestamps, torch.full((2,), boundary_us, dtype=torch.int64))
 
         # These are the eight 30 Hz frame centers inside the 2 * (G + E) overlap
         # window described in the Slack report.
@@ -645,6 +690,39 @@ class TestGaussiansModel(unittest.TestCase):
         torch.testing.assert_close(
             gathered_parameters["positions"], torch.tensor([[1, 2, 3], [7, 8, 9]], dtype=torch.float32)
         )
+
+    def test_complete_tracks_edit_preserves_gaussian_tensors(self) -> None:
+        source = SimpleNamespace(cuboid_tracks=SimpleNamespace(n_tracks=3))
+        model = cast(RigidGaussianModel, SimpleNamespace(get_motion_source=lambda: source))
+        context = cast(
+            gaussians_model.BaseGaussianModel.CollectionContext,
+            SimpleNamespace(
+                tracks_edit=LayerTrackIds.Edit(
+                    cuboid_tracks=cast(CuboidTracks, object()),
+                    mapping=torch.tensor([2, 0, 1], dtype=torch.long),
+                ),
+                kept_rows=None,
+            ),
+        )
+        gathered_parameters = {
+            "gaussian_cuboid_ids": torch.tensor([0, 1, 2, 2], dtype=torch.int32),
+            "positions": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        }
+        original_pointers = {key: value.data_ptr() for key, value in gathered_parameters.items()}
+
+        RigidGaussianModel._filter_edited_gaussians(model, context, gathered_parameters)
+
+        self.assertIsNone(context.kept_rows)
+        self.assertEqual(
+            {key: value.data_ptr() for key, value in gathered_parameters.items()},
+            original_pointers,
+        )
+
+    def test_tracks_edit_rejects_duplicate_track_ids(self) -> None:
+        edited = cast(CuboidTracks, SimpleNamespace(tracks_id=["actor", "actor"]))
+
+        with self.assertRaisesRegex(ValueError, "unique track IDs"):
+            RigidGaussianModel.create_tracks_edit_from_cuboid_tracks(cast(RigidGaussianModel, object()), edited)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CuboidTracks subsetting requires CUDA")
     def test_tracks_edit_lookup_preserves_order_and_first_matching_id(self) -> None:
@@ -803,6 +881,10 @@ class TestGaussiansModel(unittest.TestCase):
             ),
         )
         cast(Any, source)._get_calibrated_motion_data = lambda: RigidGaussianModel._get_calibrated_motion_data(source)
+        cast(Any, source).get_motion_tracks_calib = lambda: source.tracks_calib
+        cast(Any, source)._segment_track_time_data = lambda *args: RigidGaussianModel._segment_track_time_data(
+            source, *args
+        )
         resolved_timestamps = torch.tensor([123], dtype=torch.int64)
         cast(Any, source)._get_interpolated_poses = Mock(
             side_effect=lambda *args: (args[2], torch.ones(1, dtype=torch.bool), resolved_timestamps)
@@ -824,6 +906,59 @@ class TestGaussiansModel(unittest.TestCase):
         cast(Mock, source.collector.calibrate_tracks_poses).assert_called_once_with(base_poses, unicycle_data)
         torch.testing.assert_close(result.poses, calibrated_poses)
         self.assertIs(result.timestamps_us, resolved_timestamps)
+
+    def test_prepare_motion_static_calib_segment_times(self) -> None:
+        """Only unedited, exact StaticTracksCalib motion has unrestricted segment lifetimes."""
+
+        class CustomStaticTracksCalib(StaticTracksCalib):
+            def forward(self, tracks: CuboidTracks) -> CuboidTracks:
+                return tracks
+
+        tracks = _make_single_insert_track()
+        motion_data = (
+            tracks.tracks_poses.vec(),
+            tracks.tracks_timestamps_us,
+            tracks.tracks_packinfo,
+            tracks.cuboids_dims,
+            tracks.max_positive_timestamp_gap_us,
+        )
+        for calib_type in (StaticTracksCalib, CustomStaticTracksCalib):
+            for mapping in (None, [], [0]):
+                with self.subTest(calib=calib_type.__name__, mapping=mapping):
+                    calib = calib_type.__new__(calib_type)
+                    nn.Module.__init__(calib)
+                    calib.min_timestamp_us, calib.max_timestamp_us = 100, 200
+                    owner = RigidGaussianModel.__new__(RigidGaussianModel)
+                    nn.Module.__init__(owner)
+                    owner.config = cast(Any, SimpleNamespace(motion_source_layer=None))
+                    owner._motion_source_ref = None
+                    owner.is_static = False
+                    owner.tracks_calib = calib
+                    cast(Any, owner)._get_calibrated_motion_data = Mock(return_value=motion_data)
+                    cast(Any, owner)._get_edited_motion_data = Mock(return_value=motion_data)
+                    keep_mask = torch.ones(1, dtype=torch.bool)
+                    timestamps_us = torch.tensor([123], dtype=torch.int64)
+                    cast(Any, owner)._get_interpolated_poses = Mock(
+                        return_value=(motion_data[0], keep_mask, timestamps_us)
+                    )
+                    edit = (
+                        None
+                        if mapping is None
+                        else LayerTrackIds.Edit(cuboid_tracks=tracks, mapping=torch.tensor(mapping, dtype=torch.long))
+                    )
+
+                    result = owner.prepare_motion(cast(RenderingData, object()), None, False, tracks_edit=edit)
+
+                    self.assertIs(result.poses, motion_data[0])
+                    self.assertIs(result.keep_mask, keep_mask)
+                    self.assertIs(result.timestamps_us, timestamps_us)
+                    if calib_type is StaticTracksCalib and not mapping:
+                        self.assertIsNone(result.track_time_data)
+                    else:
+                        assert result.track_time_data is not None
+                        self.assertIs(result.track_time_data.tracks_timestamps_us, motion_data[1])
+                        self.assertIs(result.track_time_data.tracks_packinfo, motion_data[2])
+                        self.assertIs(result.track_time_data.max_positive_timestamp_gap_us, motion_data[4])
 
     def test_prepare_motion_uses_edited_poses_without_calibration(self) -> None:
         owner = RigidGaussianModel.__new__(RigidGaussianModel)
@@ -1711,6 +1846,19 @@ class TestDeformTablesGrowOnInsert(unittest.TestCase):
             self.assertIs(restored, original)
         self.assertEqual(volume.instance_input_embedding.embedding.num_embeddings, 3)
         self.assertEqual(model._inserted_track_indices, set())
+
+    def test_discard_releases_restore_tables_without_reverting_insert(self):
+        model, volume = self._model(3)
+        self._insert(model, 4, "t3")
+        edited = self._tables(model, volume)
+
+        with patch.object(gaussians_model.RigidGaussianModel, "discard_saved_training_parameters"):
+            DeformableGaussianModel.discard_saved_training_parameters(model)
+
+        self.assertIsNone(model._pre_insert_deform_tables)
+        for current, expected in zip(self._tables(model, volume), edited):
+            self.assertIs(current, expected)
+        self.assertEqual(model._inserted_track_indices, {3})
 
 
 if __name__ == "__main__":

@@ -77,6 +77,19 @@ class TestGetRenderedVisibilityMask:
         out = _call(_results(rendered_cam=_rendered(visibility=vis)), element_count=5, visibility_filter=True)
         assert torch.equal(out, vis)
 
+    def test_filtered_matching_visibility_does_not_allocate_ones(self, monkeypatch):
+        """The normal filtered path should reuse renderer output without a fill allocation."""
+
+        def unexpected_ones(*args, **kwargs):
+            raise AssertionError(f"unexpected torch.ones allocation: args={args}, kwargs={kwargs}")
+
+        monkeypatch.setattr(torch, "ones", unexpected_ones)
+        vis = torch.tensor([0.0, 1.0, 1.0])
+
+        out = _call(_results(rendered_cam=_rendered(visibility=vis)), element_count=3, visibility_filter=True)
+
+        assert out is vis
+
     def test_lidar_only_visibility(self):
         """Use lidar renderer visibility directly when camera output is absent."""
         vis = torch.tensor([1.0, 0.0, 1.0])
@@ -205,6 +218,20 @@ class TestMcmcCountersUseFrustumVisibility:
             visibility=passed,  # type: ignore[arg-type]
         )
         assert torch.equal(calls[0]["visibility"], passed)
+
+    def test_counter_defers_to_system_owned_visibility_packet(self):
+        calls: list = []
+        passed = torch.tensor([0.0, 1.0, 0.0])
+        results = _results(rendered_cam=_rendered(visibility=passed))
+        results.mcmc_visibility_union = object()  # type: ignore[assignment]
+
+        _maybe_update_mcmc_visibility_counters(
+            model=self._stub_composite(calls),
+            results=results,
+            visibility=passed,  # type: ignore[arg-type]
+        )
+
+        assert calls == []
 
     def test_counter_falls_back_on_shape_mismatch(self):
         """A frustum union whose numel disagrees with the passed mask is discarded."""

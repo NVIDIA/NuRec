@@ -1,13 +1,14 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import queue
 import threading
 
-from typing import Any, Iterator, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
 
 import torch
 
@@ -24,12 +25,40 @@ from nurec.utils.misc import compute_process_local_rng_seed, distributed_all_gat
 from nurec.utils.trainer import adjust_num_workers_for_world_size
 
 
+if TYPE_CHECKING:
+    from torch.utils.data.dataloader import _BaseDataLoaderIter
+
+
 logger = logging.getLogger(__name__)
 
 _T_co = TypeVar("_T_co", covariant=True)
 
 
-class MockDataLoader(DataLoader):
+class ForkSafeDataLoader(DataLoader):
+    """DataLoader that releases the OpenMP thread pool before forking its workers."""
+
+    _OMP_PAUSE_SOFT = 1
+
+    @staticmethod
+    def _release_openmp_pool() -> None:
+        """Tear down the calling thread's libgomp thread pool so that forked children do not inherit it.
+
+        A forked worker that inherits a warm libgomp pool can wait forever for threads that do not exist in
+        the child, which on DGX Spark happens in torch's BLAS (NVPL) even with a single torch thread.
+        The pool is recreated on the next parallel region in this process.
+        """
+        try:
+            ctypes.CDLL("libgomp.so.1").omp_pause_resource_all(ForkSafeDataLoader._OMP_PAUSE_SOFT)
+        except (OSError, AttributeError):
+            pass  # libgomp is not loaded in this process
+
+    def _get_iterator(self) -> _BaseDataLoaderIter:
+        if self.num_workers > 0:
+            self._release_openmp_pool()
+        return super()._get_iterator()
+
+
+class MockDataLoader(ForkSafeDataLoader):
     """
     MockDataLoader is a mock dataloader that runs data fetching and processing only ones.
     The fetched batch is then repeated in a loop.
@@ -51,7 +80,7 @@ class BaseDataModule(LightningDataModule):
     def update_epoch(self, epoch: int, system, **kwargs) -> None: ...
 
 
-class PrefetchDataLoader(DataLoader):
+class PrefetchDataLoader(ForkSafeDataLoader):
     """DataLoader with GPU prefetching capabilities that runs in a separate thread.
 
     This prefetcher continuously loads batches in a background thread and transfers them to the GPU
@@ -375,7 +404,7 @@ class SODataModule(BaseDataModule):
                 generator=self._train_loader_generator,
             )
         else:
-            DataLoaderClass = MockDataLoader if self.config.mock_dataloader else DataLoader
+            DataLoaderClass = MockDataLoader if self.config.mock_dataloader else ForkSafeDataLoader
             return DataLoaderClass(
                 self.train_dataset,
                 num_workers=self.config.train_num_workers,
@@ -394,7 +423,7 @@ class SODataModule(BaseDataModule):
         nurec.datasets.samplers!
         """
         if "val" in self.nurec_config.mode or "test" in self.nurec_config.mode:
-            return DataLoader(
+            return ForkSafeDataLoader(
                 self.val_dataset,
                 num_workers=self.config.val_num_workers,
                 persistent_workers=True if self.config.val_num_workers > 0 else False,
@@ -414,7 +443,7 @@ class SODataModule(BaseDataModule):
         nurec.datasets.samplers!
         """
         if "test" in self.nurec_config.mode:
-            return DataLoader(
+            return ForkSafeDataLoader(
                 self.val_dataset,
                 num_workers=self.config.test_num_workers,
                 persistent_workers=True if self.config.test_num_workers > 0 else False,
@@ -433,7 +462,7 @@ class SODataModule(BaseDataModule):
         at the end of training.
         """
 
-        return DataLoader(
+        return ForkSafeDataLoader(
             make_dataset(self.nurec_config.dataset.name, self.nurec_config, split="train-sequential"),
             num_workers=self.config.train_num_workers,
             persistent_workers=True if self.config.train_num_workers > 0 else False,

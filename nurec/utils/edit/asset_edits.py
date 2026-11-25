@@ -1,28 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The asset-edits bake: :class:`AssetEditsBaker` turns edits into baked clusters.
+"""The asset-edits bake: :class:`AssetEditsBaker` turns edits into baked Gaussian rows.
 
-The core of the compile pipeline (the CLI wrapper and USDZ repack live in
-``asset_edits_cli.py``, the authoring schema in ``asset_edits_schema.py``, the
-tensor-append utilities in ``layer_append.py``, and the render-time runtime in
-``nurec/asset_edits/runtime.py``). Given a parsed ``AssetEditsDoc`` and a materialized
-``GaussiansComposite``, the baker appends each asset's Gaussian clusters to the bound
-layer (each controllable variantSet state as its own hidden cluster) and accumulates
-the geometry manifest recording how to address them. An asset is a composed SimReady
-USD, or — for a static prop — a 3DGS ``.ply`` (``ply_gaussians.py``).
+The CLI wrapper and USDZ repack live in ``asset_edits_cli.py``, the authoring schema in
+``asset_edits_schema.py``, the tensor-append utilities in ``layer_append.py`` and the
+render-time runtime in ``nurec/asset_edits/runtime.py``. Given a parsed ``AssetEditsDoc`` and a
+materialized ``GaussiansComposite``, the baker applies each edit by its ``op``: ``add`` and
+``replace`` append an asset's clusters to the bound layer (``replace`` also hides the
+captured actor), ``exclude`` hides a captured actor, and ``clone`` copies a captured track's
+trained rows (or bakes another edit's asset again) onto a new track. Everything is recorded
+in the geometry manifest. An asset is a composed SimReady USD or, for a static prop, a 3DGS
+``.ply`` (``ply_gaussians.py``).
 
-The end-to-end pipeline is documented once, in ``nurec/utils/edit/README.md``.
+The end-to-end pipeline is documented in ``nurec/utils/edit/README.md``.
 
 Geometry frame
 --------------
-The whole asset is placed into the bound track's **cuboid-local** frame with one
-shared transform (rotate -> uniform scale -> align translate), so the composed
-parts keep their relative layout and ride the moving track.
+The whole asset is placed into the bound track's cuboid-local frame with one shared
+transform (rotate, uniform scale, align), so the composed parts keep their layout and ride
+the moving track.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from dataclasses import dataclass
@@ -142,11 +144,14 @@ def _elements_identical(by_state: dict, all_states: Iterable[str]) -> bool:
 
 @dataclass(frozen=True)
 class SyntheticTrack:
-    """One NEW cuboid track synthesized for a world-bound edit (an introduced prop).
+    """One NEW cuboid track synthesized by the bake: a world-bound prop or a clone.
 
     Everything the CLI needs to persist the track into the baked artifact: the
     checkpoint splice keys off ``layer_id``/``nurec_track_id``; ``datasource_summary.json``
-    takes the NuRec-frame tquat rows; ``sequence_tracks.json`` the world-frame ones.
+    takes the NuRec-frame tquat rows; ``sequence_tracks.json`` the world-frame ones. A
+    world bind has 2 constant keyframes; a clone inheriting its source's motion has the
+    source's K keyframes; a parked clone has 2, or one constant keyframe per source frame
+    when it copies a per-track-frame appearance table (``AssetEditsBaker._parked_keyframes``).
     """
 
     edit_id: str
@@ -154,18 +159,67 @@ class SyntheticTrack:
     track_id_str: str
     nurec_track_id: int  # layer-local index — MUST equal the appended rows' cuboid id
     global_index: int  # index in the composite's full (global) track list
-    timestamps_us: tuple[int, int]
-    pose_tquat_nurec: list[list[float]]  # 2 x [tx, ty, tz, qx, qy, qz, qw], NuRec frame
+    timestamps_us: list[int]  # K keyframe timestamps (NuRec playback clock)
+    pose_tquat_nurec: list[list[float]]  # K x [tx, ty, tz, qx, qy, qz, qw], NuRec frame
     pose_tquat_world: list[list[float]]  # same, world frame
     dims_nurec: list[float]  # cuboid dims in the layer's (NuRec) frame
     dims_world: list[float]
     label_class: str
+    kind: str = "world"  # world | clone
+    flags: str = "DYNAMIC"  # serialized TrackFlags name(s), '|'-joined
+    # Per-track appearance state copied from a clone's source track: one CPU row per
+    # tensor, keyed by the layer state-dict suffix ("time_embed.timestamps_us_ranges",
+    # "time_embed.u", "track_albedos", "track_scales"). The CLI splices these instead of
+    # identity rows. None for world binds (and for clones of freshly synthesized tracks).
+    per_track_state: Optional[dict[str, torch.Tensor]] = None
+    # The same kind of state for every dependent layer that also carries this track (layers
+    # whose ``motion_source_layer`` is this track's layer), keyed by layer id; None entries
+    # mean "identity / fresh rows" for that layer.
+    dependent_state: dict[str, Optional[dict[str, torch.Tensor]]] = dataclasses.field(default_factory=dict)
+
+    @property
+    def n_poses(self) -> int:
+        """Number of keyframes on the track."""
+        return len(self.timestamps_us)
+
+    @property
+    def timestamp_range_us(self) -> tuple[int, int]:
+        """First and last keyframe timestamps, in microseconds."""
+        return (int(min(self.timestamps_us)), int(max(self.timestamps_us)))
 
 
 def _tquat_rows(ct: CuboidTracks) -> list[list[float]]:
     """A track container's packed poses as plain ``[tx, ty, tz, qx, qy, qz, qw]`` rows."""
     tq = se3_matrix_to_tquat(ct.tracks_poses.matrix())
     return [[float(x) for x in row] for row in tq.detach().cpu().numpy().reshape(-1, 7)]
+
+
+def _flag_names(flags: TrackFlags) -> str:
+    """``TrackFlags`` as the ``'|'``-joined NAME string the serialized track members carry."""
+    names = [f.name for f in TrackFlags if f.value and (flags & f) == f and f.name]
+    return "|".join(names) if names else "NONE"
+
+
+def _track_timestamps(ct: CuboidTracks, track_idx: int) -> np.ndarray:
+    """Keyframe timestamps (int64 microseconds) of track ``track_idx`` of a container."""
+    start, count = (int(v) for v in ct.tracks_packinfo[track_idx].tolist())
+    return ct.tracks_timestamps_us[start : start + count].detach().cpu().numpy().astype(np.int64)
+
+
+def _nearest_frame_slots(times_us: np.ndarray, frames_us: np.ndarray) -> np.ndarray:
+    """For each time, the index of the nearest frame in a sorted frame timeline.
+
+    The rule a per-track-frame appearance table is read with at render time
+    (``nearest_track_frame_slots``): times outside the timeline clamp to its ends, a tie
+    takes the earlier frame, and an empty or one-frame timeline always gives slot 0.
+    """
+    times = np.asarray(times_us, dtype=np.int64).reshape(-1)
+    frames = np.asarray(frames_us, dtype=np.int64).reshape(-1)
+    if frames.size < 2:
+        return np.zeros(times.shape, dtype=np.int64)
+    later = np.clip(np.searchsorted(frames, times, side="left"), 1, frames.size - 1)
+    earlier = later - 1
+    return np.where(frames[later] - times < times - frames[earlier], later, earlier).astype(np.int64)
 
 
 @dataclass(frozen=True)
@@ -222,26 +276,35 @@ class _AssemblyTransform:
     up_ax: int  # cuboid-local axis most aligned with world up
 
 
+def _dependent_layers(composite: GaussiansComposite) -> dict[str, list[str]]:
+    """Layers that take their motion from another layer, keyed by that owner layer.
+
+    ``config.motion_source_layer`` names the owner. Such a layer shares the owner's track
+    list, so an edit on an owner track applies to it too (see ``AssetEditsBaker.bake_layer``).
+    """
+    out: dict[str, list[str]] = {}
+    for layer_id, node in composite.gaussians_nodes.items():
+        owner = getattr(getattr(node, "config", None), "motion_source_layer", None)
+        if owner:
+            out.setdefault(str(owner), []).append(str(layer_id))
+    return out
+
+
 class AssetEditsBaker:
     """Bakes a parsed ``AssetEditsDoc`` into a ``GaussiansComposite``'s layer tensors.
 
-    One instance per compile run; ``bake`` walks the edits layer by layer and
-    accumulates the manifest streams (baked clusters, asset records,
-    control-animation tables) on the instance; ``manifest()`` assembles them.
-
-    Preconditions: each scheduled control's variant animation has already been read
-    from its asset and passed in via ``animations``, and the edit->layer
-    grouping/collision checks happened at the command level.
-
-    The asset loaders are injectable so unit tests can bake synthetic assets
-    without USD or PLY files.
+    One instance per compile run. ``bake`` walks the edits layer by layer and accumulates the
+    manifest streams (clusters, asset records, control-animation tables); ``manifest()``
+    assembles them. The command level has already grouped the edits by layer, checked for
+    collisions and read each control's variant animation (``animations``). The asset loaders
+    are injectable so unit tests can bake synthetic assets without USD or PLY files.
     """
 
     def __init__(
         self,
         composite: GaussiansComposite,
         world_to_nurec: Any,
-        yaml_dir: Path,
+        assets_root: Path,
         *,
         asset_loader: Optional[Callable[..., Any]] = None,
         clip_window_us: Optional[tuple[int, int]] = None,
@@ -249,28 +312,40 @@ class AssetEditsBaker:
     ) -> None:
         """Bind the baker to a materialized composite.
 
-        ``clip_window_us`` (the artifact's rig playback window) is required only when
-        the document contains world binds: their synthetic tracks span that window.
-
-        ``animations`` is the variant animation the COMPILER extracted from each asset,
-        keyed ``(edit_id, control_name)`` — a constructor argument rather than fields
-        written back onto the authored ``ControlSpec``, so "has the animation been
-        attached yet?" is not a question anyone can ask of a parsed document. Controls
-        with no entry are purely static swaps (e.g. panelState).
+        ``assets_root`` resolves relative ``asset`` paths. ``clip_window_us`` (the artifact's rig
+        playback window) is needed only for world binds and parked clones, whose synthetic tracks
+        span it. ``animations`` maps ``(edit_id, control_name)`` to the variant animation the
+        compiler read from the asset; controls without an entry are static swaps.
         """
         self.composite = composite
         self.world_to_nurec = world_to_nurec
-        self.yaml_dir = yaml_dir
+        self.assets_root = assets_root
         self.clip_window_us = clip_window_us
         self._asset_loader = asset_loader
         self.baked_clusters: list[BakedCluster] = []
         self.asset_records: list[dict] = []  # informational manifest records, one per edit
         self.control_animations: list[ControlAnimation] = []  # runtime-consumed live-drive control tables
-        # World-bind bookkeeping: tracks synthesized by _materialize_world_binds (the
-        # CLI persists these into the artifact), the layer-local index each edit bakes
-        # against, and imported-asset reuse between dims derivation and the bake.
+        # Captured actors hidden by exclude edits (manifest ``excluded_tracks``).
+        self.excluded_tracks: list[dict] = []
+        # Layers driven by another layer's motion, keyed by that owner (see _dependent_layers).
+        self.dependents: dict[str, list[str]] = _dependent_layers(composite)
+        # Every layer whose tensors this bake changed, in bake order: the target layers and
+        # their dependents. The CLI splices and binds exactly these.
+        self.baked_layers: list[str] = []
+        # Synthetic-track bookkeeping: tracks synthesized by _materialize_synthetic_tracks
+        # (world binds and clones; the CLI persists these into the artifact), the
+        # layer-local index each such edit bakes against, the NuRec-frame container of each
+        # (a clone may copy the motion of a world bind synthesized in the same bake), and
+        # imported-asset reuse between world-bind dims derivation and the bake.
         self.synthetic_tracks: list[SyntheticTrack] = []
-        self._world_track_idx: dict[str, int] = {}
+        self._synthetic_track_idx: dict[str, int] = {}
+        self._synthetic_ct_nurec: dict[str, CuboidTracks] = {}
+        # Per-track-frame appearance tables (see _frame_columns): each such layer's track
+        # container as loaded, before synthetic tracks re-derive it (its columns are keyed to
+        # these frames), and, per captured clone, the source time each clone keyframe shows.
+        self._frame_timelines: dict[str, CuboidTracks] = {}
+        self._keyframe_source_times: dict[str, np.ndarray] = {}
+        self._specs_by_id: dict[str, EditSpec] = {}
         self._prepared: dict[str, tuple[Path, Any, list[_ResolvedControl], list[_PartPlan]]] = {}
         self._animations: dict[tuple[str, str], VariantAnimation] = dict(animations or {})
         # BAKE OUTPUT, keyed (edit_id, control_name): element keys whose payload is
@@ -288,20 +363,41 @@ class AssetEditsBaker:
     # ------------------------------------------------------------------
     def bake(self, edits_by_layer: dict[str, list[EditSpec]]) -> int:
         """Bake every layer's edits; returns the total number of Gaussians appended."""
-        # Validate nurec_track binds against the ORIGINAL track lists, BEFORE world-bind
-        # synthesis appends new tracks: an out-of-range id that happens to collide with
-        # a synthetic track's index must fail loud, not silently claim the prop's track.
+        self._specs_by_id = {fx.id: fx for edits in edits_by_layer.values() for fx in edits}
+        # A dependent layer has no tracks or motion of its own: its owner's edits reach it
+        # (see bake_layer). Editing it directly would bake rows its owner never sees.
+        owner_of = {dep: owner for owner, deps in self.dependents.items() for dep in deps}
+        for layer_id in edits_by_layer:
+            if layer_id in owner_of:
+                owner = owner_of[layer_id]
+                raise AssetEditsBakeError(
+                    f"edits target layer {layer_id!r}, which takes its tracks and motion from {owner!r} "
+                    f"(motion_source_layer). Edit {owner!r} instead: a replace, exclude or captured clone there "
+                    f"is applied to {layer_id!r} too."
+                )
+        # Validate captured-track references against the ORIGINAL track lists, BEFORE
+        # synthetic-track synthesis appends new tracks: an out-of-range id that happens
+        # to collide with a synthetic track's index must fail loud, not silently claim it.
         for layer_id, edits in edits_by_layer.items():
             node = self.composite.gaussians_nodes[layer_id]
             n_original = len(cast(CuboidTracks, node.cuboid_tracks).tracks_id)
             for fx in edits:
-                if not fx.bind.is_world and not 0 <= fx.bind.nurec_track_id < n_original:
+                if fx.bind is not None and not fx.bind.is_world:
+                    what, idx = "binds", fx.bind.nurec_track_id
+                elif fx.is_clone and fx.clone is not None and fx.clone.is_captured:
+                    what, idx = "clones captured track", int(fx.clone.source_nurec_track_id or 0)
+                else:
+                    continue
+                if not 0 <= idx < n_original:
                     raise AssetEditsBakeError(
-                        f"edit {fx.id!r}: invalid nurec_track_id {fx.bind.nurec_track_id} "
-                        f"(layer {layer_id!r} has {n_original} cuboid tracks: valid ids "
-                        f"0..{n_original - 1}; world-bind tracks synthesized by this bake do not count)."
+                        f"edit {fx.id!r} ({fx.op}) {what} nurec_track_id {idx}, which is out of range "
+                        f"(layer {layer_id!r} has {n_original} cuboid tracks: valid ids 0..{n_original - 1}; "
+                        "tracks synthesized by this bake do not count)."
                     )
-        self._materialize_world_binds(edits_by_layer)
+        # The bake changes track lists and row counts: retire the composite's cached gather
+        # topology before the first change, as GaussiansComposite.insert_asset does.
+        self.composite._invalidate_fused_gather_generation_plan()
+        self._materialize_synthetic_tracks(edits_by_layer)
         total_appended = 0
         for layer_id, edits in edits_by_layer.items():
             total_appended += self.bake_layer(layer_id, edits)
@@ -329,33 +425,56 @@ class AssetEditsBaker:
         return EditManifest(
             clusters=self.baked_clusters,
             assets=self.asset_records,
+            excluded_tracks=self.excluded_tracks,
             controls=self.control_animations,
         )
 
     def bake_layer(self, layer_id: str, edits: list[EditSpec]) -> int:
-        """Bake every edit targeting ``layer_id``; returns the Gaussians appended."""
+        """Bake every edit targeting ``layer_id``; returns the Gaussians appended to it.
+
+        Layers that take their motion from ``layer_id`` share its track list, so a replace or
+        exclude hides the same track's rows in them too, and a captured clone copies their rows
+        of the source track onto the clone's track.
+        """
         lc = self._make_layer_context(layer_id)
+        deps = {dep: self._make_layer_context(dep) for dep in self.dependents.get(layer_id, [])}
         n_clusters_before = len(self.baked_clusters)
 
         for fx in edits:
             track_idx = self._check_binding(lc, fx)
             centroid_world = lc.pose_world[track_idx][:3, 3].astype(np.float64)
             log.debug(
-                "Edit %s -> %s track %d centroid=(%.1f, %.1f, %.1f)",
+                "Edit %s (%s) -> %s track %d centroid=(%.1f, %.1f, %.1f)",
                 fx.id,
+                fx.op,
                 layer_id,
                 track_idx,
                 centroid_world[0],
                 centroid_world[1],
                 centroid_world[2],
             )
+            if fx.is_exclude:
+                hidden = self._hide_original_rows(lc, fx, track_idx)
+                self.asset_records.append(self._exclude_record(lc, fx, track_idx, hidden))
+                self._apply_to_dependents(deps, fx, track_idx, self.asset_records[-1], self.excluded_tracks[-1])
+                continue
+            if fx.is_clone and fx.clone is not None and fx.clone.is_captured:
+                self._bake_captured_clone(lc, fx, track_idx)
+                self._apply_to_dependents(deps, fx, track_idx, self.asset_records[-1])
+                continue
             self._log_placement_frame(lc, fx, track_idx)
             self._bake_asset(lc, fx, track_idx, centroid_world)
+            if fx.hides_original:
+                self._apply_to_dependents(deps, fx, track_idx, self.asset_records[-1])
 
         # Apply every edit's staged rows in ONE cat per layer tensor (row indices are
         # already assigned arithmetically, so the result is identical to eager cats).
         lc.appender.flush()
         lc.node._validate_fields()
+        for dep_lc in deps.values():
+            dep_lc.appender.flush()
+            dep_lc.node._validate_fields()
+        self.baked_layers.extend(lid for lid in (layer_id, *deps) if lid not in self.baked_layers)
         log.info(
             "%s layer: baked %d overlay Gaussians across %d cluster(s) (layer now has %d Gaussians)",
             layer_id,
@@ -364,6 +483,74 @@ class AssetEditsBaker:
             int(lc.node.get_num_gaussians()),
         )
         return lc.appender.appended
+
+    def _apply_to_dependents(
+        self,
+        deps: dict[str, _LayerContext],
+        fx: EditSpec,
+        track_idx: int,
+        record: dict,
+        excluded_entry: Optional[dict] = None,
+    ) -> None:
+        """Repeat a hide (replace, exclude) or a captured-clone copy on the dependent layers.
+
+        Writes what happened per layer into ``record["dependent_layers"]`` (and the
+        ``excluded_tracks`` entry): original size, rows hidden, rows copied.
+        """
+        if not deps:
+            return
+        info: dict[str, dict[str, int]] = {}
+        for dep, dep_lc in deps.items():
+            entry = {"original_layer_size": dep_lc.appender.initial_n, "gaussians_hidden": 0, "gaussians_copied": 0}
+            if fx.hides_original:
+                entry["gaussians_hidden"] = self._hide_original_rows(dep_lc, fx, track_idx)
+            elif fx.is_clone and fx.clone is not None and fx.clone.is_captured:
+                src_idx = int(fx.clone.source_nurec_track_id or 0)
+                rows = dep_lc.snapshot.rows_of_track(src_idx)
+                if rows.size:
+                    appended = dep_lc.appender.append_copied_rows(
+                        rows,
+                        track_idx,
+                        densities_logit=dep_lc.snapshot.densities_logit[rows],
+                        frame_columns=self._frame_columns(dep, fx, src_idx),
+                    )
+                    entry["gaussians_copied"] = len(appended)
+                    entry["first_index"] = appended[0]
+                log.info(
+                    "  [clone %s] copied %d captured gaussian(s) of track %d onto track %d in dependent layer %s",
+                    fx.id,
+                    int(rows.size),
+                    src_idx,
+                    track_idx,
+                    dep,
+                )
+            info[dep] = entry
+        record["dependent_layers"] = info
+        if excluded_entry is not None:
+            excluded_entry["dependent_layers"] = {
+                dep: {"gaussians_hidden": e["gaussians_hidden"]} for dep, e in info.items()
+            }
+
+    def _layer_flags(self, layer_id: str) -> TrackFlags:
+        """The flags a new track needs to pass ``layer_id``'s track filter (DYNAMIC unless it says ``is_dynamic: false``)."""
+        config = self.composite.obj_track_ids[layer_id].config
+        is_dynamic = config.get("is_dynamic", True) if hasattr(config, "get") else True
+        return TrackFlags.DYNAMIC if bool(is_dynamic) else TrackFlags.NONE
+
+    def _clone_track_state(self, node: Any, src_idx: Optional[int], motion: Any) -> Optional[dict[str, torch.Tensor]]:
+        """The per-track state a clone inherits from track ``src_idx`` of ``node``, adjusted to its motion."""
+        if src_idx is None:
+            return None
+        state = self._copy_per_track_state(node, src_idx)
+        if state is None:
+            return None
+        if motion.is_world:
+            state.pop("time_embed.timestamps_us_ranges", None)  # a parked clone spans the clip
+        elif motion.time_shift_us and "time_embed.timestamps_us_ranges" in state:
+            state["time_embed.timestamps_us_ranges"] = state["time_embed.timestamps_us_ranges"] + int(
+                motion.time_shift_us
+            )
+        return state
 
     # ------------------------------------------------------------------
     # Per-layer setup and binding checks
@@ -389,7 +576,7 @@ class AssetEditsBaker:
         except ValueError as exc:
             raise AssetEditsBakeError(f"layer {layer_id!r} cannot take baked overlays: {exc}") from exc
         # Snapshot the captured (trained) Gaussians BEFORE appending any overlays: lens
-        # detection and replace_original must address ORIGINAL rows only.
+        # detection, replace / exclude hiding and captured clones must address ORIGINAL rows only.
         return _LayerContext(
             layer_id=layer_id,
             node=layer_node,
@@ -402,85 +589,113 @@ class AssetEditsBaker:
         )
 
     # ------------------------------------------------------------------
-    # World binds: synthetic static tracks for introduced props
+    # Synthetic tracks: world binds (introduced props) and clones
     # ------------------------------------------------------------------
-    def _materialize_world_binds(self, edits_by_layer: dict[str, list[EditSpec]]) -> None:
-        """Synthesize one NEW constant-pose cuboid track per world-bound edit.
+    def _materialize_synthetic_tracks(self, edits_by_layer: dict[str, list[EditSpec]]) -> None:
+        """Synthesize one new cuboid track per world bind and per clone.
 
-        Runs BEFORE any layer bake: each world edit's track is appended to the
-        composite's GLOBAL track list, then every affected layer's ``LayerTrackIds``
-        is re-derived so the new tracks become real layer tracks — with exactly the
-        layer-local indices the appended Gaussian rows will be tagged with.
-
-        Reload agreement holds by construction (``LayerTrackIds`` masks the global
-        list in insertion order, and synthetic tracks append at the END, so their
-        layer-local indices are ``old_n, old_n+1, ...`` both now and after the baked
-        artifact reloads from ``datasource_summary.json``) — and is asserted anyway:
-        a synthetic track captured by zero or by several layers would desynchronize
-        row/track indexing, so that fails the bake loudly.
+        Runs before any layer bake, in two rounds: world binds first, then clones (a clone may copy
+        the motion of a world bind from the same bake). Each round appends its tracks to the
+        composite's global track list and re-derives every affected layer's ``LayerTrackIds``, so
+        the new tracks get exactly the layer-local indices the appended rows will be tagged with.
         """
-        world_edits = [(layer_id, fx) for layer_id, edits in edits_by_layer.items() for fx in edits if fx.bind.is_world]
-        if not world_edits:
+        world_edits = [(lid, fx) for lid, edits in edits_by_layer.items() for fx in edits if fx.is_world]
+        clone_edits = [(lid, fx) for lid, edits in edits_by_layer.items() for fx in edits if fx.is_clone]
+        if not world_edits and not clone_edits:
             return
+        window = self._clip_window_padded(world_edits + clone_edits)
+        device = self.composite.cuboid_tracks.device
+        # Taken before the first round re-derives any layer's track container.
+        carrying = dict.fromkeys(lid for target, _ in clone_edits for lid in (target, *self.dependents.get(target, [])))
+        self._frame_timelines = {
+            lid: cast(CuboidTracks, cast(RigidGaussianModel, self.composite.gaussians_nodes[lid]).cuboid_tracks)
+            for lid in carrying
+            if self._frame_table_width(lid) is not None
+        }
+        # Clone motion comes from the PRE-BAKE layer containers, CALIBRATED: the
+        # calibration's per-pose deltas are sized to those containers, and a captured
+        # clone must ride the poses its source's trained rows were fit against (the
+        # clone's own calibration rows are then identity).
+        calibrated: dict[str, CuboidTracks] = {}
+        for layer_id, _ in clone_edits:
+            if layer_id not in calibrated:
+                node = cast(RigidGaussianModel, self.composite.gaussians_nodes[layer_id])
+                getter = getattr(node, "get_calibrated_cuboid_tracks", None)
+                calibrated[layer_id] = getter() if callable(getter) else cast(CuboidTracks, node.cuboid_tracks)
+        if world_edits:
+            self._materialize_group(world_edits, lambda lid, fx: self._synthesize_world_track(lid, fx, window, device))
+        if clone_edits:
+            self._materialize_group(
+                clone_edits, lambda lid, fx: self._synthesize_clone_track(lid, fx, calibrated[lid], window, device)
+            )
+
+    def _clip_window_padded(self, edits: list[tuple[str, EditSpec]]) -> Optional[tuple[int, int]]:
+        """The padded clip window constant-pose synthetic tracks span; None when no edit needs it."""
+        needs = any(
+            fx.is_world or (fx.is_clone and fx.clone is not None and fx.clone.motion.is_world) for _, fx in edits
+        )
+        if not needs:
+            return None
         if self.clip_window_us is None:
             raise AssetEditsBakeError(
-                "document contains world binds but the baker was built without clip_window_us "
-                "(the artifact's rig playback window)"
+                "document contains world binds or parked clones but the baker was built without "
+                "clip_window_us (the artifact's rig playback window)"
             )
         t0 = int(self.clip_window_us[0]) - _WORLD_TRACK_PAD_US
         t1 = int(self.clip_window_us[1]) + _WORLD_TRACK_PAD_US
         if t1 <= t0:
             raise AssetEditsBakeError(f"clip_window_us is degenerate: {self.clip_window_us}")
-        device = self.composite.cuboid_tracks.device
+        return (t0, t1)
 
-        # Pre-append layer sizes: synthetic tracks land at indices old_n, old_n+1, ...
+    def _materialize_group(
+        self,
+        items: list[tuple[str, EditSpec]],
+        synthesize: Callable[[str, EditSpec], tuple[CuboidTracks, CuboidTracks, Optional[dict[str, torch.Tensor]]]],
+    ) -> None:
+        """Append one round of synthetic tracks and register them as layer tracks.
+
+        Synthetic tracks append at the end of the global list and ``LayerTrackIds`` keeps insertion
+        order, so their layer-local indices are ``old_n, old_n+1, ...`` both now and after the baked
+        artifact reloads. This is asserted anyway: a track captured by zero or by several layers
+        would desynchronize row and track indexing, so the bake fails instead.
+        """
+        # Pre-append layer sizes: this round's tracks land at indices old_n, old_n+1, ... in
+        # the target layers AND in their dependents (same filter, same track list).
+        targets = list(dict.fromkeys(layer_id for layer_id, _ in items))
+        affected = list(dict.fromkeys(lid for t in targets for lid in (t, *self.dependents.get(t, []))))
         old_layer_n = {
             layer_id: len(cast(RigidGaussianModel, self.composite.gaussians_nodes[layer_id]).cuboid_tracks.tracks_id)
-            for layer_id in dict.fromkeys(layer_id for layer_id, _ in world_edits)
+            for layer_id in affected
         }
-
-        pending: list[tuple[str, EditSpec, CuboidTracks, CuboidTracks]] = []
-        for layer_id, fx in world_edits:
-            bind = fx.bind
-            tid = bind.track_id or f"prop:{fx.id}"  # parse sets this; belt-and-braces for direct construction
+        pending: list[
+            tuple[
+                str,
+                EditSpec,
+                CuboidTracks,
+                CuboidTracks,
+                Optional[dict[str, torch.Tensor]],
+                dict[str, Optional[dict[str, torch.Tensor]]],
+            ]
+        ] = []
+        for layer_id, fx in items:
+            tid = fx.synthetic_track_id or ""
             if tid in self.composite.cuboid_tracks.tracks_id:
                 raise AssetEditsBakeError(
-                    f"edit {fx.id!r}: world bind track_id {tid!r} collides with an existing track in the artifact"
+                    f"edit {fx.id!r}: synthetic track_id {tid!r} collides with an existing track in the artifact"
                 )
-            dims_world = self._world_bind_dims(fx)
-            pose = np.eye(4, dtype=np.float64)
-            pose[:3, :3] = euler_xyz_to_matrix(0.0, 0.0, float(bind.yaw_deg))
-            pose[:3, 3] = np.asarray(bind.position, dtype=np.float64)
-            if bind.anchor == "base":
-                pose[2, 3] += dims_world[2] / 2.0  # position names the cuboid base center
-            ct_world = CuboidTracks.Factory.from_numpy(
-                tracks_id=[tid],
-                tracks_poses=[np.stack([pose, pose]).astype(np.float32)],
-                tracks_timestamps_us=[np.array([t0, t1], dtype=np.int64)],
-                tracks_label_class=[bind.label_class],
-                tracks_flags=[TrackFlags.DYNAMIC],
-                cuboids_dims=[dims_world.astype(np.float32)],
-                device=device,
-            )
-            ct_nurec = CuboidTracks.Ops.transform_with_frame_conversion(ct_world, self.world_to_nurec, None)
+            ct_world, ct_nurec, per_track_state = synthesize(layer_id, fx)
+            # A captured clone also inherits each dependent layer's per-track state of its source.
+            dep_state: dict[str, Optional[dict[str, torch.Tensor]]] = {}
+            for dep in self.dependents.get(layer_id, []):
+                dep_state[dep] = None
+                if fx.is_clone and fx.clone is not None and fx.clone.is_captured:
+                    dep_node = cast(RigidGaussianModel, self.composite.gaussians_nodes[dep])
+                    dep_state[dep] = self._clone_track_state(
+                        dep_node, int(fx.clone.source_nurec_track_id or 0), fx.clone.motion
+                    )
             self.composite.cuboid_tracks = CuboidTracks.Ops.concatenate([self.composite.cuboid_tracks, ct_nurec])
-            pending.append((layer_id, fx, ct_world, ct_nurec))
-            log.info(
-                "  [world bind %s] synthetic track %r: label_class=%s dims=(%.2f, %.2f, %.2f) m "
-                "at world (%.2f, %.2f, %.2f) yaw=%.1f deg over [%d..%d] us",
-                fx.id,
-                tid,
-                bind.label_class,
-                dims_world[0],
-                dims_world[1],
-                dims_world[2],
-                pose[0, 3],
-                pose[1, 3],
-                pose[2, 3],
-                float(bind.yaw_deg),
-                t0,
-                t1,
-            )
+            self._synthetic_ct_nurec[fx.id] = ct_nurec
+            pending.append((layer_id, fx, ct_world, ct_nurec, per_track_state, dep_state))
 
         # Re-derive every affected layer's track partition from the grown global list
         # (the same rail GaussiansComposite.insert_asset rides). Unaffected layers keep
@@ -492,22 +707,26 @@ class AssetEditsBaker:
             self.composite.obj_track_ids[layer_id] = new_ids
             node.cuboid_tracks = new_ids.get_layer_tracks(self.composite.cuboid_tracks)
 
-        # Membership probe across ALL layers: each synthetic track must be captured by
-        # exactly its target layer.
+        # Membership probe across ALL layers: each synthetic track must be captured by its
+        # target layer and by that layer's dependents, and by nothing else.
         membership = {
             layer_id: set(self._probe_layer_track_ids(ids_obj.config))
             for layer_id, ids_obj in self.composite.obj_track_ids.items()
         }
 
         rank: dict[str, int] = {}
-        for layer_id, fx, ct_world, ct_nurec in pending:
-            tid = fx.bind.track_id or f"prop:{fx.id}"
+        for layer_id, fx, ct_world, ct_nurec, per_track_state, dep_state in pending:
+            tid = fx.synthetic_track_id or ""
+            label_class = str(ct_nurec.tracks_label_class[0])
+            deps = self.dependents.get(layer_id, [])
             capturing = sorted(lid for lid, ids in membership.items() if tid in ids)
-            if capturing != [layer_id]:
+            if capturing != sorted([layer_id, *deps]):
                 raise AssetEditsBakeError(
-                    f"edit {fx.id!r}: synthetic track {tid!r} (label_class={fx.bind.label_class!r}) must be "
-                    f"captured by exactly its target layer {layer_id!r}, but is captured by {capturing or 'no layer'}. "
-                    "Pick a label_class the target layer's track filter accepts and no other layer does."
+                    f"edit {fx.id!r}: synthetic track {tid!r} (label_class={label_class!r}) must be captured by "
+                    f"its target layer {layer_id!r}"
+                    + (f" and that layer's dependents {deps}" if deps else "")
+                    + f", but is captured by {capturing or 'no layer'}. Pick a label_class the target layer's "
+                    "track filter accepts and no unrelated layer does."
                 )
             layer_tracks = cast(RigidGaussianModel, self.composite.gaussians_nodes[layer_id]).cuboid_tracks
             idx = layer_tracks.tracks_id.index(tid)
@@ -519,7 +738,15 @@ class AssetEditsBaker:
                     f"{expected} — the layer's track ordering is not append-stable; baking would desynchronize "
                     "row/track indexing"
                 )
-            self._world_track_idx[fx.id] = idx
+            for dep in deps:
+                dep_tracks = cast(RigidGaussianModel, self.composite.gaussians_nodes[dep]).cuboid_tracks
+                dep_idx = dep_tracks.tracks_id.index(tid)
+                if dep_idx != idx:
+                    raise AssetEditsBakeError(
+                        f"edit {fx.id!r}: synthetic track {tid!r} is track {dep_idx} in dependent layer {dep!r} "
+                        f"but track {idx} in its owner {layer_id!r}; the two layers' track lists have diverged"
+                    )
+            self._synthetic_track_idx[fx.id] = idx
             self.synthetic_tracks.append(
                 SyntheticTrack(
                     edit_id=fx.id,
@@ -527,14 +754,319 @@ class AssetEditsBaker:
                     track_id_str=tid,
                     nurec_track_id=idx,
                     global_index=self.composite.cuboid_tracks.tracks_id.index(tid),
-                    timestamps_us=(t0, t1),
+                    timestamps_us=[int(t) for t in ct_nurec.tracks_timestamps_us.detach().cpu().numpy().reshape(-1)],
                     pose_tquat_nurec=_tquat_rows(ct_nurec),
                     pose_tquat_world=_tquat_rows(ct_world),
                     dims_nurec=[float(x) for x in ct_nurec.cuboids_dims[0].detach().cpu().numpy()],
                     dims_world=[float(x) for x in ct_world.cuboids_dims[0].detach().cpu().numpy()],
-                    label_class=fx.bind.label_class,
+                    label_class=label_class,
+                    kind="clone" if fx.is_clone else "world",
+                    flags=_flag_names(TrackFlags(int(ct_nurec.tracks_flags[0].item()))),
+                    per_track_state=per_track_state,
+                    dependent_state=dep_state,
                 )
             )
+
+    def _synthesize_world_track(
+        self, layer_id: str, fx: EditSpec, window: Optional[tuple[int, int]], device: torch.device
+    ) -> tuple[CuboidTracks, CuboidTracks, Optional[dict[str, torch.Tensor]]]:
+        """A world bind's constant-pose track: (world container, NuRec container, no per-track state)."""
+        bind = fx.bind
+        assert bind is not None and window is not None
+        t0, t1 = window
+        tid = fx.synthetic_track_id or ""
+        dims_world = self._world_bind_dims(fx)
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = euler_xyz_to_matrix(0.0, 0.0, float(bind.yaw_deg))
+        pose[:3, 3] = np.asarray(bind.position, dtype=np.float64)
+        if bind.anchor == "base":
+            pose[2, 3] += dims_world[2] / 2.0  # position names the cuboid base center
+        ct_world = CuboidTracks.Factory.from_numpy(
+            tracks_id=[tid],
+            tracks_poses=[np.stack([pose, pose]).astype(np.float32)],
+            tracks_timestamps_us=[np.array([t0, t1], dtype=np.int64)],
+            tracks_label_class=[bind.label_class],
+            tracks_flags=[self._layer_flags(layer_id)],
+            cuboids_dims=[dims_world.astype(np.float32)],
+            device=device,
+        )
+        ct_nurec = CuboidTracks.Ops.transform_with_frame_conversion(ct_world, self.world_to_nurec, None)
+        log.info(
+            "  [add %s] synthetic track %r: label_class=%s dims=(%.2f, %.2f, %.2f) m "
+            "at world (%.2f, %.2f, %.2f) yaw=%.1f deg over [%d..%d] us",
+            fx.id,
+            tid,
+            bind.label_class,
+            dims_world[0],
+            dims_world[1],
+            dims_world[2],
+            pose[0, 3],
+            pose[1, 3],
+            pose[2, 3],
+            float(bind.yaw_deg),
+            t0,
+            t1,
+        )
+        return ct_world, ct_nurec, None
+
+    def _synthesize_clone_track(
+        self,
+        layer_id: str,
+        fx: EditSpec,
+        calibrated: CuboidTracks,
+        window: Optional[tuple[int, int]],
+        device: torch.device,
+    ) -> tuple[CuboidTracks, CuboidTracks, Optional[dict[str, torch.Tensor]]]:
+        """A clone's track: the source's calibrated trajectory offset in its own frame, or a parked pose.
+
+        Returns (world container, NuRec container, copied per-track appearance state). Its
+        keyframes are the ones every layer carrying it keeps on reload (``_reload_stable``);
+        the source time each one shows is recorded for ``_frame_columns``.
+        """
+        clone = fx.clone
+        assert clone is not None
+        tid = clone.track_id
+        node = cast(RigidGaussianModel, self.composite.gaussians_nodes[layer_id])
+        src_idx, src_ct = self._clone_source(layer_id, fx, calibrated)
+        src_tid = str(src_ct.tracks_id[0])
+        label_class = str(src_ct.tracks_label_class[0])
+        flags = TrackFlags(int(src_ct.tracks_flags[0].item()))
+        dims_nurec = src_ct.cuboids_dims[0].detach().cpu().numpy().astype(np.float32)
+        motion = clone.motion
+        per_track_state = self._clone_track_state(node, src_idx, motion)
+
+        if motion.is_world:
+            assert window is not None
+            times, source_times = self._parked_keyframes(layer_id, fx, window)
+            src_world = CuboidTracks.Ops.transform_with_frame_conversion(src_ct, self.world_to_nurec.inverse(), None)
+            dims_world = src_world.cuboids_dims[0].detach().cpu().numpy().astype(np.float64)
+            pose = np.eye(4, dtype=np.float64)
+            pose[:3, :3] = euler_xyz_to_matrix(0.0, 0.0, float(motion.yaw_deg))
+            pose[:3, 3] = np.asarray(motion.position, dtype=np.float64)
+            if motion.anchor == "base":
+                pose[2, 3] += dims_world[2] / 2.0
+            ct_world = CuboidTracks.Factory.from_numpy(
+                tracks_id=[tid],
+                tracks_poses=[np.repeat(pose[None].astype(np.float32), times.size, axis=0)],
+                tracks_timestamps_us=[times],
+                tracks_label_class=[label_class],
+                tracks_flags=[flags],
+                cuboids_dims=[dims_world.astype(np.float32)],
+                device=device,
+            )
+            ct_world = self._reload_stable(layer_id, ct_world)
+            kept = _track_timestamps(ct_world, 0)
+            self._keyframe_source_times[fx.id] = source_times[np.searchsorted(times, kept)]
+            ct_nurec = CuboidTracks.Ops.transform_with_frame_conversion(ct_world, self.world_to_nurec, None)
+            log.info(
+                "  [clone %s] synthetic track %r parked at world (%.2f, %.2f, %.2f) yaw=%.1f deg, %d keyframe(s) over "
+                "[%d..%d] us; source track %r (label_class=%s, dims=(%.2f, %.2f, %.2f) m)",
+                fx.id,
+                tid,
+                pose[0, 3],
+                pose[1, 3],
+                pose[2, 3],
+                float(motion.yaw_deg),
+                int(kept.size),
+                int(kept[0]),
+                int(kept[-1]),
+                src_tid,
+                label_class,
+                dims_world[0],
+                dims_world[1],
+                dims_world[2],
+            )
+            return ct_world, ct_nurec, per_track_state
+
+        poses = src_ct.tracks_poses.matrix().detach().cpu().numpy().astype(np.float64).reshape(-1, 4, 4)
+        ts = src_ct.tracks_timestamps_us.detach().cpu().numpy().astype(np.int64).reshape(-1)
+        frames = self._source_appearance_frames(layer_id, fx)
+        if getattr(node, "is_static", False) and frames.size >= 2:
+            # A static layer calibrates every track to one frozen pose (two samples far outside
+            # the clip), whatever its keyframes; hold that pose at the source's appearance frames
+            # instead, so a per-track-frame table keeps its frames.
+            poses = np.repeat(poses[:1], frames.size, axis=0)
+            ts = frames
+        delta = np.eye(4, dtype=np.float64)
+        delta[:3, :3] = euler_xyz_to_matrix(0.0, 0.0, float(motion.yaw_deg))
+        delta[:3, 3] = np.asarray(motion.offset, dtype=np.float64) * self._nurec_units_per_metre()
+        # Right-multiplying offsets every keyframe in the SOURCE track's cuboid-local frame
+        # (a lateral offset stays lateral around bends).
+        poses = poses @ delta[None, :, :]
+        ts = ts + int(motion.time_shift_us)
+        ct_nurec = CuboidTracks.Factory.from_numpy(
+            tracks_id=[tid],
+            tracks_poses=[poses.astype(np.float32)],
+            tracks_timestamps_us=[ts],
+            tracks_label_class=[label_class],
+            tracks_flags=[flags],
+            cuboids_dims=[dims_nurec],
+            device=device,
+        )
+        ct_nurec = self._reload_stable(layer_id, ct_nurec)
+        kept = _track_timestamps(ct_nurec, 0)
+        self._keyframe_source_times[fx.id] = kept - int(motion.time_shift_us)
+        ct_world = CuboidTracks.Ops.transform_with_frame_conversion(ct_nurec, self.world_to_nurec.inverse(), None)
+        log.info(
+            "  [clone %s] synthetic track %r inherits %d keyframe(s) of source track %r (label_class=%s) "
+            "with offset=(%.2f, %.2f, %.2f) m yaw=%.1f deg time_shift=%d us",
+            fx.id,
+            tid,
+            int(kept.size),
+            src_tid,
+            label_class,
+            motion.offset[0],
+            motion.offset[1],
+            motion.offset[2],
+            float(motion.yaw_deg),
+            int(motion.time_shift_us),
+        )
+        return ct_world, ct_nurec, per_track_state
+
+    def _clone_source(
+        self, layer_id: str, fx: EditSpec, calibrated: CuboidTracks
+    ) -> tuple[Optional[int], CuboidTracks]:
+        """The clone's source track: (its pre-bake layer-local index, or None for a track
+        synthesized this bake; a one-track NuRec-frame container of its poses)."""
+        clone = fx.clone
+        assert clone is not None
+        if clone.is_captured:
+            idx = int(clone.source_nurec_track_id or 0)
+            return idx, CuboidTracks.Ops.subset_from_indices(calibrated, [idx])
+        src = self._specs_by_id.get(clone.source_edit_id or "")
+        if src is None:
+            raise AssetEditsBakeError(f"edit {fx.id!r}: clone source edit {clone.source_edit_id!r} is not being baked")
+        if src.layer_id != layer_id:
+            raise AssetEditsBakeError(
+                f"edit {fx.id!r}: clone source {src.id!r} bakes into layer {src.layer_id!r}, not {layer_id!r}"
+            )
+        if src.is_world:
+            ct = self._synthetic_ct_nurec.get(src.id)
+            if ct is None:
+                raise AssetEditsBakeError(f"edit {fx.id!r}: clone source {src.id!r} has no synthesized track yet")
+            return None, ct
+        idx = src.nurec_track_id
+        return idx, CuboidTracks.Ops.subset_from_indices(calibrated, [idx])
+
+    @staticmethod
+    def _copy_per_track_state(node: RigidGaussianModel, src_idx: int) -> Optional[dict[str, torch.Tensor]]:
+        """One CPU row per per-track appearance tensor of ``src_idx`` (time embedding,
+        track albedo/scale), keyed by the layer state-dict suffix; None when the layer has none."""
+        state: dict[str, torch.Tensor] = {}
+        time_embed = getattr(node, "time_embed", None)
+        sources = (
+            (time_embed, "timestamps_us_ranges", "time_embed.timestamps_us_ranges"),
+            (time_embed, "u", "time_embed.u"),
+            (node, "track_albedos", "track_albedos"),
+            (node, "track_scales", "track_scales"),
+        )
+        for owner, attr, key in sources:
+            if owner is None:
+                continue
+            tensor = getattr(owner, attr, None)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1 and int(tensor.shape[0]) > src_idx:
+                state[key] = tensor[src_idx].detach().cpu().clone().unsqueeze(0)
+        return state or None
+
+    def _reload_stable(self, layer_id: str, ct: CuboidTracks) -> CuboidTracks:
+        """A synthetic track's container cut to the keyframes every layer carrying it keeps on reload.
+
+        Each rigid layer re-applies its own short-gap coalescing (``tracks_calib.short_gap_fusion``)
+        to its tracks when the artifact loads, and the target layer and its dependents may differ.
+        Coalescing only drops keyframes, which only widens the gaps left, so after one pass through
+        each carrying layer's rule every one of them keeps all the remaining keyframes: the
+        per-keyframe rows the CLI splices (identity calibration deltas) and a frame table's columns
+        (``_frame_columns``) then line up with the reloaded track.
+        """
+        for lid in (layer_id, *self.dependents.get(layer_id, [])):
+            node = cast(RigidGaussianModel, self.composite.gaussians_nodes[lid])
+            ct = RigidGaussianModel._maybe_coalesce_short_timestamp_gaps(node.config, ct)
+        return ct
+
+    def _frame_table_width(self, layer_id: str) -> Optional[int]:
+        """The column count of ``layer_id``'s per-track-frame appearance table; None if it has none.
+
+        With a single Fourier feature a layer has no time embedding, so a third axis on its
+        ``features_albedo`` (``[G, N, 3]``) indexes its tracks' frames: when the layer renders,
+        each Gaussian shows the column of its track's keyframe nearest the frame time, counted on
+        the layer's OWN track timeline (its datasource frames, which may be packed differently from
+        its motion source's), and a track with fewer than N frames pads with its last column.
+        """
+        albedo = getattr(self.composite.gaussians_nodes[layer_id], "features_albedo", None)
+        n_fourier = int(self.composite.config.layers[layer_id].fourier_features_dim or 1)
+        if n_fourier == 1 and isinstance(albedo, torch.Tensor) and albedo.ndim == 3:
+            return int(albedo.shape[1])
+        return None
+
+    def _source_appearance_frames(self, layer_id: str, fx: EditSpec) -> np.ndarray:
+        """The frames of a captured clone's source in the per-track-frame tables it copies rows of.
+
+        The sorted union over ``layer_id`` and its dependents, counting only layers with such a
+        table (``_frame_table_width``) where the source track has rows; empty for other clones.
+        """
+        clone = fx.clone
+        assert clone is not None
+        if not clone.is_captured:
+            return np.empty(0, dtype=np.int64)
+        src_idx = int(clone.source_nurec_track_id or 0)
+        per_layer = [
+            _track_timestamps(self._frame_timelines[lid], src_idx)
+            for lid in (layer_id, *self.dependents.get(layer_id, []))
+            if lid in self._frame_timelines
+            and bool(
+                (cast(RigidGaussianModel, self.composite.gaussians_nodes[lid]).gaussian_cuboid_ids == src_idx).any()
+            )
+        ]
+        return np.unique(np.concatenate(per_layer)) if per_layer else np.empty(0, dtype=np.int64)
+
+    def _parked_keyframes(self, layer_id: str, fx: EditSpec, window: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+        """A parked clone's keyframe times, and the source time each one shows.
+
+        The window's two ends, unless the clone copies rows of a per-track-frame appearance table
+        whose source track has several frames there. Then there is one keyframe per source frame,
+        the source's frames spread evenly over the window, so the clone plays its source's
+        appearance once across the clip. Its time-embedded appearance does the same: a parked
+        clone's time-embedding range is its own span (``_clone_track_state``).
+        """
+        t0, t1 = window
+        frames = self._source_appearance_frames(layer_id, fx)
+        if frames.size < 2:
+            ends = np.array([t0, t1], dtype=np.int64)
+            return ends, ends
+        times = t0 + np.round((frames - frames[0]) * ((t1 - t0) / (frames[-1] - frames[0]))).astype(np.int64)
+        # Strictly increasing even if rounding merged two frames (a source outliving the window).
+        steps = np.arange(times.size)
+        return np.maximum.accumulate(times - steps) + steps, frames
+
+    def _frame_columns(self, layer_id: str, fx: EditSpec, src_idx: int) -> Optional[np.ndarray]:
+        """The source column each column of a captured clone's copied frame-table rows takes.
+
+        None for a layer without a per-track-frame appearance table (``_frame_table_width``).
+        The table is keyed to the frames of the layer's own track, while the clone's track has
+        its own keyframes: the owner's calibrated ones shifted by ``time_shift_us`` (possibly
+        coalesced differently from this layer's; a static owner's frozen pose held at the
+        source's frames), or a parked clone's (``_parked_keyframes``).
+        Column ``k`` takes the source frame nearest the source time keyframe ``k`` shows, by the
+        rule the layer renders with, so at every keyframe the clone shows what its source showed
+        then; between keyframes the layer picks the nearest one. A source frame the clone has no
+        keyframe for (one the owner coalesced into a neighbour closer than its short-gap
+        threshold) shows that neighbour's column. Columns past the last keyframe repeat it, as
+        the trained table pads a short track. A clone can have more keyframes than the table has
+        columns (a parked clone's keyframes are the union of its source's frames in every such
+        layer, which may pack them differently); the copy then widens the table
+        (``LayerAppender.widen_frame_table``).
+        """
+        width = self._frame_table_width(layer_id)
+        if width is None:
+            return None
+        source_frames = _track_timestamps(self._frame_timelines[layer_id], src_idx)
+        columns = _nearest_frame_slots(self._keyframe_source_times[fx.id], source_frames)
+        padding = max(width - columns.size, 0)
+        return np.concatenate([columns, np.full(padding, columns[-1], dtype=np.int64)])
+
+    def _synthetic_track_for(self, edit_id: str) -> SyntheticTrack:
+        """The synthetic track an edit created (world bind or clone)."""
+        return next(s for s in self.synthetic_tracks if s.edit_id == edit_id)
 
     def _probe_layer_track_ids(self, config: Any) -> list[str]:
         """The track ids a layer's filter captures from the CURRENT global track list."""
@@ -549,15 +1081,13 @@ class AssetEditsBaker:
         return float(scale) if scale is not None else 1.0
 
     def _world_bind_dims(self, fx: EditSpec) -> np.ndarray:
-        """World-frame cuboid dims for a world bind: explicit, else the placed asset's bbox.
+        """World-frame cuboid dims for a world bind: explicit ``dims``, else the placed asset's bbox.
 
-        Derivation mirrors ``_compute_assembly_transform``: the same DEFAULT-VISIBLE part
-        set is rotated by the same placement euler (bboxing hidden state copies too would
-        oversize the cuboid and let the visible assembly under-fill it), so with the
-        default fixed scale the assembly fills its synthetic cuboid exactly and
-        ``align: bbox`` rests its base at the authored position. The imported asset is
-        cached for the bake to reuse.
+        Uses the same default-visible part set and placement rotation as the assembly transform, so
+        the assembly fills its synthetic cuboid exactly and ``align: bbox`` rests its base at the
+        authored position. The imported asset is cached for the bake.
         """
+        assert fx.bind is not None
         if fx.bind.dims is not None:
             return np.asarray(fx.bind.dims, dtype=np.float64)
         asset_path, asset = self._load_asset(fx)
@@ -574,16 +1104,16 @@ class AssetEditsBaker:
 
     def _check_binding(self, lc: _LayerContext, fx: EditSpec) -> int:
         """Validate the edit's track binding; returns the bound track index."""
-        if fx.bind.is_world:
-            track_idx = self._world_track_idx[fx.id]
+        if fx.binds_synthetic_track:
+            track_idx = self._synthetic_track_idx[fx.id]
             tid = lc.ct.tracks_id[track_idx]
-            if tid != (fx.bind.track_id or f"prop:{fx.id}"):
+            if tid != fx.synthetic_track_id:
                 raise AssetEditsBakeError(
                     f"edit {fx.id!r}: layer {lc.layer_id!r} track {track_idx} is {tid!r}, not the edit's "
                     "synthetic track — layer tracks changed between materialization and bake"
                 )
             return track_idx
-        track_idx = fx.bind.nurec_track_id
+        track_idx = fx.nurec_track_id
         if track_idx < 0 or track_idx >= lc.n_tracks:
             raise AssetEditsBakeError(
                 f"edit {fx.id!r} binds nurec_track_id={track_idx}, which is out of range "
@@ -635,38 +1165,51 @@ class AssetEditsBaker:
     def _bake_asset(self, lc: _LayerContext, fx: EditSpec, track_idx: int, centroid_world: np.ndarray) -> None:
         """Bake one composed SimReady asset bound to ``track_idx``.
 
-        The whole assembly (static parts + every control state's clusters) gets ONE
-        shared transform — rotate, uniform scale, align translate — preserving the
-        parts' relative layout (never per-part bbox recentring). Static parts bake
-        VISIBLE and simply ride the track. Each controllable control (a native USD
-        variantSet) bakes one cluster per state — default state visible, the rest
-        hidden — and one BakedCluster per state with aspect ``"<control>:<state>"``,
-        making the runtime an N-way variant selector. Non-controllable controls bake
-        only their default state, visible, with no cluster.
+        The whole assembly gets one shared transform (rotate, uniform scale, align), so the parts
+        keep their layout. Static parts bake visible. Each controllable control bakes one cluster
+        per state, the default state visible and the rest hidden, with aspect ``"<control>:<state>"``,
+        so the runtime is an N-way variant selector. Non-controllable controls bake only their
+        default state, visible, without a cluster.
         """
+        # A clone of an edit bakes the SOURCE edit's asset/placement/controls under its
+        # own id; every other op is its own appearance.
+        spec = self._appearance_spec(fx)
         prepared = self._prepared.pop(fx.id, None)
         if prepared is not None:
             asset_path, asset, resolved, parts = prepared
         else:
-            asset_path, asset = self._load_asset(fx)
-            resolved = self._resolve_controls(fx, asset)
-            parts = self._collect_parts(fx, asset, resolved)
-        xf = self._compute_assembly_transform(lc, fx, track_idx, parts)
+            asset_path, asset = self._load_asset(spec)
+            resolved = self._resolve_controls(spec, asset)
+            parts = self._collect_parts(spec, asset, resolved)
+        xf = self._compute_assembly_transform(lc, spec, track_idx, parts)
         part_records, state_rows, state_opacities = self._append_parts(lc, track_idx, parts, xf)
         self.baked_clusters.extend(
-            self._emit_clusters(lc, fx, track_idx, resolved, state_rows, state_opacities, centroid_world)
+            self._emit_clusters(lc, spec, track_idx, resolved, state_rows, state_opacities, centroid_world)
         )
-        self.control_animations.extend(self._emit_control_animations(lc, fx, track_idx, resolved))
-        replaced = self._replace_original(lc, fx, track_idx)
+        self.control_animations.extend(self._emit_control_animations(lc, spec, track_idx, resolved))
+        replaced = self._hide_original_rows(lc, fx, track_idx) if fx.hides_original else 0
         self.asset_records.append(
-            self._asset_record(lc, fx, track_idx, asset_path, asset, xf, resolved, part_records, replaced)
+            self._asset_record(lc, fx, spec, track_idx, asset_path, asset, xf, resolved, part_records, replaced)
         )
+
+    def _appearance_spec(self, fx: EditSpec) -> EditSpec:
+        """The spec whose asset/placement/controls/prim_path this edit bakes, under this edit's id."""
+        if fx.is_clone and fx.clone is not None and not fx.clone.is_captured:
+            src = self._specs_by_id.get(fx.clone.source_edit_id or "")
+            if src is None:
+                raise AssetEditsBakeError(
+                    f"edit {fx.id!r}: clone source edit {fx.clone.source_edit_id!r} is not being baked"
+                )
+            return dataclasses.replace(src, id=fx.id, op="add", layer_id=fx.layer_id, bind=None, clone=None)
+        return fx
 
     def _load_asset(self, fx: EditSpec) -> tuple[Path, Any]:
         """Resolve and import the edit's asset: a composed SimReady USD, or a static ``.ply``."""
-        asset_path = Path(fx.asset)  # type: ignore[arg-type]
+        if not fx.asset:
+            raise AssetEditsBakeError(f"edit {fx.id!r} ({fx.op}) has no asset to import")
+        asset_path = Path(fx.asset)
         if not asset_path.is_absolute():
-            asset_path = (self.yaml_dir / asset_path).resolve()
+            asset_path = (self.assets_root / asset_path).resolve()
         if not asset_path.exists():
             raise AssetEditsBakeError(f"asset not found: {asset_path} (edit {fx.id!r}, asset={fx.asset!r})")
 
@@ -726,14 +1269,12 @@ class AssetEditsBaker:
         return resolved
 
     def _collect_parts(self, fx: EditSpec, asset: Any, resolved: list[_ResolvedControl]) -> list[_PartPlan]:
-        """Collect every part to bake, with its role and target visibility.
+        """Collect every part to bake with its role and target visibility.
 
-        Animated controls group their parts by ELEMENT (the prims driven by visibility
-        windows/membership); an element whose payload is identical in every state it
-        appears in bakes ONCE ("element" role, state-agnostic aspect) instead of one
-        copy per state — geometry is baked once, the schedule is the only variation.
-        Records the collapsed element keys in ``self._shared_elements`` (read back when
-        clusters and animation tables emit).
+        Animated controls group their parts by element (the prims driven by visibility windows). An
+        element whose payload is identical in every state bakes once, with a state-agnostic aspect,
+        instead of once per state; the schedule is then the only variation. The collapsed element
+        keys are recorded in ``self._shared_elements`` for the cluster and animation-table emission.
         """
         parts: list[_PartPlan] = []
         for p in asset.static_parts:
@@ -1083,32 +1624,143 @@ class AssetEditsBaker:
             )
         return animations
 
-    def _replace_original(self, lc: _LayerContext, fx: EditSpec, track_idx: int) -> int:
-        """Hide every ORIGINAL (pre-bake) Gaussian riding this track, when requested.
+    def _hide_original_rows(self, lc: _LayerContext, fx: EditSpec, track_idx: int) -> int:
+        """Hide every ORIGINAL (pre-bake) Gaussian riding this track (replace / exclude).
 
-        Recoverable by rebaking from the original artifact; the manifest records the
+        Recoverable only by rebaking from the original artifact; the manifest records the
         criterion (cuboid id == track among the first original_layer_size rows) rather
         than hundreds of thousands of indices. MUST address the snapshot's rows, never
         the node's current ids — appended rows are tagged to the same track.
         """
-        if not fx.replace_original:
-            return 0
-        orig_idx = np.nonzero(lc.snapshot.cuboid_ids == track_idx)[0]
+        orig_idx = lc.snapshot.rows_of_track(track_idx)
         if orig_idx.size:
             idx_t = torch.tensor(orig_idx, device=lc.spec.device, dtype=torch.long)
             lc.node.densities.data[idx_t] = HIDDEN_DENSITY_LOGIT
         log.info(
-            "  [asset %s] replace_original: hid %d captured gaussian(s) on track %d",
+            "  [%s %s] hid %d captured gaussian(s) on track %d (%r) in layer %s",
+            fx.op,
             fx.id,
             int(orig_idx.size),
             track_idx,
+            str(lc.ct.tracks_id[track_idx]),
+            lc.layer_id,
         )
         return int(orig_idx.size)
+
+    def _bake_captured_clone(self, lc: _LayerContext, fx: EditSpec, track_idx: int) -> None:
+        """Duplicate a captured track's trained rows onto the clone's synthetic track.
+
+        Rows are copied from the pre-bake snapshot's addressing with the snapshot's
+        density logits, so a source that another edit of this bake replaces or excludes
+        still clones with its trained appearance. Positions stay in the source's
+        cuboid-local frame: the clone track carries the source's calibrated poses (offset
+        or parked), so the copies render where that track is. A per-track-frame appearance
+        table is re-indexed onto the clone's keyframes (``_frame_columns``).
+        """
+        clone = fx.clone
+        assert clone is not None and clone.source_nurec_track_id is not None
+        src_idx = int(clone.source_nurec_track_id)
+        src_tid = str(lc.ct.tracks_id[src_idx])
+        src_rows = lc.snapshot.rows_of_track(src_idx)
+        if src_rows.size == 0:
+            raise AssetEditsBakeError(
+                f"edit {fx.id!r}: captured track {src_idx} ({src_tid!r}) has no Gaussians in layer "
+                f"{lc.layer_id!r}; nothing to clone"
+            )
+        rows = lc.appender.append_copied_rows(
+            src_rows,
+            track_idx,
+            densities_logit=lc.snapshot.densities_logit[src_rows],
+            frame_columns=self._frame_columns(lc.layer_id, fx, src_idx),
+        )
+        synth = self._synthetic_track_for(fx.id)
+        log.info(
+            "  [clone %s] copied %d captured gaussian(s) of track %d (%r) onto track %d (%r, %d keyframe(s))",
+            fx.id,
+            len(rows),
+            src_idx,
+            src_tid,
+            track_idx,
+            synth.track_id_str,
+            synth.n_poses,
+        )
+        self.asset_records.append(
+            {
+                "edit_id": fx.id,
+                "op": fx.op,
+                "layer_id": lc.layer_id,
+                "nurec_track_id": track_idx,
+                "bind": self._synthetic_bind_record(synth),
+                "clone": {"source": {"nurec_track_id": src_idx, "track_id": src_tid}, "motion": clone.motion.to_dict()},
+                "asset": None,
+                "root_prim": None,
+                "up_axis": None,
+                "placement": None,
+                "parts": [
+                    {
+                        "prim_path": f"captured:{src_tid}",
+                        "role": "captured",
+                        "control": None,
+                        "state": None,
+                        "element": None,
+                        "first_index": rows[0] if rows else -1,
+                        "count": len(rows),
+                    }
+                ],
+                "controls": {},
+                "variant_sets_available": {},
+                "replaced_original_gaussians": 0,
+                "original_layer_size": lc.appender.initial_n,
+            }
+        )
+
+    def _exclude_record(self, lc: _LayerContext, fx: EditSpec, track_idx: int, hidden: int) -> dict:
+        """The manifest records of an exclude: its ``assets[]`` entry, plus the
+        ``excluded_tracks`` entry scenario-side consumers read."""
+        tid = str(lc.ct.tracks_id[track_idx])
+        self.excluded_tracks.append(
+            {
+                "edit_id": fx.id,
+                "layer_id": lc.layer_id,
+                "nurec_track_id": track_idx,
+                "track_id_str": tid,
+                "gaussians_hidden": hidden,
+            }
+        )
+        return {
+            "edit_id": fx.id,
+            "op": fx.op,
+            "layer_id": lc.layer_id,
+            "nurec_track_id": track_idx,
+            "bind": {"type": "nurec_track", "nurec_track_id": track_idx, "track_id": tid},
+            "asset": None,
+            "root_prim": None,
+            "up_axis": None,
+            "placement": None,
+            "parts": [],
+            "controls": {},
+            "variant_sets_available": {},
+            "replaced_original_gaussians": hidden,
+            "original_layer_size": lc.appender.initial_n,
+        }
+
+    @staticmethod
+    def _synthetic_bind_record(synth: SyntheticTrack) -> dict[str, Any]:
+        """The ``bind`` record of an edit riding a synthetic track (world bind or clone)."""
+        return {
+            "type": synth.kind,
+            "nurec_track_id": synth.nurec_track_id,
+            "track_id": synth.track_id_str,
+            "dims": synth.dims_world,
+            "label_class": synth.label_class,
+            "keyframes": synth.n_poses,
+        }
 
     def _asset_record(
         self,
         lc: _LayerContext,
         fx: EditSpec,
+        spec: EditSpec,
         track_idx: int,
         asset_path: Path,
         asset: Any,
@@ -1117,23 +1769,28 @@ class AssetEditsBaker:
         part_records: list[dict],
         replaced: int,
     ) -> dict:
-        """The informational manifest record for one edit."""
+        """The informational manifest record for one asset-baking edit (``spec`` is its appearance)."""
         rx, ry, rz = xf.euler_deg
-        bind_record: dict[str, Any] = {"type": fx.bind.type, "nurec_track_id": track_idx}
-        if fx.bind.is_world:
-            synth = next(s for s in self.synthetic_tracks if s.edit_id == fx.id)
-            bind_record.update(
-                {
-                    "position": [float(x) for x in fx.bind.position or []],
-                    "yaw_deg": float(fx.bind.yaw_deg),
-                    "anchor": fx.bind.anchor,
-                    "track_id": synth.track_id_str,
-                    "dims": synth.dims_world,
-                    "label_class": synth.label_class,
-                }
-            )
-        return {
+        bind_record: dict[str, Any]
+        if fx.binds_synthetic_track:
+            bind_record = self._synthetic_bind_record(self._synthetic_track_for(fx.id))
+            if fx.is_world and fx.bind is not None:
+                bind_record.update(
+                    {
+                        "position": [float(x) for x in fx.bind.position or []],
+                        "yaw_deg": float(fx.bind.yaw_deg),
+                        "anchor": fx.bind.anchor,
+                    }
+                )
+        else:
+            bind_record = {
+                "type": "nurec_track",
+                "nurec_track_id": track_idx,
+                "track_id": str(lc.ct.tracks_id[track_idx]),
+            }
+        record: dict[str, Any] = {
             "edit_id": fx.id,
+            "op": fx.op,
             "layer_id": lc.layer_id,
             "nurec_track_id": track_idx,
             "bind": bind_record,
@@ -1161,3 +1818,6 @@ class AssetEditsBaker:
             "replaced_original_gaussians": replaced,
             "original_layer_size": lc.appender.initial_n,
         }
+        if fx.is_clone and fx.clone is not None:
+            record["clone"] = {"source": {"edit_id": fx.clone.source_edit_id}, "motion": fx.clone.motion.to_dict()}
+        return record

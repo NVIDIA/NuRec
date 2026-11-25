@@ -42,6 +42,11 @@ _W, _H = 64, 48
 _GREEN = (0, 255, 0)
 
 
+def _render_metric_calls(collector):
+    """Select per-render CUDA/API samples separately from per-repetition pipeline wall samples."""
+    return [call for call in collector.record_frame.call_args_list if "cuda_ms" in call.kwargs]
+
+
 class TestSaveSemanticsLegend(unittest.TestCase):
     def test_legend_file_created_with_class_names(self):
         lut = build_semantics_class_color_lut(3)
@@ -251,6 +256,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         native_resolutions=None,
         custom_rigs=None,
     ):
+        """Execute the render CLI with controlled model, calibration and output fixtures."""
         module = importlib.import_module("nurec.utils.io.export.render")
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -266,6 +272,8 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         copy_ranges = []
         warmup_ranges = []
         frame_ranges = []
+        pipeline_ranges = []
+        pipeline_stack = []
         frame_state = SimpleNamespace(active=None)
         pinned_buffers = []
         pinned_copies = []
@@ -465,8 +473,14 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 return CameraFrame(color_image=framebuffer[:1])
             return CameraFrame(color_image=framebuffer)
 
+        def prepare_static(calibrations):
+            """Record fixed-calibration preparation separately from measured render calls."""
+            self.assertFalse(timing.active, "Fixed calibration must be prepared outside the render timer")
+            return [transform_intrinsics_to_resolution(p, r) for p, r in calibrations]
+
         renderable = SimpleNamespace(
             device=torch.device("cpu"),
+            prepare_static_camera_inputs=prepare_static,
             render_camera_frame=native_render,
             model_class_name=lambda: "MockRenderable",
             _model=object(),
@@ -475,8 +489,14 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         metrics = MagicMock()
         collectors = []
 
+        def record_frame(**sample):
+            """Reject metric insertion while any frame-pipeline timing scope is active."""
+            self.assertFalse(pipeline_stack, "Timing reports belong after frame-wall measurement")
+
         def make_metrics(**kwargs):
+            """Collect samples and metadata while checking reporting stays outside measurement."""
             collector = metrics if not collectors else MagicMock()
+            collector.record_frame.side_effect = record_frame
             collector.metadata_values = {}
             collector.set_metric_metadata.side_effect = lambda name, **metadata: collector.metadata_values.setdefault(
                 name, {}
@@ -610,6 +630,21 @@ class TestRenderBenchmarkCli(unittest.TestCase):
 
         @contextmanager
         def copy_range(label):
+            """Validate nested frame scopes independently from render and image-copy scopes."""
+            if label.startswith("nurec.render.frame_pipeline_"):
+                lifecycle = label.startswith("nurec.render.frame_pipeline_lifecycle(")
+                if lifecycle:
+                    self.assertFalse(pipeline_stack, "Each invocation owns one enclosing lifecycle")
+                else:
+                    self.assertEqual(len(pipeline_stack), 1, "Measured/excluded siblings belong inside the lifecycle")
+                pipeline_stack.append(label)
+                before = len(calls)
+                try:
+                    yield
+                finally:
+                    self.assertEqual(pipeline_stack.pop(), label)
+                    pipeline_ranges.append((label, before, calls[before:]))
+                return
             if label.startswith("nurec.render.frame("):
                 before = len(calls)
                 self.assertFalse(timing.active)
@@ -781,6 +816,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             copy_ranges=copy_ranges,
             warmup_ranges=warmup_ranges,
             frame_ranges=frame_ranges,
+            pipeline_ranges=pipeline_ranges,
             pinned_buffers=pinned_buffers,
             pinned_copies=pinned_copies,
             synchronizations=synchronizations,
@@ -879,11 +915,16 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             self.assertEqual(entry["cuda_ms"], cuda_ms)
 
     def samples(self, run, name, camera="cam0"):
+        """Return the requested metric or validity field from recorded samples for one camera."""
+        # Render-call and pipeline timings arrive in separate collector calls.
         return [
-            call.kwargs[name] for call in run.metrics.record_frame.call_args_list if call.kwargs["sensor_id"] == camera
+            call.kwargs[name]
+            for call in run.metrics.record_frame.call_args_list
+            if name in call.kwargs and call.kwargs["sensor_id"] == camera
         ]
 
     def test_invalid_cuda_samples_preserve_paired_metrics_and_saved_outputs(self):
+        """Verify invalid cuda samples preserve paired metrics and saved outputs, retaining separate render-call metrics."""
         for durations in ([None, 2.0, None, 4.0], [1.0, None, 3.0, None], [None] * 4):
             for mode in ("all-iterations", "last-iteration"):
                 with self.subTest(durations=durations, mode=mode):
@@ -905,7 +946,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                     self.assertEqual(
                         [
                             (call.kwargs["frame"], call.kwargs["iteration"])
-                            for call in run.metrics.record_frame.call_args_list
+                            for call in _render_metric_calls(run.metrics)
                         ],
                         [(0, 1), (0, 2), (1, 1), (1, 2)],
                     )
@@ -979,6 +1020,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 run.lidar_helper.assert_not_called()
 
     def test_save_none_preserves_rendering_metrics_and_captures_without_output_copies(self):
+        """Verify save none preserves rendering metrics and captures without output copies, retaining separate render-call metrics."""
         module = importlib.import_module("nurec.utils.io.export.render")
         for nsight in (False, True):
             with self.subTest(nsight=nsight), tempfile.TemporaryDirectory() as directory:
@@ -1002,7 +1044,30 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 self.assertEqual(len(run.calls), 12)  # Two warmups and four measured renders per camera.
                 self.assertEqual(len(run.warmup_ranges), 4)
                 self.assertEqual(len(run.validations), 12)
-                self.assertEqual(run.metrics.record_frame.call_count, 8)
+                self.assertEqual(len(_render_metric_calls(run.metrics)), 8)
+                invocation_calls = [
+                    call.kwargs for call in run.metrics.record_frame.call_args_list if "frame_wall_ms" in call.kwargs
+                ]
+                self.assertEqual(len(invocation_calls), 8)
+                self.assertEqual(
+                    set(run.metrics.metadata_values["frame_wall_ms"]), set(run.metrics.metadata_values["cuda_ms"])
+                )
+                self.assertEqual([call["iteration"] for call in invocation_calls], [1, 2] * 4)
+                self.assertTrue(all(call["frame_wall_ms"] > 0 for call in invocation_calls))
+                render_calls = [call.kwargs for call in _render_metric_calls(run.metrics)]
+                self.assertEqual(
+                    [(call["sensor_id"], call["frame"], call["iteration"]) for call in invocation_calls],
+                    [(call["sensor_id"], call["frame"], call["iteration"]) for call in render_calls],
+                )
+                measured_ranges = [entry for entry in run.pipeline_ranges if "frame_pipeline_measured(" in entry[0]]
+                excluded_ranges = [entry for entry in run.pipeline_ranges if "frame_pipeline_excluded(" in entry[0]]
+                lifecycle_ranges = [entry for entry in run.pipeline_ranges if "frame_pipeline_lifecycle(" in entry[0]]
+                self.assertEqual(len(lifecycle_ranges), 8)
+                self.assertEqual(len(measured_ranges), 10)  # Two first repetitions have pre/post warm-up segments.
+                self.assertEqual(len(excluded_ranges), 2)
+                self.assertTrue(all("metric=frame_wall_ms" in label for label, _, _ in measured_ranges))
+                self.assertTrue(all(timed for _, _, renders in measured_ranges for _, _, timed in renders))
+                self.assertTrue(all(not timed for _, _, renders in excluded_ranges for _, _, timed in renders))
                 for camera, first in (("cam0", 1), ("cam1", 5)):
                     self.assertEqual(self.samples(run, "cuda_ms", camera), list(range(first, first + 4)))
                     self.assertEqual(len(self.samples(run, "render_time_ms", camera)), 4)
@@ -1023,6 +1088,38 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                     self.assert_sensor_capture_lifecycle(run, ("cam0", "cam1"))
                     for record in run.nsight_capture.records:
                         self.assertEqual(record["trace"], f"nsight/{record['camera']}/performance.nsys-rep")
+
+    def test_reporting_logs_are_outside_frame_wall_for_all_save_paths(self):
+        """Keep slow reporting outside each sample, including iterations that skip output work."""
+        module = importlib.import_module("nurec.utils.io.export.render")
+        recorder_type = module.FramePipelineRecorder
+        for save_options in (("--save", "none"), (), ("--save", "all-iterations"), ("--save", "min,max")):
+            with self.subTest(save_options=save_options):
+                clock = SimpleNamespace(now=0, timing_logs=0, frame_logs=0)
+
+                def make_pipeline(**kwargs):
+                    """Advance deterministic wall time only when the reporting logger runs."""
+                    return recorder_type(**kwargs, clock=lambda: clock.now)
+
+                def report_log(message, *args, **kwargs):
+                    """Charge timing logs enough time to reveal inclusion in any measured sample."""
+                    if "rendered in" in message:
+                        clock.now += 100_000_000
+                        clock.timing_logs += 1
+                    if " at timestamp " in message:
+                        clock.frame_logs += 1
+
+                with (
+                    patch.object(module, "FramePipelineRecorder", side_effect=make_pipeline),
+                    patch.object(module.log, "info", side_effect=report_log),
+                ):
+                    run = self.run_render(["--iterations", "3", *save_options])
+                self.assert_success(run)
+                self.assertEqual(self.samples(run, "frame_wall_ms"), [0] * 6)
+                self.assertEqual(len(self.samples(run, "render_time_ms")), 6)
+                self.assertEqual(len(self.samples(run, "cuda_ms")), 6)
+                self.assertEqual(clock.timing_logs, 6)
+                self.assertEqual(clock.frame_logs, 2)
 
     def test_save_none_leaves_existing_images_and_manifests_untouched(self):
         module = importlib.import_module("nurec.utils.io.export.render")
@@ -1233,6 +1330,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 run.lidar_helper.assert_not_called()
 
     def test_only_first_trajectory_renders_into_the_provided_output_directory(self):
+        """Verify only first trajectory renders into the provided output directory, retaining separate render-call metrics."""
         run = self.run_render(
             ["--frame-index", "1", "--warmup-frames", "2", "--iterations", "2", "--save", "min,max"],
             trajectory_count=2,
@@ -1250,7 +1348,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertEqual(run.output, run.output_root.resolve())
         self.assertTrue((run.output / "render_cli_args.json").is_file())
         run.metrics.write_metrics_to_yaml.assert_called_once_with(str(run.output))
-        records = [call.kwargs for call in run.metrics.record_frame.call_args_list]
+        records = [call.kwargs for call in _render_metric_calls(run.metrics)]
         self.assertEqual([record["cuda_ms"] for record in records], [8, 2])
         self.assertEqual(
             [(record["sequence_id"], record["sensor_id"], record["frame"], record["iteration"]) for record in records],
@@ -1307,6 +1405,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 self.assertEqual({path.name for path in outside.iterdir()}, {sentinel.name})
 
     def test_camera_output_names_preserve_identity_in_frames_metrics_and_video_index(self):
+        """Verify camera output names preserve identity in frames metrics and video index, retaining separate render-call metrics."""
         module = importlib.import_module("nurec.utils.io.export.render")
         # These remain distinct: replacing punctuation or spaces with underscores would
         # rename ordinary cameras and make "front left" collide with "front_left".
@@ -1328,7 +1427,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         }
         self.assertEqual(set(run.saved), expected_saved)
         self.assertTrue(all(path.is_file() for path in expected_saved))
-        self.assertEqual({call.kwargs["sensor_id"] for call in run.metrics.record_frame.call_args_list}, set(cameras))
+        self.assertEqual({call.kwargs["sensor_id"] for call in _render_metric_calls(run.metrics)}, set(cameras))
         for metadata in run.metrics.metadata_values.values():
             self.assertEqual(metadata["resolutions"], {camera: [4, 2] for camera in cameras})
         video_root = run.output / CameraOutputSubdir.COLOR
@@ -1555,6 +1654,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                     self.assertFalse(run.calls)
 
     def test_default_replicated_views_allow_legacy_missing_camera_offsets(self):
+        """Verify default replicated views allow legacy missing camera offsets, retaining separate render-call metrics."""
         run = self.run_render(
             ["--frame-index", "1", "--warmup-frames", "1", "--iterations", "2"],
             invalid_offsets=True,
@@ -1571,7 +1671,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertEqual(run.calls, [("cam0", 1, measured) for measured in (False, True, True)])
         self.assertTrue(all(arguments["unique_frame_idx"] is None for arguments in run.render_arguments))
         self.assertTrue(all(arguments["training_frame_idx"] is None for arguments in run.render_arguments))
-        self.assertEqual(run.metrics.record_frame.call_count, 2)
+        self.assertEqual(len(_render_metric_calls(run.metrics)), 2)
         self.assertTrue((run.output / "color" / "cam0" / "000000.png").is_file())
         run.lidar_helper.assert_not_called()
 
@@ -1661,6 +1761,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         run.camera_provider_factory.assert_not_called()
 
     def test_nsight_profiles_only_first_trajectory_without_a_trajectory_directory(self):
+        """Verify nsight profiles only first trajectory without a trajectory directory, retaining separate render-call metrics."""
         module = importlib.import_module("nurec.utils.io.export.render")
         with tempfile.TemporaryDirectory() as directory:
             capture = Path(directory) / "first-trajectory"
@@ -1685,11 +1786,12 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 ["nsight/cam0/performance.nsys-rep"],
             )
             self.assertEqual(len(run.collectors), 1)
-            self.assertEqual(run.metrics.record_frame.call_count, 2)
+            self.assertEqual(len(_render_metric_calls(run.metrics)), 2)
             run.metrics.write_metrics_to_yaml.assert_called_once_with(str(capture))
             self.assertEqual(list(Path(directory).iterdir()), [capture])
 
     def test_repeated_runs_use_the_exact_output_directory_without_generated_subdirectories(self):
+        """Keep repeated output in the requested directory, without a separate pipeline timing file."""
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "renders"
             first = self.run_render(["--save", "last-iteration"], output_root=output)
@@ -1710,7 +1812,11 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 run.metrics.write_metrics_to_yaml.assert_called_once_with(str(output))
             self.assertEqual(
                 set(output.iterdir()),
-                {output / "render_cli_args.json", output / CameraOutputSubdir.COLOR, output / "color-extra"},
+                {
+                    output / "render_cli_args.json",
+                    output / CameraOutputSubdir.COLOR,
+                    output / "color-extra",
+                },
             )
 
     def test_nsight_rejects_list_tracks_before_profiling_or_loading(self):
@@ -1781,6 +1887,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             self.assertTrue(settings["args"]["nsight"])
 
     def test_nsight_captures_selected_frames_and_iterations_continuously_per_camera(self):
+        """Keep continuous per-camera capture while measuring and annotating each repetition separately."""
         run, capture = self.run_nsight_child(
             [
                 "--frame-index",
@@ -1813,7 +1920,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             [call(camera, sensor_dir=capture / "nsight" / camera) for camera in ("cam0", "cam1")],
         )
         self.assertEqual(run.nsight_capture.frame.call_count, 4)
-        self.assertEqual(run.metrics.record_frame.call_count, 12)
+        self.assertEqual(len(_render_metric_calls(run.metrics)), 12)
         self.assert_sensor_capture_lifecycle(run, ("cam0", "cam1"))
         self.assertIs(run.metrics_factory.call_args.kwargs["nsight"], True)
         self.assertEqual(
@@ -1833,10 +1940,18 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertEqual(
             [(label, start, len(renders)) for label, start, renders in run.frame_ranges],
             [
-                ("nurec.render.frame(camera=cam0, frame=1)", 2, 3),
-                ("nurec.render.frame(camera=cam0, frame=3)", 5, 3),
-                ("nurec.render.frame(camera=cam1, frame=1)", 10, 3),
-                ("nurec.render.frame(camera=cam1, frame=3)", 13, 3),
+                ("nurec.render.frame(camera=cam0, frame=1)", 2, 1),
+                ("nurec.render.frame(camera=cam0, frame=1)", 3, 1),
+                ("nurec.render.frame(camera=cam0, frame=1)", 4, 1),
+                ("nurec.render.frame(camera=cam0, frame=3)", 5, 1),
+                ("nurec.render.frame(camera=cam0, frame=3)", 6, 1),
+                ("nurec.render.frame(camera=cam0, frame=3)", 7, 1),
+                ("nurec.render.frame(camera=cam1, frame=1)", 10, 1),
+                ("nurec.render.frame(camera=cam1, frame=1)", 11, 1),
+                ("nurec.render.frame(camera=cam1, frame=1)", 12, 1),
+                ("nurec.render.frame(camera=cam1, frame=3)", 13, 1),
+                ("nurec.render.frame(camera=cam1, frame=3)", 14, 1),
+                ("nurec.render.frame(camera=cam1, frame=3)", 15, 1),
             ],
         )
         self.assertEqual(len(run.warmup_ranges), 4)
@@ -1869,6 +1984,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 self.assertFalse(run.copy_ranges)
 
     def test_nsight_zero_warmup_one_iteration_captures_only_selected_render(self):
+        """Verify nsight zero warmup one iteration captures only selected render, retaining separate render-call metrics."""
         run, _ = self.run_nsight_child(
             ["--frame-index", "1", "--warmup-frames", "0", "--iterations", "1"],
         )
@@ -1876,7 +1992,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertEqual(run.calls, [("cam0", 1, True)])
         self.assertEqual(run.capture_windows, [("cam0", 1, 0, [("cam0", 1, True)])])
         self.assertFalse(run.synchronizations)
-        self.assertEqual(run.metrics.record_frame.call_count, 1)
+        self.assertEqual(len(_render_metric_calls(run.metrics)), 1)
         self.assertEqual(len(run.nsight_capture.records), 1)
         self.assertEqual(run.nsight_capture.records[0]["frame"], 1)
         self.assertEqual(run.frame_ranges, [("nurec.render.frame(camera=cam0, frame=1)", 0, [("cam0", 1, True)])])
@@ -2046,6 +2162,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         run.load.assert_not_called()
 
     def test_camera_nsight_profiling_uses_requested_configuration_and_first_trajectory(self):
+        """Verify camera nsight profiling uses requested configuration and first trajectory, retaining separate render-call metrics."""
         run, capture = self.run_nsight_child(
             [
                 "--camera-id",
@@ -2082,8 +2199,8 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertTrue(all(arguments["resolution"] == (1, 4) for arguments in run.render_arguments))
         self.assertEqual(len(run.saved), 3)
         run.metrics.write_metrics_to_yaml.assert_called_once_with(str(capture))
-        self.assertEqual(run.metrics.record_frame.call_count, 2)
-        self.assertTrue(all(call.kwargs["sensor_id"] == "cam1" for call in run.metrics.record_frame.call_args_list))
+        self.assertEqual(len(_render_metric_calls(run.metrics)), 2)
+        self.assertTrue(all(call.kwargs["sensor_id"] == "cam1" for call in _render_metric_calls(run.metrics)))
         self.assertEqual(run.metrics.metadata_values["cuda_ms"]["resolutions"], {"cam1": [8, 4]})
         self.assertEqual(len(list((capture / CameraOutputSubdir.COLOR / "cam1").glob("*.png"))), 1)
 
@@ -2220,6 +2337,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
                 run.training_mapping.assert_not_called()
 
     def test_warmup_repeats_first_frame_per_camera_without_skipping_frames(self):
+        """Verify warmup repeats first frame per camera without skipping frames, retaining separate render-call metrics."""
         wall_durations = [11, 13, 17, 19, 23, 29, 31, 37]
         run = self.run_render(
             ["--warmup-frames", "2", "--iterations", "2", "--frame-step", "2", "--save", "last-iteration"],
@@ -2253,7 +2371,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
         self.assertEqual(len(run.saved), 8)
         self.assertTrue(all("-iteration-2." in path.name for path in self.extra_saved(run)))
         self.assertEqual(len(run.timer.milliseconds), 8)
-        records = [call.kwargs for call in run.metrics.record_frame.call_args_list]
+        records = [call.kwargs for call in _render_metric_calls(run.metrics)]
         self.assertEqual(
             [(record["sensor_id"], record["frame"], record["iteration"]) for record in records],
             [(camera, frame, iteration) for camera in ("cam0", "cam1") for frame in (0, 2) for iteration in (1, 2)],
@@ -2268,6 +2386,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             self.assertEqual(metadata[name]["iterations"], 2)
 
     def test_nonzero_single_frame_is_warmed_then_measured_and_saved(self):
+        """Verify nonzero single frame is warmed then measured and saved, retaining separate render-call metrics."""
         run = self.run_render(
             [
                 "--frame-index",
@@ -2290,7 +2409,7 @@ class TestRenderBenchmarkCli(unittest.TestCase):
             ["nurec.render.warmup(frame=3, iteration=1)", "nurec.render.warmup(frame=3, iteration=2)"],
         )
         self.assertEqual(
-            [(call.kwargs["frame"], call.kwargs["iteration"]) for call in run.metrics.record_frame.call_args_list],
+            [(call.kwargs["frame"], call.kwargs["iteration"]) for call in _render_metric_calls(run.metrics)],
             [(3, 1), (3, 2)],
         )
         self.assertEqual([path.name for path in self.canonical_saved(run)], ["000000.png"])

@@ -39,6 +39,12 @@ def test_transformer_engine_attention_imports_with_pinned_torch():
     assert attention.DotProductAttention is not None
 
 
+def test_transformer_engine_registers_harmonizer_ops():
+    """The Harmonizer TorchScript checkpoint calls tex_ts ops that importing transformer_engine registers."""
+    importlib.import_module("transformer_engine")
+    assert hasattr(torch.ops.tex_ts, "rmsnorm_fwd_inf_ts")
+
+
 class _CallableStubModule(torch.nn.Module):
     """Stand-in for a loaded model: callable and delegates to `fn`, with a buffer so
     `BaseHarmonizerModel._model_device()` resolves a real (CPU) device and `.to()` works

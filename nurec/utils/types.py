@@ -257,19 +257,25 @@ class CameraFrustum:
 
     """
 
+    _EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))
+    _PLANES = ((0, 1, 2, 3), (7, 6, 5, 4), (4, 5, 1, 0), (4, 0, 3, 7), (3, 2, 6, 7), (1, 5, 6, 2))
+
     def __init__(self, corners: torch.Tensor, device: torch.device = torch.device("cpu")) -> None:
         """Represents a camera frustum through the near plane corners, the 4 vectors and depth along the normal"""
-        self.corners: torch.Tensor = corners.to(device)  # [8,3]
-        self.device = device
-        self.edges: torch.Tensor = torch.tensor(
-            [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]
-        ).to(self.device)
-
-        self.planes: torch.Tensor = torch.tensor(
-            [[0, 1, 2, 3], [7, 6, 5, 4], [4, 5, 1, 0], [4, 0, 3, 7], [3, 2, 6, 7], [1, 5, 6, 2]]
-        ).to(self.device)
+        self._assign(
+            corners.to(device),  # [8,3]
+            device,
+            torch.tensor(self._EDGES, device=device),
+            torch.tensor(self._PLANES, device=device),
+        )
         assert self.corners.shape == (8, 3), "Frustum is defined by 8 corners"
         self.check_input_conformity()
+
+    def _assign(self, corners: torch.Tensor, device: torch.device, edges: torch.Tensor, planes: torch.Tensor) -> None:
+        self.corners: torch.Tensor = corners
+        self.device = device
+        self.edges: torch.Tensor = edges
+        self.planes: torch.Tensor = planes
 
     def check_input_conformity(self) -> None:
         """We make two assumptions on the input: 1) first and second 4 points define the near, far plane respectively. Hence,
@@ -296,7 +302,8 @@ class CameraFrustum:
 
         # Compute the normal vectors of all planes and check that the ones of near/far plane are parallel
         self.compute_normal_vectors()
-        assert torch.isclose(torch.dot(self.normals[0], self.normals[0]), torch.ones(1, device=self.device)), (
+        # Inward normals of the near and far faces point at each other.
+        assert torch.isclose(torch.dot(self.normals[0], self.normals[1]), -torch.ones(1, device=self.device)), (
             "The near and far plane are not parallel"
         )
 
@@ -320,12 +327,51 @@ class CameraFrustum:
         return self.corners.min(0).values, self.corners.max(0).values
 
     def to(self, device: torch.device) -> CameraFrustum:
+        device = torch.device(device)
+        if self.corners.device == device:
+            return self
         self.corners = self.corners.to(device=device)
-        self.edges = self.edges.to(device=self.device)
-        self.planes = self.planes.to(device=self.device)
+        self.edges = self.edges.to(device=device)
+        self.planes = self.planes.to(device=device)
         self.device = device
-        self.check_input_conformity()
+        self.compute_normal_vectors()
         return self
+
+    @classmethod
+    def from_batched_corners(cls, corners: torch.Tensor, device: torch.device) -> list[CameraFrustum]:
+        """Validate and construct many frusta with one transfer and batched normals.
+
+        - ``corners`` is [B,8,3] on any device: near-plane corners 0-3, far-plane corners 4-7, ordered as in ``__init__``.
+        - Returns B frusta on ``device`` with their normals already computed.
+        - The frusta share one ``edges`` and one ``planes`` tensor; never modify them in place.
+        - Asserts that each plane's corners are coplanar.
+        - Asserts that the near and far planes are parallel.
+        """
+        assert corners.ndim == 3 and corners.shape[1:] == (8, 3)
+        for base in (0, 4):
+            vectors = corners[:, base + 1 : base + 4] - corners[:, base : base + 1]
+            vectors = vectors / vectors.norm(dim=-1, keepdim=True)
+            assert torch.isclose(torch.det(vectors), corners.new_zeros(len(corners)), atol=1e-2).all(), (
+                "Frustum corners must be coplanar"
+            )
+        corners = corners.to(device)
+        edges = torch.tensor(cls._EDGES, device=device)
+        planes = torch.tensor(cls._PLANES, device=device)
+        points = corners[:, planes[:, :3].flatten()].reshape(-1, 6, 3, 3)
+        vectors = points[:, :, [2, 0]] - points[:, :, 1:2]
+        normals = torch.linalg.cross(vectors[:, :, 0], vectors[:, :, 1])
+        normals = normals / normals.norm(dim=-1, keepdim=True)
+        # Inward normals of the near and far faces point at each other.
+        assert torch.isclose((normals[:, 0] * normals[:, 1]).sum(-1), -corners.new_ones(len(corners))).all(), (
+            "The near and far plane are not parallel"
+        )
+        result = []
+        for c, n in zip(corners, normals):
+            frustum = cls.__new__(cls)
+            frustum._assign(c, corners.device, edges, planes)
+            frustum.normals = n
+            result.append(frustum)
+        return result
 
 
 class BoundingBox:
@@ -952,6 +998,10 @@ class GaussiansCompositeReturn:
     # the BaseSystem hook launches and resolves it; renderer fields above keep
     # their existing regularizer/MCMC meaning.
     selective_adam_visibility: Optional[AsyncVisibilityUnion] = None
+    # Prepared strict camera/LiDAR union for MCMC visibility counters. The
+    # system launches it only after coordinated forward-error handling, then
+    # resolves owner-local rows before strategy consumption.
+    mcmc_visibility_union: Optional[AsyncVisibilityUnion] = None
 
 
 @dataclass(slots=True, kw_only=True)

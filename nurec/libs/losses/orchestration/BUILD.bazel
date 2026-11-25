@@ -16,14 +16,40 @@ pytest_test(
     ],
 )
 
-# Config (and loss return types) only; no nurec/utils so nurec/config can depend on this without a cycle.
+# Configuration and return types; profiling depends only on leaf config schemas.
 py_library(
     name = "pylib_config",
     srcs = ["config.py"],
     deps = [
         "//nurec/config:pylib_base_schema",
+        "//nurec/libs/loss_aggregation_ops:pylib",
+        "//nurec/utils:pylib_profiling",
         pip_requirement("omegaconf"),
         pip_requirement("pydantic"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "accumulator_return_test",
+    srcs = ["accumulator_return_test.py"],
+    deps = [
+        ":pylib_config",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib_loss_orchestrator",
+    srcs = ["loss_orchestrator.py"],
+    deps = [
+        ":pylib_config",
+        "//nurec/datasets:pylib",
+        "//nurec/instant_nurec/models:pylib",
+        "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/libs/losses/models:pylib",
+        "//nurec/models/base:pylib",
+        "//nurec/utils:pylib_types",
         pip_requirement("torch"),
     ],
 )
@@ -55,16 +81,28 @@ py_library(
     name = "pylib",
     srcs = [
         "__init__.py",
+        "loss_accumulator.py",
         "loss_aggregator.py",
+        "loss_producers.py",
     ],
     deps = [
         ":pylib_config",
         "//nurec/datasets:pylib",
         "//nurec/instant_nurec/models:pylib",
         "//nurec/instant_nurec/primitives:pylib",
+        "//nurec/libs/losses/functional:pylib",
         "//nurec/libs/losses/models:pylib",
         "//nurec/libs/slang_gaussians:pylib",
         "//nurec/models/base:pylib",
         "//nurec/utils:pylib",
+    ],
+)
+
+pytest_test(
+    name = "loss_paths_test",
+    srcs = ["loss_paths_test.py"],
+    deps = [
+        ":pylib",
+        ":pylib_config",
     ],
 )

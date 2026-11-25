@@ -4,7 +4,7 @@
 import functools
 import logging
 
-from typing import List, Optional, cast
+from typing import Any, List, Optional, cast
 
 import torch
 
@@ -16,15 +16,15 @@ from nurec.datasets.ncore import NCOREDataset
 from nurec.datasets.tracks import CuboidTracks
 from nurec.libs.losses.models.base_losses import BaseLossWithSemanticWeights, BaseRenderLoss
 from nurec.libs.losses.models.camera_loss_masks import CameraLossKind, camera_loss_valid_mask
+from nurec.libs.losses.models.fused_loss_inputs import _get_bilateral_grids
 from nurec.libs.losses.models.reduce_functions import MeanReduceFn, SumReduceFn
 from nurec.libs.losses.models.registry import register_loss
 from nurec.libs.losses.models.utils import (
-    _get_bilateral_grids,
     _maybe_update_mcmc_visibility_counters,
     create_window,
     get_rendered_visibility_mask,
 )
-from nurec.libs.losses.orchestration.config import LossItemConfig, LossReturn
+from nurec.libs.losses.orchestration.config import AccumulatorLoss, LossItemConfig, LossReturn
 from nurec.models.background import EnvMapType, SkyEnvMapBackground
 from nurec.models.base import BaseModel
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
@@ -731,6 +731,14 @@ class PPISPLoss(BaseRenderLoss):
     def __init__(self, config: LossItemConfig, trainer_config: TrainerConfig, **kwargs) -> None:
         super().__init__("ppisp", config, trainer_config, **kwargs)
 
+    def _get_regularization_input(self, model: BaseModel):
+        if not isinstance(model, GaussiansComposite):
+            raise RuntimeError(f"{self.__class__.__name__} got unsupported model type {type(model)}")
+        for pp in model.post_processings:
+            if isinstance(pp, PPISPPostProcessing):
+                return pp.ppisp
+        return None
+
     def forward(
         self,
         results: GaussiansCompositeReturn,
@@ -738,29 +746,27 @@ class PPISPLoss(BaseRenderLoss):
         model: BaseModel,
     ) -> Optional[LossReturn]:
         # Find the PPISP post-processing module (new library version).
-        match model:
-            case GaussiansComposite():
-                for pp in model.post_processings:
-                    if isinstance(pp, PPISPPostProcessing):
-                        return self.apply_loss_fn(pp.ppisp)
-            case _:
-                raise RuntimeError(f"{self.__class__.__name__} got unsupported model type {type(model)}")
+        ppisp = self._get_regularization_input(model)
+        return None if ppisp is None else self.apply_loss_fn(ppisp)
 
-        return None
+    def accumulate(self, **kwargs: Any) -> AccumulatorLoss | None:
+        ppisp = self._get_regularization_input(kwargs["model"])
+        return (
+            None if ppisp is None else AccumulatorLoss(name=self.name, lambda_=self.lambda_, value=self.loss_fn(ppisp))
+        )
 
 
 @register_loss("ssim")
 class SSIMLoss(BaseRenderLoss, BaseLossWithSemanticWeights):
-    """PyTorch SSIM loss used when ``ssim_ssim_mean`` is not routed through ``ModuleLosses``.
+    """PyTorch SSIM loss used when ``ssim_ssim_mean`` is not routed through ``AccumulatorModuleLosses``.
 
     Default configs (e.g. ``configs/loss/gaussians.yaml``: ``window_size: 11``, ``reduce: mean``,
-    ``mask.mode: GT``, no semantic lambdas) take the gsplat SSIM path instead:
-    ``LossAggregator`` → ``ModuleLosses.forward`` → ``nurec.libs.losses.models.utils.fused_ssim_loss_map``
-    → ``gsplat.losses.FusedSSIMLosses``. Gsplat uses fused CUDA for supported 11x11 cases
-    and falls back internally otherwise; targets requiring gradients are rejected.
+    ``mask.mode: GT``, no semantic lambdas) take the gsplat SSIM accumulator path instead:
+    ``LossAccumulator`` → ``AccumulatorModuleLosses`` → ``gsplat.losses.SSIMLossAccumulator``.
+    Other window sizes stay on this PyTorch implementation; targets requiring gradients are rejected.
 
     This class remains for ``force_disable_cuda``, semantic SSIM weights, or any setup where
-    ``ssim_ssim_mean`` is not listed in ``ModuleLosses.available``.
+    ``ssim_ssim_mean`` is not listed in ``AccumulatorModuleLosses.available``.
     """
 
     camera_loss_kind = CameraLossKind.SSIM
@@ -1000,6 +1006,16 @@ class OutOfBoundLoss(BaseRenderLoss):
         )
 
 
+def ground_rotation_weight_is_safe(rotation_lambda: float | None) -> bool:
+    """Whether the float32 native Ground scalar preserves the abs epilogue."""
+    # Tiny weights can flush a scalar to zero while its native derivative stays
+    # nonzero, where abs must still zero the gradient. The kernel's std gradient
+    # cutoff makes eps a conservative lower bound; its launch weight is a C float.
+    return rotation_lambda is not None and (
+        rotation_lambda == 0.0 or torch.finfo(torch.float32).eps <= rotation_lambda <= torch.finfo(torch.float32).max
+    )
+
+
 @register_loss("road_gaussians")
 class RoadGaussiansLoss(BaseRenderLoss):
     """
@@ -1046,14 +1062,11 @@ class RoadGaussiansLoss(BaseRenderLoss):
         # The bounds are float32 by design: gsplat's launch functions take
         # rotation_lambda as a C float, so the weight is narrowed to float32
         # before it reaches the kernel whatever the tensor dtype.
-        rotation_weight_is_safe = self.rotation_lambda == 0 or (
-            torch.finfo(torch.float32).eps <= self.rotation_lambda <= torch.finfo(torch.float32).max
-        )
         self._scalar_epilogue_is_identity = (
             self.use_cuda
             and self.loss_fn is torch.abs
             and isinstance(self.reduce_fn, MeanReduceFn)
-            and rotation_weight_is_safe
+            and ground_rotation_weight_is_safe(self.rotation_lambda)
         )
 
     def _make_random_values(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

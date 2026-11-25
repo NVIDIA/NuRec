@@ -574,6 +574,26 @@ class LayerTrackDigestTest(unittest.TestCase):
         self.assertEqual(layer_track_digest(view), layer_track_digest(owned))
 
 
+class ExcludedTracksTest(unittest.TestCase):
+    """The manifest carries the exclude records through JSON, and omits the key when there are none."""
+
+    def test_roundtrip_and_omission(self) -> None:
+        """excluded_tracks survives a JSON round trip and is left out when empty."""
+        rec = {
+            "edit_id": "drop",
+            "layer_id": "dynamic_rigids",
+            "nurec_track_id": 3,
+            "track_id_str": "462",
+            "gaussians_hidden": 17,
+        }
+        manifest = EditManifest(clusters=[], excluded_tracks=[rec])
+        self.assertEqual(manifest.to_dict()["excluded_tracks"], [rec])
+        again = EditManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
+        self.assertEqual(again.excluded_tracks, [rec])
+        self.assertNotIn("excluded_tracks", EditManifest(clusters=[]).to_dict())
+        self.assertEqual(EditManifest.from_dict({"clusters": []}).excluded_tracks, [])
+
+
 class LayerRowCountsTest(unittest.TestCase):
     """layer_row_counts binds a manifest to the exact bake it addresses."""
 
@@ -655,6 +675,45 @@ class ValidateAgainstLayersTest(unittest.TestCase):
         self.assertEqual(reordered.get_num_gaussians(), baked.get_num_gaussians())
         with self.assertRaisesRegex(ValueError, "digest"):
             m.validate_against_layers({"dyn": reordered})
+
+    def test_digest_of_a_layer_without_clusters_is_checked(self) -> None:
+        """A bake binds every layer it rewrote (excludes, static replaces, dependent layers),
+        not only the cluster layers; a reordered one of those is refused too."""
+        baked = _ValidationNode([0, 1, 1, 2])
+        m = self._manifest(
+            layer_row_counts={"dyn": 4, "aux": 4},
+            layer_track_digest={
+                "dyn": layer_track_digest(baked.gaussian_cuboid_ids),
+                "aux": layer_track_digest(baked.gaussian_cuboid_ids),
+            },
+        )
+        m.validate_against_layers({"dyn": baked, "aux": _ValidationNode([0, 1, 1, 2])})  # no raise
+        with self.assertRaisesRegex(ValueError, "different layer 'aux'"):
+            m.validate_against_layers({"dyn": baked, "aux": _ValidationNode([1, 1, 0, 2])})
+
+    def test_bound_layer_missing_from_the_checkpoint_is_rejected(self) -> None:
+        """A layer the bake bound must be loaded, whether or not it holds clusters."""
+        baked = _ValidationNode([0, 1, 1, 2])
+        digest = layer_track_digest(baked.gaussian_cuboid_ids)
+        with_clusters = self._manifest(layer_row_counts={"dyn": 4, "aux": 4})
+        with self.assertRaisesRegex(ValueError, "'aux', which the loaded checkpoint does not have"):
+            with_clusters.validate_against_layers({"dyn": baked})
+        exclude_only = EditManifest(clusters=[], layer_row_counts={"aux": 4}, layer_track_digest={"aux": digest})
+        with self.assertRaisesRegex(ValueError, "'aux', which the loaded checkpoint does not have"):
+            exclude_only.validate_against_layers({"dyn": baked})
+        exclude_only.validate_against_layers({"aux": baked})  # no raise
+
+    def test_bound_layer_without_cuboid_ids_is_rejected(self) -> None:
+        """A bound layer without per-row track ids cannot be checked, so it is refused."""
+
+        class _NoIdsNode:
+            def get_num_gaussians(self) -> int:
+                """Row count of the layer."""
+                return 4
+
+        m = EditManifest(clusters=[], layer_row_counts={"aux": 4})
+        with self.assertRaisesRegex(ValueError, "no per-row gaussian_cuboid_ids"):
+            m.validate_against_layers({"aux": _NoIdsNode()})
 
     def test_rows_belonging_to_another_track_are_rejected(self) -> None:
         """Catches a stale manifest even when size and digest were never recorded."""

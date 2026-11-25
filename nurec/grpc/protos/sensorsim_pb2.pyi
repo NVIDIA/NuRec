@@ -54,6 +54,17 @@ class LidarFloatingFilterSource(int, metaclass=_enum_type_wrapper.EnumTypeWrappe
     LIDAR_FLOATING_FILTER_SOURCE_RANGEVIEW: _ClassVar[LidarFloatingFilterSource]
     LIDAR_FLOATING_FILTER_SOURCE_ANGLE: _ClassVar[LidarFloatingFilterSource]
 
+class LidarReturnType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    LIDAR_RETURN_UNSPECIFIED: _ClassVar[LidarReturnType]
+    LIDAR_RETURN_FIRST: _ClassVar[LidarReturnType]
+    LIDAR_RETURN_STRONGEST: _ClassVar[LidarReturnType]
+
+class LidarOutputMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    LIDAR_OUTPUT_POINT_CLOUD: _ClassVar[LidarOutputMode]
+    LIDAR_OUTPUT_PER_RAY: _ClassVar[LidarOutputMode]
+
 UNKNOWN: ShutterType
 ROLLING_TOP_TO_BOTTOM: ShutterType
 ROLLING_LEFT_TO_RIGHT: ShutterType
@@ -77,6 +88,11 @@ PANDAR128: LidarDeviceType
 AT128: LidarDeviceType
 LIDAR_FLOATING_FILTER_SOURCE_RANGEVIEW: LidarFloatingFilterSource
 LIDAR_FLOATING_FILTER_SOURCE_ANGLE: LidarFloatingFilterSource
+LIDAR_RETURN_UNSPECIFIED: LidarReturnType
+LIDAR_RETURN_FIRST: LidarReturnType
+LIDAR_RETURN_STRONGEST: LidarReturnType
+LIDAR_OUTPUT_POINT_CLOUD: LidarOutputMode
+LIDAR_OUTPUT_PER_RAY: LidarOutputMode
 
 class HarmonizerSessionId(_message.Message):
     __slots__ = ("session_id",)
@@ -419,6 +435,9 @@ class RGBRenderRequest(_message.Message):
         "use_cuda_ipc",
         "ipc_session_id",
         "released_buffer_id",
+        "use_rdma",
+        "rdma_session_id",
+        "rdma_buffer_id",
     )
     SCENE_ID_FIELD_NUMBER: _ClassVar[int]
     RESOLUTION_H_FIELD_NUMBER: _ClassVar[int]
@@ -437,6 +456,9 @@ class RGBRenderRequest(_message.Message):
     USE_CUDA_IPC_FIELD_NUMBER: _ClassVar[int]
     IPC_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     RELEASED_BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
+    USE_RDMA_FIELD_NUMBER: _ClassVar[int]
+    RDMA_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    RDMA_BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
     scene_id: str
     resolution_h: int
     resolution_w: int
@@ -454,6 +476,9 @@ class RGBRenderRequest(_message.Message):
     use_cuda_ipc: bool
     ipc_session_id: str
     released_buffer_id: int
+    use_rdma: bool
+    rdma_session_id: str
+    rdma_buffer_id: int
     def __init__(
         self,
         scene_id: _Optional[str] = ...,
@@ -473,6 +498,9 @@ class RGBRenderRequest(_message.Message):
         use_cuda_ipc: bool = ...,
         ipc_session_id: _Optional[str] = ...,
         released_buffer_id: _Optional[int] = ...,
+        use_rdma: bool = ...,
+        rdma_session_id: _Optional[str] = ...,
+        rdma_buffer_id: _Optional[int] = ...,
     ) -> None: ...
 
 class CameraRenderRequest(_message.Message):
@@ -498,6 +526,9 @@ class CameraRenderRequest(_message.Message):
         "use_cuda_ipc",
         "ipc_session_id",
         "released_buffer_id",
+        "use_rdma",
+        "rdma_session_id",
+        "rdma_buffer_id",
     )
     SCENE_ID_FIELD_NUMBER: _ClassVar[int]
     RESOLUTION_H_FIELD_NUMBER: _ClassVar[int]
@@ -520,6 +551,9 @@ class CameraRenderRequest(_message.Message):
     USE_CUDA_IPC_FIELD_NUMBER: _ClassVar[int]
     IPC_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     RELEASED_BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
+    USE_RDMA_FIELD_NUMBER: _ClassVar[int]
+    RDMA_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    RDMA_BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
     scene_id: str
     resolution_h: int
     resolution_w: int
@@ -541,6 +575,9 @@ class CameraRenderRequest(_message.Message):
     use_cuda_ipc: bool
     ipc_session_id: str
     released_buffer_id: int
+    use_rdma: bool
+    rdma_session_id: str
+    rdma_buffer_id: int
     def __init__(
         self,
         scene_id: _Optional[str] = ...,
@@ -564,6 +601,9 @@ class CameraRenderRequest(_message.Message):
         use_cuda_ipc: bool = ...,
         ipc_session_id: _Optional[str] = ...,
         released_buffer_id: _Optional[int] = ...,
+        use_rdma: bool = ...,
+        rdma_session_id: _Optional[str] = ...,
+        rdma_buffer_id: _Optional[int] = ...,
     ) -> None: ...
 
 class AvailableCamerasRequest(_message.Message):
@@ -670,6 +710,7 @@ class CameraRenderOutput(_message.Message):
         "distance_colormap_vmax_m",
         "format",
         "buffer_id",
+        "bytes_written",
     )
     IMAGE_BYTES_FIELD_NUMBER: _ClassVar[int]
     IMAGE_HEIGHT_FIELD_NUMBER: _ClassVar[int]
@@ -679,6 +720,7 @@ class CameraRenderOutput(_message.Message):
     DISTANCE_COLORMAP_VMAX_M_FIELD_NUMBER: _ClassVar[int]
     FORMAT_FIELD_NUMBER: _ClassVar[int]
     BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
+    BYTES_WRITTEN_FIELD_NUMBER: _ClassVar[int]
     image_bytes: bytes
     image_height: int
     image_width: int
@@ -687,6 +729,7 @@ class CameraRenderOutput(_message.Message):
     distance_colormap_vmax_m: float
     format: str
     buffer_id: int
+    bytes_written: int
     def __init__(
         self,
         image_bytes: _Optional[bytes] = ...,
@@ -697,6 +740,7 @@ class CameraRenderOutput(_message.Message):
         distance_colormap_vmax_m: _Optional[float] = ...,
         format: _Optional[str] = ...,
         buffer_id: _Optional[int] = ...,
+        bytes_written: _Optional[int] = ...,
     ) -> None: ...
 
 class CameraRenderReturn(_message.Message):
@@ -708,22 +752,34 @@ class CameraRenderReturn(_message.Message):
     ) -> None: ...
 
 class RGBRenderReturn(_message.Message):
-    __slots__ = ("image_bytes", "format", "buffer_id")
+    __slots__ = ("image_bytes", "format", "buffer_id", "bytes_written")
     IMAGE_BYTES_FIELD_NUMBER: _ClassVar[int]
     FORMAT_FIELD_NUMBER: _ClassVar[int]
     BUFFER_ID_FIELD_NUMBER: _ClassVar[int]
+    BYTES_WRITTEN_FIELD_NUMBER: _ClassVar[int]
     image_bytes: bytes
     format: str
     buffer_id: int
+    bytes_written: int
     def __init__(
-        self, image_bytes: _Optional[bytes] = ..., format: _Optional[str] = ..., buffer_id: _Optional[int] = ...
+        self,
+        image_bytes: _Optional[bytes] = ...,
+        format: _Optional[str] = ...,
+        buffer_id: _Optional[int] = ...,
+        bytes_written: _Optional[int] = ...,
     ) -> None: ...
 
 class BatchCameraRenderRequest(_message.Message):
-    __slots__ = ("items",)
+    __slots__ = ("items", "prefer_camera_batching")
     ITEMS_FIELD_NUMBER: _ClassVar[int]
+    PREFER_CAMERA_BATCHING_FIELD_NUMBER: _ClassVar[int]
     items: _containers.RepeatedCompositeFieldContainer[BatchCameraRenderRequestItem]
-    def __init__(self, items: _Optional[_Iterable[_Union[BatchCameraRenderRequestItem, _Mapping]]] = ...) -> None: ...
+    prefer_camera_batching: bool
+    def __init__(
+        self,
+        items: _Optional[_Iterable[_Union[BatchCameraRenderRequestItem, _Mapping]]] = ...,
+        prefer_camera_batching: bool = ...,
+    ) -> None: ...
 
 class BatchCameraRenderRequestItem(_message.Message):
     __slots__ = ("camera_name", "request")
@@ -840,18 +896,127 @@ class LidarRenderFilter(_message.Message):
         azimuth_max_gap_deg: _Optional[float] = ...,
     ) -> None: ...
 
+class LidarFiringPatternRequest(_message.Message):
+    __slots__ = ("scene_id", "lidar_id", "frame_start_us", "firing_pattern_id")
+    SCENE_ID_FIELD_NUMBER: _ClassVar[int]
+    LIDAR_ID_FIELD_NUMBER: _ClassVar[int]
+    FRAME_START_US_FIELD_NUMBER: _ClassVar[int]
+    FIRING_PATTERN_ID_FIELD_NUMBER: _ClassVar[int]
+    scene_id: str
+    lidar_id: str
+    frame_start_us: int
+    firing_pattern_id: str
+    def __init__(
+        self,
+        scene_id: _Optional[str] = ...,
+        lidar_id: _Optional[str] = ...,
+        frame_start_us: _Optional[int] = ...,
+        firing_pattern_id: _Optional[str] = ...,
+    ) -> None: ...
+
+class LidarPacketLayout(_message.Message):
+    __slots__ = ("num_packets", "ray_offsets_u32_le", "starts_new_scan_mask_packed", "timestamp_offsets_us")
+    NUM_PACKETS_FIELD_NUMBER: _ClassVar[int]
+    RAY_OFFSETS_U32_LE_FIELD_NUMBER: _ClassVar[int]
+    STARTS_NEW_SCAN_MASK_PACKED_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_OFFSETS_US_FIELD_NUMBER: _ClassVar[int]
+    num_packets: int
+    ray_offsets_u32_le: bytes
+    starts_new_scan_mask_packed: bytes
+    timestamp_offsets_us: bytes
+    def __init__(
+        self,
+        num_packets: _Optional[int] = ...,
+        ray_offsets_u32_le: _Optional[bytes] = ...,
+        starts_new_scan_mask_packed: _Optional[bytes] = ...,
+        timestamp_offsets_us: _Optional[bytes] = ...,
+    ) -> None: ...
+
+class LidarFiringPatternReturn(_message.Message):
+    __slots__ = (
+        "num_rays",
+        "directions_sensor",
+        "timestamp_offsets_us",
+        "num_columns",
+        "num_rows",
+        "firing_pattern_id",
+        "packet_layout",
+        "frame_period_us",
+        "requested_frame_within_scene_time_range",
+    )
+    NUM_RAYS_FIELD_NUMBER: _ClassVar[int]
+    DIRECTIONS_SENSOR_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_OFFSETS_US_FIELD_NUMBER: _ClassVar[int]
+    NUM_COLUMNS_FIELD_NUMBER: _ClassVar[int]
+    NUM_ROWS_FIELD_NUMBER: _ClassVar[int]
+    FIRING_PATTERN_ID_FIELD_NUMBER: _ClassVar[int]
+    PACKET_LAYOUT_FIELD_NUMBER: _ClassVar[int]
+    FRAME_PERIOD_US_FIELD_NUMBER: _ClassVar[int]
+    REQUESTED_FRAME_WITHIN_SCENE_TIME_RANGE_FIELD_NUMBER: _ClassVar[int]
+    num_rays: int
+    directions_sensor: bytes
+    timestamp_offsets_us: bytes
+    num_columns: int
+    num_rows: int
+    firing_pattern_id: str
+    packet_layout: LidarPacketLayout
+    frame_period_us: int
+    requested_frame_within_scene_time_range: bool
+    def __init__(
+        self,
+        num_rays: _Optional[int] = ...,
+        directions_sensor: _Optional[bytes] = ...,
+        timestamp_offsets_us: _Optional[bytes] = ...,
+        num_columns: _Optional[int] = ...,
+        num_rows: _Optional[int] = ...,
+        firing_pattern_id: _Optional[str] = ...,
+        packet_layout: _Optional[_Union[LidarPacketLayout, _Mapping]] = ...,
+        frame_period_us: _Optional[int] = ...,
+        requested_frame_within_scene_time_range: bool = ...,
+    ) -> None: ...
+
 class LidarRenderReturn(_message.Message):
-    __slots__ = ("point_xyzs", "point_intensities", "num_points", "point_xyzs_buffer", "point_intensities_buffer")
+    __slots__ = (
+        "point_xyzs",
+        "point_intensities",
+        "num_points",
+        "point_xyzs_buffer",
+        "point_intensities_buffer",
+        "num_rays",
+        "firing_pattern",
+        "firing_pattern_id",
+        "num_return_layers",
+        "return_types",
+        "ray_distances_m_buffer",
+        "ray_intensities_buffer",
+        "ray_valid_masks_packed",
+    )
     POINT_XYZS_FIELD_NUMBER: _ClassVar[int]
     POINT_INTENSITIES_FIELD_NUMBER: _ClassVar[int]
     NUM_POINTS_FIELD_NUMBER: _ClassVar[int]
     POINT_XYZS_BUFFER_FIELD_NUMBER: _ClassVar[int]
     POINT_INTENSITIES_BUFFER_FIELD_NUMBER: _ClassVar[int]
+    NUM_RAYS_FIELD_NUMBER: _ClassVar[int]
+    FIRING_PATTERN_FIELD_NUMBER: _ClassVar[int]
+    FIRING_PATTERN_ID_FIELD_NUMBER: _ClassVar[int]
+    NUM_RETURN_LAYERS_FIELD_NUMBER: _ClassVar[int]
+    RETURN_TYPES_FIELD_NUMBER: _ClassVar[int]
+    RAY_DISTANCES_M_BUFFER_FIELD_NUMBER: _ClassVar[int]
+    RAY_INTENSITIES_BUFFER_FIELD_NUMBER: _ClassVar[int]
+    RAY_VALID_MASKS_PACKED_FIELD_NUMBER: _ClassVar[int]
     point_xyzs: _containers.RepeatedScalarFieldContainer[float]
     point_intensities: _containers.RepeatedScalarFieldContainer[float]
     num_points: int
     point_xyzs_buffer: bytes
     point_intensities_buffer: bytes
+    num_rays: int
+    firing_pattern: LidarFiringPatternReturn
+    firing_pattern_id: str
+    num_return_layers: int
+    return_types: _containers.RepeatedScalarFieldContainer[LidarReturnType]
+    ray_distances_m_buffer: bytes
+    ray_intensities_buffer: bytes
+    ray_valid_masks_packed: bytes
     def __init__(
         self,
         point_xyzs: _Optional[_Iterable[float]] = ...,
@@ -859,6 +1024,14 @@ class LidarRenderReturn(_message.Message):
         num_points: _Optional[int] = ...,
         point_xyzs_buffer: _Optional[bytes] = ...,
         point_intensities_buffer: _Optional[bytes] = ...,
+        num_rays: _Optional[int] = ...,
+        firing_pattern: _Optional[_Union[LidarFiringPatternReturn, _Mapping]] = ...,
+        firing_pattern_id: _Optional[str] = ...,
+        num_return_layers: _Optional[int] = ...,
+        return_types: _Optional[_Iterable[_Union[LidarReturnType, str]]] = ...,
+        ray_distances_m_buffer: _Optional[bytes] = ...,
+        ray_intensities_buffer: _Optional[bytes] = ...,
+        ray_valid_masks_packed: _Optional[bytes] = ...,
     ) -> None: ...
 
 class LidarRenderRequest(_message.Message):
@@ -871,6 +1044,10 @@ class LidarRenderRequest(_message.Message):
         "dynamic_objects",
         "render_filter",
         "lidar_id",
+        "output_mode",
+        "include_firing_pattern",
+        "firing_pattern_id",
+        "return_types",
     )
     SCENE_ID_FIELD_NUMBER: _ClassVar[int]
     LIDAR_CONFIG_FIELD_NUMBER: _ClassVar[int]
@@ -880,6 +1057,10 @@ class LidarRenderRequest(_message.Message):
     DYNAMIC_OBJECTS_FIELD_NUMBER: _ClassVar[int]
     RENDER_FILTER_FIELD_NUMBER: _ClassVar[int]
     LIDAR_ID_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_MODE_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_FIRING_PATTERN_FIELD_NUMBER: _ClassVar[int]
+    FIRING_PATTERN_ID_FIELD_NUMBER: _ClassVar[int]
+    RETURN_TYPES_FIELD_NUMBER: _ClassVar[int]
     scene_id: str
     lidar_config: LidarSpec
     frame_start_us: int
@@ -888,6 +1069,10 @@ class LidarRenderRequest(_message.Message):
     dynamic_objects: _containers.RepeatedCompositeFieldContainer[DynamicObject]
     render_filter: LidarRenderFilter
     lidar_id: str
+    output_mode: LidarOutputMode
+    include_firing_pattern: bool
+    firing_pattern_id: str
+    return_types: _containers.RepeatedScalarFieldContainer[LidarReturnType]
     def __init__(
         self,
         scene_id: _Optional[str] = ...,
@@ -898,6 +1083,10 @@ class LidarRenderRequest(_message.Message):
         dynamic_objects: _Optional[_Iterable[_Union[DynamicObject, _Mapping]]] = ...,
         render_filter: _Optional[_Union[LidarRenderFilter, _Mapping]] = ...,
         lidar_id: _Optional[str] = ...,
+        output_mode: _Optional[_Union[LidarOutputMode, str]] = ...,
+        include_firing_pattern: bool = ...,
+        firing_pattern_id: _Optional[str] = ...,
+        return_types: _Optional[_Iterable[_Union[LidarReturnType, str]]] = ...,
     ) -> None: ...
 
 class DynamicObjectTrack(_message.Message):
@@ -990,3 +1179,11 @@ class ServerConfig(_message.Message):
     SERVER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     server_config: _containers.ScalarMap[str, str]
     def __init__(self, server_config: _Optional[_Mapping[str, str]] = ...) -> None: ...
+
+class PrefetchSceneRequest(_message.Message):
+    __slots__ = ("scene_id", "wait_for_capacity")
+    SCENE_ID_FIELD_NUMBER: _ClassVar[int]
+    WAIT_FOR_CAPACITY_FIELD_NUMBER: _ClassVar[int]
+    scene_id: str
+    wait_for_capacity: bool
+    def __init__(self, scene_id: _Optional[str] = ..., wait_for_capacity: bool = ...) -> None: ...

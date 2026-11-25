@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Python bindings for camera kernel operations.
-
-This module provides thin wrappers around Slang camera kernels via slangtorch.
-All functions are differentiable and support PyTorch autograd.
-"""
+"""Python bindings for camera projection and ray kernels."""
 
 import inspect
 
@@ -1190,6 +1186,64 @@ def generate_image_points(
     return image_points
 
 
+def camera_rays_to_world_rays_batch(
+    camera_rays: Tensor,
+    translations: Tensor,
+    rotations: Tensor,
+) -> Tensor:
+    """Transform camera-local directions by a batch of poses.
+
+    All inputs must be contiguous float32 tensors on the same CUDA device.
+    This operation does not record gradients. It uses that device's current
+    CUDA stream.
+
+    Args:
+        camera_rays: (N, 3) directions, with N > 0.
+        translations: (B, 3) camera origins in world coordinates.
+        rotations: (B, 4) unit camera-to-world quaternions in XYZW order.
+
+    Returns:
+        Tensor of shape (B, N, 6), with each ray stored as [origin, direction].
+
+    Raises:
+        TypeError: An input is not float32.
+        ValueError: Shape, device, contiguity, or nonempty-grid requirements fail.
+    """
+    if camera_rays.ndim != 2 or camera_rays.shape[1] != 3:
+        raise ValueError(f"camera_rays must have shape (N, 3), got {tuple(camera_rays.shape)}")
+    if camera_rays.shape[0] == 0:
+        raise ValueError("camera_rays must not be empty")
+    if translations.ndim != 2 or translations.shape[1] != 3:
+        raise ValueError(f"translations must have shape (B, 3), got {tuple(translations.shape)}")
+    if rotations.shape != (translations.shape[0], 4):
+        raise ValueError(f"rotations must have shape ({translations.shape[0]}, 4), got {tuple(rotations.shape)}")
+    tensors = (camera_rays, translations, rotations)
+    if camera_rays.device.type != "cuda":
+        raise ValueError("camera_rays must be on a CUDA device")
+    if any(tensor.dtype != torch.float32 for tensor in tensors):
+        raise TypeError("camera_rays, translations, and rotations must be float32")
+    if any(tensor.device != camera_rays.device for tensor in tensors):
+        raise ValueError("camera_rays, translations, and rotations must be on the same device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("camera_rays, translations, and rotations must be contiguous")
+
+    batch = translations.shape[0]
+    ray_count = camera_rays.shape[0]
+    world_rays = torch.empty((batch * ray_count, 6), device=camera_rays.device, dtype=torch.float32)
+    blocks = div_up(batch * ray_count, _THREADS_PER_BLOCK)
+    if blocks > 0:
+        with torch.cuda.device(camera_rays.device):
+            camera_slang.camera_rays_to_world_rays_batch_kernel(
+                (_THREADS_PER_BLOCK, 1, 1),
+                (blocks, 1, 1),
+                camera_rays,
+                translations,
+                rotations,
+                world_rays,
+            )
+    return world_rays.reshape(batch, ray_count, 6)
+
+
 __all__ = [
     "camera_rays_to_image_points",
     "image_points_to_camera_rays",
@@ -1198,4 +1252,5 @@ __all__ = [
     "image_points_to_world_rays_static_pose",
     "image_points_to_world_rays_shutter_pose",
     "generate_image_points",
+    "camera_rays_to_world_rays_batch",
 ]

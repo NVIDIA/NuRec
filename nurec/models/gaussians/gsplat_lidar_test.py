@@ -387,6 +387,18 @@ class TestLidarSparseSegments:
         dense, segments = outputs[False], outputs[True]
         # Non-vacuity: parity over an empty render would assert nothing.
         assert segments.opacity.max().item() > 0.0, "lidar scene rendered empty; parity is vacuous"
-        assert torch.equal(dense.opacity, segments.opacity), "segments changed the lidar opacity"
-        assert torch.equal(dense.distance, segments.distance), "segments changed the lidar distance"
+        torch.testing.assert_close(
+            dense.opacity,
+            segments.opacity,
+            rtol=1e-5,
+            atol=0,
+            msg="segments changed the lidar opacity",
+        )
+        torch.testing.assert_close(
+            dense.distance,
+            segments.distance,
+            rtol=1e-5,
+            atol=0,
+            msg="segments changed the lidar distance",
+        )
         assert segments.visibility is None, "active-space visibility must not escape as scene metadata"

@@ -18,7 +18,7 @@ import torch
 
 from einops import rearrange
 
-from nurec.utils.morton import _encode_morton_3d
+from nurec.utils.morton import _encode_morton_3d, morton_sort_order
 
 
 _MORTON_AXIS_LIMIT = 1 << 21
@@ -266,12 +266,17 @@ def _select_static_voxel_representatives(
 
     shifted_voxels = unique_voxels - unique_voxels.amin(dim=0, keepdim=True)
     if int(shifted_voxels.amax().item()) >= _MORTON_AXIS_LIMIT:
-        raise ValueError(
-            "Voxel-coordinate span exceeds the shared 21-bit Morton encoder after per-sample minimum offset; "
-            f"maximum shifted coordinate is {int(shifted_voxels.amax().item())}."
-        )
-    morton = _encode_morton_3d(shifted_voxels[:, 0], shifted_voxels[:, 1], shifted_voxels[:, 2])
-    morton_order = morton.argsort(stable=True)
+        # A finite depth outlier can exceed one code segment even in a small
+        # scene. Use the shared two-segment ordering without changing metric
+        # voxel membership or wrapping the high coordinate bits. These are
+        # already rounded integer voxels; float64 represents every coordinate
+        # in the shared 42-bit range exactly, so its floor cannot requantize them.
+        morton_order = morton_sort_order(
+            shifted_voxels.double(), voxel_size=1.0, label="Static-token voxel coordinates"
+        ).order
+    else:
+        morton = _encode_morton_3d(shifted_voxels[:, 0], shifted_voxels[:, 1], shifted_voxels[:, 2])
+        morton_order = morton.argsort(stable=True)
     return representative_indices[morton_order], num_voxels
 
 

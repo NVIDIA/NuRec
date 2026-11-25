@@ -37,7 +37,7 @@ class _GaussianModel(torch.nn.Module):
         self.gaussians_nodes = torch.nn.ModuleDict({"background": _ScaleNode()})
         self.gaussians_strategy = _SerializationGuardStrategy()
 
-    def raise_if_mcmc_publication_failed(self) -> None:
+    def raise_if_publication_failed(self) -> None:
         pass
 
 
@@ -49,7 +49,7 @@ def _serialized_artifact_checkpoint(compression_enabled: bool) -> dict:
         artifact_config=artifact_config,
         checkpoint=None,
     )
-    model = types.SimpleNamespace(raise_if_mcmc_publication_failed=lambda: None)
+    model = types.SimpleNamespace(raise_if_publication_failed=lambda: None)
     system = types.SimpleNamespace(artifact_cache=artifact_cache, model=model)
     checkpoint = {"state_dict": {"model.weight": torch.ones(1, dtype=torch.float32)}}
 
@@ -82,7 +82,7 @@ def test_normal_artifact_checkpoint_honors_fp16_setting():
 def test_render_and_loss_entrypoints_reject_failed_publication_before_work(entrypoint) -> None:
     failure = RuntimeError("unsafe MCMC state")
     gate = MagicMock(side_effect=failure)
-    system = cast(GaussiansSystem, types.SimpleNamespace(_raise_if_mcmc_publication_failed=gate))
+    system = cast(GaussiansSystem, types.SimpleNamespace(_raise_if_publication_failed=gate))
 
     with pytest.raises(RuntimeError, match="unsafe MCMC state"):
         entrypoint(system)
@@ -97,7 +97,7 @@ def test_publication_gate_uses_broadcast_exceptions_in_ddp() -> None:
         GaussiansSystem,
         types.SimpleNamespace(
             _trainer=trainer,
-            _raise_if_mcmc_publication_failed=gate,
+            _raise_if_publication_failed=gate,
         ),
     )
     sentinel = object()

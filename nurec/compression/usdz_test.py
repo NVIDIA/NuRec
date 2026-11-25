@@ -697,11 +697,29 @@ def test_decompress_usdz_restores_checkpoint_and_sidecars(tmp_path, monkeypatch)
     assert torch.equal(checkpoint["state_dict"]["model.weight"], torch.tensor([5.0]))
 
 
-def test_usdz_archive_round_trips_through_real_codec(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_table", [False, True])
+def test_usdz_archive_round_trips_through_real_codec(tmp_path, monkeypatch, with_table):
     input_path = tmp_path / "scene.usdz"
     compact_path = tmp_path / "scene.compact.usdz"
     restored_path = tmp_path / "scene.restored.usdz"
     state_dict = _small_gaussian_state()
+    if with_table:
+        prefix = "model.gaussians_nodes.dynamic_deformables"
+        state_dict = {
+            key.replace("model.gaussians_nodes.background", prefix): value for key, value in state_dict.items()
+        }
+        n = len(state_dict[prefix + ".positions"])
+        table = prefix + ".deformation_table."
+        state_dict.update(
+            {
+                prefix + ".gaussian_cuboid_ids": torch.zeros(n, dtype=torch.int64),
+                table + "global_row_ids": torch.arange(n - 1, -1, -1),
+                table + "storage.row_start_columns": torch.zeros(n, dtype=torch.int64),
+                table + "storage.row_end_columns": torch.zeros(n, dtype=torch.int64),
+                table + "storage.row_group_ids": torch.zeros(n, dtype=torch.int64),
+                table + "storage.columns.0.values": torch.arange(n * 7, dtype=torch.float32).reshape(n, 7),
+            }
+        )
     checkpoint = {"state_dict": state_dict, "epoch": 1}
     with zipfile.ZipFile(input_path, "w") as zf:
         zf.writestr("checkpoint.ckpt", _torch_save_bytes(checkpoint))
@@ -737,6 +755,8 @@ def test_usdz_archive_round_trips_through_real_codec(tmp_path, monkeypatch):
         assert isinstance(got, torch.Tensor)
         assert got.shape == expected.shape
         assert torch.isfinite(got.float()).all()
+        if ".deformation_table.storage." in key:
+            assert torch.equal(got, expected)
 
 
 def _small_gaussian_state() -> dict[str, torch.Tensor]:

@@ -25,7 +25,8 @@ from nurec.libs.losses.models.render_losses import (
     NormalLoss,
     RoadGaussiansLoss,
 )
-from nurec.libs.losses.orchestration.config import LossItemConfig
+from nurec.libs.losses.orchestration.config import LossConfig, LossItemConfig
+from nurec.libs.losses.orchestration.loss_accumulator import LossAccumulator
 from nurec.models.gaussians.gaussians_model import RigidGaussianModel
 from nurec.utils.batch import CameraFrameLabels, DataAndRenderingBatch, DataBatch, FrameMeta
 from nurec.utils.types import GaussiansCompositeReturn, GaussiansRenderReturn, RayFlags
@@ -797,6 +798,10 @@ class TestDisabledLayerGuards(unittest.TestCase):
             ({"rotation_lambda": -1.0}, False),
             ({"rotation_lambda": 1e-32}, False),
             ({"rotation_lambda": 1e40}, False),
+            ({"rotation_lambda": float("inf")}, False),
+            ({"rotation_lambda": float("nan")}, False),
+            ({"rotation_lambda": torch.finfo(torch.float32).eps}, True),
+            ({"rotation_lambda": torch.finfo(torch.float32).max}, True),
         ):
             with self.subTest(overrides=overrides):
                 loss = self._road_loss(use_cuda=True, **overrides)
@@ -860,6 +865,41 @@ class TestDisabledLayerGuards(unittest.TestCase):
         loss.apply_loss_fn.assert_called_once()
         abs_grad = torch.autograd.grad(actual.reduced_value, rotations)[0]
         self.assertFalse(bool(abs_grad.any()))
+
+        # Exercise the real production entry with a fresh native forward. Its
+        # independent route must retain the same abs zero and rotation gradient.
+        config = LossConfig.model_validate(
+            {
+                "road_gaussians": {
+                    "fn": "abs",
+                    "lambda_": 1.0,
+                    "reduce": {"name": "mean"},
+                    "layer_name": "road",
+                    "rotation_lambda": 1e-32,
+                    "n_samples": 1,
+                    "min": 0.0,
+                    "range": 0.0,
+                    "grid_len": 1.0,
+                }
+            }
+        )
+        accumulator = LossAccumulator(config, MockTrainerConfig())
+        self.assertEqual(accumulator.in_accumulator.losses, [])
+        self.assertEqual(len(accumulator.accumulator_losses), 1)
+        producer = cast(RoadGaussiansLoss, accumulator.accumulator_losses[0])
+        producer.supported_model_types = (type(model),)
+        producer._make_random_values = MagicMock(return_value=torch.zeros(1, device="cuda"))
+        model.device = positions.device
+        model.gaussians_nodes["road"]._positions = positions
+        model.gaussians_nodes["road"]._rotations = rotations
+        target = _camera_target()
+        target.rendering.camera.poses_tquat_startend = cam.reshape(1, 1, 7).expand(1, 2, 7)
+        accumulated = accumulator(step=0, model=model, results=GaussiansCompositeReturn(), target=target)
+        total = accumulated.compute_total()
+        torch.testing.assert_close(total, actual.reduced_value)
+        torch.testing.assert_close(accumulated.weighted_value(producer.name), actual.reduced_value)
+        accumulated_grad = torch.autograd.grad(total, rotations)[0]
+        torch.testing.assert_close(accumulated_grad, abs_grad, rtol=0, atol=0)
 
     def test_road_gaussians_scalar_epilogue_value_and_gradient_parity(self):
         # End to end through the native kernels: the fast path must reproduce

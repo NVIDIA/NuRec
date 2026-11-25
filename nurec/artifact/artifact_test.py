@@ -6,11 +6,14 @@
 import hashlib
 import io
 import json
+import os
 import tempfile
+import time
 import unittest
 import zipfile
 
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -30,6 +33,30 @@ def _make_usdz(entries: dict[str, bytes]) -> Path:
     return Path(tmp.name)
 
 
+def _settled_footprint(artifact: Artifact) -> str:
+    """Hash as if the file had been untouched for a minute, so the digest is trusted on its stat.
+
+    ctime cannot be back-dated the way mtime can, so the racy-clean window is cleared by hashing
+    "in the future" rather than by ageing the file.
+    """
+    with mock.patch("time.time", return_value=time.time() + 60.0):
+        return artifact.sha256_footprint
+
+
+def _rewrite_in_a_later_clock_tick(path: Path, data: bytes) -> None:
+    """Write ``data`` in place so that the file's timestamps differ from before.
+
+    File timestamps come from the kernel's coarse clock, so a rewrite within the same tick as the
+    previous write leaves mtime and ctime bit-identical; retry until the tick has moved.
+    """
+    ctime_ns = path.stat().st_ctime_ns
+    while True:
+        path.write_bytes(data)
+        if path.stat().st_ctime_ns != ctime_ns:
+            return
+        time.sleep(0.005)
+
+
 class TestSha256Footprint(unittest.TestCase):
     def test_computes_and_caches_source_digest(self):
         path = _make_usdz({"payload.bin": b"original"})
@@ -44,6 +71,86 @@ class TestSha256Footprint(unittest.TestCase):
 
         artifact.clear_cache()
         self.assertEqual(artifact.sha256_footprint, hashlib.sha256(b"changed").hexdigest())
+
+    def test_footprint_is_current_needs_a_cached_digest(self):
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        self.assertFalse(Artifact(path).footprint_is_current())
+
+    def test_footprint_is_current_for_an_untouched_file(self):
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+        _settled_footprint(artifact)
+
+        self.assertTrue(artifact.footprint_is_current())
+        artifact.clear_cache()
+        self.assertFalse(artifact.footprint_is_current())
+
+    def test_footprint_is_racy_right_after_the_file_was_written(self):
+        # Written and hashed within the racy window: timestamp granularity could hide a rewrite in between.
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+        artifact.sha256_footprint
+
+        self.assertFalse(artifact.footprint_is_current())
+
+    def test_footprint_is_stale_after_a_same_size_rewrite(self):
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+        digest = _settled_footprint(artifact)
+
+        _rewrite_in_a_later_clock_tick(path, path.read_bytes()[:-1] + b"?")  # same size, other content
+
+        self.assertFalse(artifact.footprint_is_current())
+        self.assertNotEqual(Artifact(path).sha256_footprint, digest)
+
+    def test_footprint_is_stale_after_a_replacement_that_preserves_size_and_mtime(self):
+        # `cp -p` / `rsync -t` / rename into place: same size and mtime, but a new inode and ctime.
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+        digest = _settled_footprint(artifact)
+        before = path.stat()
+
+        replacement = Path(tempfile.NamedTemporaryFile(dir=path.parent, delete=False).name)
+        replacement.write_bytes(path.read_bytes()[:-1] + b"?")
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+
+        after = path.stat()
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.assertFalse(artifact.footprint_is_current())
+        self.assertNotEqual(Artifact(path).sha256_footprint, digest)
+
+    def test_footprint_is_stale_after_an_in_place_rewrite_with_restored_mtime(self):
+        # Same inode, size and mtime (`touch -r` after the write): only ctime tells.
+        path = _make_usdz({"payload.bin": b"x"})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+        _settled_footprint(artifact)
+        before = path.stat()
+
+        _rewrite_in_a_later_clock_tick(path, path.read_bytes()[:-1] + b"?")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        after = path.stat()
+        self.assertEqual(
+            (after.st_ino, after.st_size, after.st_mtime_ns), (before.st_ino, before.st_size, before.st_mtime_ns)
+        )
+        self.assertFalse(artifact.footprint_is_current())
+
+    def test_footprint_is_stale_when_the_file_is_gone(self):
+        path = _make_usdz({"payload.bin": b"x"})
+        artifact = Artifact(path)
+        _settled_footprint(artifact)
+
+        path.unlink()
+
+        self.assertFalse(artifact.footprint_is_current())
 
 
 class TestCheckpointAccess(unittest.TestCase):
@@ -73,6 +180,71 @@ class TestCheckpointAccess(unittest.TestCase):
         self.assertFalse(artifact.is_compact)
         with self.assertRaises(KeyError):
             artifact.checkpoint
+
+    def test_open_checkpoint_reads_a_stored_member_in_place(self):
+        payload = bytes(range(256)) * 4096 + b"tail"
+        path = _make_usdz({"checkpoint.ckpt": payload, "after.bin": b"z" * 100})
+        self.addCleanup(path.unlink, missing_ok=True)
+        artifact = Artifact(path)
+
+        with artifact.open_checkpoint() as checkpoint:
+            self.assertEqual(checkpoint.seek(0, io.SEEK_END), len(payload))
+            self.assertEqual(checkpoint.tell(), len(payload))
+            checkpoint.seek(0)
+            self.assertEqual(checkpoint.read(), payload)
+            checkpoint.seek(1000)
+            buffer = bytearray(5000)
+            self.assertEqual(checkpoint.readinto(buffer), 5000)
+            self.assertEqual(bytes(buffer), payload[1000:6000])
+            checkpoint.seek(-4, io.SEEK_END)
+            self.assertEqual(checkpoint.read(), b"tail")
+            self.assertEqual(checkpoint.read(1), b"")
+        self.assertTrue(checkpoint.closed)
+        self.assertEqual(artifact.checkpoint.read(), payload)
+
+    def test_open_checkpoint_rejects_a_corrupted_stored_member(self):
+        # One flipped payload byte; sizes, headers and the recorded CRC are untouched. The clean
+        # member of the test above passes the same check.
+        payload = bytes(range(256)) * 4096
+        path = _make_usdz({"checkpoint.ckpt": payload})
+        self.addCleanup(path.unlink, missing_ok=True)
+        data = bytearray(path.read_bytes())
+        start = data.index(payload)
+        data[start + 12345] ^= 0xFF
+        path.write_bytes(data)
+
+        with self.assertRaisesRegex(zipfile.BadZipFile, "Bad CRC-32 for file 'checkpoint.ckpt'"):
+            Artifact(path).open_checkpoint()
+        with Artifact(path).open_checkpoint(verify_crc=False) as checkpoint:
+            self.assertEqual(checkpoint.read(), bytes(data[start : start + len(payload)]))
+
+    def test_open_checkpoint_falls_back_to_a_copy_for_a_compressed_member(self):
+        payload = b"compressible " * 1000
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("checkpoint.ckpt", payload)
+        tmp = tempfile.NamedTemporaryFile(suffix=".usdz", delete=False)
+        tmp.write(buf.getvalue())
+        tmp.close()
+        path = Path(tmp.name)
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        with Artifact(path).open_checkpoint() as checkpoint:
+            self.assertEqual(checkpoint.read(), payload)
+
+    def test_open_checkpoint_rejects_compact_usdz(self):
+        path = _make_usdz({"compact.safetensors": b"payload"})
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        with self.assertRaisesRegex(ValueError, "compact USDZ artifacts do not contain checkpoint.ckpt"):
+            Artifact(path).open_checkpoint()
+
+    def test_open_checkpoint_keeps_zip_error_when_missing(self):
+        path = _make_usdz({})
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        with self.assertRaises(KeyError):
+            Artifact(path).open_checkpoint()
 
 
 class TestFiringPatterns(unittest.TestCase):

@@ -26,7 +26,7 @@ from torch import nn
 
 import nurec.models.gaussians.collect as collect
 
-from ncore.data import RowOffsetStructuredSpinningLidarModelParameters
+from ncore.data import RowOffsetStructuredSpinningLidarModelParameters, ShutterType
 from ncore.sensors import RowOffsetStructuredSpinningLidarModel
 from nurec.config.model import (
     DeformableGaussiansLayerConfig,
@@ -61,6 +61,7 @@ from nurec.models.tracks_calib import (
     CompositeTracksCalib,
     DirectTracksCalib,
     ElevationAwareUnicycleTracksCalib,
+    StaticTracksCalib,
     make_row_grad_hook,
 )
 from nurec.models.utils import ExpActivation, get_activation, update_module_step
@@ -703,14 +704,16 @@ class BaseGaussianModel(BaseModel, ABC):
         """Return the current owner-local runtime scene, if materialized."""
         return getattr(self, "_mcmc_scene", None)
 
-    def mark_mcmc_publication_failed(self) -> None:
+    def mark_publication_failed(self) -> None:
         """Latch an unrecoverable post-gsplat publication failure."""
-        self._mcmc_publication_failed = True
+        self._publication_failed = True
 
-    def raise_if_mcmc_publication_failed(self) -> None:
+    def raise_if_publication_failed(self) -> None:
         """Reject later refinement or checkpointing after partial publication."""
-        if getattr(self, "_mcmc_publication_failed", False):
-            raise RuntimeError("MCMC publication previously failed; model state is unsafe to continue or checkpoint")
+        if getattr(self, "_publication_failed", False):
+            raise RuntimeError(
+                "Gaussian publication previously failed; model state is unsafe to continue or checkpoint"
+            )
 
     def register_mcmc_parameter_hooks(self, name: str, parameter: nn.Parameter) -> None:
         """Attach model-owned hooks before an MCMC topology update installs a replacement parameter."""
@@ -1142,6 +1145,12 @@ class BaseGaussianModel(BaseModel, ABC):
             self.overriden_buffers = {}
             self.overriden_state = {}
 
+    def discard_saved_training_parameters(self) -> None:
+        """Release a validation/edit rollback snapshot without restoring it."""
+        self.overriden_parameters = {}
+        self.overriden_buffers = {}
+        self.overriden_state = {}
+
     def get_number_of_gaussians_per_track(self) -> dict[str, int]:
         """
         Returns the number of gaussians, if tracks are available this is returned per track.
@@ -1228,9 +1237,7 @@ class SHGaussianModel(BaseGaussianModel):
 
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
-        # Auto-attach the fourier-freeze backward hook every time features_albedo is
-        # rebound (initialization, MCMC remove/add, PLY load). Hook captures self, so
-        # it reads the current global_step and config threshold dynamically.
+        # Reattach on parameter replacement without keeping the model alive.
         if (
             name == "features_albedo"
             and isinstance(value, nn.Parameter)
@@ -1238,7 +1245,13 @@ class SHGaussianModel(BaseGaussianModel):
             and getattr(self, "fourier_features_dim", 1) > 1
             and getattr(getattr(self, "config", None), "fourier_freeze_until_step", 0) > 0
         ):
-            value.register_hook(self._fourier_freeze_grad_hook)
+            model_ref = weakref.ref(self)
+
+            def freeze_fourier_grad(grad: torch.Tensor) -> torch.Tensor:
+                model = model_ref()
+                return grad if model is None else model._fourier_freeze_grad_hook(grad)
+
+            value.register_hook(freeze_fourier_grad)
 
     def _fourier_freeze_grad_hook(self, grad: torch.Tensor) -> torch.Tensor:
         # Zero gradient on temporal Fourier bands (features_albedo[..., 1:, :]) until
@@ -1742,6 +1755,10 @@ class RigidGaussianModel(SHGaussianModel):
         return source.tracks_calib(source.cuboid_tracks)
 
     def create_tracks_edit_from_cuboid_tracks(self, edited_cuboid_tracks: CuboidTracks) -> LayerTrackIds.Edit:
+        edited_track_ids = unpack_optional(edited_cuboid_tracks.tracks_id)
+        if len(set(edited_track_ids)) != len(edited_track_ids):
+            raise ValueError("Edited cuboid tracks must have unique track IDs")
+
         # Edits use the owner's current track indices, including inserted actors.
         # A light layer may have no Gaussians for an inserted track; its Gaussian
         # rows are filtered later without consulting its appearance-frame table.
@@ -1752,7 +1769,7 @@ class RigidGaussianModel(SHGaussianModel):
             owner_index_by_id.setdefault(track_id, index)
         existing_cuboid_tracks = CuboidTracks.Ops.subset_from_mask(
             edited_cuboid_tracks,
-            torch.tensor([t in owner_index_by_id for t in edited_cuboid_tracks.tracks_id], dtype=torch.bool),
+            torch.tensor([track_id in owner_index_by_id for track_id in edited_track_ids], dtype=torch.bool),
         )
 
         # Preserve edited-track order while mapping each entry to the owner's
@@ -1965,11 +1982,12 @@ class RigidGaussianModel(SHGaussianModel):
         prepares a fresh result in the caller's grad/inference context.
         """
         source = self.get_motion_source()
-        motion_data = (
-            source._get_edited_motion_data(tracks_edit)
-            if tracks_edit is not None and tracks_edit.mapping.shape[0] > 0
-            else source._get_calibrated_motion_data()
-        )
+        edited = tracks_edit is not None and tracks_edit.mapping.shape[0] > 0
+        if edited:
+            assert tracks_edit is not None
+            motion_data = source._get_edited_motion_data(tracks_edit)
+        else:
+            motion_data = source._get_calibrated_motion_data()
         poses, keep_mask, timestamps_us = source._get_interpolated_poses(
             rendering_data,
             frustum_cull,
@@ -1978,16 +1996,32 @@ class RigidGaussianModel(SHGaussianModel):
         )
         track_time_data = None
         if not source.is_static:
-            track_time_data = collect.TrackTimeData(
-                tracks_timestamps_us=motion_data[1],
-                tracks_packinfo=motion_data[2],
-                max_positive_timestamp_gap_us=motion_data[4],
-            )
+            track_time_data = source._segment_track_time_data(edited, motion_data[1], motion_data[2], motion_data[4])
         return PreparedRigidMotion(
             poses=poses,
             keep_mask=keep_mask,
             timestamps_us=timestamps_us,
             track_time_data=track_time_data,
+        )
+
+    def _segment_track_time_data(
+        self,
+        edited: bool,
+        timestamps: torch.Tensor,
+        packinfo: torch.Tensor,
+        gaps: torch.Tensor,
+    ) -> collect.TrackTimeData | None:
+        """Return segment lifetimes, or None when no host-side time filtering is needed.
+
+        StaticTracksCalib freezes all tracks to the same scene-wide time interval,
+        extended by 1000 s on either end. Keep the whole layer in segment selection;
+        pose interpolation still masks tracks outside its accepted time range. Edits
+        and custom calibration subclasses retain their actual topology and times.
+        """
+        if not edited and type(self.get_motion_tracks_calib()) is StaticTracksCalib:
+            return None
+        return collect.TrackTimeData(
+            tracks_timestamps_us=timestamps, tracks_packinfo=packinfo, max_positive_timestamp_gap_us=gaps
         )
 
     def _get_calibrated_motion_data(
@@ -2052,6 +2086,8 @@ class RigidGaussianModel(SHGaussianModel):
     ) -> None:
         """Keep this layer's selected Gaussian rows independently of shared motion."""
         tracks_edit = unpack_optional(context.tracks_edit)
+        if tracks_edit.mapping.shape[0] == self.get_motion_source().cuboid_tracks.n_tracks:
+            return
         with ScopedTimer("RigidGaussianModel/edit_mapping"):
             gaussian_cuboid_ids = gaussian_nodes_parameters["gaussian_cuboid_ids"]
             tracks_keep_mask = torch.zeros(
@@ -2116,6 +2152,7 @@ class RigidGaussianModel(SHGaussianModel):
 
         # Detect if this is a LiDAR sensor (for nearest neighbor selection).
         is_lidar = False
+        is_global_camera = False
         if rendering_data.sensor_model_parameters is not None and len(rendering_data.sensor_model_parameters) > 0:
             sensor_model = rendering_data.sensor_model_parameters[0]
             # Check for the Parameters type (runtime data).
@@ -2123,16 +2160,19 @@ class RigidGaussianModel(SHGaussianModel):
                 sensor_model,
                 (RowOffsetStructuredSpinningLidarModel, RowOffsetStructuredSpinningLidarModelParameters),
             )
+            is_global_camera = not is_lidar and getattr(sensor_model, "shutter_type", None) == ShutterType.GLOBAL
 
         frame_start_us, frame_end_us = BaseGaussianModel.get_frame_window(rendering_data)
         frame_exposure_us = frame_end_us - frame_start_us
 
-        ## Raycasting based timestamp estimation
-        # Get accurate timestamps for Camera and LiDAR, if rays timestamps are available
+        # Global-shutter inference uses frame start; other paths retain timestamp estimation.
         with ScopedTimer("RigidGaussianModel/get_tracks_timestamps_estimation_data"):
             tracks_timestamps_data: collect.TracksTimestampsData
-            default_timestamp = self.get_frame_timestamp(rendering_data)
-            if rendering_data.rays_timestamps_us is not None and n_tracks > 0:
+            if not is_training_batch and is_global_camera and not self.training and n_tracks > 0:
+                default_timestamp = frame_start_us
+                tracks_timestamps_data = collect.TracksTimestampsGlobalData(timestamp=default_timestamp)
+            elif rendering_data.rays_timestamps_us is not None and n_tracks > 0:
+                default_timestamp = self.get_frame_timestamp(rendering_data)
                 # Inference-only: subsample the estimation ray bundle. Gated on `not
                 # self.training` so training always uses full estimation even if a config
                 # sets the stride; the knob is meant for serve/render only.
@@ -2158,8 +2198,8 @@ class RigidGaussianModel(SHGaussianModel):
                     rays_timestamps = rendering_data.rays_timestamps_us[:, ::row_stride, ::col_stride, :].reshape(-1)
                 else:
                     estimation_rays = rendering_data.rays
-                    rays = estimation_rays.view(-1, 6)
-                    rays_timestamps = rendering_data.rays_timestamps_us.view(-1)
+                    rays = estimation_rays.reshape(-1, 6)
+                    rays_timestamps = rendering_data.rays_timestamps_us.reshape(-1)
                 tracks_timestamps_data = collect.TracksTimestampsEstimationData(
                     rays=rays,
                     rays_timestamps=rays_timestamps,
@@ -2175,6 +2215,7 @@ class RigidGaussianModel(SHGaussianModel):
                 )
             else:
                 # Estimation is disabled or no ray timestamps are available: use one timestamp for all tracks.
+                default_timestamp = self.get_frame_timestamp(rendering_data)
                 tracks_timestamps_data = collect.TracksTimestampsGlobalData(
                     timestamp=default_timestamp,
                 )
@@ -2193,8 +2234,8 @@ class RigidGaussianModel(SHGaussianModel):
             )
 
             # Timestamp estimation and pose sampling strategy:
-            # - The query timestamp is either a projection-based per-track estimate (if ray timestamps
-            #   are available) or the frame midpoint fallback.
+            # - Global-shutter inference queries frame start. Other paths estimate each track's
+            #   timestamp from rays when available, or use the frame midpoint.
             # - Ordinary interpolation returns the query timestamp. LiDAR nearest-neighbor pose lookup
             #   deliberately keeps that sensor query timestamp for DeformNet: the selected annotation is
             #   the nearest pose approximation to the queried sensor time, rather than a change to the
@@ -2295,8 +2336,13 @@ class RigidGaussianModel(SHGaussianModel):
         return optimizers
 
     def update_step_train_batch_start(self, epoch: int, global_step: int, system, **kwargs) -> dict[str, torch.Tensor]:
+        # The base advances the Fourier-freeze counter and steps ``time_embed``; without it the
+        # freeze hook keeps the temporal Fourier bands masked for the whole run. Subclasses reach
+        # ``tracks_calib`` through this method, so each module is stepped exactly once.
+        additional_parameters = super().update_step_train_batch_start(epoch, global_step, system, **kwargs)
         self.global_step = global_step
-        return update_module_step(self.tracks_calib, epoch, global_step, system)
+        additional_parameters |= update_module_step(self.tracks_calib, epoch, global_step, system)
+        return additional_parameters
 
     def get_track_poses_and_dims(self, track_id: str) -> Optional[Tuple[lt.SE3, torch.Tensor]]:
         """
@@ -3180,6 +3226,11 @@ class DeformableGaussianModel(RigidGaussianModel):
         self._inserted_track_indices.clear()
         super().restore_training_parameters()
 
+    def discard_saved_training_parameters(self) -> None:
+        """Release deform-table rollback storage while keeping the inserted edit state."""
+        self._pre_insert_deform_tables = None
+        super().discard_saved_training_parameters()
+
     def freeze_tracks(self, frozen_track_indices: Sequence[int]) -> None:
         """Freeze this deformable node's frozen tracks — the rigid params
         (``track_albedos``/``track_scales``, calibration) via the base, plus
@@ -3426,7 +3477,8 @@ class DeformableGaussianModel(RigidGaussianModel):
                 epoch, global_step - self.config.deformnet_start_iteration, system
             )
 
-        return update_module_step(self.tracks_calib, epoch, global_step, system)
+        # Rigid base: Fourier-freeze counter, ``time_embed`` and ``tracks_calib``, once each.
+        return super().update_step_train_batch_start(epoch, global_step, system, **kwargs)
 
     def get_extra_state(self) -> dict[str, Any] | None:
         extra_state = super().get_extra_state()
@@ -3906,7 +3958,8 @@ class DeformableRigidAssetModel(RigidGaussianModel):
                 f"Restriction policy {self.config.restriction_policy or 'hardcoded_masking'} not implemented"
             )
 
-        return update_module_step(self.tracks_calib, epoch, global_step, system)
+        # Rigid base: Fourier-freeze counter, ``time_embed`` and ``tracks_calib``, once each.
+        return super().update_step_train_batch_start(epoch, global_step, system, **kwargs)
 
     def _attach_vis_frequency_hook(
         self,

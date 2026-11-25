@@ -188,20 +188,24 @@ out_lidar = self.gaussians_renderer.render(
 
 ## Inference Defaults
 
-`RenderableModel.load_from_artifact` (used by the `render` CLI, `serve-grpc`, USDZ viewer, instant-nurec NVS) prepends three camera-side overrides to every call so camera inference defaults to RGB:
+`RenderableModel.load_from_artifact` (used by the `render` CLI, `serve-grpc`, USDZ viewer, instant_nurec NVS) prepends these overrides to every call so camera inference defaults to RGB and neither sensor renders normals:
 
 ```text
 model.renderer.outputs.camera.enable_extended_features=False
 model.renderer.outputs.camera.enable_sensor_features=False
 model.renderer.outputs.camera.enable_distance=False
+model.renderer.outputs.camera.enable_normals=False
+model.renderer.outputs.lidar.enable_normals=False
 ```
 
-| Override                         | Suppresses                                                    |
-| -------------------------------- | ------------------------------------------------------------- |
-| `enable_extended_features=False` | `extra_signal` (signals typed `sensor_type: "common"`)        |
-| `enable_sensor_features=False`   | `camera_extra_signal` (signals typed `sensor_type: "camera"`) |
+| Override                         | Suppresses                                                         |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `enable_extended_features=False` | `extra_signal` (signals typed `sensor_type: "common"`)             |
+| `enable_sensor_features=False`   | `camera_extra_signal` (signals typed `sensor_type: "camera"`)      |
+| `enable_distance=False`          | `distance` (camera depth channel; CDIM 4 → 3)                      |
+| `enable_normals=False`           | `normal` (camera and lidar; read only by the training normal loss) |
 
-Both feature gates are needed because either tensor can carry the trained head. The distance gate separately disables camera distance output. Lidar gates are NOT defaulted off — lidar inference reads `extra_ray_signals.intensity` and `.raydrop`. Training is unaffected (different entry point through PyTorch Lightning).
+Both feature gates are needed because either tensor can carry the trained head. Lidar feature and distance gates are NOT defaulted off — lidar inference reads `extra_ray_signals.intensity`, `.raydrop` and distance. Normals are off for both sensors because nothing on the inference path reads them. Training is unaffected (different entry point through PyTorch Lightning).
 
 ### Opting back in
 
@@ -226,7 +230,7 @@ model = RenderableModel.load_from_artifact(
 )
 ```
 
-Re-enable both feature gates for the trained extra signals, or just the gate that carries the signals you actually need. Set `model.renderer.outputs.camera.enable_distance=True` when distance output is also needed.
+Re-enable both feature gates for the trained extra signals, or just the gate that carries the signals you actually need. Set `model.renderer.outputs.camera.enable_distance=True` when distance output is also needed, and `model.renderer.outputs.camera.enable_normals=True` (or the `lidar` key) to render normals from a model trained with normal supervision.
 
 ## Best Practices
 

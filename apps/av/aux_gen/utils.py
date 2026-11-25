@@ -5,7 +5,6 @@ from typing import Tuple
 
 import matplotlib.cm
 import numpy as np
-import torch
 
 from scipy.spatial import Delaunay
 
@@ -71,37 +70,3 @@ class LidarSpinMesh:
         azimuth_elevation = np.stack([azimuth, elevation, np.zeros_like(azimuth)], axis=1)
         faces = Delaunay(azimuth_elevation[:, 0:2]).simplices
         return faces
-
-
-def _quantile(tensor, q, dim=None, keepdim=False):
-    """
-    Computes the quantile of the input tensor along the specified dimension.  This function
-    is a workaround for issue 64947 when there are more than 16 million elements:
-    https://github.com/pytorch/pytorch/issues/64947
-
-    Parameters:
-    tensor (torch.Tensor): The input tensor.
-    q (float): The quantile to compute, should be a float between 0 and 1.
-    dim (int): The dimension to reduce. If None, the tensor is flattened.
-    keepdim (bool): Whether to keep the reduced dimension in the output.
-    Returns:
-    torch.Tensor: The quantile value(s) along the specified dimension.
-    """
-    assert 0 <= q <= 1, "\n\nquantile value should be a float between 0 and 1.\n\n"
-
-    if dim is None:
-        tensor = tensor.flatten()
-        dim = 0
-
-    sorted_tensor, _ = torch.sort(tensor, dim=dim)
-    num_elements = sorted_tensor.size(dim)
-    index = q * (num_elements - 1)
-    lower_index = int(index)
-    upper_index = min(lower_index + 1, num_elements - 1)
-    lower_value = sorted_tensor.select(dim, lower_index)
-    upper_value = sorted_tensor.select(dim, upper_index)
-    # linear interpolation
-    weight = index - lower_index
-    quantile_value = (1 - weight) * lower_value + weight * upper_value
-
-    return quantile_value.unsqueeze(dim) if keepdim else quantile_value

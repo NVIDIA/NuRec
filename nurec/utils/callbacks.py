@@ -799,7 +799,7 @@ class FixedCameraRenderCallback(Callback):
             residual = np.abs(pred_hwc_f32 - gt_hwc).mean(axis=-1)  # (h, w)
             residual_rgb = scalar2img(residual, vmin=0.0, vmax=0.3, cmap="turbo")
             # Black out pixels training ignores (RayFlags.INVALID — ego mask
-            # plus lens edges). Matches nurec/libs/losses/models/losses_module.py:209.
+            # plus lens edges), matching the RGB loss validity mask.
             flags_tensor = getattr(labels, "flags", None) if labels is not None else None
             if flags_tensor is not None:
                 invalid_mask = (flags_tensor[0].squeeze(-1) & int(RayFlags.INVALID.value)) != 0  # (h, w) bool tensor
@@ -912,7 +912,6 @@ class FixedCameraRenderCallback(Callback):
             assert isinstance(dataset, NCORESequentialDataset)
 
             sorted_frame_idxs = sorted(set(self._cfg.frame_idxs))
-            orig_subsample = dataset.n_image_subsample
             for frame_idx in sorted_frame_idxs:
                 linear_idx = _compute_target_linear_idx(
                     list(dataset.camera_ids),
@@ -940,14 +939,20 @@ class FixedCameraRenderCallback(Callback):
                     self._cached_batches.clear()
                     return
 
-                # One-shot fetch at our configured subsample. Mutates the local
+                original_image_transform = dataset.image_resolution_transforms[self._cfg.camera_id]
+                render_image_transform = self._cfg.resolution.resolve(
+                    original_image_transform.source_resolution,
+                    rounding="floor",
+                )
+
+                # One-shot fetch at our configured resolution. Mutates the local
                 # dataset copy on the main process between training batches;
                 # DataLoader workers hold forked copies and are unaffected.
                 try:
-                    dataset.n_image_subsample = self._cfg.subsample
+                    dataset.image_resolution_transforms[self._cfg.camera_id] = render_image_transform
                     self._cached_batches[frame_idx] = dataset[(linear_idx, None)]
                 finally:
-                    dataset.n_image_subsample = orig_subsample
+                    dataset.image_resolution_transforms[self._cfg.camera_id] = original_image_transform
 
                 self._frames_written[frame_idx] = 0
 

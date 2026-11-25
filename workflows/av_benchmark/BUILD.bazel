@@ -97,6 +97,16 @@ py_binary(
     deps = [":pylib"],
 )
 
+# The runner alone, for callers that launch the binaries themselves (--binary), e.g. on images.
+py_binary(
+    name = "run_launcher",
+    srcs = ["run.py"],
+    data = glob(["specs/*.yaml"]) + glob(["configs/**/*.yaml"]),
+    main = "run.py",
+    visibility = [],
+    deps = [":pylib"],
+)
+
 pytest_test(
     name = "run_test",
     srcs = ["run_test.py"],

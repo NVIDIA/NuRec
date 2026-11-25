@@ -22,7 +22,7 @@ def default_layer_groups():
         "014_nurec_markdown": "\\\\.runfiles/_main/.*\\\\.(md)$$",  # NuRec Markdown code (changes frequently)
         "015_nurec_code_cu": "\\\\.runfiles/_main/.*\\\\.(cu|cuh)$$",  # NuRec CUDA code (changes frequently)
         "016_nurec_code_cpp": "\\\\.runfiles/_main/.*\\\\.(cpp|h|hpp)$$",  # NuRec C++ code (changes frequently)
-        "017_nurec_code_py": "\\\\.runfiles/_main/.*\\\\.(py|pyi)$$",  # NuRec Python code (changes frequently)
+        "017_nurec_code_py": "\\\\.runfiles/_main/.*\\\\.(py|pyi|pyc)$$",  # NuRec Python code and its precompiled bytecode (changes frequently)
         "018_nurec_code_sh": "\\\\.runfiles/_main/.*\\\\.(sh|bash)$$",  # NuRec Shell code (changes frequently)
         "019_configs": "\\\\.runfiles/_main/([^/]+/)?configs/.*",  # Configuration files (changes frequently)
         "020_nurec_other": "\\\\.runfiles/_main/.*",  # Remaining NuRec files (changes frequently)

@@ -221,7 +221,7 @@ if [[ ! -d "$USDZ_HOST_DIR" ]]; then
 fi
 
 # Build the source target in the prepared development image.
-nurec_dev bazelisk build //:run
+nurec_dev bazelisk build --build_runfile_links //:run
 bazel_bin=$(nurec_dev bazelisk info bazel-bin)
 log "source: $NUREC_SRC; development image: $NUREC_IMAGE"
 

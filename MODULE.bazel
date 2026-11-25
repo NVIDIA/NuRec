@@ -68,19 +68,19 @@ python.toolchain(
 )
 
 # rules_python 2.3.2's bundled python-build-standalone catalog doesn't include the
-# 3.13.15 "20260807" release (it tops out at 3.13.13), so we register its download
+# 3.13.18 "20261026" release (it tops out at 3.13.13), so we register its download
 # URL + sha256 explicitly here
 # (the standard single_version_override mechanism for a build not in the catalog). The
 # 3.11.14 toolchain was in-catalog, which is why it needed no urls override. The urls
 # entry is the release-relative path resolved against the default base_url.
 python.single_version_override(
-    python_version = "3.13.15",
+    python_version = "3.13.18",
     sha256 = {
-        "aarch64-unknown-linux-gnu": "68159637492dcf3501c0967b69e07665c3dda070fb42231737055f72963f66fc",
-        "x86_64-unknown-linux-gnu": "7253808c3413d9ebd03e76b3853c895b9287f12e0750a30fce1cbf430e516113",
+        "aarch64-unknown-linux-gnu": "b48451865bde9a39e2f3e71d7fdcbf1f32615f50f24d78dc50d04ede6501cf81",
+        "x86_64-unknown-linux-gnu": "126343c54daff4068efc1ac269518d0cc202d57857794948103dd1454e8881be",
     },
     strip_prefix = "python",
-    urls = ["20260807/cpython-{python_version}+20260807-{platform}-{build}.tar.gz"],
+    urls = ["20261026/cpython-{python_version}+20261026-{platform}-{build}.tar.gz"],
 )
 use_repo(python, "python_3_13", "python_versions")
 
@@ -206,6 +206,24 @@ cc_library(
     whl_name = "numpy",
 )
 
+# The main py_binary targets precompile every Python source they ship
+# (pyc_collection = "include_pyc"), which requires each one to be valid Python
+# 3.13. Drop the few that are not and are not needed at runtime.
+[
+    pip.whl_mods(
+        hub_name = "whl_mods_hub",
+        srcs_exclude_glob = [srcs_exclude_glob],
+        whl_name = whl_name,
+    )
+    for whl_name, srcs_exclude_glob in [
+        # debugpy vendors pydevd's test suite, whose fixtures include a
+        # SyntaxError fixture and an `await` outside a function.
+        ("debugpy", "site-packages/debugpy/_vendored/pydevd/tests_python/**"),
+        # PySide6's deployment tooling ships Jinja templates with a `.py` suffix.
+        ("pyside6_essentials", "site-packages/PySide6/**/*.tmpl.py"),
+    ]
+]
+
 # Patch triton to enhance libcuda.so detection and apply an arch cap for SM
 # versions not supported by CUDA 12.8.
 [
@@ -251,6 +269,15 @@ pip.override(
         "deps/zarr/zarr.patch",
     ],
 )
+
+# Accept mmcv 2.2.0, the version we build. mmdet 3.3.0 asserts mmcv < 2.2.0 at import.
+pip.override(
+    file = "mmdet-3.3.0-py3-none-any.whl",
+    patch_strip = 1,
+    patches = [
+        "deps/mmdet/mmdet.patch",
+    ],
+)
 use_repo(pip, "whl_mods_hub")
 
 EXTRA_HUB_ALIASES = {
@@ -285,6 +312,8 @@ WHL_MODIFICATIONS = {
     "@whl_mods_hub//:torch.json": "torch",
     "@whl_mods_hub//:tinycudann.json": "tinycudann",
     "@whl_mods_hub//:numpy.json": "numpy",
+    "@whl_mods_hub//:debugpy.json": "debugpy",
+    "@whl_mods_hub//:pyside6_essentials.json": "pyside6_essentials",
 }
 
 pip.parse(
@@ -438,6 +467,23 @@ bazel_dep(name = "ninja", version = "1.12.1.bcr.2")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+# Optional IPC runtime for CUDA 12.9 clients; the compiler and other libraries stay on 12.8.
+http_archive(
+    name = "ipc_cudart_12_9_x86_64",
+    build_file = "//nurec/libs/cuda_ipc_transport:runtime.BUILD.bazel",
+    sha256 = "1f6ad42d4f530b24bfa35894ccf6b7209d2354f59101fd62ec4a6192a184ce99",
+    strip_prefix = "cuda_cudart-linux-x86_64-12.9.79-archive",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.9.79-archive.tar.xz"],
+)
+
+http_archive(
+    name = "ipc_cudart_12_9_sbsa",
+    build_file = "//nurec/libs/cuda_ipc_transport:runtime.BUILD.bazel",
+    sha256 = "8b422a3b2cb8452cb678181b0bf9d7aa7342df168b5319c5488ae3b8514101fc",
+    strip_prefix = "cuda_cudart-linux-sbsa-12.9.79-archive",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-sbsa/cuda_cudart-linux-sbsa-12.9.79-archive.tar.xz"],
+)
+
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
 # mypy_integration
@@ -452,12 +498,27 @@ http_archive(
     urls = ["https://github.com/bazel-contrib/bazel-mypy-integration/archive/39321959f1ea5a1b54af2a9a6e3072d58923adeb.tar.gz"],
 )
 
+# PoissonRecon version 18.76. The patch drops an unused image include.
+http_archive(
+    name = "poisson_recon",
+    build_file = "//deps/poisson_recon:poisson_recon.BUILD",
+    patch_args = ["-p1"],
+    patches = ["//deps/poisson_recon:no_image_include.patch"],
+    sha256 = "4a07ad091a63cc8403c57a8906b97b41d07c2fd87aa8aad0e7680dac20c4dcd5",
+    strip_prefix = "PoissonRecon-262b0f539d404057d1f36e1adc07fc9388678899",
+    urls = ["https://github.com/mkazhdan/PoissonRecon/archive/262b0f539d404057d1f36e1adc07fc9388678899.tar.gz"],
+)
+
 # mmseg
 http_archive(
     name = "mmseg_repo",
     build_file = "//deps/mmseg_repo:mmseg_repo.BUILD",
     patch_args = ["-p1"],
-    patches = ["//deps/mmseg_repo:mmseg_gpu_io.patch"],
+    patches = [
+        "//deps/mmseg_repo:mmseg_gpu_io.patch",
+        "//deps/mmseg_repo:mmseg_early_trt.patch",
+        "//deps/mmseg_repo:mmseg_lazy_imports.patch",
+    ],
     sha256 = "a98f50ba2c45cca225d79221242ea898629949478026db1a458f7dedddf45992",
     strip_prefix = "mmseginference-8748ac0938a6471547f57c379bd7564f09723614-8748ac0938a6471547f57c379bd7564f09723614",
     urls = ["file:///opt/nvidia/nurec-build-deps/archives/mmseg_repo/archive.tar.gz"],
@@ -519,8 +580,8 @@ py_library(
 bazel_dep(name = "gsplat", version = "0.0.0")
 archive_override(
     module_name = "gsplat",
-    sha256 = "33c7030b63ac07486baba62c46b234027dfe330608e9f261eed49eed16581c9f",
-    strip_prefix = "gsplat-b0cedf8dc9d17fa3386e866dd72bfd308a919327-b0cedf8dc9d17fa3386e866dd72bfd308a919327",
+    sha256 = "5b90b638fc836a1ac418c91968c8c0b7134e66d25df70fcae4c1a9d6a728fde3",
+    strip_prefix = "gsplat-98e9dba0ac00223d748c17da1095eac35717e02d-98e9dba0ac00223d748c17da1095eac35717e02d",
     urls = ["file:///opt/nvidia/nurec-build-deps/archives/gsplat/archive.tar.gz"],
 )
 
@@ -545,6 +606,59 @@ http_archive(
     sha256 = "ee96f3a2ddb1043d6e1d9d8f6785e8d9c93354ea173b3d0a96407f534aad39aa",
     strip_prefix = "harmonizer-281af3eff3e81047de15d877332b5493ea5027bd",
     urls = ["https://github.com/NVIDIA/harmonizer/archive/281af3eff3e81047de15d877332b5493ea5027bd.tar.gz"],
+)
+
+# libibverbs (rdma-core) and libnl for the optional RDMA transport
+# (//nurec/libs/rdma_transport): Ubuntu noble .debs, unpacked by @ibverbs into
+# headers + link library for the build and the runtime file set for the run image
+# layer (//bazel/rdma:runtime_libs_tar). Builds without access to archive.ubuntu.com
+# can redirect these URLs with a --downloader_config rewrite; the sha256 pins hold.
+http_file(
+    name = "libibverbs_dev_deb",
+    downloaded_file_path = "libibverbs-dev.deb",
+    sha256 = "3a327a9d984f0acd6aee20f7b48b2d647322e2afaf370436af9502cf393085dc",
+    urls = ["https://archive.ubuntu.com/ubuntu/pool/main/r/rdma-core/libibverbs-dev_50.0-2build2_amd64.deb"],
+)
+
+http_file(
+    name = "libibverbs1_deb",
+    downloaded_file_path = "libibverbs1.deb",
+    sha256 = "731e9d88e498b1a8b03a4eaf6e3ed6227f1c4646b9931256f7e234b42ae618dd",
+    urls = ["https://archive.ubuntu.com/ubuntu/pool/main/r/rdma-core/libibverbs1_50.0-2build2_amd64.deb"],
+)
+
+http_file(
+    name = "ibverbs_providers_deb",
+    downloaded_file_path = "ibverbs-providers.deb",
+    sha256 = "0e21edabacc12e112b0ff182928fd147f873d83d31bf721a2eba7cea06f75374",
+    urls = ["https://archive.ubuntu.com/ubuntu/pool/main/r/rdma-core/ibverbs-providers_50.0-2build2_amd64.deb"],
+)
+
+http_file(
+    name = "libnl_3_200_deb",
+    downloaded_file_path = "libnl-3-200.deb",
+    sha256 = "0afff6a14f55122757db02ff7e11ad58f128465fd796e2e33a0b0fe5b45a09ed",
+    urls = ["https://archive.ubuntu.com/ubuntu/pool/main/libn/libnl3/libnl-3-200_3.7.0-0.3build1_amd64.deb"],
+)
+
+http_file(
+    name = "libnl_route_3_200_deb",
+    downloaded_file_path = "libnl-route-3-200.deb",
+    sha256 = "8abfa9a87f78dbba7edc19ef4cfcb16b70dde562bccc3ff7550bdd3a0487e358",
+    urls = ["https://archive.ubuntu.com/ubuntu/pool/main/libn/libnl3/libnl-route-3-200_3.7.0-0.3build1_amd64.deb"],
+)
+
+ibverbs_repo = use_repo_rule("//bazel/rdma:defs.bzl", "ibverbs_repo")
+
+ibverbs_repo(
+    name = "ibverbs",
+    dev_deb = "@libibverbs_dev_deb//file:libibverbs-dev.deb",
+    runtime_debs = [
+        "@libibverbs1_deb//file:libibverbs1.deb",
+        "@ibverbs_providers_deb//file:ibverbs-providers.deb",
+        "@libnl_3_200_deb//file:libnl-3-200.deb",
+        "@libnl_route_3_200_deb//file:libnl-route-3-200.deb",
+    ],
 )
 
 # eigen / numpyeigen
@@ -623,42 +737,43 @@ http_file(
 
 # Mask2Former TensorRT engines: one http_file per engine (not a single tarball) so
 # no archive approaches the ~5GB generic-package size limit and each engine is an
-# independent entry. Selected per (GPU, arch) in apps/av/aux_gen/estimators.py.
+# independent entry. Portable plans use SAME_COMPUTE_CAPABILITY and are
+# selected by (SM, CPU arch), with an Ampere+ fallback per CPU architecture.
 # Build-time downloads baked into the nurec_tools image runfiles at <repo>/file/<engine>;
 # nothing is fetched from the registry at runtime.
 http_file(
-    name = "trt_engine_a40_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.6.A40.x86_64.fp16.dynamic.engine",
-    sha256 = "ef5066e725bdc2af512e6b44e77256d0eb27c6774b99e44072c9970f2e408ee8",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.6.A40.x86_64.fp16.dynamic.engine"],
+    name = "trt_engine_sm80_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.0.samecc.x86_64.fp16.dynamic.engine",
+    sha256 = "e23674651fd2893960fc271730eb2db04d7b60872f7e9bf5fd40fea9ddc10cd5",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.0.samecc.x86_64.fp16.dynamic.engine"],
 )
 
 http_file(
-    name = "trt_engine_l40_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.x86_64.fp16.dynamic.engine",
-    sha256 = "494300de098d4d54f787451a2028bb4b4f06d3a1572dd845ac2aa8f962044ace",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.x86_64.fp16.dynamic.engine"],
+    name = "trt_engine_sm86_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.6.samecc.x86_64.fp16.dynamic.engine",
+    sha256 = "63e058fb0b3f2ea7150828fdbcf353ab24a0a0f21fa5f65ae0a26bc708637f81",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.6.samecc.x86_64.fp16.dynamic.engine"],
 )
 
 http_file(
-    name = "trt_engine_l40_aarch64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.aarch64.fp16.dynamic.engine",
-    sha256 = "3de7e235185ab8aa31b320926df272b6392fcc76fa7fb426586265b3dd524dd4",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L40.aarch64.fp16.dynamic.engine"],
+    name = "trt_engine_sm89_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.samecc.x86_64.fp16.dynamic.engine",
+    sha256 = "2c211b8d3c1a53bb39b2f3aab923986e12c13207b05f7e683fee3244f43b1b24",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.samecc.x86_64.fp16.dynamic.engine"],
 )
 
 http_file(
-    name = "trt_engine_a100_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.0.A100.x86_64.fp16.dynamic.engine",
-    sha256 = "4febc0d327bd6452732f5e84f98e184e72280b4b27521360a63d54506ad53e65",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.0.A100.x86_64.fp16.dynamic.engine"],
+    name = "trt_engine_sm90_x86_64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm9.0.samecc.x86_64.fp16.dynamic.engine",
+    sha256 = "22dd07e2c837e996c615cef6d9a888898ce2571f00bf7e8e367384abce93c1ed",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm9.0.samecc.x86_64.fp16.dynamic.engine"],
 )
 
 http_file(
-    name = "trt_engine_a6000_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.6.A6000.x86_64.fp16.dynamic.engine",
-    sha256 = "6bec613f26c2c3bf82ea318961d173cf9f45e7b8dd782382ddda0ba7326d80b4",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.6.A6000.x86_64.fp16.dynamic.engine"],
+    name = "trt_engine_sm103_aarch64",
+    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm10.3.samecc.aarch64.fp16.dynamic.engine",
+    sha256 = "6585ea913989d55c7dcf5246ec7c8bfe10edc2f148cbaf96c90fa3b26ffe35ee",
+    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm10.3.samecc.aarch64.fp16.dynamic.engine"],
 )
 
 http_file(
@@ -673,20 +788,6 @@ http_file(
     downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.ampereplus.aarch64.fp16.dynamic.engine",
     sha256 = "c1a561f8f2aa21c3e51115a0335e67caac3954a05031379ec14f03b363de0410",
     urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.ampereplus.aarch64.fp16.dynamic.engine"],
-)
-
-http_file(
-    name = "trt_engine_5880_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.5880.x86_64.fp16.dynamic.engine",
-    sha256 = "5bca903a894ce6eca596ca6accb206bd7bacf4ee3e36b5cc5b77c34966c79f75",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.5880.x86_64.fp16.dynamic.engine"],
-)
-
-http_file(
-    name = "trt_engine_l4_x86_64",
-    downloaded_file_path = "mask2former_dinov2_b1_0428.trt10.13.sm8.9.L4.x86_64.fp16.dynamic.engine",
-    sha256 = "fd3478eec3573010e264d6aa25ab6264df3d728ec36c5630bd63bf1fd124d6a7",
-    urls = ["file:///opt/nvidia/nurec-build-deps/archives/mask2former_dinov2_b1_0428.trt10.13.sm8.9.L4.x86_64.fp16.dynamic.engine"],
 )
 
 # big-lama inpainting weights for SimpleLama (nurec/models/background.py).

@@ -21,6 +21,9 @@ common --check_direct_dependencies=error
 # declare their own, as in the enclosing repository.
 build --incompatible_default_to_explicit_init_py
 
+# Use a bash bootstrap for Python targets, so we only rely on a hermetic interpreter.
+build --@rules_python//python/config_settings:bootstrap_impl=script
+
 # Show outputs of failing tests by default
 test --test_output=errors
 

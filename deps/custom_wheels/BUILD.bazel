@@ -25,11 +25,8 @@ exports_files(
         "mmcv",
         "opencv-python",
         "point-cloud-utils",
-        "poisson-recon",
         "sam2",
         "torch",
         "transformer_engine",
-        "viser",
-        "yourdfpy",
     ]
 ]

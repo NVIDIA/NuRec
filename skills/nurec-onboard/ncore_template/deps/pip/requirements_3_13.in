@@ -10,7 +10,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 click
-nvidia-ncore==19.8.0
+nvidia-ncore==19.8.5
 numpy
 pyyaml
 scipy

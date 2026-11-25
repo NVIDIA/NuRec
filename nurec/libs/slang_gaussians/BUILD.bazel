@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
-load("@rules_cc//cc:defs.bzl", "cc_binary")
-load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 load("//bazel/slang:defs.bzl", "slangtorch_library")
@@ -127,72 +125,6 @@ slangtorch_library(
     ],
 )
 
-# Compile the GSplat strategy slang source into a SlangTorch C++ CUDA extension.
-# Kept for test-only equivalence verification against the hand-written CUDA replacement.
-# The main pylib no longer depends on this target.
-slangtorch_library(
-    name = "gsplat_strategy_slang_cc",
-    srcs = [
-        "strategy/gsplat.slang",
-    ],
-    extra_cmd_args = (
-        "-I$$(dirname $$(dirname $(location //nurec/libs/slang_utils:extensions_slang))) "
-    ),
-    deps = COMMON_SLANG_FILES + [
-        "//nurec/libs/slang_utils:cuda_slang",
-        "//nurec/libs/slang_utils:extensions_slang",
-    ],
-)
-
-# Hand-written CUDA replacement for the GSplat strategy Slang kernel
-cuda_library(
-    name = "gsplat_strategy_cuda",
-    srcs = [
-        "strategy/gsplat_cuda.cu",
-    ],
-    hdrs = [
-        "strategy/gsplat_cuda.h",
-    ],
-    copts = [
-        # Flags to be consistent with torch-cuda-extensions
-        "-D__CUDA_NO_HALF_OPERATORS__",
-        "-D__CUDA_NO_HALF_CONVERSIONS__",
-        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-D__CUDA_NO_HALF2_OPERATORS__",
-    ],
-    deps = [
-        "//deps/torch:torch_headers",
-        "//nurec/libs/kernel_utils:ku_cc",
-        "//nurec/libs/kernel_utils:ku_cuda",
-        "@rules_python//python/cc:current_py_cc_headers",
-    ],
-)
-
-cc_binary(
-    name = "gsplat_strategy_cuda_cc",
-    srcs = ["strategy/gsplat_cuda_binding.cpp"],
-    copts = [
-        # Flags to be consistent with torch-cuda-extensions and to build correct torch-extension bindings
-        "-DTORCH_API_INCLUDE_EXTENSION_H",
-        "-DTORCH_EXTENSION_NAME=libgsplat_strategy_cuda_cc",
-    ],
-    linkopts = [
-        "-Wl,--no-undefined",
-        "-Wl,--as-needed",
-    ],
-    linkshared = True,
-    deps = [
-        ":gsplat_strategy_cuda",
-        "//deps/torch:torch_headers",
-        "//nurec/libs/kernel_utils:ku_cc",
-        "@nurec_pip_deps//torch:libc10",
-        "@nurec_pip_deps//torch:libc10_cuda",
-        "@nurec_pip_deps//torch:libtorch_cpu",
-        "@nurec_pip_deps//torch:libtorch_python",
-        "@rules_python//python/cc:current_py_cc_libs",
-    ],
-)
-
 filegroup(
     name = "collector_slang_files",
     srcs = [
@@ -208,8 +140,6 @@ py_library(
         "collector/__init__.py",
         "collector/collector.py",
         "interface.py",
-        "strategy/__init__.py",
-        "strategy/gsplat.py",
     ],
     data = [
         ":collector_slang_files",
@@ -217,7 +147,6 @@ py_library(
     ],
     deps = [
         ":collector_slang_cc",
-        ":gsplat_strategy_cuda_cc",
         ":pylib_codegen",
         "//nurec/libs/slang_utils:pylib_utils",
         "//nurec/utils:pylib",
@@ -271,11 +200,7 @@ pytest_test(
 )
 
 pytest_test(
-    name = "gsplat_test",
-    srcs = ["strategy/gsplat_test.py"],
-    deps = [
-        ":gsplat_strategy_slang_cc",
-        ":pylib",
-        "//nurec/utils:pylib",
-    ],
+    name = "collector_cache_test",
+    srcs = ["collector/collector_cache_test.py"],
+    deps = [":pylib"],
 )

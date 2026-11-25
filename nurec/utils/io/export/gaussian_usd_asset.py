@@ -4,7 +4,7 @@
 """
 Gaussian Splatting USD Export
 
-Export Gaussian models to USD format as UsdGeom.Points primitives or ParticleField schema.
+Export Gaussian models to USD format using the ParticleField schema.
 
 This module provides:
 - USDGaussianExportCache: Manages USD stages and HDR files for USDZ packaging
@@ -24,20 +24,24 @@ import zipfile
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import click
 import imageio
 import numpy as np
 import torch
 
+from omegaconf import DictConfig, OmegaConf
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
 from tqdm import tqdm
 
+from nurec.artifact import Artifact
+from nurec.config.nurec import NuRecConfig
 from nurec.config.parse import parse_typed_config
 from nurec.datasets import make as make_dataset
 from nurec.datasets.base import RigTrajectoriesProvider
 from nurec.datasets.ncore import NCOREDataSource
+from nurec.datasets.summary import DataSourceSummary
 from nurec.models.background import EnvMapType, SkyEnvMapBackground
 from nurec.models.background_sampling import sample_cubemap_seamless
 from nurec.models.post_processing import get_ppisp_from_model
@@ -47,6 +51,11 @@ from nurec.utils.io.export.gaussian_export_accessor import (
     GaussianAttributes,
     GaussianExportAccessor,
     ModelCapabilities,
+)
+from nurec.utils.io.export.gaussian_partition import (
+    OVRTX_MAX_GAUSSIANS_PER_LAYER,
+    automatic_partition_cap,
+    partition_gaussian_indices,
 )
 from nurec.utils.io.export.gaussian_radiance_scaling import apply_radiance_scale_to_sh_nodes
 from nurec.utils.io.export.gaussian_usd_writer import GaussianUSDSchemaType, create_gaussian_writer
@@ -76,6 +85,7 @@ from nurec.utils.io.rig_trajectories import rig_trajectories_time_range, seriali
 from nurec.utils.io.usd_nrend import serialize_nrend_usd
 from nurec.utils.io.utils import initialize_usd_stage
 from nurec.utils.types import NamedSerialized, NamedUSDStage
+from nurec.utils.upgrade import apply_renderer_override, upgrade_config, upgrade_model
 
 
 log = logging.getLogger(__name__)
@@ -95,7 +105,7 @@ USD_GAUSSIAN_ROOT_PATH = USD_WORLD_PATH + "/NuRec"
 SKY_DOME_LIGHT_PATH = USD_WORLD_PATH + "/SkyBackground"
 
 # Dome light defaults
-DOME_LIGHT_DEFAULT_INTENSITY = 500.0
+DOME_LIGHT_DEFAULT_INTENSITY = 1.0
 DOME_LIGHT_DEFAULT_EXPOSURE = 0.0
 
 # Material constants (used by create_gaussian_material)
@@ -213,12 +223,11 @@ class USDGaussianExportCache:
         has_nrend_volume = any(serialized_file.filename == "volume.nurec" for serialized_file in self.serialized_files)
 
         # Configure render settings for tone mapping.
-        # Runtime PPISP consumes the Gaussian HDR output and produces LDR
-        # color itself, so Kit's Gaussian skip-tonemapping path must be
-        # disabled. SH-optimized exports do not call set_ppisp(), so baked
-        # PPISP assets keep the vanilla renderer setting.
         render_settings: Dict[str, Any] = {"rtx:post:tonemap:op": 2}
         if has_runtime_ppisp:
+            # DEPRECATED: renamed ``omni:rtx:gaussian:skipTonemapping:enabled`` and now authored per RenderProduct (see
+            # ``add_camera_render_products``). Kept only for backward compatibility with older renderers; remove it
+            # once they are no longer supported.
             render_settings["rtx:rtpt:gaussian:skipTonemapping:enabled"] = False
         if has_runtime_ppisp and has_nrend_volume:
             render_settings["rtx:post:registeredCompositing:invertToneMap"] = False
@@ -377,6 +386,7 @@ def _compute_time_code(tps: float, timestamp_us: int, offset_us: int) -> float:
 def create_rig_trajectories_stage(
     datasource: Any,
     frame_rate: float,
+    export_rolling_shutter: bool = False,
 ) -> Tuple[Optional[NamedUSDStage], int, float, List[int]]:
     """
     Create a USD stage containing rig trajectory data from the datasource.
@@ -384,6 +394,7 @@ def create_rig_trajectories_stage(
     Args:
         datasource: Data source that may provide rig trajectories
         frame_rate: Target frame rate for time code calculation
+        export_rolling_shutter: Author the rolling shutter of the cameras
 
     Returns:
         Tuple of (stage, offset_us, scale, all_timestamps):
@@ -426,6 +437,7 @@ def create_rig_trajectories_stage(
                 usd_timestamp_offset=offset_us,
                 formats=["usda"],
                 add_default_cameras=False,
+                export_rolling_shutter=export_rolling_shutter,
             )
             for item in rig_usd:
                 if isinstance(item, NamedUSDStage):
@@ -550,6 +562,7 @@ def create_background_domelight(
     light_path: str = SKY_DOME_LIGHT_PATH,
     hdr_filename: str = "sky_envmap",
     intensity: float = DOME_LIGHT_DEFAULT_INTENSITY,
+    radiance_scale: float = 1.0,
 ) -> Optional[Tuple[NamedUSDStage, NamedSerialized]]:
     """Create USD DomeLight and HDR texture from a SkyEnvMapBackground model.
 
@@ -566,6 +579,9 @@ def create_background_domelight(
         light_path: USD path for the DomeLight prim
         hdr_filename: Base filename for the HDR texture (without extension)
         intensity: DomeLight intensity value
+        radiance_scale: Multiplicative scale baked into HDR texels. This is
+            intentionally separate from ``intensity`` so the DomeLight's
+            lighting calibration remains unchanged.
 
     Returns:
         Tuple of (DomeLight USD stage, HDR texture serialized data) if successful,
@@ -610,6 +626,7 @@ def create_background_domelight(
         hdr_data = np.clip(hdr_data, 0.0, 1.0)
     else:
         hdr_data = np.maximum(hdr_data, 0.0)
+    hdr_data *= float(radiance_scale)
 
     # Serialize HDR to memory for USDZ packaging
     hdr_buffer = io.BytesIO()
@@ -780,6 +797,52 @@ def create_gaussian_material(stage: Usd.Stage, has_post_processing: bool = False
 # -----------------------------------------------------------------------------
 
 
+def resolve_sorting_mode_hint(renderer_config: Any) -> str:
+    """Pick the ParticleField ``sortingModeHint`` matching the renderer's sort order.
+
+    - UT projection (``3dgut-gsplat``) with ``k_buffer_size == 0``: ``cameraDistance``
+    - UT projection with ``k_buffer_size >= 1``: ``rayDistance``
+    - Otherwise (3DGS projection): ``zDepth``
+
+    ``k_buffer_size`` only applies when ``render.mode`` is ``kbuffer``; it is 0 otherwise.
+    """
+    use_ut = getattr(renderer_config, "name", None) == "3dgut-gsplat"
+    if not use_ut:
+        return "zDepth"
+    render = getattr(renderer_config, "render", None)
+    k_buffer_size = int(getattr(render, "k_buffer_size", 0)) if getattr(render, "mode", "") == "kbuffer" else 0
+    return "rayDistance" if k_buffer_size >= 1 else "cameraDistance"
+
+
+def _estimate_usdz_bytes_per_gaussian(attributes: Any) -> float:
+    """Estimate the serialized bytes written per Gaussian row.
+
+    Starts from the exported attribute tensors, then adds the arrays the writers
+    synthesize on top of them so the USDZ member-size budget stays conservative.
+    """
+    num_gaussians = max(1, len(attributes.positions))
+    total = sum(
+        int(getattr(attributes, name).nbytes)
+        for name in (
+            "positions",
+            "rotations",
+            "scales",
+            "densities",
+            "albedo_coefficients",
+            "specular_coefficients",
+        )
+        if getattr(attributes, name, None) is not None
+    )
+    bytes_per_gaussian = total / num_gaussians
+    has_lidar_signal = (
+        getattr(attributes, "lidar_intensity", None) is not None
+        or getattr(attributes, "lidar_raydrop_logits", None) is not None
+    )
+    if has_lidar_signal:
+        bytes_per_gaussian += 3 * 4  # lidarExtraSignals: float3 per row
+    return bytes_per_gaussian
+
+
 def apply_gaussian_subsampling(gaussian_indices: torch.Tensor, percentage_gaussians: float) -> torch.Tensor:
     """
     Randomly subsample Gaussian indices to the specified percentage.
@@ -803,6 +866,28 @@ def apply_gaussian_subsampling(gaussian_indices: torch.Tensor, percentage_gaussi
     random_indices = torch.randperm(n_gaussians_original, device=gaussian_indices.device)[:n_gaussians_to_keep]
     random_indices = torch.sort(random_indices)[0]
     return gaussian_indices[random_indices]
+
+
+def _select_partition_rows(
+    accessor: GaussianExportAccessor,
+    percentage_gaussians: float,
+    timestamp_us: int,
+    preactivation: bool,
+) -> torch.Tensor:
+    """Filter and subsample once per node or original track before partitioning."""
+    valid_mask = torch.from_numpy(accessor.get_valid_gaussian_mask(timestamp_us, preactivation=preactivation))
+    if not accessor.get_capabilities().has_rigid_tracks:
+        return apply_gaussian_subsampling(torch.where(valid_mask)[0], percentage_gaussians)
+
+    selected: List[torch.Tensor] = []
+    mapping = accessor.get_track_gaussian_mapping()
+    for track_id in accessor.get_cuboid_tracks().tracks_id:
+        if track_id not in mapping:
+            continue
+        indices = mapping[track_id]
+        indices = indices[valid_mask.to(indices.device)[indices]]
+        selected.append(apply_gaussian_subsampling(indices, percentage_gaussians).cpu())
+    return torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
 
 
 # -----------------------------------------------------------------------------
@@ -829,6 +914,59 @@ class TrackExportContext:
 # -----------------------------------------------------------------------------
 
 
+def _get_track_export_timestamps(
+    accessor: GaussianExportAccessor,
+    track_index: int,
+    track_id: str,
+    reference_timestamps_us: Optional[List[int]],
+) -> List[int]:
+    """Select the track timeline shared by export and partition size estimation."""
+    # Get timestamps for this track (native pose keyframe times from model)
+    native_timestamps = accessor.get_track_timestamps(track_index)
+    valid_time_samples = list(native_timestamps) if native_timestamps else []
+    if reference_timestamps_us:
+        valid_time_samples = resample_timestamps(valid_time_samples, reference_timestamps_us)
+
+    # Restrict to track's native time range so we never write extrapolated poses
+    # (poses outside [track_min_us, track_max_us] can be wrong and make tracks render at wrong position)
+    time_range = accessor.get_track_time_range_safe(track_index)
+    if time_range is not None and valid_time_samples:
+        track_min_us, track_max_us = time_range
+        original_count = len(valid_time_samples)
+        valid_time_samples = [t for t in valid_time_samples if track_min_us <= t <= track_max_us]
+        dropped = original_count - len(valid_time_samples)
+        if dropped > 0:
+            log.debug(
+                "USD export: track '%s' clipped %d frame(s) outside native range [%d, %d] us",
+                track_id,
+                dropped,
+                track_min_us,
+                track_max_us,
+            )
+
+    return valid_time_samples
+
+
+def _get_export_timestamps(
+    accessor: GaussianExportAccessor,
+    capabilities: ModelCapabilities,
+    reference_timestamps_us: Optional[List[int]],
+    timestamp_offset_us: int,
+) -> List[int]:
+    """Return the export timeline (a conservative union for rigid tracks)."""
+    if capabilities.has_rigid_tracks:
+        track_mapping = accessor.get_track_gaussian_mapping()
+        timestamps: Set[int] = set()
+        for track_index, track_id in enumerate(accessor.get_cuboid_tracks().tracks_id):
+            if track_id not in track_mapping or len(track_mapping[track_id]) == 0:
+                continue
+            timestamps.update(_get_track_export_timestamps(accessor, track_index, track_id, reference_timestamps_us))
+        return sorted(timestamps)
+    if capabilities.has_temporal_appearance and reference_timestamps_us is not None:
+        return reference_timestamps_us
+    return [timestamp_offset_us]
+
+
 def _prepare_track_contexts(
     accessor: GaussianExportAccessor,
     stage: Usd.Stage,
@@ -843,6 +981,7 @@ def _prepare_track_contexts(
     linear_srgb: bool,
     has_post_processing: bool,
     valid_gaussian_mask: Optional[np.ndarray] = None,
+    gaussian_indices_override: Optional[torch.Tensor] = None,
 ) -> Tuple[List[TrackExportContext], List[int]]:
     """
     Prepare track contexts and collect all timestamps for frame-first export.
@@ -876,6 +1015,10 @@ def _prepare_track_contexts(
 
         gaussian_indices = track_mapping[track_id]
 
+        if gaussian_indices_override is not None:
+            allowed = gaussian_indices_override.to(device=gaussian_indices.device)
+            gaussian_indices = gaussian_indices[torch.isin(gaussian_indices, allowed)]
+
         # Filter out invalid Gaussians (NaN/Inf) before subsampling
         if valid_gaussian_mask is not None:
             valid_mask_tensor = torch.from_numpy(valid_gaussian_mask).to(gaussian_indices.device)
@@ -888,28 +1031,7 @@ def _prepare_track_contexts(
             skipped_no_gaussians.append(track_id)
             continue
 
-        # Get timestamps for this track (native pose keyframe times from model)
-        native_timestamps = accessor.get_track_timestamps(track_enum_index)
-        valid_time_samples = list(native_timestamps) if native_timestamps else []
-        if reference_timestamps_us:
-            valid_time_samples = resample_timestamps(valid_time_samples, reference_timestamps_us)
-
-        # Restrict to track's native time range so we never write extrapolated poses
-        # (poses outside [track_min_us, track_max_us] can be wrong and make tracks render at wrong position)
-        time_range = accessor.get_track_time_range_safe(track_enum_index)
-        if time_range is not None and valid_time_samples:
-            track_min_us, track_max_us = time_range
-            original_count = len(valid_time_samples)
-            valid_time_samples = [t for t in valid_time_samples if track_min_us <= t <= track_max_us]
-            dropped = original_count - len(valid_time_samples)
-            if dropped > 0:
-                log.debug(
-                    "USD export: track '%s' clipped %d frame(s) outside native range [%d, %d] us",
-                    track_id,
-                    dropped,
-                    track_min_us,
-                    track_max_us,
-                )
+        valid_time_samples = _get_track_export_timestamps(accessor, track_enum_index, track_id, reference_timestamps_us)
 
         # Skip tracks with no valid timestamps (no pose data in range); do not export with a single frame
         # at offset, which would use an extrapolated/wrong pose.
@@ -1096,6 +1218,8 @@ def export_gaussians_as_usd_asset(
     half_precision: bool = False,
     linear_srgb: bool = False,
     has_post_processing: bool = False,
+    # Partitioning integration point.
+    gaussian_indices_override: Optional[torch.Tensor] = None,
 ) -> List[PrimExportInfo]:
     """
     Export Gaussians to USD stage as points primitives or particle fields.
@@ -1112,7 +1236,7 @@ def export_gaussians_as_usd_asset(
         accessor: Export accessor wrapping the Gaussian model
         stage: USD stage to export to (must have upAxis and timeCodesPerSecond set)
         content_root_path: Root path for content prims
-        schema_type: USD schema type (geompoints or lightfield)
+        schema_type: USD schema type (lightfield)
         percentage_gaussians: Percentage of Gaussians to export (subsampling)
         node_layer_name: Optional layer name for composite models
         force_sh_0: Force SH degree to 0 (skip f_rest coefficients)
@@ -1136,8 +1260,19 @@ def export_gaussians_as_usd_asset(
     Returns:
         List of PrimExportInfo objects containing export statistics for each prim
     """
-    num_gaussians = accessor.get_num_gaussians()
-    log.info(f"Exporting {node_layer_name if node_layer_name else 'model'} with {num_gaussians} Gaussians to USD stage")
+    model_num_gaussians = accessor.get_num_gaussians()
+    num_gaussians = len(gaussian_indices_override) if gaussian_indices_override is not None else model_num_gaussians
+    if gaussian_indices_override is None:
+        log.info(
+            f"Exporting {node_layer_name if node_layer_name else 'model'} with {num_gaussians} Gaussians to USD stage"
+        )
+    else:
+        log.info(
+            "Exporting %s partition with %d/%d Gaussians to USD stage",
+            node_layer_name if node_layer_name else "model",
+            num_gaussians,
+            model_num_gaussians,
+        )
 
     computed_offset_us: int = usd_timestamp_offset_us if usd_timestamp_offset_us is not None else 0
     capabilities = accessor.get_capabilities()
@@ -1152,7 +1287,14 @@ def export_gaussians_as_usd_asset(
     # Use first reference timestamp if available, otherwise use computed offset
     nan_check_timestamp = reference_timestamps_us[0] if reference_timestamps_us else computed_offset_us
     valid_gaussian_mask = accessor.get_valid_gaussian_mask(nan_check_timestamp, preactivation=preactivation)
-    num_invalid = num_gaussians - np.sum(valid_gaussian_mask)
+    if gaussian_indices_override is None:
+        num_invalid = model_num_gaussians - np.sum(valid_gaussian_mask)
+    else:
+        # The validity mask is model-wide, while the denominator below is the
+        # number of Gaussians in this partition. Restrict both counts to the
+        # active partition before reporting the percentage.
+        partition_indices = gaussian_indices_override.detach().cpu().numpy()
+        num_invalid = len(partition_indices) - np.sum(valid_gaussian_mask[partition_indices])
     if num_invalid > 0:
         log.info(f"Filtering {num_invalid} Gaussians with NaN/Inf values ({100 * num_invalid / num_gaussians:.4f}%)")
 
@@ -1178,6 +1320,7 @@ def export_gaussians_as_usd_asset(
             linear_srgb=linear_srgb,
             has_post_processing=has_post_processing,
             valid_gaussian_mask=valid_gaussian_mask,
+            gaussian_indices_override=gaussian_indices_override,
         )
 
         if not track_contexts:
@@ -1270,11 +1413,21 @@ def export_gaussians_as_usd_asset(
         # =====================================================================
         # Non-track export: single prim for all Gaussians
         # =====================================================================
-        gaussian_indices = torch.arange(num_gaussians)
+        gaussian_indices = (
+            gaussian_indices_override if gaussian_indices_override is not None else torch.arange(num_gaussians)
+        )
 
         # Filter out invalid Gaussians (NaN/Inf) before subsampling
-        valid_mask_tensor = torch.from_numpy(valid_gaussian_mask)
+        valid_mask_tensor = torch.from_numpy(valid_gaussian_mask).to(device=gaussian_indices.device)
+        # Partition indices refer to rows in the full model. Restrict the full
+        # validity mask to those rows before applying it to this partition.
+        if gaussian_indices_override is not None:
+            valid_mask_tensor = valid_mask_tensor[gaussian_indices]
         gaussian_indices = gaussian_indices[valid_mask_tensor]
+
+        if len(gaussian_indices) == 0:
+            log.info("No valid Gaussians to export")
+            return []
 
         gaussian_indices = apply_gaussian_subsampling(gaussian_indices, percentage_gaussians)
 
@@ -1282,12 +1435,9 @@ def export_gaussians_as_usd_asset(
             f"Gaussians: {num_gaussians} total -> {len(gaussian_indices)} after NaN/Inf filtering and {percentage_gaussians:.1f}% subsampling"
         )
 
-        # Determine time samples for non-track case
-        non_track_time_samples: List[int]
-        if capabilities.has_temporal_appearance and reference_timestamps_us is not None:
-            non_track_time_samples = reference_timestamps_us
-        else:
-            non_track_time_samples = [computed_offset_us]
+        non_track_time_samples = _get_export_timestamps(
+            accessor, capabilities, reference_timestamps_us, computed_offset_us
+        )
 
         # Create writer and prim
         writer = create_gaussian_writer(
@@ -1453,7 +1603,13 @@ def write_export_summary(summary: ExportSummary, output_path: Path) -> None:
 
 @click.command("export-gaussian-usd-asset")
 @click.option(
-    "--config-name", type=str, required=True, help="Hydra config to load - has to contain a dataset specification"
+    "--config-name", type=str, required=False, help="Hydra config to load - has to contain a dataset specification"
+)
+@click.option(
+    "--artifact-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="USDZ artifact containing checkpoint.ckpt and parsed_config.yaml.",
 )
 @click.option("--output-dir", type=str, required=False, help="Path to the output target directory")
 @click.option(
@@ -1461,6 +1617,24 @@ def write_export_summary(summary: ExportSummary, output_path: Path) -> None:
     type=float,
     default=100.0,
     help="Percentage of Gaussians to export (0, 100].",
+)
+@click.option(
+    "--max-gaussians-per-partition",
+    type=click.IntRange(min=1, max=OVRTX_MAX_GAUSSIANS_PER_LAYER),
+    default=None,
+    help=(
+        "Spatially partition Gaussian nodes into USD layers containing at most "
+        "this many Gaussians. With --usd-format usdz, each partition is packaged as its "
+        "own .usdc layer."
+    ),
+)
+@click.option(
+    "--auto-partition/--no-auto-partition",
+    default=True,
+    help=(
+        "Automatically partition Gaussian layers when the OVRTX 2^24-index limit "
+        "(all formats) or conservative USDZ member-size limit requires it (default: enabled)."
+    ),
 )
 @click.option(
     "--usd-format",
@@ -1484,9 +1658,18 @@ def write_export_summary(summary: ExportSummary, output_path: Path) -> None:
     "--export-parsed-extra-signals",
     is_flag=True,
     default=False,
-    help="Export parsed extra signal components as primvars (not yet implemented)",
+    help="Deprecated compatibility option; LiDAR intensity and raydrop logits are exported when present",
 )
 @click.option("--export-rig-trajectories", is_flag=True, default=True, help="Export rig trajectories")
+@click.option(
+    "--export-rolling-shutter/--no-export-rolling-shutter",
+    default=False,
+    show_default=True,
+    help=(
+        "Author the camera rolling shutter (OmniRtxRollingShutterAPI). RTX applies it to animated geometry only, "
+        "not to the motion of the camera or to Gaussians, so it is off by default."
+    ),
+)
 @click.option("--flip-axis", type=str, default="", help="Axes to flip in 'xyz' form")
 @click.option("--do-not-cast-shadows", is_flag=True, default=False, help="Author doNotCastShadows primvar")
 @click.option("--skip-gaussian-deformation", is_flag=True, default=False, help="Disable gaussian deformation animation")
@@ -1532,7 +1715,8 @@ def write_export_summary(summary: ExportSummary, output_path: Path) -> None:
     default=1.0,
     show_default=True,
     help=(
-        "Global multiplicative scale applied to Gaussian SH coefficients before export "
+        "Global multiplicative scale applied to Gaussian SH coefficients and sky HDR "
+        "radiance before export "
         "(strictly positive, finite). Used to retune the asset's brightness for "
         "integration into a target USD scene without re-training. Layered on top of "
         "the optional SH-match output."
@@ -1597,7 +1781,8 @@ def write_export_summary(summary: ExportSummary, output_path: Path) -> None:
 )
 @click.argument("hydra-args", nargs=-1)
 def export_gaussian_usd_asset(
-    config_name: str,
+    config_name: Optional[str],
+    artifact_path: Optional[Path],
     output_dir: Optional[str],
     percentage_gaussians: float,
     usd_format: str,
@@ -1621,6 +1806,9 @@ def export_gaussian_usd_asset(
     enable_ppisp_controller_export: Optional[bool],
     sh_optimization_num_iterations: Optional[int],
     hydra_args: list[str],
+    max_gaussians_per_partition: Optional[int] = None,
+    auto_partition: bool = True,
+    export_rolling_shutter: bool = False,
     *,
     sh_optimization_config: Optional[SHMatchingOptimizationConfig] = None,
 ) -> None:
@@ -1717,29 +1905,62 @@ def export_gaussian_usd_asset(
 
     # Validate half-precision is only used with LightField schema
     if half_precision and schema_type != GaussianUSDSchemaType.LIGHT_FIELD:
-        raise click.BadParameter(
-            f"--half-precision is only supported with --usd-schema=lightfield. "
-            f"The {schema_type.value} schema uses UsdGeomPoints which has schema-locked float32 attributes."
-        )
+        raise click.BadParameter("--half-precision is only supported with --usd-schema=lightfield.")
 
-    if export_parsed_extra_signals:
-        log.warning("--export-parsed-extra-signals is not yet implemented, flag will be ignored")
+    if bool(config_name) == bool(artifact_path):
+        raise click.UsageError("Specify exactly one of --config-name or --artifact-path.")
 
-    # Parse config and load checkpoint
-    config = parse_typed_config(config_name=config_name, hydra_args=[*hydra_args, "mode=val"])
-    checkpoint_path: Path = Path(config.ckpt_dir) / "last.ckpt"
+    # Parse config and load checkpoint. Artifacts carry both pieces together; their
+    # parsed config may be from an older NRE version, so run the normal upgrade path
+    # before validating it against the current schema.
+    checkpoint_path: Path | Any
+    checkpoint_is_artifact_stream = artifact_path is not None
+    if artifact_path is not None:
+        artifact = Artifact(source=artifact_path)
+        original_artifact_config = OmegaConf.create(artifact.parsed_config)
+        artifact_config = OmegaConf.create(artifact.parsed_config)
+        if hydra_args:
+            overrides = [argument.lstrip("+") for argument in hydra_args]
+            artifact_config = cast(DictConfig, OmegaConf.merge(artifact_config, OmegaConf.from_dotlist(overrides)))
+        config = NuRecConfig.model_validate(upgrade_config(apply_renderer_override(artifact_config, None)))
+        checkpoint_path = artifact.checkpoint
+    else:
+        assert config_name is not None
+        config = parse_typed_config(config_name=config_name, hydra_args=[*hydra_args, "mode=val"])
+        checkpoint_path = Path(config.ckpt_dir) / "last.ckpt"
 
-    if not checkpoint_path.exists():
+    config.mode = "val"
+
+    if not checkpoint_is_artifact_stream and isinstance(checkpoint_path, Path) and not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
     # Instantiate system without checkpoint, then load state dict with strict=False so that
     # older checkpoints (e.g. missing model.gaussians_strategy.invisible_steps.*) still load.
     resume = config.resume
-    if resume is None:
+    if resume is None and not checkpoint_is_artifact_stream:
         config.resume = str(checkpoint_path)
 
+    checkpoint = torch.load(
+        checkpoint_path if checkpoint_is_artifact_stream else str(checkpoint_path),
+        map_location="cpu" if checkpoint_is_artifact_stream else "cuda",
+        weights_only=False,
+    )
+    if artifact_path is not None:
+        model_state_dict = {
+            key.removeprefix("model."): value
+            for key, value in checkpoint["state_dict"].items()
+            if key.startswith("model.")
+        }
+        upgraded_model_state_dict = upgrade_model(
+            model_state_dict,
+            original_artifact_config,
+            datasource_summary=DataSourceSummary.from_dict(artifact.datasource_summary, infer_missing=True),
+        )
+        checkpoint["state_dict"] = {
+            key: value for key, value in checkpoint["state_dict"].items() if not key.startswith("model.")
+        }
+        checkpoint["state_dict"].update({f"model.{key}": value for key, value in upgraded_model_state_dict.items()})
     system = make_system(config.system.name, config)
-    checkpoint = torch.load(str(checkpoint_path), map_location="cuda", weights_only=False)
     system.load_state_dict(checkpoint["state_dict"], strict=False, assign=True)
     # Ensure model is on CUDA so Slang/collector ops (e.g. calib_gradient_mask) see CUDA tensors.
     system.cuda()
@@ -1750,7 +1971,11 @@ def export_gaussian_usd_asset(
     # Setup output path
     output_path: Path
     if output_dir is None:
-        output_path = Path(config.ckpt_dir).parent / "usd_asset"
+        output_path = (
+            artifact_path.parent / f"{artifact_path.stem}_usd_asset"
+            if artifact_path is not None
+            else Path(config.ckpt_dir).parent / "usd_asset"
+        )
     else:
         output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1791,9 +2016,12 @@ def export_gaussian_usd_asset(
     rig_timestamps: List[int] = []
     camera_name_to_index: Dict[str, int] = {}
 
+    if export_rolling_shutter and not export_rig_trajectories:
+        log.warning("export_rolling_shutter is ignored, the rolling shutter is part of the rig trajectories")
+
     if export_rig_trajectories:
         rig_stage_named, timestamp_offset_us, _, rig_timestamps = create_rig_trajectories_stage(
-            datasource, frame_rate=DEFAULT_FRAME_RATE
+            datasource, frame_rate=DEFAULT_FRAME_RATE, export_rolling_shutter=export_rolling_shutter
         )
 
         # Build camera name to index mapping and extract camera render products for PPISP
@@ -2011,9 +2239,7 @@ def export_gaussian_usd_asset(
         sorting_mode_hint = "cameraDistance"  # Default
         try:
             if hasattr(model, "config") and hasattr(model.config, "renderer"):
-                global_z_order = getattr(model.config.renderer, "global_z_order", False)
-                sorting_mode_hint = "zDepth" if global_z_order else "cameraDistance"
-                log.info(f"Detected global_z_order={global_z_order} from renderer config")
+                sorting_mode_hint = resolve_sorting_mode_hint(model.config.renderer)
         except Exception as e:
             log.warning(f"Could not determine sorting mode from renderer config: {e}")
         log.info(f"Using sorting mode hint: {sorting_mode_hint}")
@@ -2034,39 +2260,91 @@ def export_gaussian_usd_asset(
                 gaussian_model,
                 group=model.gaussian_process_group,
             )
-            filename = f"{node_name}_gaussians.{stage_ext}" if len(nodes) > 1 else f"gaussians.{stage_ext}"
             node_layer_name = node_name if len(nodes) > 1 else None
+            capabilities = accessor.get_capabilities()
+            partition_indices: Sequence[Optional[torch.Tensor]] = [None]
+            node_prim_info: List[PrimExportInfo] = []
+            partition_cap = max_gaussians_per_partition
+            if max_gaussians_per_partition is not None:
+                probe, _, _ = accessor.get_attributes_at_timestamp(timestamp_offset_us, preactivation=False)
+            elif auto_partition:
+                probe, _, _ = accessor.get_attributes_at_timestamp(timestamp_offset_us, preactivation=False)
+                # The OVRTX row limit applies to every format; only the member-size
+                # budget is USDZ-specific. A zero estimate disables the size cap.
+                bytes_per_gaussian = 0.0
+                if usd_format.lower() == "usdz":
+                    bytes_per_gaussian = _estimate_usdz_bytes_per_gaussian(probe)
+                    # Animated deformation/appearance writes per-frame samples into
+                    # the crate. Use the exported timeline as a conservative multiplier
+                    # so each partition remains below the member-size budget.
+                    if capabilities.has_deformation or capabilities.has_temporal_appearance:
+                        export_timestamps = _get_export_timestamps(
+                            accessor,
+                            capabilities,
+                            rig_timestamps if resample_animation else None,
+                            timestamp_offset_us,
+                        )
+                        bytes_per_gaussian *= max(1, len(export_timestamps))
+                partition_cap = automatic_partition_cap(len(probe.positions), bytes_per_gaussian)
 
-            gauss_stage = initialize_usd_stage()
-            UsdGeom.SetStageUpAxis(gauss_stage, UsdGeom.Tokens.y)
-            gauss_stage.SetTimeCodesPerSecond(DEFAULT_FRAME_RATE)
-            root_path = create_gaussian_model_root(
-                gauss_stage,
-                flip_x_axis=flip_x_axis,
-                flip_y_axis=flip_y_axis,
-                flip_z_axis=flip_z_axis,
-                dataset_offset=dataset_offset,
-            )
+            partition_percentage = percentage_gaussians
+            if partition_cap is not None:
+                reference_timestamps = rig_timestamps if resample_animation else None
+                nan_check_timestamp = reference_timestamps[0] if reference_timestamps else timestamp_offset_us
+                selected_rows = _select_partition_rows(
+                    accessor, percentage_gaussians, nan_check_timestamp, preactivation=(not apply_activation)
+                )
+                partition_indices = (
+                    [
+                        selected_rows[indices]
+                        for indices in partition_gaussian_indices(probe.positions[selected_rows.numpy()], partition_cap)
+                    ]
+                    if len(selected_rows)
+                    else []
+                )
+                partition_percentage = 100.0
+                log.info("Partitioned node %s into %d USD layer(s)", node_name or "model", len(partition_indices))
 
-            node_prim_info = export_gaussians_as_usd_asset(
-                accessor=accessor,
-                stage=gauss_stage,
-                percentage_gaussians=percentage_gaussians,
-                node_layer_name=node_layer_name,
-                force_sh_0=force_sh_0,
-                preactivation=(not apply_activation),
-                do_not_cast_shadows=do_not_cast_shadows,
-                skip_gaussian_deformation=skip_gaussian_deformation,
-                usd_timestamp_offset_us=timestamp_offset_us,
-                reference_timestamps_us=rig_timestamps if resample_animation else None,
-                content_root_path=root_path,
-                schema_type=schema_type,
-                sorting_mode_hint=sorting_mode_hint,
-                half_precision=half_precision,
-                linear_srgb=runtime_post_processing,
-                has_post_processing=runtime_post_processing,
-            )
-            all_prim_info.extend(node_prim_info)
+            for partition_id, gaussian_indices in enumerate(partition_indices):
+                gauss_stage = initialize_usd_stage()
+                UsdGeom.SetStageUpAxis(gauss_stage, UsdGeom.Tokens.y)
+                gauss_stage.SetTimeCodesPerSecond(DEFAULT_FRAME_RATE)
+                root_path = create_gaussian_model_root(
+                    gauss_stage,
+                    flip_x_axis=flip_x_axis,
+                    flip_y_axis=flip_y_axis,
+                    flip_z_axis=flip_z_axis,
+                    dataset_offset=dataset_offset,
+                )
+                partition_prim_info = export_gaussians_as_usd_asset(
+                    accessor=accessor,
+                    stage=gauss_stage,
+                    percentage_gaussians=partition_percentage,
+                    node_layer_name=node_layer_name,
+                    force_sh_0=force_sh_0,
+                    preactivation=(not apply_activation),
+                    do_not_cast_shadows=do_not_cast_shadows,
+                    skip_gaussian_deformation=skip_gaussian_deformation,
+                    usd_timestamp_offset_us=timestamp_offset_us,
+                    reference_timestamps_us=rig_timestamps if resample_animation else None,
+                    content_root_path=root_path,
+                    schema_type=schema_type,
+                    sorting_mode_hint=sorting_mode_hint,
+                    half_precision=half_precision,
+                    linear_srgb=runtime_post_processing,
+                    has_post_processing=runtime_post_processing,
+                    gaussian_indices_override=gaussian_indices,
+                )
+                node_prim_info.extend(partition_prim_info)
+                all_prim_info.extend(partition_prim_info)
+                if len(partition_indices) == 1 and max_gaussians_per_partition is None:
+                    filename = f"{node_name}_gaussians.{stage_ext}" if len(nodes) > 1 else f"gaussians.{stage_ext}"
+                elif len(nodes) > 1:
+                    filename = f"{node_name}_gaussians_{partition_id:03d}.{stage_ext}"
+                else:
+                    filename = f"gaussians_{partition_id:03d}.{stage_ext}"
+                usdz_cache.add_usd_stage(NamedUSDStage(filename=filename, stage=gauss_stage))
+            # END partitioning integration.
             # Log export manifest (index, track_id) per node for comparison with GT
             if len(node_prim_info) > 1:
                 manifest = [(p.track_index, p.track_id) for p in node_prim_info]
@@ -2079,15 +2357,17 @@ def export_gaussian_usd_asset(
             if all_capabilities is None:
                 all_capabilities = accessor.get_capabilities()
 
-            usdz_cache.add_usd_stage(NamedUSDStage(filename=filename, stage=gauss_stage))
-
         # Export background as USD DomeLight if applicable.
-        # TODO(spg-reintro): when external PPISP SPG export is wired back in, switch
-        # this default to neutral 1.0 (so the SPG owns exposure) and align with the
-        # per-RenderProduct camera shim (see ideutsch/ppisp-update-spg-snapshot).
+        # Keep the dome light neutral so the environment texture's radiance is not
+        # multiplied by an exporter-specific exposure scale.
         background_model = getattr(system.model, "background", None)
         if schema_type != GaussianUSDSchemaType.NREND_VOLUME and background_model is not None:
-            result = create_background_domelight(background_model, output_path, intensity=DOME_LIGHT_DEFAULT_INTENSITY)
+            result = create_background_domelight(
+                background_model,
+                output_path,
+                intensity=DOME_LIGHT_DEFAULT_INTENSITY,
+                radiance_scale=scene_radiance_scale,
+            )
             if result is not None:
                 named_stage, named_hdr = result
                 usdz_cache.add_usd_stage(named_stage)

@@ -28,6 +28,30 @@ void generate_image_points_kernel(
     output.storeVec(uint2(idx, 0), float2(float(x)+0.5f, float(y)+0.5f));
 }
 
+[CUDAKernel]
+[AutoPyBindCUDA]
+void camera_rays_to_world_rays_batch_kernel(
+    TensorView<float> camera_rays,       // [N, 3]
+    TensorView<float> translations,      // [B, 3]
+    TensorView<float> rotations,         // [B, 4]
+    TensorView<float> world_rays         // [B*N, 6]
+) {
+    uint idx = cudaBlockIdx().x * cudaBlockDim().x + cudaThreadIdx().x;
+    uint ray_count = camera_rays.size(0);
+    uint count = translations.size(0) * ray_count;
+    if (idx >= count) return;
+
+    uint camera_idx = idx / ray_count;
+    uint ray_idx = idx - camera_idx * ray_count;
+    float3 translation = translations.loadVec<3>(uint2(camera_idx, 0));
+    float4 rotation = rotations.loadVec<4>(uint2(camera_idx, 0));
+    float3 direction = camera_rays.loadVec<3>(uint2(ray_idx, 0));
+    SE3Pose pose = SE3Pose.from_translation_quaternion(translation, rotation);
+
+    world_rays.storeVec(uint2(idx, 0), translation);
+    world_rays.storeVec(uint2(idx, 3), pose.transform_direction(direction));
+}
+
 // ============================================================================
 // Helper Functions for Loading Struct Parameters from Tensors
 // ============================================================================
@@ -2128,4 +2152,3 @@ void image_points_to_world_rays_shutter_pose_ftheta_bivariate_windshield(
         timestamps_us, poses_translation, poses_rotation
     );
 }
-

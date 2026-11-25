@@ -19,11 +19,11 @@ from ncore.data import (
     RowOffsetStructuredSpinningLidarModelParameters,
     ShutterType,
 )
-from ncore.sensors import RowOffsetStructuredSpinningLidarModel, camera_model_from_parameters
+from ncore.sensors import OpenCVFisheyeCameraModel, RowOffsetStructuredSpinningLidarModel, camera_model_from_parameters
 from nurec.libs.geometry.kernels.pose import se3pose_from_matrix
-from nurec.libs.sensors.kernels.cameras import image_points_to_world_rays_shutter_pose
+from nurec.libs.sensors.kernels.cameras import image_points_to_camera_rays, image_points_to_world_rays_shutter_pose
 from nurec.libs.sensors.kernels.lidars import generate_spinning_lidar_rays
-from nurec.utils.batch import generate_grid_2d_indices
+from nurec.utils.batch import RenderingData, compute_pixel_footprint, generate_grid_2d_indices
 from nurec.utils.prober import (
     ProberDataSet,
     ProberTestResult,
@@ -81,16 +81,18 @@ def test_pixels_to_world_rays_shutter_pose(data: ProberDataSet, test_mode: _Impl
     The old implementation used sensor_model.pixels_to_world_rays_shutter_pose and lidar_model.elements_to_world_rays_shutter_pose from NCore.
     The new implementation uses CameraModelComputations.pixels_to_world_rays_shutter_pose and LidarModelComputations.elements_to_world_rays_shutter_pose.
 
-    This test ensures both implementations produce the same results.
+    Compare rays, timestamps, and isolated pose gradients against a converged NCore reference.
     """
     """Generate test data for comparing the two implementations."""
 
     world_rays_map = {}
     timestamps_us_map = {}
-    T_sensor_world_startend_grad_map = {}
+    T_sensor_world_startend_grad_map: dict[int, torch.Tensor] = {}
 
     for camera_model_index in range(3):
         T_sensor_world_startend = data["T_sensor_world_startend"]
+        # Each camera must contribute its own pose gradient, not an accumulated sum.
+        T_sensor_world_startend.grad = None
         timestamps_startend_us = data["timestamps_startend_us"]
         world_rays_grad = data["world_rays_grad"]
 
@@ -146,10 +148,65 @@ def test_pixels_to_world_rays_shutter_pose(data: ProberDataSet, test_mode: _Impl
         sensorlib_parameters = CameraModelConverter.convert(camera_model, device=pixel_idxs.device)
         image_points = 0.5 + pixel_idxs.to(camera_model.dtype)
 
-        camera_rays = camera_model.image_points_to_camera_rays(image_points)
-        camera_rays = camera_rays.reshape(-1, 3)
-
         if test_mode == _ImplementationTestMode.NCORE_IMPLEMENTATION:
+            camera_rays = camera_model.image_points_to_camera_rays(image_points).reshape(-1, 3)
+            if isinstance(camera_model, OpenCVFisheyeCameraModel):
+                # Validate NCore's default inverse independently over the entire image.
+                # Its convergence tolerance is angular: the polynomial slope can
+                # amplify an acceptable angle error into a larger radius residual.
+                # NCore >= 19.8.5 converges to ~2e-7 rad in float32 (19.8.4 left
+                # up to 1.6e-6 rad), keep the tolerance tight to catch regressions.
+                with torch.no_grad():
+                    assert torch.isfinite(camera_rays).all()
+                    rays64 = camera_rays.double()
+                    theta = torch.atan2(torch.linalg.vector_norm(rays64[:, :2], dim=-1), rays64[:, 2])
+                    assert (theta < camera_model.max_angle).all()
+                    normalized_points = (
+                        image_points.double() - camera_model.principal_point.double()
+                    ) / camera_model.focal_length.double()
+                    radius = torch.linalg.vector_norm(normalized_points, dim=-1)
+                    coefficients = camera_model.forward_poly[[3, 5, 7, 9]].double()
+                    assert torch.isfinite(coefficients).all() and (coefficients >= 0.0).all()
+                    k1, k2, k3, k4 = coefficients.unbind()
+
+                    # Nonnegative coefficients make this fixture strictly increasing.
+                    # Bisection in float64 supplies an oracle independent of Newton.
+                    lower = torch.zeros_like(radius)
+                    upper = torch.full_like(radius, camera_model.max_angle)
+                    upper2 = upper.square()
+                    max_radius = upper * (1.0 + upper2 * (k1 + upper2 * (k2 + upper2 * (k3 + upper2 * k4))))
+                    assert torch.isfinite(radius).all() and (radius < max_radius).all()
+                    for _ in range(48):
+                        midpoint = (lower + upper) * 0.5
+                        midpoint2 = midpoint.square()
+                        midpoint_radius = midpoint * (
+                            1.0 + midpoint2 * (k1 + midpoint2 * (k2 + midpoint2 * (k3 + midpoint2 * k4)))
+                        )
+                        below_root = midpoint_radius < radius
+                        lower = torch.where(below_root, midpoint, lower)
+                        upper = torch.where(below_root, upper, midpoint)
+                    torch.testing.assert_close(theta, (lower + upper) * 0.5, atol=3e-7, rtol=0.0)
+
+                    # Correct rays must also retain accurate footprints at this
+                    # resolution. acos(float32 dot) amplifies small ray errors.
+                    reference_theta = (lower + upper) * 0.5
+                    reference_xy = normalized_points * (reference_theta.sin() / radius.clamp_min(1e-30)).unsqueeze(-1)
+                    reference_rays = torch.cat([reference_xy, reference_theta.cos().unsqueeze(-1)], dim=-1)
+                    width, height = (int(value) for value in camera_params.resolution)
+                    expected_footprints = compute_pixel_footprint(reference_rays.reshape(height, width, 3).cpu())
+                    footprints = compute_pixel_footprint(camera_rays.reshape(height, width, 3))
+                    assert torch.isfinite(footprints).all() and (footprints > 0).all()
+                    torch.testing.assert_close(footprints.cpu().double(), expected_footprints, atol=2e-6, rtol=1e-4)
+
+                    theta2 = theta.square()
+                    projected_radius = theta * (1.0 + theta2 * (k1 + theta2 * (k2 + theta2 * (k3 + theta2 * k4))))
+                    derivative = 1.0 + theta2 * (
+                        3.0 * k1 + theta2 * (5.0 * k2 + theta2 * (7.0 * k3 + theta2 * 9.0 * k4))
+                    )
+                    assert torch.isfinite(derivative).all() and (derivative > 0.0).all()
+                    angular_residual = (projected_radius - radius) / derivative
+                    torch.testing.assert_close(angular_residual, torch.zeros_like(radius), atol=3e-7, rtol=0.0)
+
             world_rays_return = camera_model.pixels_to_world_rays_shutter_pose(
                 pixel_idxs,
                 T_sensor_world_startend[0],
@@ -190,7 +247,8 @@ def test_pixels_to_world_rays_shutter_pose(data: ProberDataSet, test_mode: _Impl
 
         world_rays_map[camera_model_index] = world_rays
         timestamps_us_map[camera_model_index] = timestamps_us
-        T_sensor_world_startend_grad_map[camera_model_index] = T_sensor_world_startend.grad
+        assert T_sensor_world_startend.grad is not None
+        T_sensor_world_startend_grad_map[camera_model_index] = T_sensor_world_startend.grad.detach().clone()
 
     return ProberTestResult(
         str(test_mode),
@@ -205,6 +263,75 @@ def test_pixels_to_world_rays_shutter_pose(data: ProberDataSet, test_mode: _Impl
             timestamps_us_map[2],
             T_sensor_world_startend_grad_map[2],
         ),
+    )
+
+
+def test_fisheye_default_inverse_agrees_for_rays_footprints_and_depth_scale():
+    """The NCore paths used outside Slang must select the same optical-axis root.
+
+    This cubic has two positive roots. Its closed-form inverse on the increasing
+    branch detects finite but incorrect rays from the old unconstrained solver.
+    All pixels are inside both the configured FOV and the monotonic domain; this
+    test deliberately does not equate the backends' out-of-domain policies.
+    """
+    device = torch.device("cuda")
+    width, height = 32, 24
+    camera_params = OpenCVFisheyeCameraModelParameters(
+        resolution=np.array([width, height], dtype=np.uint64),
+        shutter_type=ShutterType.GLOBAL,
+        principal_point=np.array([width / 2, height / 2], dtype=np.float32),
+        focal_length=np.array([32.0, 32.0], dtype=np.float32),
+        radial_coeffs=np.array([-1 / 3, 0.0, 0.0, 0.0], dtype=np.float32),
+        max_angle=2.0,
+    )
+    camera_model = camera_model_from_parameters(camera_params, device=device, dtype=torch.float32)
+    pixel_idxs = generate_grid_2d_indices((width, height), device=device, order="xy")
+    image_points = pixel_idxs.float() + 0.5
+    normalized_points = (
+        image_points.double() - camera_model.principal_point.double()
+    ) / camera_model.focal_length.double()
+    radius = torch.linalg.vector_norm(normalized_points, dim=-1)
+    # Invert theta - a*theta**3 using the smaller positive root, including the
+    # actual float32 coefficient rather than the idealized value a=1/3.
+    sqrt_3a = np.sqrt(-3 * float(camera_params.radial_coeffs[0]))
+    assert (1.5 * sqrt_3a * radius < 1.0).all()
+    theta = 2 / sqrt_3a * torch.asin(1.5 * sqrt_3a * radius).div(3).sin()
+    expected_rays = (
+        torch.cat([normalized_points * (theta.sin() / radius).unsqueeze(-1), theta.cos().unsqueeze(-1)], dim=-1)
+        .float()
+        .reshape(height, width, 3)
+    )
+
+    # NCore produces footprint inputs and also serves the depth-export path.
+    ncore_rays = camera_model.pixels_to_camera_rays(pixel_idxs).reshape(height, width, 3)
+    sensorlib_parameters = CameraModelConverter.convert(camera_model, device=device)
+    slang_rays = image_points_to_camera_rays(
+        image_points, sensorlib_parameters.projection, sensorlib_parameters.external_distortion
+    ).reshape(height, width, 3)
+    expected_footprints = compute_pixel_footprint(expected_rays)
+    for camera_rays, ray_atol in ((ncore_rays, 3e-7), (slang_rays, 2e-6)):
+        torch.testing.assert_close(camera_rays, expected_rays, atol=ray_atol, rtol=0.0)
+        footprints = compute_pixel_footprint(camera_rays)
+        assert torch.isfinite(footprints).all() and (footprints > 0.0).all()
+        torch.testing.assert_close(footprints, expected_footprints, atol=2e-6, rtol=1e-4)
+
+    # Exercise the production property: it reconstructs NCore from host camera
+    # parameters, independently of the already generated Slang rays.
+    poses = torch.zeros((1, 2, 7), device=device)
+    poses[..., 6] = 1.0
+    timestamps_cpu = torch.tensor([[0, 1]], dtype=torch.int64)
+    rendering = RenderingData(
+        rays=torch.cat([torch.zeros_like(slang_rays), slang_rays], dim=-1).unsqueeze(0),
+        sensor_model_parameters=[camera_params],
+        poses_tquat_startend=poses,
+        timestamps_startend_us=timestamps_cpu.to(device),
+        timestamps_startend_us_cpu=timestamps_cpu,
+    )
+    torch.testing.assert_close(
+        rendering.distance_to_depth_scale,
+        expected_rays[..., 2].unsqueeze(0).unsqueeze(-1),
+        atol=2e-6,
+        rtol=0.0,
     )
 
 
@@ -338,7 +465,7 @@ def test_cpu_gpu_timestamp_consistency():
     sensor_models = torch.nn.ModuleDict({"camera_0": camera_model})
 
     # Create subsampling parameters
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=100,
         j=200,
         width=800,
@@ -475,7 +602,7 @@ def test_full_sensor_subsample_skips_cpu_timestamp_interpolation(
 ):
     device = torch.device("cuda")
     timestamps_startend_us_allviews_cpu = torch.tensor([[100, 200], [300, 500]], dtype=torch.int64)
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=0,
         j=0,
         width=subsampled_width,
@@ -528,7 +655,7 @@ def test_full_sensor_timestamp_fast_path_preserves_float32_endpoint_contract(
         ],
         dtype=torch.int64,
     )
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=0,
         j=0,
         width=960,
@@ -583,7 +710,7 @@ def test_subsample_coverage_follows_shutter_scan_axis(
     covers_vertical: bool,
     covers_horizontal: bool,
 ):
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=0,
         j=0,
         width=subsampled_width,
@@ -619,7 +746,7 @@ def test_crop_orthogonal_to_shutter_scan_skips_cpu_timestamp_interpolation(
 ):
     device = torch.device("cuda")
     timestamps_startend_us_allviews_cpu = torch.tensor([[100, 200], [300, 500]], dtype=torch.int64)
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=i,
         j=j,
         width=subsampled_width,
@@ -653,7 +780,7 @@ def test_crop_orthogonal_to_shutter_scan_skips_cpu_timestamp_interpolation(
 def test_cropped_subsample_uses_cpu_timestamp_interpolation():
     device = torch.device("cuda")
     timestamps_startend_us_allviews_cpu = torch.tensor([[100, 200], [300, 500]], dtype=torch.int64)
-    subsample = RectSubsampledSensor(
+    subsample = RectSubsampledSensor.from_subsample(
         i=10,
         j=20,
         width=320,

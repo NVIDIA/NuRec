@@ -20,10 +20,12 @@ from nurec.utils.edit.asset_edits_schema import (
     AssetEditsError,
     AssetPlacement,
     Binding,
+    CloneMotion,
     ControlSpec,
     EditSpec,
     _as_vec3,
     _norm_token,
+    binding_key,
     is_ply_asset,
     load_asset_edits,
 )
@@ -33,10 +35,31 @@ def _edit(**over: Any) -> dict[str, Any]:
     """A minimal valid edit dict; keyword args override fields."""
     d: dict[str, Any] = {
         "id": "truck_1",
+        "op": "replace",
         "bind": {"type": "nre_track", "nre_track_id": 3},
         "asset": "usd/configurable_asset/scene.usd",
         "controls": {"panelState": {"default": "off", "controllable": True}},
     }
+    d.update(over)
+    return d
+
+
+def _clone(**over: Any) -> dict[str, Any]:
+    """A minimal valid clone-of-captured-track edit dict; keyword args override fields."""
+    d: dict[str, Any] = {
+        "id": "lead_clone",
+        "op": "clone",
+        "source": {"nurec_track_id": 12},
+        "motion": {"inherit": True, "offset": [0.0, -2.4, 0.0]},
+        "track_id": "9000221",
+    }
+    d.update(over)
+    return d
+
+
+def _exclude(**over: Any) -> dict[str, Any]:
+    """A minimal valid exclude edit dict; keyword args override fields."""
+    d: dict[str, Any] = {"id": "drop_1", "op": "exclude", "bind": {"type": "nurec_track", "nurec_track_id": 5}}
     d.update(over)
     return d
 
@@ -67,6 +90,7 @@ class NormTokenTest(unittest.TestCase):
         text = """
         edits:
           - id: truck_1
+            op: replace
             bind: {nurec_track_id: 3}
             asset: scene.usd
             controls:
@@ -202,8 +226,10 @@ class WorldEditInterplayTest(unittest.TestCase):
 
     @staticmethod
     def _world_edit(**over: Any) -> dict[str, Any]:
+        """A world-bind add edit; keyword arguments override its fields."""
         d: dict[str, Any] = {
             "id": "barrier_1",
+            "op": "add",
             "bind": {"type": "world", "position": [150.0, -3.5, 0.0], "yaw_deg": 90.0},
             "asset": "props/barrier/Body.usd",
         }
@@ -213,12 +239,13 @@ class WorldEditInterplayTest(unittest.TestCase):
     def test_track_id_defaults_to_prop_edit_id(self) -> None:
         """A world bind without an explicit track_id gets "prop:<edit_id>" on parse."""
         fx = EditSpec.from_dict(self._world_edit(), "edits[0]")
+        assert fx.bind is not None
         self.assertEqual(fx.bind.track_id, "prop:barrier_1")
 
-    def test_replace_original_rejected(self) -> None:
-        """replace_original on a world bind is meaningless and fails loud."""
-        with self.assertRaisesRegex(AssetEditsError, "replace_original"):
-            EditSpec.from_dict(self._world_edit(replace_original=True), "edits[0]")
+    def test_replace_on_world_bind_rejected(self) -> None:
+        """A replace at a world pose is meaningless (no captured actor there) and fails loud."""
+        with self.assertRaisesRegex(AssetEditsError, "replace edit binds an existing track"):
+            EditSpec.from_dict(self._world_edit(op="replace"), "edits[0]")
 
     def test_scale_defaults_to_fixed_one(self) -> None:
         """With no explicit scale, world binds keep real-world size (fixed 1.0, not fit_length)."""
@@ -247,10 +274,40 @@ class WorldEditInterplayTest(unittest.TestCase):
         self.assertEqual(fx.placement.scale_mode, "fit_length")
 
     def test_nurec_track_edits_keep_fit_length_default(self) -> None:
-        """The world-bind scale default does not leak into nurec_track edits."""
+        """The world-bind scale default does not leak into replace edits."""
         fx = EditSpec.from_dict(_edit(), "edits[0]")
         assert fx.placement is not None
         self.assertEqual(fx.placement.scale_mode, "fit_length")
+
+    def test_attachment_keeps_real_size_by_default(self) -> None:
+        """An add on a track (attachment) is not fitted to the actor's cuboid unless asked."""
+        fx = EditSpec.from_dict(_edit(op="add", controls={}), "edits[0]")
+        self.assertEqual((fx.placement.scale_mode, fx.placement.scale), ("fixed", 1.0))
+        fitted = EditSpec.from_dict(_edit(op="add", controls={}, placement={"scale": "fit_length"}), "edits[0]")
+        self.assertEqual(fitted.placement.scale_mode, "fit_length")
+        again = EditSpec.from_dict(fx.to_dict(), "edits[0]")
+        self.assertEqual(again, fx)
+
+    def test_track_id_with_at_sign_rejected(self) -> None:
+        """NuRec strips '@<source>' from track ids at load, so such an id would not survive."""
+        with self.assertRaisesRegex(AssetEditsError, "contains '@'.*'221'"):
+            EditSpec.from_dict(
+                self._world_edit(bind={"type": "world", "position": [1.0, 2.0, 0.0], "track_id": "221@clone"}),
+                "edits[0]",
+            )
+        with self.assertRaisesRegex(AssetEditsError, "defaults to 'prop:<id>'"):
+            EditSpec.from_dict(self._world_edit(id="barrier@1"), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "contains '@'"):
+            EditSpec.from_dict(
+                {
+                    "id": "c",
+                    "op": "clone",
+                    "source": {"nurec_track_id": 1},
+                    "motion": {"inherit": True},
+                    "track_id": "221@clone",
+                },
+                "edits[0]",
+            )
 
 
 class AssetPlacementTest(unittest.TestCase):
@@ -319,9 +376,13 @@ class EditSpecTest(unittest.TestCase):
     """Edit parsing: required keys, strict unknown-field rejection, and control handling."""
 
     def test_requires_id_bind_and_asset(self) -> None:
-        """Missing id, bind or asset each fails with an error naming the absent key."""
+        """Missing id, op, bind or asset each fails with an error naming the absent key."""
         with self.assertRaisesRegex(AssetEditsError, "requires an 'id'"):
-            EditSpec.from_dict({"bind": {"nre_track_id": 1}, "asset": "a.usd"}, "edits[0]")
+            EditSpec.from_dict({"op": "add", "bind": {"nurec_track_id": 1}, "asset": "a.usd"}, "edits[0]")
+        no_op = _edit()
+        del no_op["op"]
+        with self.assertRaisesRegex(AssetEditsError, "requires an 'op'"):
+            EditSpec.from_dict(no_op, "edits[0]")
         no_bind = _edit()
         del no_bind["bind"]
         with self.assertRaisesRegex(AssetEditsError, "requires a 'bind'"):
@@ -342,10 +403,26 @@ class EditSpecTest(unittest.TestCase):
             with self.assertRaisesRegex(AssetEditsError, "unknown edit field"):
                 EditSpec.from_dict(_edit(**{field_name: value}), "edits[0]")
 
-    def test_replace_original_must_be_boolean(self) -> None:
-        """A string value for replace_original is rejected; only real booleans pass."""
-        with self.assertRaisesRegex(AssetEditsError, "expected a boolean"):
-            EditSpec.from_dict(_edit(replace_original="no"), "edits[0]")
+    def test_retired_replace_original_key_rejected(self) -> None:
+        """The POC's replace_original flag is gone: the op says whether the actor is hidden."""
+        with self.assertRaisesRegex(AssetEditsError, "unknown edit field.*replace_original"):
+            EditSpec.from_dict(_edit(replace_original=True), "edits[0]")
+
+    def test_unknown_op_rejected(self) -> None:
+        """An op outside add/replace/clone/exclude fails, naming the supported set."""
+        with self.assertRaisesRegex(AssetEditsError, "unsupported op 'swap'.*add.*replace.*clone.*exclude"):
+            EditSpec.from_dict(_edit(op="swap"), "edits[0]")
+
+    def test_op_predicates(self) -> None:
+        """replace hides the captured actor and bakes an asset; add on a track is an attachment."""
+        replace = EditSpec.from_dict(_edit(), "edits[0]")
+        self.assertEqual(
+            (replace.op, replace.hides_original, replace.has_asset, replace.is_world), ("replace", True, True, False)
+        )
+        attach = EditSpec.from_dict(_edit(op="add"), "edits[0]")
+        self.assertEqual((attach.hides_original, attach.has_asset, attach.binds_synthetic_track), (False, True, False))
+        self.assertEqual(attach.nurec_track_id, 3)
+        self.assertEqual(binding_key(attach), (DEFAULT_LAYER_ID, 3))
 
     def test_controls_must_be_a_mapping(self) -> None:
         """A list under controls is rejected; a name-to-spec mapping is required."""
@@ -359,13 +436,11 @@ class EditSpecTest(unittest.TestCase):
 
     def test_parses_happy_path(self) -> None:
         """A fully-specified edit parses with bind, flags and normalized controls intact."""
-        fx = EditSpec.from_dict(
-            _edit(placement={"align": "bbox", "scale": "fit_length"}, replace_original=True),
-            "edits[0]",
-        )
+        fx = EditSpec.from_dict(_edit(placement={"align": "bbox", "scale": "fit_length"}), "edits[0]")
         self.assertEqual(fx.id, "truck_1")
+        assert fx.bind is not None
         self.assertEqual(fx.bind.nurec_track_id, 3)
-        self.assertTrue(fx.replace_original)
+        self.assertTrue(fx.hides_original)
         self.assertEqual(fx.controls[0].name, "panelstate")
         self.assertTrue(fx.controls[0].controllable)
 
@@ -393,6 +468,7 @@ class PlyAssetEditTest(unittest.TestCase):
         world = EditSpec.from_dict(
             {
                 "id": "cone_1",
+                "op": "add",
                 "bind": {"type": "world", "position": [1.0, 2.0, 0.0], "dims": [0.4, 0.4, 0.7]},
                 "asset": "props/cone.ply",
                 "placement": {"scale": "fit_length"},
@@ -400,6 +476,7 @@ class PlyAssetEditTest(unittest.TestCase):
             "edits[0]",
         )
         self.assertEqual(world.placement.scale_mode, "fit_length")
+        assert world.bind is not None
         self.assertEqual(world.bind.dims, [0.4, 0.4, 0.7])
 
     def test_controls_rejected(self) -> None:
@@ -521,6 +598,7 @@ class DuplicateKeyTest(unittest.TestCase):
                 tmp,
                 "edits:\n"
                 "  - id: a\n"
+                "    op: add\n"
                 "    bind: {type: nurec_track, nurec_track_id: 7}\n"
                 "    bind: {type: nurec_track, nurec_track_id: 42}\n"
                 "    asset: scene.usd\n",
@@ -535,6 +613,7 @@ class DuplicateKeyTest(unittest.TestCase):
                 tmp,
                 "edits:\n"
                 "  - id: a\n"
+                "    op: add\n"
                 "    bind: {type: nurec_track, nurec_track_id: 7}\n"
                 "    asset: scene.usd\n"
                 "    controls:\n"
@@ -547,23 +626,25 @@ class DuplicateKeyTest(unittest.TestCase):
     def test_malformed_yaml_becomes_a_domain_error(self) -> None:
         """A bad indent must not escape as a raw PyYAML traceback."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write(tmp, "edits:\n  - id: a\n   bind: {nurec_track_id: 1}\n")
+            path = self._write(tmp, "edits:\n  - id: a\n   op: add\n   bind: {nurec_track_id: 1}\n")
             with self.assertRaisesRegex(AssetEditsError, "invalid YAML"):
                 load_asset_edits(path)
 
     def test_valid_document_still_parses(self) -> None:
+        """A well-formed document loads through the strict loader."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(
                 tmp,
-                "edits:\n  - id: a\n    bind: {type: nurec_track, nurec_track_id: 7}\n    asset: scene.usd\n",
+                "edits:\n  - id: a\n    op: add\n    bind: {type: nurec_track, nurec_track_id: 7}\n    asset: scene.usd\n",
             )
-            self.assertEqual(load_asset_edits(path).edits[0].bind.nurec_track_id, 7)
+            self.assertEqual(load_asset_edits(path).edits[0].nurec_track_id, 7)
 
 
 class NonFiniteScalarTest(unittest.TestCase):
     """Booleans and non-finite numbers are schema errors, never silent placement values."""
 
     def test_vec3_rejects_bool_and_non_finite_components(self) -> None:
+        """A placement offset with a bool, NaN or inf component is refused."""
         for bad in ([True, 0.0, 0.0], [0.0, float("nan"), 0.0], [0.0, 0.0, float("inf")]):
             with self.subTest(bad=bad), self.assertRaises(AssetEditsError):
                 AssetEditsDoc.from_dict(
@@ -571,6 +652,7 @@ class NonFiniteScalarTest(unittest.TestCase):
                         "edits": [
                             {
                                 "id": "a",
+                                "op": "add",
                                 "bind": {"type": "nre_track", "nre_track_id": 0},
                                 "asset": "s.usd",
                                 "placement": {"offset": bad},
@@ -580,6 +662,7 @@ class NonFiniteScalarTest(unittest.TestCase):
                 )
 
     def test_non_finite_scale_and_yaw_rejected(self) -> None:
+        """A NaN scale or an infinite yaw is refused."""
         for field, bad in (("scale", float("nan")), ("yaw_deg", float("inf"))):
             with self.subTest(field=field), self.assertRaises(AssetEditsError):
                 AssetEditsDoc.from_dict(
@@ -587,6 +670,7 @@ class NonFiniteScalarTest(unittest.TestCase):
                         "edits": [
                             {
                                 "id": "a",
+                                "op": "add",
                                 "bind": {"type": "nre_track", "nre_track_id": 0},
                                 "asset": "s.usd",
                                 "placement": {field: bad},
@@ -594,6 +678,231 @@ class NonFiniteScalarTest(unittest.TestCase):
                         ]
                     }
                 )
+
+
+class ExcludeEditTest(unittest.TestCase):
+    """An exclude edit names a captured track and nothing else."""
+
+    def test_parses_and_predicates(self) -> None:
+        """An exclude parses without asset or controls and is keyed by its track."""
+        fx = EditSpec.from_dict(_exclude(), "edits[0]")
+        self.assertEqual((fx.op, fx.is_exclude, fx.hides_original, fx.has_asset), ("exclude", True, True, False))
+        self.assertIsNone(fx.asset)
+        self.assertEqual(fx.controls, [])
+        self.assertEqual(fx.nurec_track_id, 5)
+        self.assertEqual(binding_key(fx), (DEFAULT_LAYER_ID, 5))
+
+    def test_extra_keys_rejected(self) -> None:
+        """An exclude bakes nothing: asset, controls and placement are refused."""
+        for key, value in (("asset", "a.usd"), ("controls", {}), ("placement", {}), ("prim_path", "/Car")):
+            with self.subTest(key=key), self.assertRaisesRegex(AssetEditsError, "unknown exclude edit field"):
+                EditSpec.from_dict(_exclude(**{key: value}), "edits[0]")
+
+    def test_world_bind_rejected(self) -> None:
+        """There is no captured actor at a world pose to exclude."""
+        with self.assertRaisesRegex(AssetEditsError, "binds an existing track"):
+            EditSpec.from_dict(_exclude(bind={"type": "world", "position": [0, 0, 0]}), "edits[0]")
+
+    def test_layer_id_honoured(self) -> None:
+        """An exclude keeps an explicit layer_id."""
+        fx = EditSpec.from_dict(_exclude(layer_id="static_rigids"), "edits[0]")
+        self.assertEqual(fx.layer_id, "static_rigids")
+
+
+class CloneEditTest(unittest.TestCase):
+    """Clone edits: source (captured track or another edit), motion (inherit or parked), track id."""
+
+    def test_captured_clone_parses(self) -> None:
+        """A clone of a captured track parses with inherited motion and its own track id."""
+        fx = EditSpec.from_dict(_clone(), "edits[0]")
+        assert fx.clone is not None
+        self.assertTrue(fx.is_clone and fx.binds_synthetic_track)
+        self.assertEqual((fx.has_asset, fx.hides_original, fx.is_world), (False, False, False))
+        self.assertTrue(fx.clone.is_captured)
+        self.assertEqual(fx.clone.source_nurec_track_id, 12)
+        self.assertEqual(fx.clone.track_id, "9000221")
+        self.assertEqual(fx.synthetic_track_id, "9000221")
+        self.assertEqual(binding_key(fx), ("synthetic", "9000221"))
+        motion = fx.clone.motion
+        self.assertEqual(
+            (motion.kind, motion.offset, motion.yaw_deg, motion.time_shift_us), ("inherit", [0.0, -2.4, 0.0], 0.0, 0)
+        )
+
+    def test_parked_motion_parses(self) -> None:
+        """A clone with a world motion parks there, anchored at its base by default."""
+        fx = EditSpec.from_dict(_clone(motion={"world": {"position": [1.0, 2.0, 0.0], "yaw_deg": 90.0}}), "edits[0]")
+        assert fx.clone is not None
+        motion = fx.clone.motion
+        self.assertTrue(motion.is_world)
+        self.assertEqual((motion.position, motion.yaw_deg, motion.anchor), ([1.0, 2.0, 0.0], 90.0, "base"))
+
+    def test_edit_source_parses_at_document_level(self) -> None:
+        """A clone of an edit takes the source's layer and resolves its appearance to it."""
+        doc = AssetEditsDoc.from_dict(
+            {"edits": [_edit(layer_id="custom_rigids"), _clone(id="c", source={"edit_id": "truck_1"})]}
+        )
+        clone = doc.edits[1]
+        assert clone.clone is not None
+        self.assertFalse(clone.clone.is_captured)
+        self.assertEqual(clone.layer_id, "custom_rigids")
+        self.assertIs(doc.appearance_of(clone), doc.edits[0])
+        self.assertIs(doc.appearance_of(doc.edits[0]), doc.edits[0])
+
+    def test_required_keys(self) -> None:
+        """A clone without source, motion or track_id is refused."""
+        for key in ("source", "motion", "track_id"):
+            d = _clone()
+            del d[key]
+            with self.subTest(key=key), self.assertRaisesRegex(AssetEditsError, f"requires '{key}'"):
+                EditSpec.from_dict(d, "edits[0]")
+
+    def test_foreign_keys_rejected(self) -> None:
+        """A clone copies an appearance: asset/controls/bind/placement are not its to declare."""
+        for key, value in (("asset", "a.usd"), ("controls", {}), ("bind", {"nurec_track_id": 1}), ("placement", {})):
+            with self.subTest(key=key), self.assertRaisesRegex(AssetEditsError, "unknown clone edit field"):
+                EditSpec.from_dict(_clone(**{key: value}), "edits[0]")
+
+    def test_source_needs_exactly_one_kind(self) -> None:
+        """A clone source names one captured track or one edit id, and nothing else."""
+        with self.assertRaisesRegex(AssetEditsError, "exactly one of"):
+            EditSpec.from_dict(_clone(source={"nurec_track_id": 1, "edit_id": "x"}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "exactly one of"):
+            EditSpec.from_dict(_clone(source={}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "unknown clone source field"):
+            EditSpec.from_dict(_clone(source={"track_id": "x"}), "edits[0]")
+
+    def test_motion_forms_validated(self) -> None:
+        """Clone motion is either 'inherit: true' or a world pose, and its fields are checked."""
+        with self.assertRaisesRegex(AssetEditsError, "exactly one of 'inherit: true' or 'world"):
+            EditSpec.from_dict(_clone(motion={}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "exactly one of 'inherit: true' or 'world"):
+            EditSpec.from_dict(_clone(motion={"inherit": True, "world": {"position": [0, 0, 0]}}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "inherit: must be true"):
+            EditSpec.from_dict(_clone(motion={"inherit": False}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "unknown motion field"):
+            EditSpec.from_dict(_clone(motion={"inherit": True, "position": [0, 0, 0]}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "world: requires 'position'"):
+            EditSpec.from_dict(_clone(motion={"world": {"yaw_deg": 1.0}}), "edits[0]")
+        with self.assertRaisesRegex(AssetEditsError, "time_shift_us.*integer"):
+            EditSpec.from_dict(_clone(motion={"inherit": True, "time_shift_us": 0.5}), "edits[0]")
+
+    def test_track_id_must_be_non_empty(self) -> None:
+        """A blank clone track_id is refused."""
+        with self.assertRaisesRegex(AssetEditsError, "track_id"):
+            EditSpec.from_dict(_clone(track_id="  "), "edits[0]")
+
+    def test_source_edit_must_exist_and_bake_an_asset(self) -> None:
+        """A clone's source edit must be in the document and bake an asset."""
+        with self.assertRaisesRegex(AssetEditsError, "not in this document"):
+            AssetEditsDoc.from_dict({"edits": [_clone(source={"edit_id": "ghost"})]})
+        with self.assertRaisesRegex(AssetEditsError, "is an exclude edit"):
+            AssetEditsDoc.from_dict({"edits": [_exclude(), _clone(source={"edit_id": "drop_1"})]})
+        with self.assertRaisesRegex(AssetEditsError, "is a clone edit"):
+            AssetEditsDoc.from_dict(
+                {"edits": [_clone(), _clone(id="c2", source={"edit_id": "lead_clone"}, track_id="x")]}
+            )
+
+    def test_source_edit_layer_mismatch_rejected(self) -> None:
+        """A clone may not name a layer other than its source edit's."""
+        with self.assertRaisesRegex(AssetEditsError, "differs from its clone source"):
+            AssetEditsDoc.from_dict(
+                {"edits": [_edit(), _clone(source={"edit_id": "truck_1"}, layer_id="custom_rigids")]}
+            )
+
+    def test_explicit_default_layer_mismatch_rejected(self) -> None:
+        """An explicit ``layer_id`` equal to the default is still an explicit mismatch, not an omission."""
+        source = _edit(layer_id="static_rigids")
+        with self.assertRaisesRegex(AssetEditsError, "layer_id 'dynamic_rigids' differs from its clone source"):
+            AssetEditsDoc.from_dict(
+                {"edits": [source, _clone(source={"edit_id": "truck_1"}, layer_id=DEFAULT_LAYER_ID)]}
+            )
+        doc = AssetEditsDoc.from_dict({"edits": [source, _clone(id="c", source={"edit_id": "truck_1"})]})
+        self.assertEqual(doc.edits[1].layer_id, "static_rigids")  # omitted: inherited from the source
+
+    def test_synthetic_track_id_collisions_rejected(self) -> None:
+        """World binds and clones each claim a NEW track id; two edits on one id fail."""
+        world = {
+            "id": "prop",
+            "op": "add",
+            "bind": {"type": "world", "position": [0, 0, 0], "track_id": "9000221"},
+            "asset": "a.usd",
+        }
+        with self.assertRaisesRegex(AssetEditsError, "synthetic track id.*9000221"):
+            AssetEditsDoc.from_dict({"edits": [world, _clone()]})
+        with self.assertRaisesRegex(AssetEditsError, "synthetic track id"):
+            AssetEditsDoc.from_dict({"edits": [_clone(), _clone(id="c2", source={"nurec_track_id": 1})]})
+
+    def test_exclude_and_clone_of_the_same_track_coexist(self) -> None:
+        """Hiding the source and cloning it elsewhere is a move; the keys do not collide."""
+        doc = AssetEditsDoc.from_dict({"edits": [_exclude(bind={"nurec_track_id": 12}), _clone()]})
+        self.assertNotEqual(binding_key(doc.edits[0]), binding_key(doc.edits[1]))
+
+    def test_needs_clip_window(self) -> None:
+        """Parked clones and world binds need the clip window; inheriting clones do not."""
+        self.assertFalse(AssetEditsDoc.from_dict({"edits": [_clone()]}).needs_clip_window)
+        parked = _clone(motion={"world": {"position": [0, 0, 0]}})
+        self.assertTrue(AssetEditsDoc.from_dict({"edits": [parked]}).needs_clip_window)
+        self.assertTrue(
+            AssetEditsDoc.from_dict(
+                {"edits": [_edit(op="add", bind={"type": "world", "position": [0, 0, 0]}, controls={})]}
+            ).needs_clip_window
+        )
+
+
+class ToDictRoundTripTest(unittest.TestCase):
+    """``to_dict`` writes the authored form with every default resolved; re-parsing it is a fixpoint."""
+
+    def _roundtrip(self, doc_dict: dict[str, Any]) -> None:
+        """Assert that the document survives to_dict and from_dict unchanged."""
+        doc = AssetEditsDoc.from_dict(doc_dict)
+        again = AssetEditsDoc.from_dict(doc.to_dict())
+        self.assertEqual(again, doc)
+        self.assertEqual(again.to_dict(), doc.to_dict())
+
+    def test_every_op_roundtrips(self) -> None:
+        """Every op, with its optional fields, round-trips through to_dict."""
+        self._roundtrip(
+            {
+                "edits": [
+                    _edit(placement={"yaw_deg": 90.0, "rotation_deg": [1.0, 2.0, 3.0]}, prim_path="/Car"),
+                    _edit(id="attach", op="add", controls={"appearance": {"semantics": ["x"]}}),
+                    {
+                        "id": "prop",
+                        "op": "add",
+                        "bind": {"type": "world", "position": [1.0, 2.0, 0.0], "dims": [1, 1, 1]},
+                        "asset": "p.usd",
+                        "placement": {"scale": "fit_length"},
+                    },
+                    _clone(motion={"inherit": True, "offset": [1.0, 0.0, 0.0], "yaw_deg": 5.0, "time_shift_us": 3}),
+                    _clone(
+                        id="parked",
+                        source={"edit_id": "truck_1"},
+                        motion={"world": {"position": [0, 1, 2], "anchor": "center"}},
+                        track_id="p2",
+                    ),
+                    _exclude(layer_id="static_rigids"),
+                ]
+            }
+        )
+
+    def test_world_bind_default_track_id_is_written(self) -> None:
+        """to_dict writes a world bind's default track id and scale."""
+        doc = AssetEditsDoc.from_dict(
+            {"edits": [{"id": "prop", "op": "add", "bind": {"type": "world", "position": [0, 0, 0]}, "asset": "p.usd"}]}
+        )
+        self.assertEqual(doc.to_dict()["edits"][0]["bind"]["track_id"], "prop:prop")
+        self.assertEqual(doc.to_dict()["edits"][0]["placement"]["scale"], 1.0)
+
+    def test_clone_motion_dict_forms(self) -> None:
+        """CloneMotion.to_dict writes every field, defaults included."""
+        self.assertEqual(
+            CloneMotion.from_dict({"inherit": True}, "m").to_dict(),
+            {"inherit": True, "offset": [0.0, 0.0, 0.0], "yaw_deg": 0.0, "time_shift_us": 0},
+        )
+        self.assertEqual(
+            CloneMotion.from_dict({"world": {"position": [1, 2, 3]}}, "m").to_dict(),
+            {"world": {"position": [1.0, 2.0, 3.0], "yaw_deg": 0.0, "anchor": "base"}},
+        )
 
 
 if __name__ == "__main__":

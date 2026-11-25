@@ -299,7 +299,7 @@ CODEX_TRUSTED=false      # check_codex_setup; gates the Codex sandbox probes, wh
 DATA_PATH=""             # check_input_yaml; feeds the path checks and, at launch,
                          # the generated permission overrides
 NUREC_IMAGE=""           # check_input_yaml; the pull (or local build) and the container GPU probe
-NUREC_DEV_BASE_IMAGE=""  # resolve_nurec_images; dev dependencies image the checkout's Dockerfile-dev.build extends
+NUREC_DEV_DEPS_IMAGE=""  # resolve_nurec_images; dev dependencies image the checkout's Dockerfile-dev.build copies from
 NUREC_SOURCE_DIR=""      # resolve_nurec_images; selected source checkout
 NUREC_GIT_COMMON_DIR=""  # Linked worktree metadata may live outside the source mount
 NUREC_BUILD_NETRC=""     # Only a development checkout uses host build credentials
@@ -372,7 +372,7 @@ resolve_nurec_images() {
     # A development checkout runs in the development image it pins. A released checkout runs in a
     # development image built on the dev dependencies image selected by the skill.
     if [[ -z "$NUREC_BUILD_NETRC" ]]; then
-        NUREC_DEV_BASE_IMAGE="$NUREC_IMAGE"
+        NUREC_DEV_DEPS_IMAGE="$NUREC_IMAGE"
     fi
     if [[ -n "$NUREC_BUILD_NETRC" ]]; then
         preflight_pass "Build authentication: read-only $NUREC_BUILD_NETRC mount in the checkout-pinned development image"
@@ -405,7 +405,7 @@ pull_nurec_image() {
 }
 
 build_nurec_dev_image() {
-    # Build the development image on the dev dependencies image $NUREC_DEV_BASE_IMAGE, then make
+    # Build the development image, copying in the dev dependencies from $NUREC_DEV_DEPS_IMAGE, then make
     # $NUREC_IMAGE its tag. The tag is per checkout, so runs on different checkouts cannot replace
     # each other's image. The build log is shown only on failure.
     local build_log tag
@@ -414,9 +414,9 @@ build_nurec_dev_image() {
         return 1
     fi
     tag="nurec_dev:onboard-$(printf '%s' "$NUREC_SOURCE_DIR" | sha256sum | cut -c1-12)"
-    echo "  ! Building the NuRec development image $tag on $NUREC_DEV_BASE_IMAGE; can take several minutes on a cold cache"
+    echo "  ! Building the NuRec development image $tag with dependencies from $NUREC_DEV_DEPS_IMAGE; can take several minutes on a cold cache"
     build_log="$(mktemp)"
-    if docker buildx build --network=host --build-arg "BASE_IMAGE=$NUREC_DEV_BASE_IMAGE" -t "$tag" \
+    if docker buildx build --network=host --build-arg "NUREC_DEV_DEPS_IMAGE=$NUREC_DEV_DEPS_IMAGE" -t "$tag" \
         -f "$NUREC_SOURCE_DIR/deps/docker/Dockerfile-dev.build" --load "$NUREC_SOURCE_DIR/deps/docker" >"$build_log" 2>&1; then
         NUREC_IMAGE="$tag"
         preflight_pass "NuRec development image is built: $tag"
@@ -436,8 +436,8 @@ check_nurec_images() {
         return
     fi
 
-    if [[ -n "$NUREC_DEV_BASE_IMAGE" ]]; then
-        pull_nurec_image "$NUREC_DEV_BASE_IMAGE" "NuRec dev dependencies image" || return
+    if [[ -n "$NUREC_DEV_DEPS_IMAGE" ]]; then
+        pull_nurec_image "$NUREC_DEV_DEPS_IMAGE" "NuRec dev dependencies image" || return
         build_nurec_dev_image || return
     else
         pull_nurec_image "$NUREC_IMAGE" "NuRec development image" || return

@@ -206,7 +206,9 @@ treat undocumented paths as unverified.
 | `dataset.n_samples_per_epoch`                                                                                        | `30000`                        | Effective epoch length.                                                                                                                                                  |
 | `dataset.n_train_sample_camera_rays`                                                                                 | `6144`                         | Camera rays per training sample.                                                                                                                                         |
 | `dataset.n_train_sample_lidar_rays`                                                                                  | `2048`                         | LiDAR rays per training sample.                                                                                                                                          |
-| `dataset.n_val_image_subsample`                                                                                      | recipe default                 | Sub-sample validation cameras (Waymo: `2`, NV/Alpasim/Tesla: `4`, PandaSet: `1`).                                                                                        |
+| `dataset.n_val_image_resolution`                                                                                     | recipe default                 | Validation resolution: relative `subsample`, or absolute `camera_groups`.                                                                                                |
+| `dataset.n_train_sequential_image_resolution`                                                                        | recipe default                 | Train-sequential resolution with the same relative/absolute camera-group forms.                                                                                          |
+| `dataset.samplers.batch_sampler.camera_pixel_sampler.resolution`                                                     | recipe default                 | Training camera-pixel resolution with the same relative/absolute camera-group forms.                                                                                     |
 | `dataset.val_camera`                                                                                                 | `true`                         | Render camera rays at val/test.                                                                                                                                          |
 | `dataset.val_lidar`                                                                                                  | `false`                        | Render LiDAR rays at val/test.                                                                                                                                           |
 | `dataset.val_sensor_transl_delta_m`                                                                                  | `null` (`[0,0,0]` effectively) | XYZ metres translation delta for novel views. No spaces inside the brackets.                                                                                             |
@@ -228,6 +230,44 @@ treat undocumented paths as unverified.
 | `dataset.lidar_model_parameter_cwccw_fallback`                                                                       | `false`                        | Backwards-compat fallback for old NCore lidar spin direction.                                                                                                            |
 | `dataset.lidar_model_parameter_nominal_values`                                                                       | `{}`                           | Map LiDAR ID → nominal model name (`HESAI-Pandar128`, `HESAI-AT128`).                                                                                                    |
 | `dataset.use_real_lidar_rays`                                                                                        | `false`                        | Compute LiDAR rays from the actual point clouds.                                                                                                                         |
+
+Camera-backed resolution settings select exactly one mode. Relative mode broadcasts one divisor to every active camera:
+
+```yaml
+resolution:
+  mode: relative
+  subsample: 2
+```
+
+Absolute mode partitions the active cameras into groups:
+
+```yaml
+resolution:
+  mode: absolute
+  camera_groups:
+    - camera_ids: [camera_front_wide_120fov]
+      width: 1920
+      keep_aspect_ratio: true
+```
+
+The block above is the resolved shape. When overriding an existing preset, select its absolute Hydra option first so the relative option's `subsample` field is removed. For example, in a validation preset:
+
+```yaml
+defaults:
+  - override /image_resolution/camera@_global_.dataset.n_val_image_resolution: absolute
+
+dataset:
+  n_val_image_resolution:
+    camera_groups:
+      - camera_ids: [camera_front_wide_120fov]
+        width: 1920
+```
+
+The equivalent Hydra CLI selection is `image_resolution/camera@dataset.n_val_image_resolution=absolute`, followed by a `dataset.n_val_image_resolution.camera_groups=...` override; neither needs `+`.
+
+Every active camera must occur exactly once, and cameras with different source resolutions must use separate groups. With `keep_aspect_ratio: true`, use either `width` (which defaults to the `"original"` sentinel) or the height-only form `width: null` plus `height`. With `keep_aspect_ratio: false`, specify both dimensions. `allow_upsampling` defaults to `false`.
+
+`fixed_camera_render.resolution` uses the same relative form and a single absolute width/height leaf without `camera_groups`. The old `n_val_image_subsample`, `n_train_sequential_image_subsample`, camera-pixel `subsample`, and `fixed_camera_render.subsample` remain deprecated input-only compatibility overrides. Flat fixed-render width/height options are not supported; use `fixed_camera_render.resolution` and its absolute Hydra option instead.
 
 ### Cuboid track classification (`dataset.cuboid_tracks_params.*`)
 
@@ -527,7 +567,7 @@ tool emits the IDs to stdout when `--store-meta` is set.
 - `logger=dummy` disables logging entirely.
 - `logger.run_id=<id>` makes `<RUN-ID>` deterministic; otherwise a
   random hash is generated.
-- `+log_level=4` enables DEBUG output across the training pipeline.
+- `verbose=True` enables DEBUG output.
 - Per-run logs land in `<out_dir>/<RUN-ID>/logs/`.
 
 ## Resuming a training run
@@ -551,6 +591,7 @@ Note: `out_dir` cannot change between the original and resumed runs.
 | `NUREC_ENV_RUN_ID`        | Forces a specific `<RUN-ID>` (subdirectory name). Used by SLURM/cluster wrappers to keep outputs co-located. **Must be unset when running a `wandb` sweep agent**, otherwise every sweep run inherits the same ID.                |
 | `CUDA_SYNC_DEBUG=1`       | Enables `torch.cuda.set_sync_debug_mode("warn")` to surface implicit GPU sync points that hurt training perf. Supported by NuRec training (`mode=train                                                             \| trainval`). |
 | `PYTORCH_CUDA_ALLOC_CONF` | Standard PyTorch CUDA allocator knobs. NuRec appends `max_split_size_mb:N` when `system.max_split_size_mb=N` is set in the config.                                                                                                |
+| `NUREC_TUNE_GLIBC_MALLOC` | `main` and `profile-dataloader` set glibc's mmap and trim thresholds to 32 and 256 MiB. Any value but `1` or `true` skips this. A threshold set in `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` or `GLIBC_TUNABLES` wins.   |
 | `WANDB_API_KEY`           | W&B auth (alternative to `wandb login`).                                                                                                                                                                                          |
 | `WANDB_MODE=disabled`     | Skip W&B even if `logger=wandb`.                                                                                                                                                                                                  |
 | `HF_TOKEN`                | Used when fetching gated HuggingFace assets (e.g. PhysicalAI dataset, Harmonizer weights).                                                                                                                                        |

@@ -7,8 +7,10 @@ import logging
 import os
 import time
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, List, Optional, Tuple
+from typing import IO, Any, AsyncIterator, Callable, Iterator, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
 import aiofiles
 import click
@@ -44,10 +46,14 @@ from nurec.grpc.protos.sensorsim_pb2 import (
     HarmonizerSessionId,
     ImageFormat,
     LidarDeviceType,
+    LidarFiringPatternRequest,
+    LidarFiringPatternReturn,
     LidarFloatingFilterSource,
+    LidarOutputMode,
     LidarRenderFilter,
     LidarRenderRequest,
     LidarRenderReturn,
+    LidarReturnType,
     LidarSpec,
     OverlayBoundingBoxSource,
     PosePair,
@@ -378,11 +384,44 @@ def generate_lidar_request(
     dynamic_poses: list,
     render_filter: LidarRenderFilter | None,
     lidar_id: str = "",
+    output_mode: LidarOutputMode | None = None,
+    firing_pattern_id: str = "",
+    return_types: Sequence[LidarReturnType] = (),
 ) -> LidarRenderRequest:
+    """Construct a lidar RPC request from trajectory and output settings.
+
+    Args:
+        scene_id: Scene identifier known to the rendering service.
+        lidar_spec: Optional modeled-lidar configuration; ``None`` omits it.
+        poses: Pair of ``(4, 4)`` lidar-to-world transforms at frame start and end.
+        frame_start_timestamp_us: Physical frame-start timestamp in microseconds.
+        frame_end_timestamp_us: End of the requested pose interval in microseconds.
+        dynamic_poses: Actor records with ``track_id`` and start/end actor-to-world
+            poses, converted to protobuf dynamic-object entries.
+        render_filter: Optional filter overrides; ``None`` leaves server defaults in effect.
+        lidar_id: Logical sensor ID, or an empty string for a single-lidar artifact.
+        output_mode: Requested output representation; ``None`` leaves the field unset
+            for the server's point-cloud default. Per-ray output must be explicit.
+        firing_pattern_id: Optional exact pattern ID, overriding phase selection by time.
+        return_types: Requested per-ray return layers in output order. Empty selects
+            strongest in per-ray mode and is required for point-cloud mode.
+
+    Returns:
+        A populated ``LidarRenderRequest``. Semantic compatibility is checked by the server.
+
+    Raises:
+        KeyError: If an actor record lacks a required pose or track field.
+        IndexError: If the pose pair does not contain both start and end transforms.
+        TypeError: If a value cannot be assigned to its protobuf field.
+        ValueError: If a numeric value is outside its protobuf field's range.
+    """
     return LidarRenderRequest(
         scene_id=scene_id,
         lidar_config=lidar_spec,
         lidar_id=lidar_id,
+        output_mode=output_mode,
+        firing_pattern_id=firing_pattern_id,
+        return_types=return_types,
         frame_start_us=frame_start_timestamp_us,
         frame_end_us=frame_end_timestamp_us,
         sensor_pose=PosePair(
@@ -399,24 +438,393 @@ async def save_request(fname: str, image_bytes: bytes) -> None:
         await output_file.write(image_bytes)
 
 
-async def save_lidar_response(fname: str, response: LidarRenderReturn, format: str = "bin") -> None:
-    """Save LiDAR response as raw binary or PLY.
+def firing_pattern_arrays(pattern: LidarFiringPatternReturn) -> dict[str, np.ndarray]:
+    """Decode a firing pattern into the arrays that index every per-ray frame.
 
     Args:
-        fname: Output filename (extension will be added based on format)
-        response: LiDAR render response from gRPC
-        format: "bin" for raw binary, "ply" for PLY with intensity colors
+        pattern: Protobuf pattern response with ray directions, firing times,
+            and optional packet boundaries, grid dimensions, and content ID.
+
+    Returns:
+        Named NumPy arrays for offline storage: float32 ``(n_rays, 3)`` directions
+        and int64 ``(n_rays,)`` firing offsets in microseconds, plus available
+        metadata. Exact per-packet times are expanded to per-ray offsets.
+        Arrays decoded with ``frombuffer`` may be read-only views of message bytes.
+
+    Raises:
+        ValueError: If buffer lengths disagree with declared sizes, packet offsets
+            are invalid, or per-ray and per-packet timing is missing or ambiguous.
     """
+    directions = np.frombuffer(pattern.directions_sensor, dtype="<f4")
+    expected_direction_values = pattern.num_rays * 3
+    if directions.shape != (expected_direction_values,):
+        raise ValueError(
+            f"firing pattern declares {pattern.num_rays} rays but carries {len(directions)} direction values"
+        )
+    arrays: dict[str, np.ndarray] = {
+        "directions_sensor": directions.reshape(pattern.num_rays, 3),
+    }
+    ray_timestamp_offsets = np.frombuffer(pattern.timestamp_offsets_us, dtype="<i8")
+    packet_ray_offsets = None
+    packet_timestamp_offsets = None
+    # Zero means the sensor exposes no (column, line) addressing, so write neither key
+    # rather than a grid of zeros a reader would take at face value.
+    if pattern.num_columns or pattern.num_rows:
+        if not (pattern.num_columns and pattern.num_rows) or pattern.num_columns * pattern.num_rows != pattern.num_rays:
+            raise ValueError("firing pattern grid dimensions must both be set and cover every ray")
+        arrays["n_columns"] = np.array(pattern.num_columns, dtype=np.int64)
+        arrays["n_rows"] = np.array(pattern.num_rows, dtype=np.int64)
+    if pattern.firing_pattern_id:
+        arrays["firing_pattern_id"] = np.asarray(pattern.firing_pattern_id)
+    if pattern.frame_period_us:
+        arrays["frame_period_us"] = np.asarray(pattern.frame_period_us, dtype=np.int64)
+    if pattern.HasField("packet_layout"):
+        layout = pattern.packet_layout
+        packet_ray_offsets = np.frombuffer(layout.ray_offsets_u32_le, dtype="<u4")
+        if packet_ray_offsets.shape != (layout.num_packets + 1,):
+            raise ValueError(
+                f"packet layout declares {layout.num_packets} packets but carries "
+                f"{len(packet_ray_offsets)} prefix offsets"
+            )
+        if (
+            len(packet_ray_offsets) == 0
+            or packet_ray_offsets[0] != 0
+            or packet_ray_offsets[-1] != pattern.num_rays
+            or np.any(packet_ray_offsets[1:] <= packet_ray_offsets[:-1])
+        ):
+            raise ValueError("packet layout prefix offsets must start at zero, increase, and cover every ray")
+        arrays["packet_ray_offsets"] = packet_ray_offsets
+        if layout.timestamp_offsets_us:
+            packet_timestamp_offsets = np.frombuffer(layout.timestamp_offsets_us, dtype="<i8")
+            if packet_timestamp_offsets.shape != (layout.num_packets,):
+                raise ValueError(
+                    f"packet layout declares {layout.num_packets} packets but carries "
+                    f"{len(packet_timestamp_offsets)} timestamp offsets"
+                )
+            arrays["packet_timestamp_offsets_us"] = packet_timestamp_offsets
+        if layout.starts_new_scan_mask_packed:
+            expected_bytes = (layout.num_packets + 7) // 8
+            if len(layout.starts_new_scan_mask_packed) != expected_bytes:
+                raise ValueError(f"packet scan-start mask must contain exactly {expected_bytes} bytes")
+            arrays["packet_starts_new_scan"] = np.unpackbits(
+                np.frombuffer(layout.starts_new_scan_mask_packed, dtype=np.uint8),
+                count=layout.num_packets,
+                bitorder="little",
+            ).view(bool)
+
+    if len(ray_timestamp_offsets) and packet_timestamp_offsets is not None:
+        raise ValueError("firing pattern must use either per-ray or per-packet timestamps, not both")
+    if len(ray_timestamp_offsets):
+        if ray_timestamp_offsets.shape != (pattern.num_rays,):
+            raise ValueError(
+                f"firing pattern declares {pattern.num_rays} rays but carries "
+                f"{len(ray_timestamp_offsets)} timestamp offsets"
+            )
+        arrays["timestamp_offsets_us"] = ray_timestamp_offsets
+    elif packet_timestamp_offsets is not None:
+        assert packet_ray_offsets is not None
+        arrays["timestamp_offsets_us"] = np.repeat(packet_timestamp_offsets, np.diff(packet_ray_offsets))
+    else:
+        raise ValueError("firing pattern carries neither per-ray nor per-packet timestamps")
+    return arrays
+
+
+@contextmanager
+def _atomic_output(path: str) -> Iterator[IO[bytes]]:
+    """Atomically publish a completed file with ordinary umask-based permissions."""
+    temporary_path = os.path.join(os.path.dirname(path) or ".", f".lidar-{uuid4().hex}")
+    # Exclusive creation respects the umask (unlike NamedTemporaryFile's fixed 0600)
+    # without changing process-wide permissions while other export threads are writing.
+    with open(temporary_path, "xb") as output:
+        try:
+            yield output
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            os.replace(temporary_path, path)
+        finally:
+            output.close()
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+
+def _atomic_save_npz(path: str, arrays: dict[str, np.ndarray]) -> None:
+    """Compress an NPZ without exposing a partially written destination."""
+    with _atomic_output(path if path.endswith(".npz") else f"{path}.npz") as output:
+        np.savez_compressed(output, **arrays)
+
+
+def _claim_per_ray_output(output_dir: str) -> None:
+    """Reserve one run's pattern directory, refusing existing or legacy exports."""
+    os.makedirs(output_dir, exist_ok=True)
+    if any(os.path.lexists(os.path.join(output_dir, name)) for name in ("firing_patterns.json", "firing_pattern.npz")):
+        raise ValueError(
+            "Per-ray export requires a fresh output directory; an existing firing-pattern export was found"
+        )
+    try:
+        os.mkdir(os.path.join(output_dir, "firing_patterns"))
+    except FileExistsError as exc:
+        raise ValueError("Per-ray export requires a fresh output directory; firing_patterns already exists") from exc
+
+
+def _save_firing_pattern_catalog(
+    output_dir: str,
+    patterns_by_id: dict[str, LidarFiringPatternReturn],
+    catalog: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Atomically publish newly observed patterns, then their output-root-relative catalog."""
+    if not patterns_by_id:
+        raise ValueError("a per-ray render sequence must select at least one firing pattern")
+
+    catalog_path = os.path.join(output_dir, "firing_patterns.json")
+    if catalog is None and os.path.exists(catalog_path):
+        raise ValueError("Refusing to replace another run's firing-pattern catalog")
+    updated = dict(catalog or {})
+    missing = {key: pattern for key, pattern in patterns_by_id.items() if key not in updated}
+    if not missing:
+        return updated
+    os.makedirs(os.path.join(output_dir, "firing_patterns"), exist_ok=True)
+    for pattern_id, pattern in missing.items():
+        relative_path = f"firing_patterns/pattern_{len(updated):03d}.npz"
+        _atomic_save_npz(os.path.join(output_dir, relative_path), firing_pattern_arrays(pattern))
+        updated[pattern_id] = relative_path
+    with _atomic_output(catalog_path) as output:
+        output.write(json.dumps(updated, indent=2).encode("utf-8"))
+    log.info(f"wrote {catalog_path}: {len(updated)} firing patterns")
+    return updated
+
+
+async def _cache_response_firing_patterns(
+    client_service,
+    *,
+    scene_id: str,
+    lidar_id: str,
+    requests: list[LidarRenderRequest],
+    responses: list[LidarRenderReturn],
+    patterns_by_id: dict[str, LidarFiringPatternReturn],
+) -> None:
+    """Cache and validate exact geometry for response IDs without changing requests."""
+    if len(requests) != len(responses):
+        raise ValueError(f"render returned {len(responses)} lidar frames for {len(requests)} requests")
+
+    missing_ids: dict[str, int] = {}
+    for request, response in zip(requests, responses):
+        pattern_id = response.firing_pattern_id
+        if not pattern_id:
+            raise ValueError("server returned a per-ray frame without a firing pattern ID")
+        if request.firing_pattern_id and request.firing_pattern_id != pattern_id:
+            raise ValueError(
+                f"server returned firing pattern {pattern_id!r} for a request pinned to {request.firing_pattern_id!r}"
+            )
+
+        if response.HasField("firing_pattern"):
+            pattern = response.firing_pattern
+            if pattern.firing_pattern_id != pattern_id:
+                raise ValueError(
+                    f"embedded firing pattern {pattern.firing_pattern_id!r} does not match response ID {pattern_id!r}"
+                )
+            firing_pattern_arrays(pattern)
+            if pattern.num_rays != response.num_rays:
+                raise ValueError(
+                    f"firing pattern {pattern_id!r} has {pattern.num_rays} rays but its response "
+                    f"has {response.num_rays}"
+                )
+            patterns_by_id.setdefault(pattern_id, pattern)
+        elif pattern_id not in patterns_by_id:
+            missing_ids.setdefault(pattern_id, response.num_rays)
+
+    for pattern_id, expected_rays in missing_ids.items():
+        # A later response in this batch may have supplied the geometry.
+        if pattern_id in patterns_by_id:
+            continue
+        try:
+            pattern = await _call_with_admission_retry(
+                client_service.get_lidar_firing_pattern,
+                LidarFiringPatternRequest(
+                    scene_id=scene_id,
+                    lidar_id=lidar_id,
+                    firing_pattern_id=pattern_id,
+                ),
+            )
+        except grpc.aio.AioRpcError as exc:
+            if exc.code() not in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND):
+                raise
+            raise ValueError(
+                f"server selected firing pattern {pattern_id!r} but its exact geometry is unavailable: {exc.details()}"
+            ) from exc
+        if pattern.firing_pattern_id != pattern_id:
+            raise ValueError(f"requested firing pattern {pattern_id!r}, got {pattern.firing_pattern_id!r}")
+        firing_pattern_arrays(pattern)
+        if pattern.num_rays != expected_rays:
+            raise ValueError(
+                f"firing pattern {pattern_id!r} has {pattern.num_rays} rays but its response has {expected_rays}"
+            )
+        patterns_by_id[pattern_id] = pattern
+
+    for request, response in zip(requests, responses):
+        pattern = patterns_by_id[response.firing_pattern_id]
+        if pattern.num_rays != response.num_rays:
+            raise ValueError(
+                f"firing pattern {response.firing_pattern_id!r} has {pattern.num_rays} rays but "
+                f"a response has {response.num_rays}"
+            )
+
+
+def _pin_requests_to_response_patterns(requests: list[LidarRenderRequest], responses: list[LidarRenderReturn]) -> None:
+    """Explicitly reuse first-pass geometry on later export repetitions."""
+    for request, response in zip(requests, responses, strict=True):
+        request.firing_pattern_id = response.firing_pattern_id
+
+
+def per_ray_arrays(response: LidarRenderReturn) -> dict[str, np.ndarray]:
+    """Decode a per-ray response into layer-major arrays indexed by return then ray.
+
+    Each packed validity layer has its own trailing padding bits, so masks must be split at
+    ``ceil(num_rays / 8)`` before unpacking. Treating the concatenation as one bit stream
+    would shift every layer after the first whenever num_rays is not byte-aligned.
+
+    Args:
+        response: Protobuf per-ray render result declaring ray count, return layers,
+            distances in metres, validity bits, and optional intensities and pattern ID.
+
+    Returns:
+        Arrays named ``return_types``, ``return_type_names``, ``distance_m``, and ``valid``, plus optional
+        ``intensity`` and ``firing_pattern_id``. Ray data has shape
+        ``(num_return_layers, num_rays)``; invalid distances and intensities must be
+        ignored using ``valid``. Buffer-backed distance and intensity arrays may be read-only.
+
+    Raises:
+        ValueError: If there are no return layers, layer types are unspecified or unsupported,
+            layer types disagree with the declared count, or any distance, validity, or
+            intensity buffer has the wrong size.
+    """
+    n = response.num_rays
+    num_layers = response.num_return_layers
+    if num_layers == 0:
+        raise ValueError("per-ray response declares zero return layers")
+    if len(response.return_types) != num_layers:
+        raise ValueError(
+            f"per-ray response declares {num_layers} return layers but carries "
+            f"{len(response.return_types)} return types"
+        )
+    if any(
+        value not in (LidarReturnType.LIDAR_RETURN_FIRST, LidarReturnType.LIDAR_RETURN_STRONGEST)
+        for value in response.return_types
+    ):
+        raise ValueError("per-ray response contains an unspecified or unsupported return type")
+
+    expected_values = num_layers * n
+    distances = np.frombuffer(response.ray_distances_m_buffer, dtype="<f4")
+    if distances.size != expected_values:
+        raise ValueError(
+            f"per-ray distance buffer has {distances.size} entries but the response declares "
+            f"{num_layers} layers x {n} rays"
+        )
+
+    mask_stride = (n + 7) // 8
+    packed_valid = np.frombuffer(response.ray_valid_masks_packed, dtype=np.uint8)
+    if packed_valid.size != num_layers * mask_stride:
+        raise ValueError(
+            f"per-ray validity buffer has {packed_valid.size} bytes but the response declares "
+            f"{num_layers} layers x {n} rays"
+        )
+
+    arrays: dict[str, np.ndarray] = {
+        "return_types": np.asarray(response.return_types, dtype=np.int32),
+        "return_type_names": np.asarray([LidarReturnType.Name(value) for value in response.return_types]),
+        "distance_m": distances.reshape(num_layers, n),
+        "valid": np.unpackbits(packed_valid.reshape(num_layers, mask_stride), axis=1, bitorder="little")[:, :n].view(
+            bool
+        ),
+    }
+    if response.ray_intensities_buffer:
+        intensities = np.frombuffer(response.ray_intensities_buffer, dtype="<f4")
+        if intensities.size != expected_values:
+            raise ValueError(
+                f"per-ray intensity buffer has {intensities.size} entries but the response declares "
+                f"{num_layers} layers x {n} rays"
+            )
+        arrays["intensity"] = intensities.reshape(num_layers, n)
+    if response.firing_pattern_id:
+        arrays["firing_pattern_id"] = np.asarray(response.firing_pattern_id)
+    return arrays
+
+
+def _lidar_request_arrays(request: LidarRenderRequest) -> dict[str, np.ndarray]:
+    """Record the actual wire poses and interval without reducing their precision."""
+    arrays = {
+        "frame_start_us": np.asarray(request.frame_start_us, dtype=np.int64),
+        "frame_end_us": np.asarray(request.frame_end_us, dtype=np.int64),
+        "scene_id": np.asarray(request.scene_id),
+        "lidar_id": np.asarray(request.lidar_id),
+    }
+    for name, pose in (("start", request.sensor_pose.start_pose), ("end", request.sensor_pose.end_pose)):
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = R.from_quat([pose.quat.x, pose.quat.y, pose.quat.z, pose.quat.w]).as_matrix()
+        transform[:3, 3] = [pose.vec.x, pose.vec.y, pose.vec.z]
+        arrays[f"T_lidar_to_world_{name}"] = transform
+    return arrays
+
+
+async def save_lidar_response(
+    fname: str,
+    response: LidarRenderReturn,
+    format: str = "bin",
+    request: LidarRenderRequest | None = None,
+) -> None:
+    """Save a lidar response as raw binary, PLY, or per-ray NPZ arrays.
+
+    Args:
+        fname: Output path. Callers supply the suffix; NumPy appends ``.npz`` for
+            per-ray output when it is missing.
+        response: Render response matching the requested storage representation.
+        format: ``per-ray`` stores all emitted rays in NPZ, including an embedded
+            pattern when supplied; ``ply`` stores the point cloud with intensity
+            colors; ``bin`` stores raw point and intensity buffers.
+        request: Optional originating request. Per-ray exports include its exact
+            interval, sensor poses, and scene/sensor IDs when supplied. The CLI always
+            supplies it; point-cloud exports ignore it.
+
+    Returns:
+        ``None`` after the output file has been written.
+
+    Raises:
+        ValueError: If per-ray data is absent or malformed, an embedded pattern is
+            invalid, or point-cloud buffers cannot be reshaped for PLY output.
+        OSError: If the destination cannot be opened or written.
+    """
+    if format == "per-ray":
+        if not response.num_rays:
+            raise ValueError(
+                "The server returned no per-ray data. Was the request sent with "
+                "output_mode=LIDAR_OUTPUT_PER_RAY against a lidar served from a firing pattern?"
+            )
+        arrays = per_ray_arrays(response)
+        # Only present when the request asked the server to embed it. The run-level catalog
+        # maps every selected ID to its sidecar, including singleton runs.
+        if response.HasField("firing_pattern"):
+            if response.firing_pattern.firing_pattern_id != response.firing_pattern_id:
+                raise ValueError("embedded firing pattern ID does not match the response ID")
+            if response.firing_pattern.num_rays != response.num_rays:
+                raise ValueError("embedded firing pattern ray count does not match the response")
+            arrays.update(firing_pattern_arrays(response.firing_pattern))
+        if request is not None:
+            arrays.update(_lidar_request_arrays(request))
+        # CPU-bound on ~3.9 MB a frame, and the caller gathers every frame, so doing it inline
+        # would serialise that gather and stall the loop's in-flight reads.
+        await asyncio.to_thread(_atomic_save_npz, fname, arrays)
+        return
+
     if format == "ply":
         # Parse xyz and intensity from response
         if response.point_xyzs_buffer:
-            xyz = np.frombuffer(response.point_xyzs_buffer, dtype=np.float32).reshape(-1, 3)
+            xyz = np.frombuffer(response.point_xyzs_buffer, dtype="<f4").reshape(-1, 3)
         else:
             xyz = np.array(response.point_xyzs, dtype=np.float32).reshape(-1, 3)
 
         intensity = None
         if response.point_intensities_buffer:
-            intensity = np.frombuffer(response.point_intensities_buffer, dtype=np.float32)
+            intensity = np.frombuffer(response.point_intensities_buffer, dtype="<f4")
         elif response.point_intensities:
             intensity = np.array(response.point_intensities, dtype=np.float32)
 
@@ -494,7 +902,7 @@ async def _call_with_admission_retry(
     base_backoff_s: float = _RESOURCE_EXHAUSTED_BASE_BACKOFF_S,
     max_backoff_s: float = _RESOURCE_EXHAUSTED_MAX_BACKOFF_S,
 ) -> Any:
-    """Invoke a unary render RPC, tolerating server-side render-admission backpressure.
+    """Invoke a unary render or pattern-lookup RPC, tolerating capacity backpressure.
 
     Retries ONLY grpc RESOURCE_EXHAUSTED (the admission-shed status) with capped exponential
     backoff, up to ``max_attempts`` total tries; every other status -- and a genuine failure --
@@ -518,14 +926,14 @@ async def _call_with_admission_retry(
             attempt += 1
             if attempt >= max_attempts:
                 log.error(
-                    "render still shed as RESOURCE_EXHAUSTED after %d attempts; giving up. Consider a "
-                    "nonzero --multiproc-admission-timeout-s or a lower --max-concurrent-renders.",
+                    "RPC still reports RESOURCE_EXHAUSTED after %d attempts; giving up. "
+                    "Check server capacity and concurrent load.",
                     max_attempts,
                 )
                 raise
             backoff_s = min(base_backoff_s * (2 ** (attempt - 1)), max_backoff_s)
             log.warning(
-                "render admission shed (RESOURCE_EXHAUSTED); retrying in %.3fs (attempt %d/%d)",
+                "RPC capacity exhausted (RESOURCE_EXHAUSTED); retrying in %.3fs (attempt %d/%d)",
                 backoff_s,
                 attempt,
                 max_attempts,
@@ -655,8 +1063,11 @@ async def _execute_renders(
 )
 @click.option(
     "--lidar-format",
-    type=click.Choice(["bin", "ply"]),
-    help="Output format for lidar: 'bin' (raw binary) or 'ply' (with intensity colors, like validation).",
+    type=click.Choice(["bin", "ply", "per-ray"]),
+    help="Output format for lidar: 'bin' (raw binary), 'ply' (with intensity colors, like validation), "
+    "or 'per-ray' (one uncompensated .npz per frame plus firing_patterns.json mapping IDs to "
+    "firing_patterns/ sidecars). Per-ray runs require a fresh output directory. 'per-ray' also selects "
+    "the server's per-ray output mode, which needs a lidar served from a firing pattern.",
     default="bin",
 )
 @click.option(
@@ -863,8 +1274,72 @@ def render_grpc(
     lidar_distance_filter_azimuth_max_gap_deg: Optional[float],
     frame_naming: str,
 ) -> None:
-    """Render camera or LiDAR outputs over the artifact trajectory."""
+    """Render camera or LiDAR outputs over the artifact trajectory.
 
+    Args:
+        ctx: Click invocation context used to capture and save effective CLI settings.
+        artifact_path: Local artifact path supplying trajectories and sensor calibration.
+        output_dir: Directory for rendered frames, settings, and optional pattern sidecars.
+        host: Rendering service hostname or IP address.
+        port: Rendering service TCP port.
+        height: Requested camera image height in pixels.
+        camera_id: Logical camera to render when ``lidar`` is false.
+        image_format: Camera image encoding, ``png`` or ``jpeg``.
+        output_type: Camera products to render, selected from ``color``,
+            ``distance-colorized``, and ``semantics-colorized`` without duplicates.
+        overlay_bboxes: Bounding-box source: ``none``, ``model``, or ``artifact``.
+        bbox_color: Optional RGB byte values overriding the bounding-box color.
+        colorization_max_distance: Optional distance-colormap maximum in metres.
+        frame_step: Stride through trajectory frames when generating requests.
+        repeat_count: Positive number of repetitions of the same request sequence;
+            multiple runs write separate ``repeat-NNN`` directories.
+        disable_rolling_shutter: Whether camera requests use a single exposure pose.
+        enable_editing_actors: Whether requests may update actor poses.
+        demo_actor_transform: Apply demonstration actor transforms; requires actor editing.
+        wait_server: Connection-wait limit in seconds, zero for indefinite waiting,
+            or ``None`` to fail on the first unsuccessful RPC.
+        shutdown_server_on_completion: Whether to shut down the service after rendering.
+        rig_name: Optional ego-hood rig identifier for camera inpainting; requires color output.
+        rig_translation_offset: ``(tx, ty, tz)`` offset in metres in rig coordinates.
+        rig_rotation_offset: ``(yaw, -roll, -pitch)`` offset in degrees in rig coordinates.
+        edit_assets: Optional path to a JSON configuration for asset replacement or insertion.
+        lidar: Whether to render lidar instead of cameras.
+        lidar_id: Optional logical lidar ID; required when selection would be ambiguous.
+        lidar_format: ``bin`` or ``ply`` for point clouds, or ``per-ray`` for NPZ
+            ray results and an ID-to-pattern catalog; per-ray mode requires stored patterns.
+        sequential: Whether to issue requests one at a time after warmup.
+        max_concurrent_renders: Optional positive bound on concurrent render RPCs.
+        temporal_harmonizer_session: Deprecated flag; temporal sessions are now
+            detected and managed automatically and force ordered camera rendering.
+        lidar_raydrop_threshold: Drop rays with predicted raydrop above this [0, 1] threshold.
+        lidar_opacity_threshold: Drop rays at or below this [0, 1] opacity threshold;
+            zero disables this filter.
+        lidar_enable_distance_filter: Optional edge-filter switch; ``None`` uses artifact defaults.
+        lidar_distance_filter_threshold: Optional [0, 1] edge threshold; higher
+            values filter fewer points, and ``None`` uses artifact defaults.
+        lidar_distance_filter_neighbor_source: Optional ``rangeview`` or ``angle``
+            neighbor source; ``None`` uses artifact defaults. Model-free rays need ``angle``.
+        lidar_distance_filter_elevation_resolution_deg: Optional angular row spacing
+            in degrees for the angle filter; ``None`` uses artifact defaults.
+        lidar_distance_filter_azimuth_max_gap_deg: Optional maximum neighbor gap in
+            degrees for the angle filter; ``None`` uses artifact defaults.
+        frame_naming: ``frame-end-timestamp`` for absolute microsecond timestamps,
+            or ``contiguous-output-index`` for zero-based output indices per sensor.
+
+    Returns:
+        ``None``; writes rendered outputs and associated metadata to ``output_dir``.
+
+    Raises:
+        click.UsageError: If a per-ray output directory is nonempty or claimed by another run.
+        ValueError: If option combinations, sensor selection, concurrency or repetition
+            limits, trajectory data, or per-ray responses are invalid.
+        RuntimeError: If requested asset edits fail or the async runner cannot start.
+        grpc.RpcError: If an RPC fails after applicable admission retries.
+        OSError: If artifact, configuration, or output files cannot be read or written.
+    """
+
+    if lidar and lidar_format == "per-ray" and os.path.isdir(output_dir) and any(Path(output_dir).iterdir()):
+        raise click.UsageError("Per-ray export requires a fresh, empty --output-dir for each run and lidar", ctx)
     os.makedirs(output_dir, exist_ok=True)
 
     if demo_actor_transform and not enable_editing_actors:
@@ -894,6 +1369,13 @@ def render_grpc(
             else:
                 seen.append(v)
         raise ValueError(f"--output-type cannot be specified more than once; duplicate(s): {', '.join(dups)}.")
+
+    per_ray_output_claimed = lidar and lidar_format == "per-ray"
+    if per_ray_output_claimed:
+        try:
+            _claim_per_ray_output(output_dir)
+        except ValueError as exc:
+            raise click.UsageError(str(exc), ctx) from exc
 
     # Capture, log, and save CLI settings
     collector = SettingsCollector.from_click_context(ctx, "render-grpc")
@@ -966,6 +1448,7 @@ def render_grpc(
             bbox_color,
             repeat_count,
             apply_harmonizer,
+            per_ray_output_claimed=per_ray_output_claimed,
         )
     )
 
@@ -1043,9 +1526,14 @@ async def _render_grpc(
     bbox_color: Optional[Tuple[int, int, int]] = None,
     repeat_count: int = 1,
     apply_harmonizer: bool = False,
+    *,
+    per_ray_output_claimed: bool = False,
 ) -> None:
+    """Render outputs, claiming per-ray storage unless the CLI already did so."""
     if repeat_count < 1:
         raise ValueError("repeat_count must be a positive integer")
+    if lidar and lidar_format == "per-ray" and not per_ray_output_claimed:
+        _claim_per_ray_output(output_dir)
 
     # Concurrent render fan-out clamp. Unset `--max-concurrent-renders` = unbounded with adaptive
     # serialize-on-shed (see _AdmissionLimiter): against a non-admission server nothing sheds so the
@@ -1317,6 +1805,11 @@ async def _render_grpc(
         lidar_requests: list[LidarRenderRequest] = []
         lidar_spec = LidarSpec(lidar_type=LidarDeviceType.PANDAR128) if lidar else None
         lidar_id_for_request = unique_lidar_id.split("@")[0] if lidar else ""
+        per_ray = lidar_format == "per-ray"
+        lidar_file_suffix = "npz" if per_ray else lidar_format
+        lidar_output_mode = (
+            LidarOutputMode.LIDAR_OUTPUT_PER_RAY if per_ray else LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+        )
 
         # Build lidar render filter from CLI parameters
         lidar_render_filter = (
@@ -1493,6 +1986,7 @@ async def _render_grpc(
                         frame_end_timestamp_us=frame_end_us_grpc,
                         dynamic_poses=dynamic_poses,
                         render_filter=lidar_render_filter,
+                        output_mode=lidar_output_mode,
                     )
                 )
 
@@ -1500,9 +1994,9 @@ async def _render_grpc(
                     case "frame-end-timestamp":
                         # Zero-pad to 20 digits to match the camera RGB naming above and the val
                         # export in GaussiansSystem, so a lexical filename sort stays numeric.
-                        lidar_file_name = f"{frame_end_us:020d}.{lidar_format}"
+                        lidar_file_name = f"{frame_end_us:020d}.{lidar_file_suffix}"
                     case "contiguous-output-index":
-                        lidar_file_name = f"{frame_count:06d}.{lidar_format}"
+                        lidar_file_name = f"{frame_count:06d}.{lidar_file_suffix}"
                     case _:
                         raise ValueError(f"Invalid frame naming scheme: {frame_naming}")
                 output_frame_timestamps.append(
@@ -1515,10 +2009,30 @@ async def _render_grpc(
                 )
                 frame_count += 1
 
+            # Per-ray frames are indexed by firing-pattern ray order. Learn IDs from the
+            # ordered render responses and fetch exact geometry only for cache misses.
+            patterns_by_id: dict[str, LidarFiringPatternReturn] = {}
+            pattern_catalog: dict[str, str] | None = None
+
             async for repeat_index, lidar_responses in _repeat_request_sequence(
                 client_service.render_lidar, lidar_requests, sequential, repeat_count, render_limiter
             ):
                 if output_dir:
+                    if per_ray:
+                        await _cache_response_firing_patterns(
+                            client_service,
+                            scene_id=scene_id,
+                            lidar_id=lidar_id_for_request,
+                            requests=lidar_requests,
+                            responses=lidar_responses,
+                            patterns_by_id=patterns_by_id,
+                        )
+                        # Repeats intentionally pin the first response's exact geometry;
+                        # they benchmark replay, not repeated timestamp-based selection.
+                        _pin_requests_to_response_patterns(lidar_requests, lidar_responses)
+                        pattern_catalog = await asyncio.to_thread(
+                            _save_firing_pattern_catalog, output_dir, patterns_by_id, pattern_catalog
+                        )
                     repeat_output_dir = _output_dir_for_repeat(output_dir, repeat_index, repeat_count)
                     os.makedirs(repeat_output_dir, exist_ok=True)
                     await asyncio.gather(
@@ -1530,6 +2044,7 @@ async def _render_grpc(
                                 ),
                                 response,
                                 format=lidar_format,
+                                request=lidar_requests[idx],
                             )
                             for idx, response in enumerate(lidar_responses)
                         ]

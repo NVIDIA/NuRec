@@ -10,6 +10,7 @@ import nurec.libs.sensors.libcamera_slang_cc as camera_slang  # type: ignore
 
 from nurec.libs.sensors.kernels.cameras.bindings import (
     camera_rays_to_image_points,
+    camera_rays_to_world_rays_batch,
     generate_image_points,
     image_points_to_camera_rays,
     image_points_to_world_rays_shutter_pose,
@@ -50,6 +51,7 @@ __all__ = [
     # Kernel functions
     "generate_image_points",
     "camera_rays_to_image_points",
+    "camera_rays_to_world_rays_batch",
     "image_points_to_camera_rays",
     "image_points_to_world_rays_static_pose",
     "image_points_to_world_rays_shutter_pose",

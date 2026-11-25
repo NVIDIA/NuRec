@@ -37,7 +37,7 @@ def load_or_construct_system(
         load_checkpoint_state_dict(system, load_from_checkpoint, torch_load_weights_only=False)
         return system
     if load_from_checkpoint is not None:
-        return system_cls.load_from_checkpoint(load_from_checkpoint, strict=True, config=config)
+        return system_cls.load_from_checkpoint(load_from_checkpoint, strict=True, config=config, weights_only=False)
 
     return system_cls(config)
 

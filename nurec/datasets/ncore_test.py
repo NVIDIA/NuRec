@@ -13,15 +13,19 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import numpy.testing as npt
+import pytest
 import torch
 
 from PIL import Image
 
 import nurec.datasets.ncore as ncore_module
 
+from nurec.config.image_resolution import AbsoluteCameraImageResolutionConfig, CameraImageResolutionGroupConfig
 from nurec.datasets.base import ActiveTileMappingPrewarmEntry, ActiveTileMappingPrewarmPlan
 from nurec.datasets.ncore import (
+    NCOREDataset,
     NCOREDataSource,
+    NCORESequentialDataset,
     NCORETrainDataset,
     UniqueSensorId,
     _CameraRGBMode,
@@ -32,6 +36,7 @@ from nurec.datasets.samplers.base import BaseBatchSampler, BaseCameraPixelSample
 from nurec.datasets.samplers.holdout import compute_holdout_training_frame_mask
 from nurec.datasets.samplers.image_crop import ImageCropCameraPixelSampler
 from nurec.utils.batch import RectSubsampled
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.types import RayFlags
 
 
@@ -158,7 +163,7 @@ class TestCameraDataBatchWithoutRGB(unittest.TestCase):
 
     def test_skips_rgb_decode_and_uses_sampled_shape(self) -> None:
         dataset, datasource = self._dataset()
-        sampled = RectSubsampled(
+        sampled = RectSubsampled.from_subsample(
             i=0,
             j=0,
             height=2,
@@ -224,7 +229,7 @@ class TestCameraDataBatchWithoutRGB(unittest.TestCase):
             torch.zeros((4, 6, 2)),
             torch.ones((4, 6, 3)),
         )
-        sampled = RectSubsampled(
+        sampled = RectSubsampled.from_subsample(
             i=0,
             j=0,
             height=4,
@@ -257,7 +262,7 @@ class TestCameraDataBatchWithoutRGB(unittest.TestCase):
     def test_rgb_path_still_applies_requested_sample_rectangle(self) -> None:
         dataset, datasource = self._dataset()
         datasource.decode_image_cpu.return_value = np.full((2, 3, 3), 255, dtype=np.uint8)
-        sampled = RectSubsampled(
+        sampled = RectSubsampled.from_subsample(
             i=1,
             j=0,
             height=2,
@@ -272,7 +277,57 @@ class TestCameraDataBatchWithoutRGB(unittest.TestCase):
         rgb = batch.labels.rgb
         assert rgb is not None
         self.assertEqual(rgb.shape, (1, 2, 2, 3))
-        self.assertEqual(datasource.decode_image_cpu.call_args.kwargs["subsample_factor"], 2.0)
+        self.assertEqual(
+            datasource.decode_image_cpu.call_args.kwargs["image_transform"],
+            sampled.image_transform,
+        )
+
+
+def test_sequential_dataset_resolves_absolute_camera_groups(monkeypatch) -> None:
+    datasource = SimpleNamespace(
+        camera_models={
+            "front": SimpleNamespace(resolution=np.asarray((8, 6))),
+            "rear": SimpleNamespace(resolution=np.asarray((10, 6))),
+        },
+        camera_frame_ranges={"front": range(2), "rear": range(2)},
+        lidar_frame_ranges={},
+    )
+    resolution = AbsoluteCameraImageResolutionConfig(
+        camera_groups=[
+            CameraImageResolutionGroupConfig(camera_ids=["front"], width=4),
+            CameraImageResolutionGroupConfig(camera_ids=["rear"], width=None, height=3),
+        ]
+    )
+    config = SimpleNamespace(
+        name="ncore",
+        n_val_image_resolution=resolution,
+        val_camera_frame_start=0,
+        val_camera_frame_step=1,
+        val_camera_exclude_frame_start=None,
+        val_camera_exclude_frame_step=None,
+        val_lidar_frame_start=0,
+        val_lidar_frame_step=1,
+        val_lidar_exclude_frame_start=None,
+        val_lidar_exclude_frame_step=None,
+        val_camera=True,
+        val_lidar=False,
+        val_sensor_transl_delta_m=None,
+        val_sensor_rot_delta_deg=None,
+    )
+
+    def initialize_base_dataset(self: NCOREDataset, datasource: Any, config: Any, split: str) -> None:
+        del config, split
+        self.datasource = datasource
+        self.camera_ids = ["front", "rear"]
+        self.lidar_ids = []
+
+    monkeypatch.setattr(NCOREDataset, "__init__", initialize_base_dataset)
+
+    dataset = NCORESequentialDataset(cast(Any, datasource), cast(Any, config), "val")
+
+    assert {
+        camera_id: transform.output_resolution for camera_id, transform in dataset.image_resolution_transforms.items()
+    } == {"front": (4, 3), "rear": (5, 3)}
 
 
 def _lidar_point_cloud_datasource() -> MagicMock:
@@ -620,6 +675,246 @@ def test_ego_valid_camera_rgb_ignores_masked_housing_observations() -> None:
     torch.testing.assert_close(color, torch.tensor([[255, 0, 0]], dtype=torch.uint8))
     torch.testing.assert_close(color_valid_mask, torch.tensor([True]))
     torch.testing.assert_close(scale, torch.tensor([2.0]))
+
+
+def _decode_data_source(*, jpeg_backend_cpu: str) -> MagicMock:
+    datasource = MagicMock(spec=NCOREDataSource)
+    datasource.jpeg_backend_cpu = jpeg_backend_cpu
+    datasource.simplejpeg_fastdct = True
+    datasource.simplejpeg_fastupsample = False
+    return datasource
+
+
+def _image_handle(*, encoded_format: str, decoded_image: Image.Image | None = None) -> MagicMock:
+    image_data = MagicMock()
+    image_data.get_encoded_image_format.return_value = encoded_format
+    image_data.get_encoded_image_data.return_value = b"encoded-image"
+    image_data.get_decoded_image.return_value = decoded_image
+    image_handle = MagicMock()
+    image_handle.get_data.return_value = image_data
+    return image_handle
+
+
+@pytest.mark.parametrize(
+    ("encoded_format", "image_transform", "expected_size"),
+    [
+        ("jpeg", None, (8, 6)),
+        ("jpg", ImageResolutionTransform.from_subsample((8, 6), 2.0, rounding="floor"), (4, 3)),
+    ],
+)
+def test_decode_image_cpu_simplejpeg_characterization(
+    monkeypatch,
+    encoded_format: str,
+    image_transform: ImageResolutionTransform | None,
+    expected_size: tuple[int, int],
+) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format=encoded_format)
+    decode_jpeg = MagicMock(return_value=np.full((expected_size[1], expected_size[0], 3), 17, dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (6, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(datasource, image_handle, image_transform=image_transform)
+
+    np.testing.assert_array_equal(image, np.full((expected_size[1], expected_size[0], 3), 17, dtype=np.uint8))
+    decode_jpeg.assert_called_once_with(
+        b"encoded-image",
+        fastdct=True,
+        fastupsample=False,
+        min_width=expected_size[0],
+        min_height=expected_size[1],
+    )
+
+
+@pytest.mark.parametrize("decoder_returns_requested_size", [False, True])
+def test_decode_image_cpu_simplejpeg_supports_absolute_anisotropic_resolution(
+    monkeypatch,
+    decoder_returns_requested_size: bool,
+) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format="jpeg")
+    decoded_shape = (2, 3, 3) if decoder_returns_requested_size else (6, 8, 3)
+    decode_jpeg = MagicMock(return_value=np.full(decoded_shape, [17, 31, 47], dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (6, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=ImageResolutionTransform.from_absolute(
+            (8, 6),
+            width=3,
+            height=2,
+            keep_aspect_ratio=False,
+        ),
+    )
+
+    assert image.shape == (2, 3, 3)
+    np.testing.assert_array_equal(
+        image,
+        np.broadcast_to(np.array([17, 31, 47], dtype=np.uint8), (2, 3, 3)),
+    )
+    decode_jpeg.assert_called_once_with(
+        b"encoded-image",
+        fastdct=True,
+        fastupsample=False,
+        min_width=3,
+        min_height=2,
+    )
+
+
+def test_decode_image_cpu_simplejpeg_resizes_anisotropic_relative_transform(monkeypatch) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format="jpeg")
+    decode_jpeg = MagicMock(return_value=np.full((4, 4, 3), [17, 31, 47], dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (8, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=ImageResolutionTransform.from_subsample(
+            (8, 8),
+            (2.0, 4.0),
+            require_divisible=True,
+            rounding="floor",
+        ),
+    )
+
+    assert image.shape == (2, 4, 3)
+    decode_jpeg.assert_called_once_with(
+        b"encoded-image",
+        fastdct=True,
+        fastupsample=False,
+        min_width=4,
+        min_height=2,
+    )
+
+
+def test_decode_image_cpu_simplejpeg_supports_rounded_absolute_keep_aspect_resolution(monkeypatch) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format="jpeg")
+    decode_jpeg = MagicMock(return_value=np.full((5, 8, 3), [17, 31, 47], dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (5, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=ImageResolutionTransform.from_absolute(
+            (8, 5),
+            width=3,
+            height=None,
+            keep_aspect_ratio=True,
+        ),
+    )
+
+    assert image.shape == (2, 3, 3)
+
+
+def test_decode_image_cpu_simplejpeg_supports_explicitly_allowed_upsampling(monkeypatch) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format="jpeg")
+    decode_jpeg = MagicMock(return_value=np.full((6, 8, 3), [17, 31, 47], dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (6, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=ImageResolutionTransform.from_absolute(
+            (8, 6),
+            width=16,
+            height=12,
+            keep_aspect_ratio=False,
+            allow_upsampling=True,
+        ),
+    )
+
+    assert image.shape == (12, 16, 3)
+    decode_jpeg.assert_called_once_with(
+        b"encoded-image",
+        fastdct=True,
+        fastupsample=False,
+        min_width=16,
+        min_height=12,
+    )
+
+
+@pytest.mark.parametrize(
+    ("jpeg_backend_cpu", "encoded_format", "image_transform", "expected_shape"),
+    [
+        ("simplejpeg", "png", None, (6, 8, 3)),
+        ("pil", "jpeg", ImageResolutionTransform.from_subsample((8, 6), 1.0), (6, 8, 3)),
+        ("pil", "jpeg", ImageResolutionTransform.from_subsample((8, 6), 2.0, rounding="floor"), (3, 4, 3)),
+        ("pil", "jpeg", ImageResolutionTransform.from_subsample((8, 6), 2.5, rounding="floor"), (2, 3, 3)),
+        (
+            "pil",
+            "jpeg",
+            ImageResolutionTransform.from_absolute((8, 6), width=3, height=2, keep_aspect_ratio=False),
+            (2, 3, 3),
+        ),
+    ],
+)
+def test_decode_image_cpu_pil_characterization(
+    jpeg_backend_cpu: str,
+    encoded_format: str,
+    image_transform: ImageResolutionTransform | None,
+    expected_shape: tuple[int, int, int],
+) -> None:
+    source = np.full((6, 8, 3), [17, 31, 47], dtype=np.uint8)
+    datasource = _decode_data_source(jpeg_backend_cpu=jpeg_backend_cpu)
+    image_handle = _image_handle(encoded_format=encoded_format, decoded_image=Image.fromarray(source))
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=image_transform,
+    )
+
+    assert image.shape == expected_shape
+    np.testing.assert_array_equal(
+        image,
+        np.broadcast_to(np.array([17, 31, 47], dtype=np.uint8), expected_shape),
+    )
+
+
+@pytest.mark.parametrize("backend", ["simplejpeg", "pil"])
+def test_decode_image_cpu_rejects_mismatched_transform_source(monkeypatch, backend: str) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu=backend)
+    decoded_image = Image.fromarray(np.zeros((6, 8, 3), dtype=np.uint8))
+    image_handle = _image_handle(encoded_format="jpeg", decoded_image=decoded_image)
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (6, 8, 3, "RGB"))
+
+    with pytest.raises(AssertionError, match="source resolution"):
+        NCOREDataSource.decode_image_cpu(
+            datasource,
+            image_handle,
+            image_transform=ImageResolutionTransform.from_subsample((10, 6), 2.0),
+        )
+
+
+def test_decode_image_cpu_supports_relative_canonical_transform(monkeypatch) -> None:
+    datasource = _decode_data_source(jpeg_backend_cpu="simplejpeg")
+    image_handle = _image_handle(encoded_format="jpeg")
+    decode_jpeg = MagicMock(return_value=np.zeros((3, 4, 3), dtype=np.uint8))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg_header", lambda _: (6, 8, 3, "RGB"))
+    monkeypatch.setattr(ncore_module.simplejpeg, "decode_jpeg", decode_jpeg)
+
+    image = NCOREDataSource.decode_image_cpu(
+        datasource,
+        image_handle,
+        image_transform=ImageResolutionTransform.from_subsample((8, 6), 2.0, rounding="floor"),
+    )
+
+    assert image.shape == (3, 4, 3)
+    decode_jpeg.assert_called_once_with(
+        b"encoded-image",
+        fastdct=True,
+        fastupsample=False,
+        min_width=4,
+        min_height=3,
+    )
 
 
 class TestComputeHoldoutTrainingFrameMask(unittest.TestCase):
@@ -1211,7 +1506,19 @@ def _make_active_tile_prewarm_dataset() -> tuple[
 ]:
     pixel_sampler = ImageCropCameraPixelSampler.__new__(ImageCropCameraPixelSampler)
     pixel_sampler.crop_type = "full_image"
-    pixel_sampler.subsample = 2
+    image_transform = ImageResolutionTransform.from_subsample(
+        (8, 6),
+        2,
+        require_divisible=True,
+    )
+    pixel_sampler.image_resolution_transforms_by_camera_id = {
+        "camera_a": image_transform,
+        "camera_b": image_transform,
+    }
+    pixel_sampler.image_resolution_transforms = {
+        "camera_a": image_transform,
+        "camera_b": image_transform,
+    }
     pixel_sampler.crop_width_ratio = pixel_sampler.crop_height_ratio = 1.0
     batch_sampler = SimpleNamespace(
         n_train_sample_camera_rays=1,
@@ -1327,9 +1634,18 @@ class TestActiveTileMappingPrewarmPlan(unittest.TestCase):
 
     def test_fixed_full_image_geometry_matches_normal_sampling(self) -> None:
         _, pixel_sampler, _, _ = _make_active_tile_prewarm_dataset()
-        for subsample in (2, True):
-            with self.subTest(subsample=subsample):
-                pixel_sampler.subsample = subsample
+        for image_transform in (
+            ImageResolutionTransform.from_subsample((8, 6), 2, require_divisible=True),
+            ImageResolutionTransform.from_absolute(
+                (8, 6),
+                width=4,
+                height=3,
+                keep_aspect_ratio=False,
+            ),
+        ):
+            with self.subTest(transform=image_transform):
+                pixel_sampler.image_resolution_transforms_by_camera_id["camera_a"] = image_transform
+                pixel_sampler.image_resolution_transforms["camera_a"] = image_transform
                 sampled_pixels = pixel_sampler.sample_camera_pixels(
                     rng=np.random.default_rng(0),
                     batch_idx=0,
@@ -1343,7 +1659,11 @@ class TestActiveTileMappingPrewarmPlan(unittest.TestCase):
 
                 self.assertEqual(
                     sampled_pixels,
-                    pixel_sampler.fixed_sampled_pixels(original_width=8, original_height=6),
+                    pixel_sampler.fixed_sampled_pixels(
+                        camera_id="camera_a",
+                        original_width=8,
+                        original_height=6,
+                    ),
                 )
 
     def test_entry_rejects_a_sensor_index_that_disagrees_with_its_batch(self) -> None:
@@ -1393,15 +1713,6 @@ class TestActiveTileMappingPrewarmPlan(unittest.TestCase):
             "requires_fixed_full_image_sampling",
         )
 
-        for invalid_subsample in (False, 0, 1.5):
-            dataset, pixel_sampler, _, _ = _make_active_tile_prewarm_dataset()
-            pixel_sampler.subsample = invalid_subsample
-            with self.subTest(invalid_subsample=invalid_subsample):
-                self.assertEqual(
-                    NCORETrainDataset.get_active_tile_mapping_prewarm_plan(dataset).skip_reason,
-                    "requires_fixed_full_image_sampling",
-                )
-
     def test_plan_reports_every_sensor_selection_skip_gate(self) -> None:
         dataset, _, _, _ = _make_active_tile_prewarm_dataset()
         dataset.camera_ids = []
@@ -1435,13 +1746,6 @@ class TestActiveTileMappingPrewarmPlan(unittest.TestCase):
         self.assertEqual(
             NCORETrainDataset.get_active_tile_mapping_prewarm_plan(dataset).skip_reason,
             "camera_without_training_frames:camera_b",
-        )
-
-        dataset, _, _, datasource = _make_active_tile_prewarm_dataset()
-        datasource.camera_model_parameters["camera_b"].resolution[0] = 7
-        self.assertEqual(
-            NCORETrainDataset.get_active_tile_mapping_prewarm_plan(dataset).skip_reason,
-            "requires_fixed_full_image_sampling",
         )
 
     def test_plan_skips_real_lidar_rays(self) -> None:

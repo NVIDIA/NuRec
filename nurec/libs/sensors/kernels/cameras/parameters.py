@@ -7,12 +7,15 @@ These dataclasses mirror the Slang structs and contain working parameters for GP
 They are used by Layer 0 kernels and created by Layer 2 models.
 """
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import IntEnum
 
+import numpy as np
 import torch
 
 from torch import Tensor
+
+from nurec.libs.fisheye import FisheyeInverseDomain, opencv_fisheye_domain
 
 
 MAX_H_POLYNOMIAL_TERMS = 6
@@ -404,15 +407,18 @@ class OpenCVFisheyeProjection(CameraProjection):
 
     Wide-angle fisheye camera model using equidistant projection.
 
-    Stores all 16 differentiable parameters in a single tensor for efficient GPU transfer
+    Stores all 11 differentiable parameters in a single tensor for efficient GPU transfer
     (avoiding overhead of multiple DiffTensorView objects). Individual parameters are
     accessible via properties. Non-differentiable config values are stored separately.
 
     Attributes:
         intrinsics: (11,) packed tensor containing all differentiable parameters in order:
             [cx, cy, fx, fy, k1, k2, k3, k4, ab, resolution_x, resolution_y]
-        max_angle: Maximum ray angle in radians (non-differentiable)
-        newton_iterations: Number of Newton iterations for undistortion (non-differentiable)
+        max_angle: Maximum ray angle in radians, limited to the increasing polynomial
+            branch containing the optical axis (non-differentiable). Rebuild the
+            projection after changing distortion coefficients.
+        newton_iterations: Deprecated compatibility field; the safeguarded GPU inverse
+            has its own iteration bound and convergence criterion.
         min_2d_norm: Minimum 2D norm threshold (non-differentiable)
 
     Properties:
@@ -427,6 +433,104 @@ class OpenCVFisheyeProjection(CameraProjection):
     max_angle: float
     newton_iterations: int
     min_2d_norm: float
+    _host_intrinsics: InitVar[np.ndarray | None] = None
+    _intrinsics_host: np.ndarray = field(init=False, repr=False)
+    _intrinsics_version: tuple[int, int | None] = field(init=False, repr=False)
+    _inverse_domain: FisheyeInverseDomain = field(init=False, repr=False)
+
+    def __post_init__(self, _host_intrinsics: np.ndarray | None) -> None:
+        # The host factory and transform supply the same values they used to
+        # construct the tensor. Direct tensor construction validates once with a
+        # readback instead; supplying arbitrary unchecked GPU metadata is not a
+        # public factory option.
+        values = self.intrinsics.detach().cpu().numpy() if _host_intrinsics is None else _host_intrinsics
+        self._set_validated_host_intrinsics(values, self.max_angle)
+
+    def _set_validated_host_intrinsics(self, values: np.ndarray, configured_max_angle: float) -> None:
+        with np.errstate(over="ignore", invalid="ignore"):
+            values = np.asarray(values, dtype=np.float32)
+        if self.intrinsics.shape != (11,):
+            raise ValueError("OpenCV fisheye intrinsics must contain 11 finite values")
+        if values.shape != (11,) or not np.isfinite(values).all():
+            raise ValueError("OpenCV fisheye intrinsics must contain 11 finite values")
+        if (values[2:4] <= 0.0).any() or (values[9:11] <= 0.0).any():
+            raise ValueError("OpenCV fisheye focal lengths and resolution must be positive")
+        if not 0.0 < self.min_2d_norm < float("inf"):
+            raise ValueError("OpenCV fisheye min_2d_norm must be finite and positive")
+        self._inverse_domain = opencv_fisheye_domain(values[4:8], configured_max_angle)
+        self.max_angle = self._inverse_domain.max_angle
+        self._intrinsics_host = values.copy()
+        self._intrinsics_version = self._tensor_version()
+
+    def _tensor_version(self) -> tuple[int, int | None]:
+        try:
+            return id(self.intrinsics), self.intrinsics._version
+        except RuntimeError:
+            # Inference tensors have no version counter. Their calibration must
+            # stay immutable unless the caller explicitly revalidates it.
+            return id(self.intrinsics), None
+
+    @property
+    def configured_max_angle(self) -> float:
+        """Original calibrated FOV, before applying the conditioned inverse limit."""
+        return self._inverse_domain.configured_max_angle
+
+    @property
+    def inverse_monotonic_limit(self) -> float:
+        """Conditioned polynomial limit, independently of the configured FOV."""
+        return self._inverse_domain.inverse_monotonic_limit
+
+    def revalidate(self, max_angle: float | None = None) -> None:
+        """Refresh host metadata after changing packed calibration values.
+
+        This intentionally reads the tensor back once. Call it before using a
+        projection whose intrinsics were modified, including inference tensors
+        and changes through ``.data`` that do not increment the version counter.
+        """
+        configured_max_angle = self.configured_max_angle if max_angle is None else max_angle
+        self._set_validated_host_intrinsics(self.intrinsics.detach().cpu().numpy(), configured_max_angle)
+
+    @classmethod
+    def from_host_components(
+        cls,
+        principal_point: np.ndarray,
+        focal_length: np.ndarray,
+        forward_poly: np.ndarray,
+        resolution: np.ndarray,
+        max_angle: float,
+        newton_iterations: int,
+        min_2d_norm: float,
+        device: torch.device,
+    ) -> "OpenCVFisheyeProjection":
+        """Pack and validate host calibration without a device-to-host transfer.
+
+        Use this for non-differentiable source calibration already available on
+        the host. Tensor inputs that carry gradients use ``from_components``.
+        """
+        principal_point = np.asarray(principal_point, dtype=np.float32)
+        focal_length = np.asarray(focal_length, dtype=np.float32)
+        forward_poly = np.asarray(forward_poly, dtype=np.float32)
+        resolution = np.asarray(resolution, dtype=np.float32)
+        if any(
+            value.shape != shape
+            for value, shape in (
+                (principal_point, (2,)),
+                (focal_length, (2,)),
+                (forward_poly, (4,)),
+                (resolution, (2,)),
+            )
+        ):
+            raise ValueError("OpenCV fisheye component shapes must be (2,), (2,), (4,), (2,)")
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            factor = np.float32(max_angle) / np.max(resolution / np.float32(2.0) / focal_length)
+        values = np.concatenate((principal_point, focal_length, forward_poly, [factor], resolution)).astype(np.float32)
+        return cls(
+            intrinsics=torch.as_tensor(values, device=device),
+            max_angle=max_angle,
+            newton_iterations=newton_iterations,
+            min_2d_norm=min_2d_norm,
+            _host_intrinsics=values,
+        )
 
     @classmethod
     def from_components(
@@ -437,7 +541,9 @@ class OpenCVFisheyeProjection(CameraProjection):
         resolution: Tensor,
         max_angle: float,
         newton_iterations: int,
-        min_2d_norm: Tensor,
+        min_2d_norm: Tensor | float,
+        *,
+        _host_intrinsics: np.ndarray | None = None,
     ) -> "OpenCVFisheyeProjection":
         """Create projection from individual component tensors.
 
@@ -451,7 +557,7 @@ class OpenCVFisheyeProjection(CameraProjection):
             forward_poly: (4,) [k1, k2, k3, k4] forward distortion coefficients
             resolution: (2,) [width, height] resolution in pixels
             max_angle: Maximum ray angle in radians
-            newton_iterations: Number of Newton iterations for undistortion
+            newton_iterations: Deprecated compatibility field, ignored by the safeguarded inverse
             min_2d_norm: Minimum 2D norm threshold (scalar tensor)
 
         Returns:
@@ -475,6 +581,7 @@ class OpenCVFisheyeProjection(CameraProjection):
             max_angle=max_angle,
             newton_iterations=newton_iterations,
             min_2d_norm=float(min_2d_norm.item()) if isinstance(min_2d_norm, Tensor) else min_2d_norm,
+            _host_intrinsics=_host_intrinsics,
         )
 
     @property
@@ -523,6 +630,22 @@ class OpenCVFisheyeProjection(CameraProjection):
         device = self.intrinsics.device
         dtype = self.intrinsics.dtype
 
+        if self._tensor_version() != self._intrinsics_version:
+            self.revalidate()
+        host_scale = np.asarray(
+            image_domain_scale if isinstance(image_domain_scale, tuple) else (image_domain_scale,) * 2,
+            dtype=np.float32,
+        )
+        host_offset = np.asarray(image_domain_offset, dtype=np.float32)
+        host_values = self._intrinsics_host.copy()
+        host_values[:2] = host_values[:2] * host_scale - host_offset
+        host_values[2:4] *= host_scale
+        host_values[9:11] = new_resolution if new_resolution is not None else host_values[9:11] * host_scale
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            host_values[8] = np.float32(self.configured_max_angle) / np.max(
+                host_values[9:11] / np.float32(2.0) / host_values[2:4]
+            )
+
         # Get scale factors
         if isinstance(image_domain_scale, tuple):
             scale = torch.tensor(image_domain_scale, device=device, dtype=dtype)
@@ -546,9 +669,10 @@ class OpenCVFisheyeProjection(CameraProjection):
             focal_length=new_focal_length,
             forward_poly=self.forward_poly.clone(),
             resolution=new_res,
-            max_angle=self.max_angle,
+            max_angle=self.configured_max_angle,
             newton_iterations=self.newton_iterations,
-            min_2d_norm=torch.tensor(self.min_2d_norm, device=device, dtype=dtype),
+            min_2d_norm=self.min_2d_norm,
+            _host_intrinsics=host_values,
         )
 
 

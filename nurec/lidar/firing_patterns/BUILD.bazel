@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+py_library(
+    name = "schema",
+    srcs = [
+        "__init__.py",
+        "schema.py",
+    ],
+    visibility = [
+        "//:core_package_group",
+    ],
+    deps = [
+        "//nurec/lidar:pylib",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "recovery",
+    srcs = ["recovery.py"],
+    deps = [
+        "//nurec/lidar:pylib",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "templates",
+    srcs = ["templates.py"],
+    deps = [
+        ":schema",
+        pip_requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "io",
+    srcs = ["io.py"],
+    deps = [
+        ":recovery",
+        ":schema",
+        ":templates",
+        "//nurec/artifact:pylib",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils:pylib_types",
+        "//nurec/utils/io:pylib",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+pytest_test(
+    name = "schema_test",
+    size = "small",
+    srcs = ["schema_test.py"],
+    deps = [
+        ":schema",
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "recovery_test",
+    size = "small",
+    srcs = ["recovery_test.py"],
+    deps = [
+        ":recovery",
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "templates_test",
+    size = "small",
+    srcs = ["templates_test.py"],
+    deps = [
+        ":schema",
+        ":templates",
+        pip_requirement("numpy"),
+    ],
+)
+
+pytest_test(
+    name = "io_test",
+    srcs = ["io_test.py"],
+    deps = [
+        ":io",
+        ":schema",
+        ":templates",
+        "//nurec/artifact:pylib",
+        "//nurec/config:pylib",
+        "//nurec/ncore_backends:pylib",
+        "//nurec/utils:pylib_types",
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)

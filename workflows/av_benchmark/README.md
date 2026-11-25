@@ -89,9 +89,8 @@ Metric files are written by the stages themselves:
 
 `render_video` writes the published video, `release_video/color/<camera>/video.mp4`, at 3840x2160.
 
-`benchmark_row` runs before the runner writes `manifest.json`, so its reconstruction-time fields
-carry an absence reason. The orchestrator re-runs it with the task's own arguments plus
-`--manifest=$WORK/manifest.json` to fill them.
+`benchmark_row` reads reconstruction-time fields from `manifest.json` automatically.
+Pass `--manifest=$WORK/manifest.json` when running `benchmark-row` separately.
 
 ## What it does not produce
 

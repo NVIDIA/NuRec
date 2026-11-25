@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - override /image_resolution/camera@_global_.dataset.n_val_image_resolution: relative_1
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_1
+
 # Owner: Haithem Turki
 
 dataset:
-  n_val_image_subsample: 1
 
   # evaluation setup from NFL paper
   # Validate on frames 4,9,14,...
@@ -19,7 +22,6 @@ dataset:
     batch_sampler:
       camera_pixel_sampler:
         crop_type: full_image
-        subsample: 1
       camera_frame_sampler:
         name: holdout
         # Exclude frames used during validation from the training set.

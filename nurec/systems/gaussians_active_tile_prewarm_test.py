@@ -99,7 +99,7 @@ class _PrewarmPlan:
 
 
 def _entry(sensor_idx: int) -> _PrewarmEntry:
-    camera_subsample = RectSubsampled(
+    camera_subsample = RectSubsampled.from_subsample(
         i=0,
         j=0,
         height=3,

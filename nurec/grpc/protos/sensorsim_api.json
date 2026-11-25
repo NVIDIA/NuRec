@@ -1,0 +1,2055 @@
+{
+  "enums": {
+    "nurec.grpc.protos.sensorsim.BivariateWindshieldModelParameters.ReferencePolynomial": {
+      "BACKWARD": 1,
+      "FORWARD": 0
+    },
+    "nurec.grpc.protos.sensorsim.CameraRenderProduct": {
+      "CAMERA_RENDER_PRODUCT_COLOR": 0,
+      "CAMERA_RENDER_PRODUCT_DISTANCE_COLORIZED": 1,
+      "CAMERA_RENDER_PRODUCT_SEMANTICS_COLORIZED": 2
+    },
+    "nurec.grpc.protos.sensorsim.FthetaCameraParam.PolynomialType": {
+      "ANGLE_TO_PIXELDIST": 2,
+      "PIXELDIST_TO_ANGLE": 1,
+      "UNKNOWN": 0
+    },
+    "nurec.grpc.protos.sensorsim.ImageFormat": {
+      "AV1": 6,
+      "AVC": 5,
+      "JPEG": 2,
+      "JPEG2000": 3,
+      "PNG": 1,
+      "RGB_UINT8_PLANAR": 4,
+      "UNDEFINED": 0
+    },
+    "nurec.grpc.protos.sensorsim.LidarDeviceType": {
+      "AT128": 1,
+      "PANDAR128": 0
+    },
+    "nurec.grpc.protos.sensorsim.LidarFloatingFilterSource": {
+      "LIDAR_FLOATING_FILTER_SOURCE_ANGLE": 1,
+      "LIDAR_FLOATING_FILTER_SOURCE_RANGEVIEW": 0
+    },
+    "nurec.grpc.protos.sensorsim.OverlayBoundingBoxSource": {
+      "OVERLAY_BOUNDING_BOX_SOURCE_ARTIFACT": 2,
+      "OVERLAY_BOUNDING_BOX_SOURCE_MODEL": 1,
+      "OVERLAY_BOUNDING_BOX_SOURCE_UNSPECIFIED": 0
+    },
+    "nurec.grpc.protos.sensorsim.ShutterType": {
+      "GLOBAL": 5,
+      "ROLLING_BOTTOM_TO_TOP": 3,
+      "ROLLING_LEFT_TO_RIGHT": 2,
+      "ROLLING_RIGHT_TO_LEFT": 4,
+      "ROLLING_TOP_TO_BOTTOM": 1,
+      "UNKNOWN": 0
+    }
+  },
+  "messages": {
+    "nurec.grpc.protos.common.AABB": {
+      "size_x": [
+        1,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "size_y": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "size_z": [
+        3,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.AvailableScenesReturn": {
+      "scene_ids": [
+        1,
+        "TYPE_STRING",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.Empty": {},
+    "nurec.grpc.protos.common.Pose": {
+      "quat": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Quat",
+        "",
+        true
+      ],
+      "vec": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Vec3",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.common.PoseAtTime": {
+      "pose": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Pose",
+        "",
+        true
+      ],
+      "timestamp_us": [
+        2,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.Quat": {
+      "w": [
+        1,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "x": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "y": [
+        3,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "z": [
+        4,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.Trajectory": {
+      "poses": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.common.PoseAtTime",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.Vec3": {
+      "x": [
+        1,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "y": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "z": [
+        3,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.VersionId": {
+      "git_hash": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "grpc_api_version": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.VersionId.APIVersion",
+        "",
+        true
+      ],
+      "version_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.common.VersionId.APIVersion": {
+      "major": [
+        1,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "minor": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "patch": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.ipc.CloseIpcSessionRequest": {
+      "session_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.ipc.CloseIpcSessionResponse": {
+      "error_message": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "success": [
+        1,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.ipc.OpenIpcSessionRequest": {
+      "requested_buffer_count": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "requested_height": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "requested_width": [
+        1,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.ipc.OpenIpcSessionResponse": {
+      "actual_height": [
+        6,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "actual_width": [
+        5,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "buffer_size": [
+        3,
+        "TYPE_UINT64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "cuda_ipc_mem_handles": [
+        2,
+        "TYPE_BYTES",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "device_uuid": [
+        4,
+        "TYPE_BYTES",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "session_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AspectState": {
+      "aspects": [
+        1,
+        "TYPE_STRING",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "gains": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.AspectState.AspectGain",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AspectState.AspectGain": {
+      "aspect": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "cold_rgb": [
+        3,
+        "TYPE_FLOAT",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "gain": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_gain",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableCamerasRequest": {
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableCamerasReturn": {
+      "available_cameras": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.AvailableCamerasReturn.AvailableCamera",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableCamerasReturn.AvailableCamera": {
+      "intrinsics": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraSpec",
+        "",
+        true
+      ],
+      "logical_id": [
+        3,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "rig_to_camera": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Pose",
+        "",
+        true
+      ],
+      "trajectory_idx": [
+        4,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableDynamicObjectsRequest": {
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableDynamicObjectsReturn": {
+      "dynamic_objects": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.DynamicObjectTrack",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableEgoMasksReturn": {
+      "ego_mask_metadata": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.AvailableEgoMasksReturn.EgoMaskMetadata",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableEgoMasksReturn.EgoMaskMetadata": {
+      "ego_mask_id": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.EgoMaskId",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableTrajectoriesRequest": {
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableTrajectoriesReturn": {
+      "available_trajectories": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.AvailableTrajectoriesReturn.AvailableTrajectory",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.AvailableTrajectoriesReturn.AvailableTrajectory": {
+      "trajectory": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Trajectory",
+        "",
+        true
+      ],
+      "trajectory_idx": [
+        1,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchCameraRenderRequest": {
+      "items": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.BatchCameraRenderRequestItem",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchCameraRenderRequestItem": {
+      "camera_name": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "request": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraRenderRequest",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchCameraRenderReturn": {
+      "items": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.BatchCameraRenderReturnItem",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchCameraRenderReturnItem": {
+      "camera_name": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "error_message": [
+        4,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "result": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraRenderReturn",
+        "",
+        true
+      ],
+      "success": [
+        3,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchRGBRenderRequest": {
+      "items": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.BatchRGBRenderRequestItem",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchRGBRenderRequestItem": {
+      "camera_name": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "request": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.RGBRenderRequest",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchRGBRenderReturn": {
+      "items": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.BatchRGBRenderReturnItem",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BatchRGBRenderReturnItem": {
+      "camera_name": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "error_message": [
+        4,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "result": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.RGBRenderReturn",
+        "",
+        true
+      ],
+      "success": [
+        3,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BboxColor": {
+      "b": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "g": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "r": [
+        1,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.BivariateWindshieldModelParameters": {
+      "horizontal_poly": [
+        2,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "horizontal_poly_inverse": [
+        4,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "reference_poly": [
+        1,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.BivariateWindshieldModelParameters.ReferencePolynomial",
+        "",
+        false
+      ],
+      "vertical_poly": [
+        3,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "vertical_poly_inverse": [
+        5,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.CameraRenderOutput": {
+      "buffer_id": [
+        8,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "distance_colormap_vmax_m": [
+        6,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_distance_colormap_vmax_m",
+        true
+      ],
+      "format": [
+        7,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "image_bytes": [
+        1,
+        "TYPE_BYTES",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "image_height": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "image_width": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "render_product": [
+        4,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraRenderProduct",
+        "",
+        false
+      ],
+      "semantics_class_mapping": [
+        5,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.SemanticsClassEntry",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.CameraRenderRequest": {
+      "apply_harmonizer": [
+        18,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "_apply_harmonizer",
+        true
+      ],
+      "bbox_color": [
+        16,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.BboxColor",
+        "_bbox_color",
+        true
+      ],
+      "camera_intrinsics": [
+        4,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraSpec",
+        "",
+        true
+      ],
+      "distance_colormap_vmax_m": [
+        15,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_distance_colormap_vmax_m",
+        true
+      ],
+      "dynamic_objects": [
+        8,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.DynamicObject",
+        "",
+        false
+      ],
+      "ego_mask_id": [
+        12,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.EgoMaskId",
+        "",
+        true
+      ],
+      "frame_end_us": [
+        6,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "frame_start_us": [
+        5,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "harmonizer_session_id": [
+        17,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "_harmonizer_session_id",
+        true
+      ],
+      "image_format": [
+        9,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.ImageFormat",
+        "",
+        false
+      ],
+      "image_quality": [
+        10,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "insert_ego_mask": [
+        11,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "ipc_session_id": [
+        20,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "overlay_bounding_boxes": [
+        14,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.OverlayBoundingBoxSource",
+        "",
+        false
+      ],
+      "released_buffer_id": [
+        21,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "_released_buffer_id",
+        true
+      ],
+      "render_products": [
+        13,
+        "TYPE_ENUM",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.CameraRenderProduct",
+        "",
+        false
+      ],
+      "resolution_h": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "resolution_w": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "sensor_pose": [
+        7,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.PosePair",
+        "",
+        true
+      ],
+      "use_cuda_ipc": [
+        19,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.CameraRenderReturn": {
+      "camera_render_outputs": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.CameraRenderOutput",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.CameraSpec": {
+      "bivariate_windshield_model_param": [
+        10,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.BivariateWindshieldModelParameters",
+        "external_distortion",
+        true
+      ],
+      "ftheta_param": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.FthetaCameraParam",
+        "camera_param",
+        true
+      ],
+      "logical_id": [
+        5,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "opencv_fisheye_param": [
+        4,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.OpenCVFisheyeCameraParam",
+        "camera_param",
+        true
+      ],
+      "opencv_pinhole_param": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.OpenCVPinholeCameraParam",
+        "camera_param",
+        true
+      ],
+      "resolution_h": [
+        7,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "resolution_w": [
+        8,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "shutter_type": [
+        9,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.ShutterType",
+        "",
+        false
+      ],
+      "temporary_camera_spec": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "trajectory_idx": [
+        6,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.DynamicObject": {
+      "aspect_state": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.AspectState",
+        "_aspect_state",
+        true
+      ],
+      "pose_pair": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.PosePair",
+        "",
+        true
+      ],
+      "track_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.DynamicObjectTrack": {
+      "asset_id": [
+        5,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "object_size": [
+        4,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.AABB",
+        "",
+        true
+      ],
+      "semantic_class": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "trajectory": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Trajectory",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.EditAssetsRequest": {
+      "insert": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.DynamicObjectTrack",
+        "",
+        false
+      ],
+      "replace": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.ReplaceAssetAction",
+        "",
+        false
+      ],
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.EditAssetsResponse": {
+      "message": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "success": [
+        1,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.EgoMaskId": {
+      "camera_logical_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "rig_config_id": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.ExternalAssetObjectsRequest": {
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.ExternalAssetObjectsReturn": {
+      "track_ids": [
+        1,
+        "TYPE_STRING",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.FthetaCameraParam": {
+      "angle_to_pixeldist_poly": [
+        5,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "linear_cde": [
+        7,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.LinearCde",
+        "",
+        true
+      ],
+      "max_angle": [
+        6,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "pixeldist_to_angle_poly": [
+        4,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "principal_point_x": [
+        1,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "principal_point_y": [
+        2,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "reference_poly": [
+        3,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.FthetaCameraParam.PolynomialType",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.HarmonizerSessionId": {
+      "session_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LidarRenderFilter": {
+      "azimuth_max_gap_deg": [
+        7,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_azimuth_max_gap_deg",
+        true
+      ],
+      "distance_filter_threshold": [
+        4,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_distance_filter_threshold",
+        true
+      ],
+      "elevation_resolution_deg": [
+        6,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_elevation_resolution_deg",
+        true
+      ],
+      "enable_distance_filter": [
+        3,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "_enable_distance_filter",
+        true
+      ],
+      "neighbor_source": [
+        5,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.LidarFloatingFilterSource",
+        "_neighbor_source",
+        true
+      ],
+      "opacity_threshold": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_opacity_threshold",
+        true
+      ],
+      "raydrop_threshold": [
+        1,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "_raydrop_threshold",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LidarRenderRequest": {
+      "dynamic_objects": [
+        6,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.DynamicObject",
+        "",
+        false
+      ],
+      "frame_end_us": [
+        4,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "frame_start_us": [
+        3,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "lidar_config": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.LidarSpec",
+        "",
+        true
+      ],
+      "lidar_id": [
+        8,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "render_filter": [
+        7,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.LidarRenderFilter",
+        "",
+        true
+      ],
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "sensor_pose": [
+        5,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.PosePair",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LidarRenderReturn": {
+      "num_points": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "point_intensities": [
+        2,
+        "TYPE_FLOAT",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "point_intensities_buffer": [
+        5,
+        "TYPE_BYTES",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "point_xyzs": [
+        1,
+        "TYPE_FLOAT",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "point_xyzs_buffer": [
+        4,
+        "TYPE_BYTES",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LidarSpec": {
+      "lidar_type": [
+        2,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.LidarDeviceType",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LinearCde": {
+      "linear_c": [
+        1,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "linear_d": [
+        2,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "linear_e": [
+        3,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LoadedSceneEntry": {
+      "loaded_instance_count": [
+        2,
+        "TYPE_UINT64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "reusable_instance_count": [
+        3,
+        "TYPE_UINT64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.LoadedScenesReturn": {
+      "loaded_instance_capacity": [
+        2,
+        "TYPE_UINT64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "scenes": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.LoadedSceneEntry",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.OpenCVFisheyeCameraParam": {
+      "focal_length_x": [
+        3,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "focal_length_y": [
+        4,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "max_angle": [
+        6,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "principal_point_x": [
+        1,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "principal_point_y": [
+        2,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "radial_coeffs": [
+        5,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.OpenCVPinholeCameraParam": {
+      "focal_length_x": [
+        3,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "focal_length_y": [
+        4,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "principal_point_x": [
+        1,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "principal_point_y": [
+        2,
+        "TYPE_DOUBLE",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "radial_coeffs": [
+        5,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "tangential_coeffs": [
+        6,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ],
+      "thin_prism_coeffs": [
+        7,
+        "TYPE_DOUBLE",
+        "LABEL_REPEATED",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.PosePair": {
+      "end_pose": [
+        2,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Pose",
+        "",
+        true
+      ],
+      "start_pose": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.Pose",
+        "",
+        true
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.RGBRenderRequest": {
+      "apply_harmonizer": [
+        21,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "_apply_harmonizer",
+        true
+      ],
+      "camera_intrinsics": [
+        4,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.CameraSpec",
+        "",
+        true
+      ],
+      "dynamic_objects": [
+        8,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.DynamicObject",
+        "",
+        false
+      ],
+      "ego_mask_id": [
+        12,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.EgoMaskId",
+        "",
+        true
+      ],
+      "frame_end_us": [
+        6,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "frame_start_us": [
+        5,
+        "TYPE_FIXED64",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "harmonizer_session_id": [
+        20,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "_harmonizer_session_id",
+        true
+      ],
+      "image_format": [
+        9,
+        "TYPE_ENUM",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.ImageFormat",
+        "",
+        false
+      ],
+      "image_quality": [
+        10,
+        "TYPE_FLOAT",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "insert_ego_mask": [
+        11,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "ipc_session_id": [
+        23,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "released_buffer_id": [
+        24,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "_released_buffer_id",
+        true
+      ],
+      "resolution_h": [
+        2,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "resolution_w": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "sensor_pose": [
+        7,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.sensorsim.PosePair",
+        "",
+        true
+      ],
+      "use_cuda_ipc": [
+        22,
+        "TYPE_BOOL",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.RGBRenderReturn": {
+      "buffer_id": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "format": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "image_bytes": [
+        1,
+        "TYPE_BYTES",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.ReplaceAssetAction": {
+      "object_size": [
+        3,
+        "TYPE_MESSAGE",
+        "LABEL_OPTIONAL",
+        "nurec.grpc.protos.common.AABB",
+        "",
+        true
+      ],
+      "original_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "replacement_id": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.RestoreModelParametersRequest": {
+      "scene_id": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.SemanticsClassEntry": {
+      "class_index": [
+        1,
+        "TYPE_INT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "class_name": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "color_b": [
+        5,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "color_g": [
+        4,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "color_r": [
+        3,
+        "TYPE_UINT32",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.ServerConfig": {
+      "server_config": [
+        1,
+        "TYPE_MESSAGE",
+        "LABEL_REPEATED",
+        "nurec.grpc.protos.sensorsim.ServerConfig.ServerConfigEntry",
+        "",
+        false
+      ]
+    },
+    "nurec.grpc.protos.sensorsim.ServerConfig.ServerConfigEntry": {
+      "key": [
+        1,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ],
+      "value": [
+        2,
+        "TYPE_STRING",
+        "LABEL_OPTIONAL",
+        "",
+        "",
+        false
+      ]
+    }
+  },
+  "rpcs": {
+    "batch_render_camera": [
+      "nurec.grpc.protos.sensorsim.BatchCameraRenderRequest",
+      "nurec.grpc.protos.sensorsim.BatchCameraRenderReturn",
+      false,
+      false
+    ],
+    "batch_render_rgb": [
+      "nurec.grpc.protos.sensorsim.BatchRGBRenderRequest",
+      "nurec.grpc.protos.sensorsim.BatchRGBRenderReturn",
+      false,
+      false
+    ],
+    "close_ipc_session": [
+      "nurec.grpc.protos.ipc.CloseIpcSessionRequest",
+      "nurec.grpc.protos.ipc.CloseIpcSessionResponse",
+      false,
+      false
+    ],
+    "create_harmonizer_session": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.sensorsim.HarmonizerSessionId",
+      false,
+      false
+    ],
+    "edit_assets": [
+      "nurec.grpc.protos.sensorsim.EditAssetsRequest",
+      "nurec.grpc.protos.sensorsim.EditAssetsResponse",
+      false,
+      false
+    ],
+    "end_harmonizer_session": [
+      "nurec.grpc.protos.sensorsim.HarmonizerSessionId",
+      "nurec.grpc.protos.common.Empty",
+      false,
+      false
+    ],
+    "get_available_cameras": [
+      "nurec.grpc.protos.sensorsim.AvailableCamerasRequest",
+      "nurec.grpc.protos.sensorsim.AvailableCamerasReturn",
+      false,
+      false
+    ],
+    "get_available_ego_masks": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.sensorsim.AvailableEgoMasksReturn",
+      false,
+      false
+    ],
+    "get_available_scenes": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.common.AvailableScenesReturn",
+      false,
+      false
+    ],
+    "get_available_trajectories": [
+      "nurec.grpc.protos.sensorsim.AvailableTrajectoriesRequest",
+      "nurec.grpc.protos.sensorsim.AvailableTrajectoriesReturn",
+      false,
+      false
+    ],
+    "get_dynamic_objects": [
+      "nurec.grpc.protos.sensorsim.AvailableDynamicObjectsRequest",
+      "nurec.grpc.protos.sensorsim.AvailableDynamicObjectsReturn",
+      false,
+      false
+    ],
+    "get_external_asset_objects": [
+      "nurec.grpc.protos.sensorsim.ExternalAssetObjectsRequest",
+      "nurec.grpc.protos.sensorsim.ExternalAssetObjectsReturn",
+      false,
+      false
+    ],
+    "get_loaded_scenes": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.sensorsim.LoadedScenesReturn",
+      false,
+      false
+    ],
+    "get_server_config": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.sensorsim.ServerConfig",
+      false,
+      false
+    ],
+    "get_version": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.common.VersionId",
+      false,
+      false
+    ],
+    "open_ipc_session": [
+      "nurec.grpc.protos.ipc.OpenIpcSessionRequest",
+      "nurec.grpc.protos.ipc.OpenIpcSessionResponse",
+      false,
+      false
+    ],
+    "render_camera": [
+      "nurec.grpc.protos.sensorsim.CameraRenderRequest",
+      "nurec.grpc.protos.sensorsim.CameraRenderReturn",
+      false,
+      false
+    ],
+    "render_lidar": [
+      "nurec.grpc.protos.sensorsim.LidarRenderRequest",
+      "nurec.grpc.protos.sensorsim.LidarRenderReturn",
+      false,
+      false
+    ],
+    "render_rgb": [
+      "nurec.grpc.protos.sensorsim.RGBRenderRequest",
+      "nurec.grpc.protos.sensorsim.RGBRenderReturn",
+      false,
+      false
+    ],
+    "restore_model_parameters": [
+      "nurec.grpc.protos.sensorsim.RestoreModelParametersRequest",
+      "nurec.grpc.protos.common.Empty",
+      false,
+      false
+    ],
+    "shut_down": [
+      "nurec.grpc.protos.common.Empty",
+      "nurec.grpc.protos.common.Empty",
+      false,
+      false
+    ]
+  },
+  "service": "nurec.grpc.protos.sensorsim.SensorsimService",
+  "source": "26.10-rc6"
+}

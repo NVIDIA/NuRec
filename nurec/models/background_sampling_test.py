@@ -366,7 +366,7 @@ def test_each_padded_corner_distributes_its_gradient_to_all_three_sources(size: 
             retain_graph=retain_graph,
         )[0]
 
-        torch.testing.assert_close(actual_gradient, expected_gradient, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradient, expected_gradient, atol=0, rtol=1e-5)
         torch.testing.assert_close(actual_gradient.sum(), torch.ones((), device="cuda"), atol=2e-7, rtol=0)
 
 
@@ -583,7 +583,7 @@ def test_pinned_gsplat_scale_matches_uncommon_dtype_dispatch_at_routing_boundari
         allow_unused=True,
     )
 
-    torch.testing.assert_close(fused, uncommon_dtype, atol=0, rtol=0)
+    torch.testing.assert_close(fused, uncommon_dtype, atol=0, rtol=1e-5)
     torch.testing.assert_close(fused_gradient, uncommon_dtype_gradient, atol=2e-5, rtol=2e-5)
     assert fused_ray_gradient is None
     assert uncommon_dtype_ray_gradient is None

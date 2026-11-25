@@ -75,6 +75,7 @@ pytest_test(
 )
 
 # End-to-end tests that run `run.sh` in a temporary copy of the launcher files.
+# The autorun suites spawn many subprocesses, so use the medium integration-test budget.
 py_library(
     name = "launcher_test_base",
     testonly = True,
@@ -87,7 +88,7 @@ py_library(
 
 pytest_test(
     name = "claude_autorun_test",
-    size = "small",
+    size = "medium",
     srcs = ["claude_autorun_test.py"],
     data = ["//skills/nurec-onboard:launcher_test_data"],
     deps = [
@@ -98,7 +99,7 @@ pytest_test(
 
 pytest_test(
     name = "codex_autorun_test",
-    size = "small",
+    size = "medium",
     srcs = ["codex_autorun_test.py"],
     data = ["//skills/nurec-onboard:launcher_test_data"],
     deps = [

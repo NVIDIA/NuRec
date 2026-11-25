@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+cuda_library(
+    name = "entropy_cuda",
+    srcs = ["entropy.cu"],
+    deps = ["//deps/torch:torch_headers"],
+)
+
+cc_binary(
+    name = "libmask2former_cc.so",
+    srcs = ["binding.cpp"],
+    copts = [
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libmask2former_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":entropy_cuda",
+        "//deps/torch:torch_headers",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = ["entropy.py"],
+    data = [":libmask2former_cc.so"],
+    visibility = ["//apps/av/aux_gen:__pkg__"],
+    deps = [pip_requirement("torch")],
+)
+
+pytest_test(
+    name = "entropy_test",
+    size = "small",
+    srcs = ["entropy_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)

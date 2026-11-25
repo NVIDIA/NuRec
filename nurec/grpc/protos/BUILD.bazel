@@ -3,7 +3,7 @@
 
 load("@mypy_integration//:rules.bzl", "mypy_stubs")
 load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 
 DEFAULT_VISIBILITY = [
@@ -24,6 +24,7 @@ filegroup(
     srcs = [
         "common.proto",
         "ipc.proto",
+        "rdma.proto",
         "sensorsim.proto",
     ],
     visibility = [
@@ -67,4 +68,29 @@ pytest_test(
     name = "ipc_proto_test",
     srcs = ["ipc_proto_test.py"],
     deps = [":grpc_pb2"],
+)
+
+pytest_test(
+    name = "rdma_proto_test",
+    srcs = ["rdma_proto_test.py"],
+    deps = [":grpc_pb2"],
+)
+
+pytest_test(
+    name = "sensorsim_proto_test",
+    srcs = ["sensorsim_proto_test.py"],
+    data = ["sensorsim_api.json"],
+    deps = [":grpc_pb2"],
+)
+
+# Regenerates sensorsim_api.json from a release: bazel run //nurec/grpc/protos:sensorsim_api -- <tag>
+py_binary(
+    name = "sensorsim_api",
+    srcs = ["sensorsim_proto_test.py"],
+    main = "sensorsim_proto_test.py",
+    deps = [
+        ":grpc_pb2",
+        pip_requirement("grpcio-tools"),
+        pip_requirement("pytest"),
+    ],
 )

@@ -56,6 +56,7 @@ from nurec.render import (
 from nurec.utils.cli import SettingsCollector
 from nurec.utils.cudaeventtimer import CudaEventTimer
 from nurec.utils.geometry import pose_offsets_to_se3, se3_matrix_to_tquat
+from nurec.utils.io.export.render_frame_pipeline import FramePipelineRecorder
 from nurec.utils.io.export.render_helpers import (
     CameraOutputSubdir,
     parse_frame_index,
@@ -1526,7 +1527,11 @@ def render(
         renderable._model.set_edit_overrides(runtime)
 
     def render_trajectory() -> None:
-        """Execute camera rendering, LiDAR rendering, or track-only listing."""
+        """Execute the selected export with matching per-repetition render and pipeline samples.
+
+        Each pipeline sample includes current-frame preparation and consumption;
+        warm-up intervals, timing reports/logs, and final export drains are excluded explicitly.
+        """
         if save_outputs and render_options.semantic_image and semantics_legend and class_color_lut is not None:
             _save_semantics_legend(
                 output_dir,
@@ -1542,7 +1547,9 @@ def render(
                 frame_metrics=True,
                 nsight=nsight,
             )
-            for metric, method in (("render_time_ms", "wall_clock"), ("cuda_ms", "cuda_event")):
+            timing_metrics = [("render_time_ms", "wall_clock"), ("cuda_ms", "cuda_event")]
+            timing_metrics.append(("frame_wall_ms", "wall_clock"))
+            for metric, method in timing_metrics:
                 metrics_collector.set_metric_metadata(
                     metric,
                     timing_method=method,
@@ -1774,6 +1781,12 @@ def render(
                 [calib_provider.get_unique_sensor_id(cid) for cid in render_camera_ids]
             )
         cuda_timer = CudaEventTimer("nurec.render.forward")
+        pipeline = FramePipelineRecorder(
+            enabled=report,
+            range_factory=torch.cuda.nvtx.range,
+            collector=metrics_collector,
+            sequence_id=metrics_sequence_id or "",
+        )
 
         camera_resolutions: dict[str, list[int]] = {}
         # Each selected camera owns its warm-up, iterations and output snapshots.
@@ -1799,6 +1812,7 @@ def render(
                 raise ValueError(f"Camera {camera_id!r} has invalid render resolution {requested_resolution}")
             # Native calibration may adjust rounded dimensions. Preserve the original
             # request while validating and reporting the size the renderer will produce.
+            # Resolve dimensions for validation only; the scalar render still prepares its own uncached calibration.
             output_intrinsics = transform_intrinsics_to_resolution(
                 requested_camera.camera_model_parameters, requested_resolution
             )
@@ -1806,8 +1820,13 @@ def render(
             output_resolution = (int(output_width), int(output_height))
             if metrics_collector is not None:
                 camera_resolutions[camera_id] = list(output_resolution)
-                for metric in ("render_time_ms", "cuda_ms"):
-                    metrics_collector.set_metric_metadata(metric, resolutions=camera_resolutions)
+                for metric in ("render_time_ms", "cuda_ms", "frame_wall_ms"):
+                    metrics_collector.set_metric_metadata(
+                        metric,
+                        resolutions=camera_resolutions,
+                        timing_scope="single_camera_call",
+                        input_preparation="uncached_single_view_per_call",
+                    )
 
             num_frames = calib_provider.get_num_camera_frames(camera_id)
             try:
@@ -2005,120 +2024,184 @@ def render(
                         save_futures.append(executor.submit(_save_rendered_frame_to_disk, image, image_path))
 
                 for frame_idx in frame_indices:
-                    # Get the camera-to-world pose of the current frame.
-                    camera_to_world = calib_provider.get_camera_view_pose(camera_id, frame_idx)
+                    with nsight_capture.frame(camera_id, frame_idx):
+                        for iteration in range(1, iterations + 1):
+                            frame_prepared = render_complete = False
+                            actors_snapshot: Optional[ActorsSnapshot] = None
+                            overlay_actors_snapshot: Optional[ActorsSnapshot] = None
+                            # Report after the timer even when output handling continues the loop early.
+                            try:
+                                with pipeline.measure(camera_id, frame_idx, iteration=iteration) as pipeline_timing:
+                                    # Get the camera-to-world pose of the current frame.
+                                    camera_to_world = calib_provider.get_camera_view_pose(camera_id, frame_idx)
 
-                    frame_start_us = camera_to_world.start_timestamp_us
-                    frame_end_us = camera_to_world.end_timestamp_us
-                    assert frame_start_us >= 0 and frame_end_us >= 0
+                                    frame_start_us = camera_to_world.start_timestamp_us
+                                    frame_end_us = camera_to_world.end_timestamp_us
+                                    assert frame_start_us >= 0 and frame_end_us >= 0
+                                    frame_prepared = True
 
-                    log.info(
-                        f"Frame {frame_idx} at timestamp {frame_start_us} with {frame_end_us - frame_start_us} us exposure"
-                    )
+                                    # Test whether the provided frame capture timestamps are within the timestamp range of the rendering clip.
+                                    # Actors do not render correctly beyond this timestamp range.
+                                    if frame_start_us < rendering_clip_start_us or frame_end_us > rendering_clip_end_us:
+                                        raise ValueError(
+                                            f"Frame capture timestamp range"
+                                            f"({frame_start_us}, {frame_end_us}) is outside of rendering clip"
+                                            f"timestamp range ({rendering_clip_start_us}, {rendering_clip_end_us})."
+                                        )
 
-                    # Test whether the provided frame capture timestamps are within the timestamp range of the rendering clip.
-                    # Actors do not render correctly beyond this timestamp range.
-                    if frame_start_us < rendering_clip_start_us or frame_end_us > rendering_clip_end_us:
-                        raise ValueError(
-                            f"Frame capture timestamp range"
-                            f"({frame_start_us}, {frame_end_us}) is outside of rendering clip"
-                            f"timestamp range ({rendering_clip_start_us}, {rendering_clip_end_us})."
-                        )
+                                    # Only update actors if enable_editing_actors is enabled
+                                    # Otherwise, skip to ensure all objects are rendered without modification.
+                                    if enable_editing_actors:
+                                        assert actor_tracks is not None
+                                        actors_snapshot = actor_tracks.get_snapshot_at_frame(
+                                            frame_start_us, frame_end_us
+                                        )
+                                        if demo_actor_transform:
+                                            actors_snapshot = manipulate_actor_poses(actors_snapshot)
 
-                    # Only update actors if enable_editing_actors is enabled
-                    # Otherwise, skip to ensure all objects are rendered without modification.
-                    actors_snapshot: Optional[ActorsSnapshot] = None
-                    if enable_editing_actors:
-                        assert actor_tracks is not None
-                        actors_snapshot = actor_tracks.get_snapshot_at_frame(frame_start_us, frame_end_us)
-                        log.info(f"{actors_snapshot.num_actors()} active actors")
-                        if demo_actor_transform:
-                            actors_snapshot = manipulate_actor_poses(actors_snapshot)
+                                    if actor_tracks_to_overlay is not None:
+                                        overlay_actors_snapshot = actor_tracks_to_overlay.get_snapshot_at_frame(
+                                            frame_start_us, frame_end_us
+                                        )
 
-                    overlay_actors_snapshot: Optional[ActorsSnapshot] = None
-                    if actor_tracks_to_overlay is not None:
-                        overlay_actors_snapshot = actor_tracks_to_overlay.get_snapshot_at_frame(
-                            frame_start_us, frame_end_us
-                        )
-                        if overlay_actors_snapshot.num_actors() == 0 and actor_tracks_to_overlay.num_tracks() > 0:
-                            log.warning(
-                                f"Frame {frame_idx}: --render-bboxes {render_bboxes}: "
-                                f"{actor_tracks_to_overlay.num_tracks()} track(s) loaded but none overlap "
-                                f"frame timestamp [{frame_start_us}, {frame_end_us}]; no boxes drawn. "
-                                "Check that the render trajectory timestamps overlap the track timestamps."
-                            )
+                                    unique_frame_idx = (
+                                        calib_provider.get_unique_frame_index(camera_id, frame_idx)
+                                        if replicate_training_views
+                                        else None
+                                    )
 
-                    unique_frame_idx = (
-                        calib_provider.get_unique_frame_index(camera_id, frame_idx)
-                        if replicate_training_views
-                        else None
-                    )
+                                    # Resolve training_frame_idx for per-frame post-processing (e.g. PPISP).
+                                    # The mapping array uses -1 for held-out frames; normalize to None at the API boundary.
+                                    training_frame_idx: int | None = None
+                                    if unique_frame_idx is not None and training_frame_mapping is not None:
+                                        if not 0 <= unique_frame_idx < len(training_frame_mapping):
+                                            raise ValueError(
+                                                f"Unique frame index {unique_frame_idx} is outside the training-frame mapping"
+                                            )
+                                        mapped = int(training_frame_mapping[unique_frame_idx])
+                                        if mapped >= 0:
+                                            training_frame_idx = mapped
 
-                    # Resolve training_frame_idx for per-frame post-processing (e.g. PPISP).
-                    # The mapping array uses -1 for held-out frames; normalize to None at the API boundary.
-                    training_frame_idx: int | None = None
-                    if unique_frame_idx is not None and training_frame_mapping is not None:
-                        if not 0 <= unique_frame_idx < len(training_frame_mapping):
-                            raise ValueError(
-                                f"Unique frame index {unique_frame_idx} is outside the training-frame mapping"
-                            )
-                        mapped = int(training_frame_mapping[unique_frame_idx])
-                        if mapped >= 0:
-                            training_frame_idx = mapped
+                                    render_frame = partial(
+                                        renderable.render_camera_frame,
+                                        camera_intrinsics=requested_camera.camera_model_parameters,
+                                        camera_to_world=camera_to_world,
+                                        resolution=requested_resolution,
+                                        unique_sensor_idx=requested_camera.unique_sensor_idx,
+                                        unique_frame_idx=unique_frame_idx,
+                                        training_frame_idx=training_frame_idx,
+                                        render_options=render_options,
+                                        actors_snapshot=actors_snapshot,
+                                        frame_start_us=frame_start_us,
+                                        frame_end_us=frame_end_us,
+                                    )
 
-                    render_frame = partial(
-                        renderable.render_camera_frame,
-                        camera_intrinsics=requested_camera.camera_model_parameters,
-                        camera_to_world=camera_to_world,
-                        resolution=requested_resolution,
-                        unique_sensor_idx=requested_camera.unique_sensor_idx,
-                        unique_frame_idx=unique_frame_idx,
-                        training_frame_idx=training_frame_idx,
-                        render_options=render_options,
-                        actors_snapshot=actors_snapshot,
-                        frame_start_us=frame_start_us,
-                        frame_end_us=frame_end_us,
-                    )
+                                    with (
+                                        torch.cuda.device(renderable.device),
+                                        torch.inference_mode(),
+                                    ):
+                                        # Warm the first selected frame, then measure it normally; never skip input frames.
+                                        if iteration == 1 and frame_idx == frame_indices.start and warmup_frames > 0:
+                                            with pipeline_timing.warmup():
+                                                for warmup_iteration in range(1, warmup_frames + 1):
+                                                    # Match measured event boundaries without publishing warmup samples.
+                                                    with cuda_timer(
+                                                        renderable.device,
+                                                        label=f"nurec.render.warmup(frame={frame_idx}, iteration={warmup_iteration})",
+                                                        record_sample=False,
+                                                    ):
+                                                        warmup = render_frame()
+                                                    validate_camera_output(warmup, output_resolution, render_options)
+                                                    del warmup
 
-                    with (
-                        torch.cuda.device(renderable.device),
-                        torch.inference_mode(),
-                        nsight_capture.frame(camera_id, frame_idx),
-                    ):
-                        # Warm the first selected frame, then measure it normally; never skip input frames.
-                        if frame_idx == frame_indices.start:
-                            for warmup_iteration in range(1, warmup_frames + 1):
-                                # Match measured event boundaries without publishing warmup samples.
-                                with cuda_timer(
-                                    renderable.device,
-                                    label=f"nurec.render.warmup(frame={frame_idx}, iteration={warmup_iteration})",
-                                    record_sample=False,
-                                ):
-                                    warmup = render_frame()
-                                validate_camera_output(warmup, output_resolution, render_options)
-                                del warmup
+                                        with torch.cuda.nvtx.range(
+                                            f"nurec.render.frame(camera={camera_id}, frame={frame_idx})"
+                                        ):
+                                            # Include native per-frame uploads; exports happen after the stop event.
+                                            if report:
+                                                with cuda_timer(renderable.device):
+                                                    start_time = time.perf_counter()
+                                                    camera_frame = render_frame()
+                                                    elapsed_time = (time.perf_counter() - start_time) * 1000
+                                            else:
+                                                with cuda_timer(renderable.device, record_sample=save_outputs):
+                                                    camera_frame = render_frame()
+                                            validate_camera_output(camera_frame, output_resolution, render_options)
+                                            if not report and not save_outputs:
+                                                # Use the same timing and output lifetime as warm-up renders.
+                                                del camera_frame
+                                                continue
+                                            cuda_ms = cuda_timer.milliseconds[-1]
+                                            cuda_valid = cuda_timer.valid[-1]
+                                            render_complete = True
 
-                        # Group measured iterations after all warm-up GPU work has completed.
-                        with torch.cuda.nvtx.range(f"nurec.render.frame(camera={camera_id}, frame={frame_idx})"):
-                            for iteration in range(1, iterations + 1):
-                                # Include native per-frame uploads; exports happen after the stop event.
-                                if report:
-                                    with cuda_timer(renderable.device):
-                                        start_time = time.perf_counter()
-                                        camera_frame = render_frame()
-                                        elapsed_time = (time.perf_counter() - start_time) * 1000
-                                else:
-                                    with cuda_timer(renderable.device, record_sample=save_outputs):
-                                        camera_frame = render_frame()
-                                validate_camera_output(camera_frame, output_resolution, render_options)
-                                if not report and not save_outputs:
-                                    # Use the same timing and output lifetime as warm-up renders.
-                                    del camera_frame
-                                    continue
-                                cuda_ms = cuda_timer.milliseconds[-1]
-                                cuda_valid = cuda_timer.valid[-1]
+                                            if not save_outputs:
+                                                # Match warmup output lifetime and skip all export conversion/download work.
+                                                del camera_frame
+                                                continue
 
-                                if metrics_collector is not None:
+                                            save_primary = iteration == iterations
+                                            save_extra = "all-iterations" in save_modes or (
+                                                "last-iteration" in save_modes and iteration == iterations
+                                            )
+                                            improved = [
+                                                mode
+                                                for mode in ("min", "max")
+                                                if cuda_valid
+                                                and mode in extrema_modes
+                                                and (
+                                                    mode not in best_samples
+                                                    or (mode == "min" and cuda_ms < best_samples[mode].cuda_ms)
+                                                    or (mode == "max" and cuda_ms > best_samples[mode].cuda_ms)
+                                                )
+                                            ]
+                                            if not save_primary and not save_extra and not improved:
+                                                del camera_frame
+                                                continue
+                                            # A render selected by several save modes is converted/downloaded only once.
+                                            selection = ",".join(
+                                                (["index"] if save_primary or save_extra else []) + improved
+                                            )
+                                            images = prepare_images(
+                                                camera_frame,
+                                                camera_to_world,
+                                                overlay_actors_snapshot,
+                                                f"nurec.render.image_copy(selection={selection}, "
+                                                f"frame={frame_idx}, iteration={iteration})",
+                                            )
+                                            del camera_frame
+                                            if not images:
+                                                continue
+                                            sample = CameraRenderSample(
+                                                frame_idx, iteration, images, camera_to_world, cuda_ms, valid=cuda_valid
+                                            )
+                                            if save_primary:
+                                                save_frame(sample)
+                                            if save_extra:
+                                                save_frame(sample, extra=True)
+                                            for mode in improved:
+                                                best_samples[mode] = sample
+                            finally:
+                                if frame_prepared and iteration == 1:
+                                    log.info(
+                                        f"Frame {frame_idx} at timestamp {frame_start_us} with {frame_end_us - frame_start_us} us exposure"
+                                    )
+                                    if actors_snapshot is not None:
+                                        log.info(f"{actors_snapshot.num_actors()} active actors")
+                                    if (
+                                        overlay_actors_snapshot is not None
+                                        and actor_tracks_to_overlay is not None
+                                        and overlay_actors_snapshot.num_actors() == 0
+                                        and actor_tracks_to_overlay.num_tracks() > 0
+                                    ):
+                                        log.warning(
+                                            f"Frame {frame_idx}: --render-bboxes {render_bboxes}: "
+                                            f"{actor_tracks_to_overlay.num_tracks()} track(s) loaded but none overlap "
+                                            f"frame timestamp [{frame_start_us}, {frame_end_us}]; no boxes drawn. "
+                                            "Check that the render trajectory timestamps overlap the track timestamps."
+                                        )
+
+                                if render_complete and metrics_collector is not None:
                                     result_width, result_height = output_resolution
                                     log.info(
                                         f"Frame {frame_idx}, iteration {iteration}/{iterations}: {result_width}x{result_height} rendered in "
@@ -2134,49 +2217,6 @@ def render(
                                         cuda_ms=cuda_ms,
                                         metric_validity={"cuda_ms": cuda_valid},
                                     )
-
-                                if not save_outputs:
-                                    # Match warmup output lifetime and skip all export conversion/download work.
-                                    del camera_frame
-                                    continue
-
-                                save_primary = iteration == iterations
-                                save_extra = "all-iterations" in save_modes or (
-                                    "last-iteration" in save_modes and iteration == iterations
-                                )
-                                improved = [
-                                    mode
-                                    for mode in ("min", "max")
-                                    if cuda_valid
-                                    and mode in extrema_modes
-                                    and (
-                                        mode not in best_samples
-                                        or (mode == "min" and cuda_ms < best_samples[mode].cuda_ms)
-                                        or (mode == "max" and cuda_ms > best_samples[mode].cuda_ms)
-                                    )
-                                ]
-                                if not save_primary and not save_extra and not improved:
-                                    continue
-                                # A render selected by several save modes is converted/downloaded only once.
-                                selection = ",".join((["index"] if save_primary or save_extra else []) + improved)
-                                images = prepare_images(
-                                    camera_frame,
-                                    camera_to_world,
-                                    overlay_actors_snapshot,
-                                    f"nurec.render.image_copy(selection={selection}, "
-                                    f"frame={frame_idx}, iteration={iteration})",
-                                )
-                                if not images:
-                                    continue
-                                sample = CameraRenderSample(
-                                    frame_idx, iteration, images, camera_to_world, cuda_ms, valid=cuda_valid
-                                )
-                                if save_primary:
-                                    save_frame(sample)
-                                if save_extra:
-                                    save_frame(sample, extra=True)
-                                for mode in improved:
-                                    best_samples[mode] = sample
 
                 for mode in ("min", "max"):
                     if mode in best_samples:

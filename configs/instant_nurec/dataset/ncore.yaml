@@ -79,5 +79,7 @@ lidar_frame_batch:
 
 compute_rendering_data: false
 cache_loaders_and_sensors: false
+cache_full_clip_cuboid_observations: false
+cache_full_clip_cuboid_consolidation: false
 
 augmentations: null

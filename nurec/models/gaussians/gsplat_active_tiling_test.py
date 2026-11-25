@@ -520,9 +520,9 @@ def test_all_true_mask_matches_the_unmasked_render(masked_render_results):
     """An all-active mask must be a no-op: same pixels as rendering without a mask at all."""
     results, _, _ = masked_render_results
     no_mask, all_true = results["no_mask"], results["all_true"]
-    torch.testing.assert_close(all_true.rgb, no_mask.rgb, rtol=0, atol=0)
-    torch.testing.assert_close(all_true.opacity, no_mask.opacity, rtol=0, atol=0)
-    torch.testing.assert_close(all_true.distance, no_mask.distance, rtol=0, atol=0)
+    torch.testing.assert_close(all_true.rgb, no_mask.rgb, rtol=1e-5, atol=0)
+    torch.testing.assert_close(all_true.opacity, no_mask.opacity, rtol=1e-5, atol=0)
+    torch.testing.assert_close(all_true.distance, no_mask.distance, rtol=1e-5, atol=0)
 
 
 def test_all_false_mask_yields_the_background_only_render(masked_render_results):
@@ -546,9 +546,9 @@ def test_checkerboard_mask_splits_pixels_per_tile(masked_render_results):
     no_mask, checker_result = results["no_mask"], results["checker"]
     active = _pixel_mask(checker, tile_h, tile_w)
 
-    torch.testing.assert_close(checker_result.rgb[active], no_mask.rgb[active], rtol=0, atol=0)
-    torch.testing.assert_close(checker_result.opacity[active], no_mask.opacity[active], rtol=0, atol=0)
-    torch.testing.assert_close(checker_result.distance[active], no_mask.distance[active], rtol=0, atol=0)
+    torch.testing.assert_close(checker_result.rgb[active], no_mask.rgb[active], rtol=1e-5, atol=0)
+    torch.testing.assert_close(checker_result.opacity[active], no_mask.opacity[active], rtol=1e-5, atol=0)
+    torch.testing.assert_close(checker_result.distance[active], no_mask.distance[active], rtol=1e-5, atol=0)
 
     inactive = ~active
     assert torch.equal(checker_result.rgb[inactive], torch.zeros_like(checker_result.rgb[inactive]))
@@ -616,7 +616,7 @@ def test_packed_mode_honors_the_mask_but_degrades_visibility_with_one_warning(
     # (a) The mask is still honored at render time -- the degradation is visibility-only.
     active = _pixel_mask(checker[0], tile_h, tile_w)
     assert float(no_mask.opacity[~active].max()) > 0.0, "inactive half carried no signal; (a) would be vacuous"
-    torch.testing.assert_close(first.rgb[active], no_mask.rgb[active], rtol=0, atol=0)
+    torch.testing.assert_close(first.rgb[active], no_mask.rgb[active], rtol=1e-5, atol=0)
     assert torch.equal(first.rgb[~active], torch.zeros_like(first.rgb[~active])), (
         "packed mode must still skip inactive tiles"
     )

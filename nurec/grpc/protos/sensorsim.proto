@@ -6,6 +6,7 @@ package nurec.grpc.protos.sensorsim;
 
 import "nurec/grpc/protos/common.proto";
 import "nurec/grpc/protos/ipc.proto";
+import "nurec/grpc/protos/rdma.proto";
 
 ////////////////////////////////////////////////////////////////////////////////
 // Sensor simulator <-> Runtime
@@ -24,12 +25,21 @@ service SensorsimService {
         option deprecated = true;
     }
     rpc batch_render_camera (BatchCameraRenderRequest) returns (BatchCameraRenderReturn);
+    // Submit a local Gaussian scene for CPU preparation. OK means admitted, not ready.
+    // If background preparation fails, a later scene request loads synchronously.
+    // wait_for_capacity may wait for admission until the RPC or server deadline.
+    rpc prefetch_scene (PrefetchSceneRequest) returns (nurec.grpc.protos.common.Empty);
     rpc render_lidar (LidarRenderRequest) returns (LidarRenderReturn);
+    // One firing-geometry phase of a lidar: where and when each ray is emitted. A client
+    // caches each opaque pattern ID it observes; render_lidar's per-ray output echoes the
+    // exact ID whose ray order indexes that frame.
+    rpc get_lidar_firing_pattern (LidarFiringPatternRequest) returns (LidarFiringPatternReturn);
     // Open a temporal-harmonizer session holding the frame history for ONE coherent render
     // sequence (a single trajectory). Use one session per sequence — reusing it across separate
     // or interleaved sequences corrupts the temporal conditioning. Send the session's frames in
     // trajectory order, one at a time (await each render before sending the next); concurrent or
-    // out-of-order requests build the history wrongly and are not rejected. Returns
+    // out-of-order requests build the history wrongly and are not rejected. In a batch render each
+    // item names its own session; a repeated session fails the whole batch. Returns
     // FAILED_PRECONDITION unless the server runs --enable-harmonizer-temporal.
     rpc create_harmonizer_session (nurec.grpc.protos.common.Empty) returns (HarmonizerSessionId);
     rpc end_harmonizer_session (HarmonizerSessionId) returns (nurec.grpc.protos.common.Empty);
@@ -51,6 +61,13 @@ service SensorsimService {
     // pre-allocated buffers exported as cudaIpcMemHandle_t bytes in the open response.
     rpc open_ipc_session  (nurec.grpc.protos.ipc.OpenIpcSessionRequest)  returns (nurec.grpc.protos.ipc.OpenIpcSessionResponse);
     rpc close_ipc_session (nurec.grpc.protos.ipc.CloseIpcSessionRequest) returns (nurec.grpc.protos.ipc.CloseIpcSessionResponse);
+
+    // RDMA session lifecycle. After open_rdma_session + register_receive_buffer,
+    // render_rgb / render_camera may be called with use_rdma=true to deliver the
+    // frame via RDMA WRITE into a client buffer registered on that session.
+    rpc open_rdma_session       (nurec.grpc.protos.rdma.OpenRdmaSessionRequest)       returns (nurec.grpc.protos.rdma.OpenRdmaSessionResponse);
+    rpc register_receive_buffer (nurec.grpc.protos.rdma.RegisterReceiveBufferRequest) returns (nurec.grpc.protos.rdma.RegisterReceiveBufferResponse);
+    rpc close_rdma_session      (nurec.grpc.protos.rdma.CloseRdmaSessionRequest)      returns (nurec.grpc.protos.rdma.CloseRdmaSessionResponse);
 }
 
 message LoadedSceneEntry {
@@ -333,6 +350,14 @@ message RGBRenderRequest {
     bool            use_cuda_ipc       = 22;
     string          ipc_session_id     = 23;
     optional uint32 released_buffer_id = 24;
+
+    // RDMA delivery: when true, the server writes the rendered frame via RDMA WRITE into
+    // the client buffer registered as `rdma_buffer_id` on `rdma_session_id`, and the
+    // response's `image_bytes` is left empty. The client must call open_rdma_session +
+    // register_receive_buffer first. Mutually exclusive with use_cuda_ipc.
+    bool   use_rdma        = 25;
+    string rdma_session_id = 26;
+    uint32 rdma_buffer_id  = 27;
 }
 
 message CameraRenderRequest {
@@ -398,6 +423,14 @@ message CameraRenderRequest {
     bool            use_cuda_ipc       = 19;
     string          ipc_session_id     = 20;
     optional uint32 released_buffer_id = 21;
+
+    // RDMA delivery: when true, the server writes the CAMERA_RENDER_PRODUCT_COLOR product via
+    // RDMA WRITE into the client buffer registered as `rdma_buffer_id` on `rdma_session_id`,
+    // leaving `image_bytes` empty. Same product and overlay restrictions as use_cuda_ipc, with
+    // which it is mutually exclusive.
+    bool   use_rdma        = 22;
+    string rdma_session_id = 23;
+    uint32 rdma_buffer_id  = 24;
 }
 
 message AvailableCamerasRequest {
@@ -459,10 +492,14 @@ message CameraRenderOutput {
     optional float distance_colormap_vmax_m = 6; // when output is distance
 
     // For CUDA IPC (request.use_cuda_ipc=true): format is the literal string
-    // "rgb_uint8_planar" and buffer_id is the server-selected buffer that now holds the
-    // rendered frame; image_bytes is left empty. Unset for the normal encoded-bytes path.
-    string format    = 7;
-    uint32 buffer_id = 8;
+    // "rgb_uint8_planar" and buffer_id identifies the server-selected buffer;
+    // image_bytes is empty. EVENT_ORDERED sessions require a producer-event wait
+    // before reading it. Unset for the normal encoded-bytes path.
+    // For RDMA (request.use_rdma=true): the same, with buffer_id echoing the request's
+    // rdma_buffer_id and bytes_written the size of the RDMA WRITE.
+    string format        = 7;
+    uint32 buffer_id     = 8;
+    uint64 bytes_written = 9;
 }
 
 message CameraRenderReturn {
@@ -475,12 +512,16 @@ message RGBRenderReturn {
 
     string format    = 2;  // e.g. "rgb_uint8_planar"
     // For CUDA IPC (use_cuda_ipc=true), the server-selected buffer id that now
-    // holds the rendered frame.
+    // holds the rendered frame. For RDMA (use_rdma=true), the request's rdma_buffer_id.
     uint32 buffer_id = 3;
+    // For RDMA (use_rdma=true): size of the RDMA WRITE that delivered the frame.
+    uint64 bytes_written = 4;
 }
 
 message BatchCameraRenderRequest {
     repeated BatchCameraRenderRequestItem items = 1;
+    // For IPC batches, try shared-scene gsplat rendering; render the whole batch sequentially if incompatible.
+    bool prefer_camera_batching = 2;
 }
 
 message BatchCameraRenderRequestItem {
@@ -577,20 +618,164 @@ message LidarRenderFilter {
     optional float azimuth_max_gap_deg = 7;
 }
 
+// Return layers a caller may request. The current renderer models one STRONGEST layer;
+// FIRST is temporarily populated with the same samples for interface compatibility.
+enum LidarReturnType {
+    // Sentinel only, never a rendered layer. Explicit requests for it are invalid.
+    LIDAR_RETURN_UNSPECIFIED = 0;
+    LIDAR_RETURN_FIRST = 1;
+    LIDAR_RETURN_STRONGEST = 2;
+}
+
+enum LidarOutputMode {
+    // Points compacted to those that returned and compensated into end-of-spin lidar
+    // space, in metres: LidarRenderReturn.point_xyzs / point_intensities. Default when omitted.
+    LIDAR_OUTPUT_POINT_CLOUD = 0;
+    // One entry per emitted ray, uncompensated: LidarRenderReturn.ray_* .
+    LIDAR_OUTPUT_PER_RAY = 1;
+}
+
+message LidarFiringPatternRequest {
+    string scene_id = 1;
+    // Which lidar of the artifact. May be omitted when the artifact has exactly one.
+    string lidar_id = 2;
+
+    // Select the pattern for this physical frame when firing_pattern_id is empty.
+    // Omitting both selectors is valid only for a single-template sensor; otherwise
+    // the server returns INVALID_ARGUMENT.
+    optional fixed64 frame_start_us = 3;
+
+    // Opaque ID returned by an earlier lookup or render. When non-empty this exact pattern
+    // is selected and frame_start_us does not choose the pattern phase.
+    string firing_pattern_id = 4;
+}
+
+message LidarPacketLayout {
+    uint32 num_packets = 1;
+
+    // (num_packets + 1) little-endian uint32 prefix offsets into every ray-aligned
+    // firing-pattern and render buffer. Starts at zero, is strictly increasing, and ends
+    // at num_rays. These are source-decoder boundaries, not groups inferred by NuRec.
+    bytes ray_offsets_u32_le = 2;
+
+    // Optional one bit per packet, LSB-first. When empty, packet zero is the only packet
+    // that begins a new scan because render_lidar returns one complete frame.
+    // When present, byte length must be ceil(num_packets / 8).
+    bytes starts_new_scan_mask_packed = 3;
+
+    // Firing time of each packet measured from frame start, (num_packets,) little-endian int64,
+    // microseconds. When non-empty, every ray in a packet has this time and the enclosing
+    // LidarFiringPatternReturn omits its per-ray timestamp_offsets_us. Empty when timestamps
+    // vary inside at least one packet.
+    bytes timestamp_offsets_us = 4;
+}
+
+message LidarFiringPatternReturn {
+    // Rays emitted by this firing pattern. This is the length of its per-ray arrays and
+    // matches LidarRenderReturn.num_rays when a response selects this pattern.
+    uint32 num_rays = 1;
+
+    // Unit ray directions in the sensor frame, (num_rays, 3) little-endian float32, row-major.
+    bytes directions_sensor = 2;
+
+    // Firing time of each ray measured from the start of the frame it was captured in,
+    // (num_rays,) little-endian int64, microseconds. Empty exactly when packet_layout.timestamp_offsets_us
+    // supplies one exact shared time per packet; otherwise this is required. These are the
+    // unit's own offsets, carried through as measured: render_lidar adds them to the
+    // request's frame_start_us rather than stretching them onto the requested window, since
+    // a sweep of a different length is a different sensor. The minimum is not necessarily
+    // zero -- a unit that idles before its first firing has a real gap there. For the same
+    // reason render_lidar accepts pose durations from min(last firing offset, frame period)
+    // through 1.05 * frame period, inclusive. There is no extra tolerance below that minimum.
+    bytes timestamp_offsets_us = 3;
+
+    // Scan grid, when the sensor fires on one. Both are zero when it does not, and then rays
+    // carry no (column, row) addressing at all.
+    // When set, num_columns * num_rows == num_rays and, for ray index i:
+    //     column_id = i / num_rows,  row_id = i % num_rows
+    uint32 num_columns = 4;
+    uint32 num_rows = 5;
+
+    // Opaque, deterministic content ID of this pattern. Safe for client-side caching.
+    string firing_pattern_id = 6;
+
+    // Source packet boundaries when the artifact carries them. Packetless patterns remain
+    // valid and fully renderable.
+    LidarPacketLayout packet_layout = 7;
+
+    // Physical period of the pattern's frame grid, in microseconds.
+    uint64 frame_period_us = 8;
+
+    // Present when the request supplied frame_start_us. True when the full
+    // [frame_start_us, frame_start_us + frame_period_us) window is within the
+    // scene's rig-trajectory time interval; false when that sweep crosses a scene
+    // boundary. This reports scene availability and does not affect pattern selection.
+    optional bool requested_frame_within_scene_time_range = 9;
+}
+
 message LidarRenderReturn {
-    // The xyz of the lidar points in the end-of-spin lidar space
+    // Retired development-draft buffer/scalar slots; never reuse them.
+    reserved 7 to 9, 11;
+
+    // The xyz of the lidar points in the end-of-sweep lidar space, in metres.
+    // For stored patterns this is the final firing pose, not necessarily the requested end pose.
     // [x1, y1, z1, x2, y2, z2, .....]
     repeated float point_xyzs = 1;
-    // The intensity of the points
-    // range [0, 1]
+    // Model-predicted intensity, passed through without clipping. May exceed [0, 1].
     repeated float point_intensities = 2;
 
     uint32 num_points=3;
+    // Little-endian float32, (num_points, 3), row-major, metres.
     bytes point_xyzs_buffer = 4;
+    // Little-endian float32, (num_points,); empty when intensity is not predicted.
     bytes point_intensities_buffer=5;
+
+    // Per-ray output, set when LIDAR_OUTPUT_PER_RAY was selected explicitly.
+    //
+    // Every layer below has exactly num_rays entries, in the ray order of
+    // get_lidar_firing_pattern -- including rays that got no return. For frames with the
+    // same firing_pattern_id, (layer, ray) therefore means the same return layer and emitted
+    // ray. This is the uncompensated form: nothing is transformed into end-of-spin space, so
+    // a client that needs a point cloud composes it itself from the pattern and its own poses:
+    //     xyz_sensor_at_firing[layer][ray] =
+    //         directions_sensor[ray] * ray_distances_m[layer][ray]
+    // The fields above (point_xyzs etc.) are left empty in this mode.
+    uint32 num_rays = 6;
+
+    // The same pattern get_lidar_firing_pattern would return, present only when the request
+    // set include_firing_pattern.
+    LidarFiringPatternReturn firing_pattern = 10;
+
+    // The selected artifact firing pattern. Set whenever per-ray rendering used an
+    // artifact-resident pattern, including when firing_pattern is not embedded.
+    string firing_pattern_id = 12;
+
+    // Number of return layers in the layer-major buffers. This equals return_types.size().
+    uint32 num_return_layers = 13;
+
+    // Meaning and order of the layers in every layer-major buffer below.
+    repeated LidarReturnType return_types = 14;
+
+    // Distance along directions_sensor[ray], (num_return_layers, num_rays) little-endian float32,
+    // metres, row-major with the return layer as the outer dimension. Undefined where the
+    // corresponding validity bit is false. Byte length is 4 * num_return_layers * num_rays.
+    bytes ray_distances_m_buffer = 15;
+
+    // Per-ray little-endian float32 intensity in [0, 1], with the same layer-major shape and ordering as
+    // ray_distances_m_buffer. Undefined where not valid. Empty when the model has no
+    // intensity prediction; otherwise its byte length is 4 * num_return_layers * num_rays.
+    bytes ray_intensities_buffer = 16;
+
+    // One LSB-first packed validity mask per return layer, concatenated in return_types
+    // order. Each mask occupies ceil(num_rays / 8) bytes; padding bits at the end of every
+    // layer are zero. A ray is valid when
+    // (byte[layer * ceil(num_rays / 8) + ray / 8] >> (ray % 8)) & 1 is set.
+    bytes ray_valid_masks_packed = 17;
 }
 
 message LidarRenderRequest {
+    // Retired development-draft scalar return selector.
+    reserved 11;
 
     string scene_id = 1;
 
@@ -609,6 +794,28 @@ message LidarRenderRequest {
     // Which lidar of the artifact to render. May be omitted when the artifact
     // has exactly one lidar; required on multi-lidar artifacts.
     string lidar_id = 8;
+
+    // Omission defaults to the compact, compensated point cloud for every sensor.
+    // Request LIDAR_OUTPUT_PER_RAY explicitly for dense, uncompensated output. That mode
+    // requires artifact-resident firing geometry; otherwise FAILED_PRECONDITION is returned.
+    optional LidarOutputMode output_mode = 9;
+
+    // With LIDAR_OUTPUT_PER_RAY, also embed the selected firing pattern in every response,
+    // repeating geometry otherwise cacheable by its ID. Prefer get_lidar_firing_pattern
+    // on pattern-ID cache misses. Large lookups, multiple layers, or embedded patterns may
+    // require a larger client receive limit. Must be false in point-cloud mode.
+    bool include_firing_pattern = 10;
+
+    // Optional opaque artifact pattern ID. When non-empty it takes precedence over the
+    // normal server-side phase selection from frame_start_us, in either output mode.
+    string firing_pattern_id = 12;
+
+    // Ordered, unique return layers requested for LIDAR_OUTPUT_PER_RAY. Empty selects the
+    // default, [LIDAR_RETURN_STRONGEST]. FIRST and STRONGEST may be requested separately or
+    // together. Until NuRec models a distinct first return, FIRST repeats the STRONGEST data.
+    // Explicit UNSPECIFIED or unknown values are rejected with INVALID_ARGUMENT.
+    // Must be empty in point-cloud mode; otherwise INVALID_ARGUMENT is returned.
+    repeated LidarReturnType return_types = 13;
 }
 
 message DynamicObjectTrack {
@@ -648,6 +855,24 @@ message RestoreModelParametersRequest {
     string scene_id = 1;
 }
 
+// Returned by get_server_config. Mostly the server's GrpcServerConfig fields, keyed by field name with
+// str(value) as the value (bools "True" / "False", None "null", enums their value), plus derived keys
+// such as "serving.mode". Keys clients gate optional behaviour on include (a missing key means off):
+//   "enable_harmonizer"          non-temporal Harmonizer enabled at launch ("True" / "False")
+//   "enable_harmonizer_temporal" temporal Harmonizer enabled at launch ("True" / "False"); the two
+//                                are mutually exclusive, the server enables at most one
+//   "asset_edits.aspect_state"   present ("stateless-v1") when DynamicObject.aspect_state is honoured
+// The Harmonizer keys are launch flags, not load status: if the model fails to load, harmonized
+// renders return the load error.
 message ServerConfig {
     map<string, string> server_config = 1;
+}
+
+message PrefetchSceneRequest {
+    // Must match x-nre-scene-id when that metadata is present.
+    string scene_id = 1;
+    // Wait for queue capacity, subject to RPC and server deadlines. Requires single-process serving
+    // with --max-workers >= 2. Only one caller may wait; other distinct hints that need to wait
+    // receive RESOURCE_EXHAUSTED.
+    bool wait_for_capacity = 2;
 }

@@ -3,10 +3,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, List, Literal, Optional, cast
+
+from pydantic import model_validator
 
 from ncore.data import LabelSource as NCoreLabelSource
 from nurec.config.base_schema import BaseConfigSchema, Field, PerSensor
+from nurec.config.image_resolution import (
+    CameraImageResolutionConfig,
+    parse_camera_image_resolution_config,
+)
 
 
 LidarNominalModel = Literal["HESAI-Pandar128", "HESAI-AT128"]
@@ -16,9 +23,51 @@ class _BaseDatasetSOConfig(BaseConfigSchema):
     n_samples_per_epoch: int
     n_train_sample_camera_rays: int
     n_train_sample_lidar_rays: int = Field(default=2048)
-    n_val_image_subsample: int
-    n_train_sequential_image_subsample: int
+    n_val_image_resolution: CameraImageResolutionConfig
+    n_train_sequential_image_resolution: CameraImageResolutionConfig
     aux_data: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_image_resolutions(cls, values: Any) -> Any:
+        if not isinstance(values, Mapping) and not hasattr(values, "items"):
+            return values
+        normalized = dict(values)
+        for resolution_field, subsample_field in (
+            ("n_val_image_resolution", "n_val_image_subsample"),
+            ("n_train_sequential_image_resolution", "n_train_sequential_image_subsample"),
+        ):
+            normalized[resolution_field] = parse_camera_image_resolution_config(
+                normalized.get(resolution_field),
+                legacy_subsample=normalized.pop(subsample_field, None),
+                field_name=f"dataset.{resolution_field}",
+            )
+
+        samplers = normalized.get("samplers")
+        if isinstance(samplers, Mapping) or hasattr(samplers, "items"):
+            normalized_samplers = dict(cast(Mapping[Any, Any], samplers))
+            batch_sampler = normalized_samplers.get("batch_sampler")
+            if isinstance(batch_sampler, Mapping) or hasattr(batch_sampler, "items"):
+                # Keep DictConfig values intact: sampler validation and factories use attribute access.
+                normalized_batch_sampler = (
+                    cast(Any, batch_sampler).copy()
+                    if hasattr(batch_sampler, "copy")
+                    else dict(cast(Mapping[Any, Any], batch_sampler))
+                )
+                camera_pixel_sampler = normalized_batch_sampler.get("camera_pixel_sampler")
+                if isinstance(camera_pixel_sampler, Mapping) or hasattr(camera_pixel_sampler, "items"):
+                    normalized_camera_pixel_sampler = dict(cast(Mapping[Any, Any], camera_pixel_sampler))
+                    if normalized_camera_pixel_sampler.get("name") == "image-crop":
+                        image_resolution = parse_camera_image_resolution_config(
+                            normalized_camera_pixel_sampler.get("resolution"),
+                            legacy_subsample=normalized_camera_pixel_sampler.pop("subsample", None),
+                            field_name="dataset.samplers.batch_sampler.camera_pixel_sampler.resolution",
+                        )
+                        normalized_camera_pixel_sampler["resolution"] = image_resolution.model_dump()
+                        normalized_batch_sampler["camera_pixel_sampler"] = normalized_camera_pixel_sampler
+                        normalized_samplers["batch_sampler"] = normalized_batch_sampler
+                        normalized["samplers"] = normalized_samplers
+        return normalized
 
 
 class VisibleTrackSplitConfig(BaseConfigSchema):

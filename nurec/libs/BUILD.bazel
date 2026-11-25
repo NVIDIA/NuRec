@@ -1,11 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
 load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
 
 DEFAULT_VISIBILITY = ["//:core_package_group"]
 
 package(default_visibility = DEFAULT_VISIBILITY)
+
+py_library(
+    name = "fisheye_domain",
+    srcs = ["fisheye.py"],
+    deps = [
+        pip_requirement("numpy"),
+        pip_requirement("nvidia-ncore"),
+    ],
+)
+
+pytest_test(
+    name = "fisheye_test",
+    srcs = ["fisheye_test.py"],
+    deps = [
+        ":fisheye_domain",
+        pip_requirement("numpy"),
+    ],
+)
 
 py_library(
     name = "pylib",

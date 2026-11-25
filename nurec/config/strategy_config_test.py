@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
@@ -11,6 +11,7 @@ from nurec.config.model import (
     MCMCStrategyConfig,
     PruneConfig,
     ResetDensityConfig,
+    TamingGSMCMCStrategyConfig,
 )
 
 
@@ -109,6 +110,38 @@ def test_mcmc_same_track_layer_ids_reject_duplicates() -> None:
         )
 
 
+def test_taminggs_mcmc_has_bounded_scoring_defaults() -> None:
+    taminggs = TamingGSMCMCStrategyConfig.model_validate({"name": "taminggs_mcmc"}).add.taminggs
+    assert taminggs.current_gradient_weight == 50.0
+    assert taminggs.gradient_ema_weight == 10.0
+    assert taminggs.opacity_weight == 100.0
+    assert taminggs.scale_weight == 25.0
+    assert taminggs.visibility_weight == 5.0
+    assert taminggs.normalization_clip == 10.0
+    assert taminggs.minimum_source_weight == 1.0e-6
+
+
+def test_mcmc_taminggs_rejects_all_zero_or_invalid_score_controls() -> None:
+    with pytest.raises(ValidationError, match="at least one positive score weight"):
+        TamingGSMCMCStrategyConfig.model_validate(
+            {
+                "name": "taminggs_mcmc",
+                "add": {
+                    "taminggs": {
+                        "current_gradient_weight": 0.0,
+                        "gradient_ema_weight": 0.0,
+                        "opacity_weight": 0.0,
+                        "scale_weight": 0.0,
+                        "visibility_weight": 0.0,
+                    }
+                },
+            }
+        )
+    for field, value in (("current_gradient_weight", -1.0), ("normalization_clip", 0.0)):
+        with pytest.raises(ValidationError):
+            TamingGSMCMCStrategyConfig.model_validate({"name": "taminggs_mcmc", "add": {"taminggs": {field: value}}})
+
+
 def test_mcmc_max_scale_guard_is_disabled_by_default() -> None:
     config = MCMCStrategyConfig.model_validate({"name": "mcmc"})
     assert not config.max_scale_guard.enabled
@@ -145,3 +178,35 @@ def test_mcmc_max_scale_guard_is_disabled_by_default() -> None:
 def test_mcmc_max_scale_guard_rejects_invalid_values(max_scale_guard: dict) -> None:
     with pytest.raises(ValidationError):
         MCMCStrategyConfig.model_validate({"name": "mcmc", "max_scale_guard": max_scale_guard})
+
+
+@pytest.mark.parametrize("name,schema", [("mcmc", MCMCStrategyConfig), ("taminggs_mcmc", TamingGSMCMCStrategyConfig)])
+def test_mcmc_strategy_names_select_exclusive_schemas(
+    name: str, schema: type[MCMCStrategyConfig | TamingGSMCMCStrategyConfig]
+) -> None:
+    config = schema.model_validate({"name": name})
+    assert config.opacity_threshold == 0.005
+    assert ("taminggs" in config.add.model_dump()) == (name == "taminggs_mcmc")
+    other_name = "mcmc" if name == "taminggs_mcmc" else "taminggs_mcmc"
+    with pytest.raises(ValidationError):
+        schema.model_validate({"name": other_name})
+
+
+def test_ordinary_mcmc_rejects_taminggs_scoring() -> None:
+    with pytest.raises(ValidationError):
+        MCMCStrategyConfig.model_validate({"name": "mcmc", "add": {"taminggs": {}}})
+
+
+def test_taminggs_scoring_rejects_removed_enable_flag() -> None:
+    with pytest.raises(ValidationError):
+        TamingGSMCMCStrategyConfig.model_validate({"name": "taminggs_mcmc", "add": {"taminggs": {"enabled": True}}})
+
+
+@pytest.mark.parametrize("cap", [0.0, 1.0])
+def test_gsplat_reset_cap_endpoints(cap: float) -> None:
+    values = {
+        "name": "gsplat",
+        "reset_density": {**REQUIRED_FIELDS, "new_max_density": cap},
+    }
+    with pytest.raises(ValidationError, match="strictly between 0 and 1"):
+        GsplatStrategyConfig.model_validate(values)

@@ -59,6 +59,7 @@ from nurec.artifact.artifact import Artifact
 from nurec.config.model import RendererBackend
 from nurec.grpc.cache_keys import BackendCacheKey, SceneCacheKey
 from nurec.grpc.downloader import Downloader, check_safe_scene_id
+from nurec.grpc.fatal_worker import REQUEST_ID_HEADERS, FatalWorkerExceptionInterceptor, is_fatal_worker_exception
 from nurec.grpc.grpc_server_config import GrpcServerConfig
 from nurec.grpc.model_owner import (
     AttachSceneRequest,
@@ -80,17 +81,25 @@ from nurec.grpc.protos.sensorsim_pb2_grpc import (
 )
 from nurec.grpc.scene_cache import SceneCache, SceneCacheEviction
 from nurec.grpc.serve import (
+    LEGACY_SENSORSIM_SERVICE_NAME,
+    SENSORSIM_HEALTH_SERVICE_NAME,
     Backend,
+    BackendCacheWaitPolicy,
     BackendInUseError,
+    CacheWaitAbortedError,
+    CacheWaitAbortedReason,
     MetricsInterceptor,
     SensorSimService,
     ServerMetricsManager,
+    add_sensorsim_servicer_to_server,
     allowed_image_format_values,
+    collect_cuda_worker_diagnostics,
     is_local_scene_uri,
     require_allowed_image_format,
     resolve_scene_artifact_path,
 )
 from nurec.models.gaussians.context_composite import alias_external_weights
+from nurec.models.gaussians.gaussians_composite import GaussiansComposite
 from nurec.utils import mps_prelaunch
 from nurec.utils.metrics import MetricsCollector, create_metric_sample
 
@@ -104,6 +113,7 @@ _CHANNEL_OPTIONS = [
 ]
 _RAY_CHUNK_SIZE = 1 << 31  # effectively "do not chunk rays"
 _SHUTDOWN_GRACE_S = 2.0  # let any in-flight render drain before the worker stops
+_CORRELATION_ID_HEADERS = frozenset(REQUEST_ID_HEADERS)
 
 # Worker bring-up (start_worker_pool): bounds + poll cadence for the spawn->attach->ready handshake.
 # The waits poll at `_BRINGUP_POLL_INTERVAL_S` so they notice a worker that died (no message coming) or a
@@ -135,12 +145,20 @@ _DEFAULT_ADMISSION_TIMEOUT_S = 0.0  # how long an over-limit render queues for a
 # Cadence for re-checking client cancellation/deadline while a render is queued for an admission slot, so a
 # client that goes away frees its handler thread promptly instead of pinning it for the full admission wait.
 _ADMISSION_CANCEL_POLL_INTERVAL_S = 0.1
+# Legacy edit transitions use the same cadence while waiting for another transition or old-generation
+# leases to drain. Once detach/rebuild starts it runs to completion, matching the single-process policy that
+# cancellation is honored while queued but does not interrupt an active model mutation.
+_EDIT_CANCEL_POLL_INTERVAL_S = 0.1
 # Upper bound separating a real forwardable client deadline from grpc's inf-future "no deadline" sentinel.
 # `ServicerContext.time_remaining()` is `max(deadline - now, 0)` and never None; a deadline-less client
 # surfaces as ~9.2e18 s, which must NOT be forwarded (it overflows grpc's deadline math into an immediate
 # DEADLINE_EXCEEDED). 1 year is far above any real render deadline and far below the inf-future sentinel.
 _MAX_FORWARDABLE_DEADLINE_S = 365 * 24 * 60 * 60.0
-_PROXY_HEALTH_SERVICE_NAMES = ("", "nurec.grpc.protos.sensorsim.SensorsimService")
+_PROXY_HEALTH_SERVICE_NAMES = ("", SENSORSIM_HEALTH_SERVICE_NAME, LEGACY_SENSORSIM_SERVICE_NAME)
+# The fatal owner budget (proxy drain grace + slack, plus three reap stages) must stay below
+# DEFAULT_FATAL_WORKER_EXIT_DELAY_S, or the hard-exit watchdog fires mid-reap.
+_FATAL_OWNER_REAP_STAGE_TIMEOUT_S = 0.5
+_FATAL_OWNER_PROXY_STOP_SLACK_S = 1.0
 
 
 def _await_seq_ack(ack_q: Any, seq: int, timeout_s: float, *, timeout_status: str = "error") -> tuple[str, Any]:
@@ -182,18 +200,45 @@ def _await_seq_ack(ack_q: Any, seq: int, timeout_s: float, *, timeout_status: st
         # else ack_seq < seq: stale ack from a previously timed-out command — discard and keep waiting.
 
 
+def _install_fatal_queue_error_handler(
+    outgoing_queue: Any,
+    interceptor: FatalWorkerExceptionInterceptor,
+    *,
+    operation: str,
+) -> None:
+    # multiprocessing.Queue serializes CUDA tensors asynchronously. Its feeder captures this hook at
+    # first put; install it before sending anything. Spawn state excludes this owner-only instance hook.
+    previous_handler = getattr(outgoing_queue, "_on_queue_feeder_error", None)
+    if previous_handler is None:  # synchronous queue.Queue test doubles have no feeder
+        return
+    poisoned_payloads: list[Any] = []
+
+    def on_feeder_error(exc: Exception, payload: Any) -> None:
+        if is_fatal_worker_exception(exc):
+            # The feeder otherwise drops this payload on error. Keep partially exported CUDA storage
+            # alive until owner exit; the shared shutdown handler reaps consumers without CUDA cleanup.
+            poisoned_payloads.append(payload)
+            interceptor.handle_fatal_exception(exc, operation=operation)
+            return
+        previous_handler(exc, payload)
+
+    outgoing_queue._on_queue_feeder_error = on_feeder_error
+
+
 def _scene_attach_listener(
     attached: "dict[str, Any]",
-    build_backend: "Callable[[str, str, dict], Any]",
+    build_backend: "Callable[..., Any]",
     scene_q: Any,
     scene_ack_q: Any,
+    fatal_worker_interceptor: "FatalWorkerExceptionInterceptor | None" = None,
 ) -> None:
     """Worker thread: attach/detach scenes on demand from owner-pushed commands and ack each.
 
     ``attached`` is the worker's ``{scene_id: backend}`` map (the render path looks scenes up here);
-    ``build_backend(scene_id, artifact_path, ipc_tensors)`` loads the structure and aliases it onto the
-    owner's IPC weights — injected so this dispatch is unit-testable without a GPU. Attach is idempotent
-    (a re-broadcast of an already-attached scene is a no-op), as is detach. Exits on the ``stop`` sentinel.
+    ``build_backend(scene_id, artifact_path, ipc_tensors, edit_journal)`` loads the structure, replays the
+    edit journal (empty for unedited scenes), and aliases it onto the owner's IPC weights — injected so this
+    dispatch is unit-testable without a GPU. Attach is idempotent (a re-broadcast of an already-attached
+    scene is a no-op), as is detach. Exits on the ``stop`` sentinel.
     """
 
     def acknowledge(seq: int, status: str, detail: Any) -> None:
@@ -205,22 +250,49 @@ def _scene_attach_listener(
         except Exception as exc:
             log.warning(f"scene listener could not send {status!r} ack for seq={seq}: {exc!r}")
 
+    def stop_on_fatal(exc: Exception, operation: str, scene_id: str) -> bool:
+        if fatal_worker_interceptor is None:
+            return False
+        return fatal_worker_interceptor.handle_fatal_exception(
+            exc,
+            operation=operation,
+            scene_ids=(scene_id,),
+        )
+
     while True:
-        message = scene_q.get()
+        try:
+            # Receiving a scene command also reconstructs CUDA IPC tensors, before backend construction.
+            message = scene_q.get()
+        except Exception as exc:
+            if fatal_worker_interceptor is not None and fatal_worker_interceptor.handle_fatal_exception(
+                exc, operation="worker_scene_receive"
+            ):
+                return
+            raise
+        if fatal_worker_interceptor is not None and fatal_worker_interceptor.state.is_fatal:
+            return
         kind = message[0]
         if kind == _SCENE_STOP:
             return
         seq = message[1]
         if kind == _SCENE_ATTACH:
-            _, _, scene_id, artifact_path, ipc_tensors = message
+            _, _, scene_id, artifact_path, ipc_tensors, edit_journal = message
             if scene_id in attached:  # idempotent: a barrier re-attach must not rebuild
                 acknowledge(seq, "ok", kind)
                 continue
             try:
-                # A build failure occurs before the worker publishes/mutates any scene state, so an explicit
-                # error is proof that the attach did not install and the owner may roll its refcount back.
-                backend = build_backend(scene_id, artifact_path, ipc_tensors)
+                # A nonfatal build failure occurs before publication and gets an explicit error ack below.
+                # Fatal CUDA failures are different: asynchronous reporting means aliasing may already have
+                # happened, so that path reports uncertainty and retains owner storage until worker reap.
+                backend = build_backend(scene_id, artifact_path, ipc_tensors, edit_journal)
             except Exception as exc:
+                # Backend construction includes CUDA IPC aliasing and cache cleanup. Error 700 can surface
+                # after the mapping was partially or fully installed, so it is NOT proof that the owner may
+                # release its attachment. Retain the owner refcount until this worker is reaped.
+                if fatal_worker_interceptor is not None and is_fatal_worker_exception(exc):
+                    stop_on_fatal(exc, "worker_scene_attach_build", scene_id)
+                    acknowledge(seq, "uncertain", f"{kind}: {exc!r}")
+                    return
                 acknowledge(seq, "error", f"{kind}: {exc!r}")
                 continue
             try:
@@ -229,7 +301,10 @@ def _scene_attach_listener(
                 # drives an idempotent detach (or releases only after this worker is reaped).
                 attached[scene_id] = backend
             except Exception as exc:
+                fatal = stop_on_fatal(exc, "worker_scene_attach_publish", scene_id)
                 acknowledge(seq, "uncertain", f"{kind}: {exc!r}")
+                if fatal:
+                    return
                 continue
             # Drop this frame's strong refs to the just-attached backend and its owner-IPC tensors before
             # looping to the next command. The listener frame lives for the whole worker process, so keeping
@@ -239,6 +314,7 @@ def _scene_attach_listener(
             # scene table (service BackendCache) is the sole intended retainer; mirrors the bootstrap cleanup.
             backend = None
             ipc_tensors = None
+            edit_journal = ()
         elif kind == _SCENE_DETACH:
             _, _, scene_id = message
             try:
@@ -254,7 +330,10 @@ def _scene_attach_listener(
             except Exception as exc:
                 # Removal can also fail after partial mutation. Keep ownership until a retry proves the mapping
                 # gone; SceneAttachChannel.detach treats every non-ok outcome conservatively.
+                fatal = stop_on_fatal(exc, "worker_scene_detach", scene_id)
                 acknowledge(seq, "uncertain", f"{kind}: {exc!r}")
+                if fatal:
+                    return
                 continue
         else:
             error = ValueError(f"unknown scene command: {kind!r}")
@@ -279,7 +358,13 @@ class OwnerSceneRegistry:
     gated on the worker refcount (a scene is freed only once no worker still holds it).
     """
 
-    def __init__(self, registry: "ModelOwnerRegistry | None" = None) -> None:
+    def __init__(
+        self,
+        registry: "ModelOwnerRegistry | None" = None,
+        *,
+        fatal_worker_interceptor: FatalWorkerExceptionInterceptor | None = None,
+    ) -> None:
+        self.fatal_worker_interceptor = fatal_worker_interceptor
         self._registry = registry if registry is not None else ModelOwnerRegistry()
         self._guard = threading.Lock()  # guards the maps below (NOT held across a load)
         self._scene_locks: dict[str, threading.Lock] = {}
@@ -318,8 +403,15 @@ class OwnerSceneRegistry:
                 existing = self._owners.get(scene_id)
             if existing is not None:
                 return existing
-            owner = loader()
-            self._registry.put_loaded(scene_id, _model_of(owner))
+            try:
+                owner = loader()
+                self._registry.put_loaded(scene_id, _model_of(owner))
+            except BaseException as exc:
+                if self.fatal_worker_interceptor is not None:
+                    self.fatal_worker_interceptor.handle_fatal_exception(
+                        exc, operation="owner_scene_load", scene_ids=(scene_id,)
+                    )
+                raise
             with self._guard:
                 self._owners[scene_id] = owner
             return owner
@@ -427,7 +519,14 @@ class SceneAttachChannel:
         with self._lock:
             self._attachments.setdefault(scene_id, attachment_id)
 
-    def attach(self, scene_id: str, artifact_path: str, *, ack_timeout_s: float = _SCENE_ATTACH_ACK_TIMEOUT_S) -> None:
+    def attach(
+        self,
+        scene_id: str,
+        artifact_path: str,
+        *,
+        edit_journal: "tuple[bytes, ...]" = (),
+        ack_timeout_s: float = _SCENE_ATTACH_ACK_TIMEOUT_S,
+    ) -> None:
         """Attach ``scene_id`` (already loaded on the owner) onto this worker; idempotent per worker.
 
         Acknowledgement uncertainty is handled symmetrically with `detach`: an **explicit** worker
@@ -447,7 +546,8 @@ class SceneAttachChannel:
             self._attachments[scene_id] = attachment.attachment_id
             seq = next(self._seq)
             try:
-                self._push_q.put((_SCENE_ATTACH, seq, scene_id, artifact_path, dict(attachment.tensors)))
+                command = (_SCENE_ATTACH, seq, scene_id, artifact_path, dict(attachment.tensors), tuple(edit_journal))
+                self._push_q.put(command)
             except Exception as exc:
                 # Queue delivery failure is not proof that a multiprocessing feeder did not accept/deliver
                 # the command. Retain the refcount and provisional record until worker reap (fail closed).
@@ -607,12 +707,19 @@ def _alias_and_release_worker_weights(backend: "Backend", ipc_tensors: dict) -> 
     the weights is still live, so those freed blocks otherwise linger in the caching allocator as per-worker
     *reserved* bytes even though nothing references them. ``alias_external_weights`` rebinds every param/buffer
     onto the owner's zero-copy IPC storage (preserving the read-only / external-storage invariant), dropping the
-    worker's local tensors; a ``gc.collect()`` then breaks any cycle still holding them and
+    worker's local tensors. Refreshing MCMC scenes also releases their non-module references to the old
+    parameters; a ``gc.collect()`` then breaks any cycle still holding them and
     ``torch.cuda.empty_cache()`` returns the now-unreferenced cached blocks to the driver. Ordering matters: the
     cache drop must run AFTER aliasing has replaced the local tensors, otherwise it frees nothing that the
     still-live locals occupy.
     """
-    alias_external_weights(canonical_model(backend.renderable_model), ipc_tensors)
+    model = canonical_model(backend.renderable_model)
+    alias_external_weights(model, ipc_tensors)
+    if isinstance(model, GaussiansComposite):
+        # MCMC scenes are plain objects, not registered submodules. Their ParameterDicts otherwise retain
+        # the pre-alias worker-local weights even after GC/empty_cache. Rebind them to the live IPC-backed
+        # parameters before releasing storage, preserving scene IDs and the external-storage invariant.
+        model.refresh_mcmc_scenes()
 
     # The replaced local tensors are now unreferenced by the module. Collect first so any container/cycle holding
     # them is dropped before empty_cache, which only frees allocator blocks with no live tensor.
@@ -636,6 +743,41 @@ def _pool_backend_cache_key(scene_id: str, artifact: "Artifact") -> BackendCache
     return BackendCacheKey(SceneCacheKey(scene_id=scene_id), artifact.sha256_footprint)
 
 
+def _serialize_edit_request(request: Any) -> bytes:
+    """Copy one legacy ``EditAssets`` delta into a stable, process-safe journal entry.
+
+    A protobuf request object is mutable and is not an appropriate cross-process lifecycle payload.  The
+    serialized delta retains the original operation order while making the coordinator's journal independent
+    of the caller's object lifetime.  ``scene_id`` is deliberately not included: the coordinator owns that
+    identity and replays the same actions against its one scene generation.
+    """
+    edit = sensorsim_pb2.EditAssetsRequest()
+    edit.replace.extend(request.replace)
+    edit.insert.extend(request.insert)
+    return edit.SerializeToString(deterministic=True)
+
+
+def _replay_edit_journal(owner: Any, edit_journal: "tuple[bytes, ...]") -> None:
+    """Apply serialized legacy edit deltas to a freshly built owner or worker backend.
+
+    The owner applies the journal before it publishes CUDA-IPC tensors.  Every worker applies the identical
+    journal while constructing its local model *structure*, then aliases that structure onto the owner's
+    resulting tensors.  This avoids sharing a mutable model or assuming an insertion/replacement preserves
+    the original parameter topology.
+    """
+    for payload in edit_journal:
+        edit = sensorsim_pb2.EditAssetsRequest()
+        edit.ParseFromString(payload)
+        owner.edit_assets(replace_assets=list(edit.replace), insert_assets=list(edit.insert))
+    if edit_journal:
+        model = canonical_model(owner.renderable_model)
+        if isinstance(model, GaussiansComposite):
+            # Restore is implemented by rebuilding from the journal, so the in-place edit snapshot has no
+            # remaining purpose. It is outside the module tree and would otherwise retain a full private
+            # pre-edit weight copy in every worker after IPC aliasing (and another copy in the owner).
+            model.discard_saved_training_parameters()
+
+
 def _build_and_release_worker_backend(
     artifact: "Artifact",
     renderer_name: str,
@@ -643,8 +785,9 @@ def _build_and_release_worker_backend(
     tracks_timestamp_ray_stride: int = 1,
     *,
     scene_id: str,
+    edit_journal: "tuple[bytes, ...]" = (),
 ) -> "Backend":
-    """Load a worker-side backend from ``artifact`` and alias + release it onto the owner's IPC tensors.
+    """Load a worker-side backend, replay edits, then alias + release it onto owner IPC tensors.
 
     The single build-and-release seam shared by both worker load sites — bootstrap ``_worker`` and runtime
     ``_scene_backend_builder`` — ensures the post-alias release runs identically in both and can be exercised in
@@ -657,23 +800,25 @@ def _build_and_release_worker_backend(
         tracks_timestamp_ray_stride,
         backend_cache_key=_pool_backend_cache_key(scene_id, artifact),
     )
+    _replay_edit_journal(backend, edit_journal)
     _alias_and_release_worker_weights(backend, ipc_tensors)
     return backend
 
 
-def _scene_backend_builder(
-    renderer_name: str, tracks_timestamp_ray_stride: int = 1
-) -> "Callable[[str, str, dict], Any]":
+def _scene_backend_builder(renderer_name: str, tracks_timestamp_ray_stride: int = 1) -> "Callable[..., Any]":
     """Build the worker-side `build_backend` used by `_scene_attach_listener`: load the structure from the
     scene's artifact, alias it onto the owner's IPC weights, and release the replaced worker-local storage."""
 
-    def build(scene_id: str, artifact_path: str, ipc_tensors: dict) -> "Backend":
+    def build(
+        scene_id: str, artifact_path: str, ipc_tensors: dict, edit_journal: "tuple[bytes, ...]" = ()
+    ) -> "Backend":
         return _build_and_release_worker_backend(
             Artifact(Path(artifact_path)),
             renderer_name,
             ipc_tensors,
             tracks_timestamp_ray_stride,
             scene_id=scene_id,
+            edit_journal=edit_journal,
         )
 
     return build
@@ -710,12 +855,12 @@ class _WorkerSceneTable:
         # mutating cache state; retaining this record makes a subsequent idempotent detach able to find and
         # clean the partially-installed backend. The coordinator never routes this scene until the attach ack.
         self._scenes[scene_id] = backend
-        # The coordinator — never this worker's own count-LRU — is the sole eviction authority over table
-        # scenes: an LRU-dropped table scene is unrecoverable worker-side (it is not in `artifacts`) while
-        # the coordinator still routes to it → permanent NOT_FOUND on a scene the pool reports as loaded.
+        # allow_automatic_backend_eviction=False keeps the coordinator the sole eviction authority.
+        # Capacity still applies: put marks the new backend in-use until checkin, so leave +1 headroom
+        # to avoid a spurious CacheFullError during that transient window.
         # With coordinator eviction ON the cache is pre-sized to max_scenes + 1 and this is a no-op; with
         # eviction OFF (max_scenes == 0: unbounded admission) grow the capacity in step so the attach
-        # stream can never trip the worker LRU. Grow-only; `grow_maxsize` bumps maxsize under the cache lock.
+        # stream does not fill the worker cache. Grow-only; `grow_maxsize` takes the cache lock.
         cache = self._service.backend_cache
         needed = len(self._scenes) + 1
         if needed > cache.maxsize:
@@ -965,8 +1110,18 @@ class _DetachResult(enum.Enum):
     victim or fails the requester retryable WITHOUT quarantining or degrading the fleet."""
 
     RELEASED = "released"  # no worker maps it, owner tensors freed -> safe to drop its bookkeeping
-    BUSY = "busy"  # a worker is still rendering it (in-use); refcounts correct, retry later (no degrade)
+    BUSY = "busy"  # a worker is rendering; old mappings restored fleet-wide, retry later
     QUARANTINED = "quarantined"  # detach unconfirmed / invariant fault -> pool degraded fail-closed, tensors retained
+
+
+class SceneEditBusyError(Exception):
+    """A legacy edit could not start because an already-cancelled worker render still owns the scene.
+
+    The proxy has drained its normal leases before a rebuild, but a worker may continue a native render after
+    the client cancelled its gRPC call.  That worker's explicit ``busy`` detach acknowledgement is safe and
+    retryable, so editing returns an in-band failure rather than force-detaching CUDA IPC state or degrading
+    the entire pool.
+    """
 
 
 class SceneCoordinator:
@@ -1015,6 +1170,13 @@ class SceneCoordinator:
         # never evicted (it could not be reloaded). A glob fleet registers every scene's path ⇒ zero pinned.
         self._pinned: set[str] = set(pinned)
         self._inflight: dict[str, int] = {}  # scene_id -> active render/discovery leases (eviction skips > 0)
+        # A legacy EditAssets/restore transition is exclusive for one mutable scene-id alias. Acquires wait
+        # here before taking a lease, so no render can start on the old generation after the rebuild begins.
+        self._transitions: set[str] = set()
+        # Serialized protobuf deltas replayed from clean artifact bytes whenever the legacy alias is rebuilt
+        # or later reattached after ordinary coordinated eviction. Step 2 replaces this mutable alias with an
+        # immutable edit-derived scene identity; do not use it as a cross-client cache key.
+        self._edit_journals: dict[str, tuple[bytes, ...]] = {}
         self._lru: dict[str, int] = {}  # scene_id -> last-access stamp (lower = older); LRU victim selection
         self._evicting: set[str] = set()  # scenes mid-eviction (detach+release in progress); not re-routable
         # Scenes whose slot is claimed but not yet in `_attached` (mid first-load/attach). Counted toward the
@@ -1065,13 +1227,15 @@ class SceneCoordinator:
         return self._registry._pending_invalidation  # noqa: SLF001
 
     def _is_resident_locked(self, scene_id: str) -> bool:
-        """Whether ``scene_id`` still occupies residency/VRAM: attached, mid-attach (reserved/attach-active),
-        evicting, quarantined (retained), or leased/in-flight. Evaluated under `self._lock`; the shared
+        """Whether ``scene_id`` still occupies residency/VRAM or has a registration-bound transition:
+        attached, mid-attach (reserved/attach-active), editing, evicting, quarantined (retained), or
+        leased/in-flight. Evaluated under `self._lock`; the shared
         `SceneRegistry` uses it to defer a disk invalidation while a scene is still resident. Mirrors the
         residency test the registration bookkeeping ran inline before the F012 split."""
         return (
             scene_id in self._attached
             or scene_id in self._reserved
+            or scene_id in self._transitions
             or scene_id in self._evicting
             or scene_id in self._retained
             or self._inflight.get(scene_id, 0) > 0
@@ -1131,6 +1295,8 @@ class SceneCoordinator:
         composed `SceneRegistry`, which shares this coordinator's lock and defers the drop while the scene is
         still resident — applied by `_prune_evicted_bookkeeping_locked` / lease-release once it goes quiet)."""
         self._registry.invalidate_scene(scene_id, generation)
+        with self._lock:
+            self._drop_orphaned_edit_journal_locked(scene_id)
 
     def handle_cache_eviction(self, eviction: SceneCacheEviction) -> None:
         """Correctness-critical cache callback: invalidate this exact generation or degrade fail-closed.
@@ -1141,6 +1307,8 @@ class SceneCoordinator:
         try:
             self.invalidate_scene(eviction.scene_id, eviction.generation)
         except Exception as exc:
+            if is_fatal_worker_exception(exc):
+                raise
             with self._lock:
                 self._mark_degraded_locked(
                     f"disk-cache invalidation failed for scene {eviction.scene_id!r} "
@@ -1181,7 +1349,7 @@ class SceneCoordinator:
         with self._lock:
             return self._scene_locks.setdefault(scene_id, threading.Lock())
 
-    def ensure_attached(self, scene_id: str) -> None:
+    def ensure_attached(self, scene_id: str, *, _allow_transition: bool = False, _has_lease: bool = False) -> None:
         """Make ``scene_id`` renderable on every worker; idempotent. Raises `SceneNotKnownError` if the
         owner has no artifact for it, `SceneLoadError` if its artifact/backend cannot be owner-loaded,
         `SceneAttachError` (after cleanup) if a worker fails to attach, `SceneBudgetError` if the budget is
@@ -1192,11 +1360,21 @@ class SceneCoordinator:
         Prefer `acquire`/`release_scene` from the render path: they additionally hold a lease so the scene
         cannot be evicted out from under an in-flight render. `ensure_attached` alone is the attach barrier."""
         with self._lock:
+            # A public/direct caller uses the same admission gate as proxy leases. The transition owner itself
+            # opts through so it can build its candidate generation. A pre-existing lease also proceeds:
+            # the transition drains that lease before changing the journal or detaching its generation.
+            while scene_id in self._transitions and not (_allow_transition or _has_lease) and self._degraded is None:
+                self._lock.wait()
             # Fail closed even for an already-attached scene: once degraded the whole fleet is restarting.
             self._raise_if_degraded_locked()
             if scene_id in self._attached:
                 return
             artifact_path = self._registry.artifact_path_locked(scene_id)
+            edit_journal = self._edit_journals.get(scene_id, ())
+            if artifact_path is not None:
+                # Admission, journal selection and the transition drain gate are one atomic decision. An edit
+                # cannot start with an older attach paused between observing the journal and registering here.
+                self._attach_active[scene_id] = self._attach_active.get(scene_id, 0) + 1
         if artifact_path is None:
             raise SceneNotKnownError(f"scene {scene_id!r} is not known to this server")
         # Register an active attach for this scene **before** taking the per-scene lock, so an eviction's
@@ -1205,8 +1383,6 @@ class SceneCoordinator:
         # when no attach is active, at which instant no thread holds it and any future acquirer increments
         # (under `_lock`) before `setdefault`, so all acquirers still share one lock. Decremented in the
         # finally (which also covers the early "already attached" return).
-        with self._lock:
-            self._attach_active[scene_id] = self._attach_active.get(scene_id, 0) + 1
         try:
             with self._scene_lock(scene_id):  # serialize the barrier for this scene (one first-load + fan-out)
                 with self._lock:
@@ -1222,13 +1398,19 @@ class SceneCoordinator:
                 # first-time attaches of different scenes can't both pass the cap.
                 self._reserve_slot(scene_id)
                 try:
-                    self._owner_registry.ensure_loaded(scene_id, lambda: self._load_owner(scene_id, artifact_path))
-                    self._attach_all(scene_id, artifact_path)
+                    self._owner_registry.ensure_loaded(
+                        scene_id, lambda: self._load_owner(scene_id, artifact_path, edit_journal)
+                    )
+                    self._attach_all(scene_id, artifact_path, edit_journal)
                     with self._lock:
                         self._attached.add(scene_id)
                         self._reserved.discard(scene_id)  # the reservation becomes a real attachment
                         self._lru[scene_id] = next(self._lru_counter)
                 except BaseException as exc:
+                    # A poisoned owner context must reach the outer fatal interceptor unchanged. Any rollback
+                    # here could issue more CUDA work (detach/release/eviction) before the owner is marked fatal.
+                    if is_fatal_worker_exception(exc):
+                        raise
                     # Single centralized cleanup on load/attach failure — FAIL CLOSED. Default to
                     # UNCLEAN and never suppress a cleanup fault: detach any partial worker attachments fleet-wide
                     # with bounded retry, then release the now-idle owner load — or quarantine + degrade. A loader
@@ -1237,8 +1419,11 @@ class SceneCoordinator:
                     # and keep the scene charged/retained rather than letting the fault bypass quarantine.
                     cleaned = False
                     loaded = True
-                    with contextlib.suppress(Exception):
+                    try:
                         loaded = self._owner_registry.is_loaded(scene_id)
+                    except Exception as loaded_exc:
+                        if is_fatal_worker_exception(loaded_exc):
+                            raise
                     if loaded:
                         try:
                             # A failed attach never became routable, so no render can be in flight against it:
@@ -1247,6 +1432,8 @@ class SceneCoordinator:
                             # we never free tensors a worker might still map.
                             cleaned = self._detach_release_or_quarantine(scene_id) == _DetachResult.RELEASED
                         except Exception as cleanup_exc:  # noqa: BLE001 - a cleanup fault must fail closed
+                            if is_fatal_worker_exception(cleanup_exc):
+                                raise
                             with self._lock:
                                 self._mark_degraded_locked(
                                     f"scene {scene_id!r} rollback cleanup raised: {cleanup_exc!r}; "
@@ -1256,7 +1443,15 @@ class SceneCoordinator:
                     else:
                         cleaned = True  # nothing loaded/attached -> nothing to clean up
                     with self._lock:
-                        self._reserved.discard(scene_id)  # release the claimed slot on failure
+                        # A legacy edit owns its original generation's slot until the candidate succeeds or
+                        # the transition finishes. Preserve that claim after a clean candidate failure so
+                        # the rollback cannot lose a max_scenes race; the transition's finally releases any
+                        # leftover claim after rollback. Unsafe cleanup still converts it to `_retained`.
+                        preserve_transition_reservation = (
+                            _allow_transition and scene_id in self._transitions and cleaned and self._degraded is None
+                        )
+                        if not preserve_transition_reservation:
+                            self._reserved.discard(scene_id)  # release the claimed slot on ordinary failure
                         if not cleaned:
                             # Quarantined: keep the scene CHARGED (reserved -> retained) so we don't over-admit
                             # on still-resident VRAM; its owner tensors are freed only post-reap.
@@ -1275,6 +1470,220 @@ class SceneCoordinator:
         finally:
             with self._lock:
                 self._dec_attach_active_locked(scene_id)
+                # A legacy edit transition may be waiting for a direct ensure_attached caller to leave its
+                # attach critical section before it can safely detach the current generation.
+                self._lock.notify_all()
+
+    def append_edit_assets(
+        self,
+        scene_id: str,
+        request: Any,
+        *,
+        wait_policy: "BackendCacheWaitPolicy | None" = None,
+    ) -> None:
+        """Append one legacy edit delta and atomically rebuild that mutable scene-id generation.
+
+        The public gRPC interface is intentionally unchanged in step 1, but applying an edit directly to a
+        worker-local backend would make the round-robin fleet diverge. This turns the legacy mutation into a
+        scene-local transaction: block new leases, drain the old generation, detach it safely, construct a
+        clean owner backend with the complete journal, then require the all-worker attach barrier before the
+        alias becomes routable again.
+        """
+        self._transition_edit_journal(
+            scene_id,
+            append=_serialize_edit_request(request),
+            wait_policy=wait_policy,
+        )
+
+    def restore_edited_scene(
+        self,
+        scene_id: str,
+        *,
+        wait_policy: "BackendCacheWaitPolicy | None" = None,
+    ) -> None:
+        """Clear the legacy edit journal and rebuild the unedited base generation in the same pool."""
+        self._transition_edit_journal(scene_id, reset=True, wait_policy=wait_policy)
+
+    @staticmethod
+    def _ensure_edit_wait_continues(
+        scene_id: str,
+        wait_policy: "BackendCacheWaitPolicy | None",
+    ) -> None:
+        """Abort an edit before it mutates state when its queued RPC is no longer live."""
+        if wait_policy is None or wait_policy.should_continue is None or wait_policy.should_continue():
+            return
+        reason = (
+            wait_policy.abort_reason() if wait_policy.abort_reason is not None else CacheWaitAbortedReason.CANCELLED
+        )
+        raise CacheWaitAbortedError(f"Stopped waiting to edit scene {scene_id!r}", reason)
+
+    def _wait_for_edit_condition_locked(
+        self,
+        scene_id: str,
+        predicate: "Callable[[], bool]",
+        wait_policy: "BackendCacheWaitPolicy | None",
+    ) -> None:
+        """Wait under ``_lock`` while polling the caller's cancellation/deadline policy."""
+        self._ensure_edit_wait_continues(scene_id, wait_policy)
+        while predicate() and self._degraded is None:
+            self._lock.wait(timeout=_EDIT_CANCEL_POLL_INTERVAL_S if wait_policy is not None else None)
+            self._ensure_edit_wait_continues(scene_id, wait_policy)
+        self._ensure_edit_wait_continues(scene_id, wait_policy)
+
+    def _set_edit_journal_locked(self, scene_id: str, journal: "tuple[bytes, ...]") -> None:
+        """Publish the journal used by the next clean owner/worker build. Caller holds ``_lock``."""
+        if journal and self._registry.is_registered_locked(scene_id):
+            self._edit_journals[scene_id] = journal
+        else:
+            self._edit_journals.pop(scene_id, None)
+
+    def _transition_edit_journal(
+        self,
+        scene_id: str,
+        *,
+        append: "bytes | None" = None,
+        reset: bool = False,
+        wait_policy: "BackendCacheWaitPolicy | None" = None,
+    ) -> None:
+        """Run one exclusive legacy edit/restore generation transition.
+
+        At most one transition owns a legacy scene ID. Normal ``acquire`` calls wait before taking a lease;
+        existing leases drain before the old worker mappings are detached. A detach refused because a native
+        worker render is still in use is explicitly safe and retryable. Any uncertain detach preserves the
+        pre-existing fail-closed quarantine behavior. If preparation of a new journal fails after a clean
+        detach, the coordinator makes one best-effort attempt to restore the former ready generation before
+        surfacing the failure.
+        """
+        if reset == (append is not None):
+            raise ValueError("exactly one of append or reset must be specified for an edit transition")
+
+        with self._lock:
+            self._wait_for_edit_condition_locked(
+                scene_id,
+                lambda: scene_id in self._transitions,
+                wait_policy,
+            )
+            self._raise_if_degraded_locked()
+            if self._registry.artifact_path_locked(scene_id) is None:
+                raise SceneNotKnownError(f"scene {scene_id!r} is not known to this server")
+
+            previous_journal = self._edit_journals.get(scene_id, ())
+            candidate_journal = () if reset else previous_journal + (cast(bytes, append),)
+            if candidate_journal == previous_journal and (
+                scene_id in self._attached or not self._is_resident_locked(scene_id)
+            ):
+                return  # An unedited scene needs neither lease draining nor a first load for restore.
+            self._transitions.add(scene_id)
+        was_attached = False
+        detached_cleanly = False
+        try:
+            with self._lock:
+                # Acquires check `_transitions` before incrementing this count. Once the transition flag is set,
+                # this wait drains every pre-existing render/discovery lease and admits no new old-generation work.
+                self._wait_for_edit_condition_locked(
+                    scene_id,
+                    lambda: (
+                        self._inflight.get(scene_id, 0) > 0
+                        or self._attach_active.get(scene_id, 0) > 0
+                        or scene_id in self._evicting
+                    ),
+                    wait_policy,
+                )
+                self._raise_if_degraded_locked()
+                was_attached = scene_id in self._attached
+                if was_attached:
+                    # Mirror coordinated eviction: remove this alias from routability before touching worker IPC
+                    # mappings, and retain its residency charge until detach/release has a proven outcome.
+                    self._attached.discard(scene_id)
+                    self._evicting.add(scene_id)
+
+            detached_cleanly = not was_attached
+            if was_attached:
+                try:
+                    result = self._detach_release_or_quarantine(scene_id)
+                except BaseException as detach_exc:
+                    if is_fatal_worker_exception(detach_exc):
+                        raise
+                    # The normal helper classifies worker outcomes itself. A fault escaping that boundary
+                    # (executor/registry/programming failure) is still unsafe: retain the ownership charge
+                    # and take the same fail-closed path instead of leaving a stale `_evicting` marker.
+                    with self._lock:
+                        self._evicting.discard(scene_id)
+                        self._retained.add(scene_id)
+                        self._mark_degraded_locked(
+                            f"scene {scene_id!r} edit detach raised: {detach_exc!r}; "
+                            "retaining its residency budget charge until fleet reap"
+                        )
+                    raise
+                with self._lock:
+                    self._evicting.discard(scene_id)
+                    if result == _DetachResult.RELEASED:
+                        detached_cleanly = True
+                        # Keep this transition's budget slot claimed across candidate construction and any
+                        # rollback. Without this atomic evicting -> reserved transfer, another scene can take
+                        # the just-freed slot and make both the edited generation and its rollback fail.
+                        self._reserved.add(scene_id)
+                        self._lru.pop(scene_id, None)
+                    elif result == _DetachResult.BUSY:
+                        # A worker still owns an in-flight native render. The old generation remains fully
+                        # coherent, so put it back without treating a retryable edit rejection as degradation.
+                        self._attached.add(scene_id)
+                        self._set_edit_journal_locked(scene_id, previous_journal)
+                        raise SceneEditBusyError(
+                            f"scene {scene_id!r} is still rendering on at least one worker; retry edit after it drains"
+                        )
+                    else:
+                        # `_detach_release_or_quarantine` already latched the diagnostic reason. Keep the
+                        # ownership charged and fail closed; never route a partly-detached old generation.
+                        self._lru.pop(scene_id, None)
+                        self._retained.add(scene_id)
+                        raise ScenePoolDegradedError(
+                            f"scene {scene_id!r} could not be safely detached for an edit rebuild"
+                        )
+                    self._lock.notify_all()
+
+            with self._lock:
+                # Keep the old journal available until detach succeeds: a mixed BUSY detach may need to
+                # rebuild released workers against the still-live old owner tensors before rejecting the edit.
+                self._set_edit_journal_locked(scene_id, candidate_journal)
+            # The candidate journal is visible to `ensure_attached`, so it loads clean base bytes, applies the
+            # full ordered edit sequence on the owner, and sends that same sequence to every worker build.
+            self.ensure_attached(scene_id, _allow_transition=True)
+        except BaseException as exc:
+            if is_fatal_worker_exception(exc):
+                raise
+            # A failed new generation must not leave a successful legacy alias pointing at a journal that never
+            # reached every worker. Restore the former ready generation when it was cleanly detached and the
+            # pool remains healthy; if that rollback cannot be proven, the normal attach cleanup/degradation
+            # policy leaves the scene unavailable instead of serving a mixed fleet.
+            with self._lock:
+                self._set_edit_journal_locked(scene_id, previous_journal)
+            if was_attached and detached_cleanly and not self.is_degraded():
+                try:
+                    self.ensure_attached(scene_id, _allow_transition=True)
+                except Exception as rollback_exc:  # noqa: BLE001 - ordinary edit failure remains primary
+                    if is_fatal_worker_exception(rollback_exc):
+                        raise
+                    log.error(
+                        "legacy edit rebuild for scene %r failed and prior generation could not be restored: %r",
+                        scene_id,
+                        rollback_exc,
+                    )
+            raise
+        finally:
+            with self._lock:
+                self._transitions.discard(scene_id)
+                # A successful rebuild converted this reservation into `_attached`; a failed candidate and
+                # rollback may leave the transition-owned reservation behind. No other caller can reserve
+                # this scene while `_transitions` is set, so releasing it here cannot steal another attach's
+                # claim.
+                self._reserved.discard(scene_id)
+                # A disk-cache invalidation that arrived during an unloaded edit was deferred because the
+                # transition owns this registration identity. Consume it now if the rebuild did not establish
+                # another resident generation, and never leave its journal available to a reused scene ID.
+                self._registry.apply_pending_invalidation_if_quiescent_locked(scene_id)
+                self._drop_orphaned_edit_journal_locked(scene_id)
+                self._lock.notify_all()
 
     def acquire(self, scene_id: str) -> None:
         """Attach ``scene_id`` (driving the barrier + any eviction) **and** take a render lease on it, so it
@@ -1283,12 +1692,16 @@ class SceneCoordinator:
         lease-free scenes) can never select a scene a caller is committed to. Raises the same errors as
         `ensure_attached`."""
         with self._lock:
+            while scene_id in self._transitions and self._degraded is None:
+                self._lock.wait()
+            self._raise_if_degraded_locked()
             self._inflight[scene_id] = self._inflight.get(scene_id, 0) + 1
         try:
-            self.ensure_attached(scene_id)
+            self.ensure_attached(scene_id, _has_lease=True)
         except BaseException:
             with self._lock:
                 self._dec_inflight_locked(scene_id)
+                self._lock.notify_all()  # An edit may be draining this failed acquisition's lease.
             raise
         with self._lock:
             self._lru[scene_id] = next(self._lru_counter)  # touch LRU on access
@@ -1306,6 +1719,7 @@ class SceneCoordinator:
         else:
             self._inflight.pop(scene_id, None)
         self._registry.apply_pending_invalidation_if_quiescent_locked(scene_id)
+        self._drop_orphaned_edit_journal_locked(scene_id)
 
     def _dec_attach_active_locked(self, scene_id: str) -> None:
         count = self._attach_active.get(scene_id, 0) - 1
@@ -1314,6 +1728,12 @@ class SceneCoordinator:
         else:
             self._attach_active.pop(scene_id, None)
         self._registry.apply_pending_invalidation_if_quiescent_locked(scene_id)
+        self._drop_orphaned_edit_journal_locked(scene_id)
+
+    def _drop_orphaned_edit_journal_locked(self, scene_id: str) -> None:
+        """Forget edits when the registration identity they belong to has been dropped."""
+        if not self._registry.is_registered_locked(scene_id):
+            self._edit_journals.pop(scene_id, None)
 
     def _prune_evicted_bookkeeping_locked(self, scene_id: str) -> None:
         """Drop a fully-evicted scene's per-scene bookkeeping so the maps stay bounded under on-demand churn.
@@ -1335,6 +1755,7 @@ class SceneCoordinator:
         # Apply a deferred disk-cache invalidation now that the scene has left residency (never for a
         # permanent glob/bootstrap scene, which keeps its mapping regardless of the disk cache).
         self._registry.apply_pending_invalidation_if_quiescent_locked(scene_id)
+        self._drop_orphaned_edit_journal_locked(scene_id)
         self._owner_registry.forget_scene_lock(scene_id)
 
     def _reserve_slot(self, incoming: str) -> None:
@@ -1358,6 +1779,8 @@ class SceneCoordinator:
         while True:
             with self._lock:
                 self._raise_if_degraded_locked()  # re-checked after every wait (loop re-enters here)
+                if incoming in self._reserved:
+                    return  # an edit transition transferred its old generation's budget claim to this attach
                 # Count `_evicting` **and** `_retained` toward occupancy: a victim moved out of
                 # `_attached` still has its VRAM mapped until its detach+release completes (evicting) or,
                 # if its detach could not be confirmed, indefinitely until post-reap (retained). A concurrent
@@ -1399,6 +1822,8 @@ class SceneCoordinator:
                 # worker may still map them for an uncertain reason.
                 result = self._detach_release_or_quarantine(victim)
             except Exception as cleanup_exc:  # noqa: BLE001 - eviction cleanup must fail closed
+                if is_fatal_worker_exception(cleanup_exc):
+                    raise
                 # An unexpected queue/executor/registry fault must not bypass quarantine or recreate
                 # over-admission: latch degradation and keep the victim charged/retained (below). The next
                 # loop iteration hits `_raise_if_degraded_locked`, so the reserving caller fails closed.
@@ -1471,7 +1896,9 @@ class SceneCoordinator:
         if not self._channels:
             return []
         outcomes: list[tuple[int, "Exception | None", bool, bool]] = []
-        with futures.ThreadPoolExecutor(max_workers=len(self._channels)) as pool:
+        fatal_exit = False
+        pool = futures.ThreadPoolExecutor(max_workers=len(self._channels))
+        try:
             future_to_index = {pool.submit(channel.detach, scene_id): i for i, channel in enumerate(self._channels)}
             for future in futures.as_completed(future_to_index):
                 index = future_to_index[future]
@@ -1479,8 +1906,16 @@ class SceneCoordinator:
                     future.result()
                     outcomes.append((index, None, False, False))
                 except Exception as exc:  # noqa: BLE001 - classify per worker for the quarantine decision
+                    if is_fatal_worker_exception(exc):
+                        # Do not let the executor context wait for slow sibling detach acks after the owner
+                        # CUDA context is poisoned. Running calls cannot be cancelled, but the fatal owner
+                        # path will stop/reap those workers before its immediate nonzero process exit.
+                        fatal_exit = True
+                        raise
                     retained = self._channels[index].is_attached(scene_id)
                     outcomes.append((index, exc, retained, isinstance(exc, SceneDetachBusyError)))
+        finally:
+            pool.shutdown(wait=not fatal_exit, cancel_futures=fatal_exit)
         return outcomes
 
     def _detach_release_or_quarantine(
@@ -1490,10 +1925,10 @@ class SceneCoordinator:
         worker still renders it) or quarantine + degrade if a consistent terminal state cannot be **proven**.
 
         Returns `_DetachResult.RELEASED` iff the scene was proven fully released (no worker maps it, owner
-        tensors freed → safe to drop its bookkeeping). Returns `_DetachResult.BUSY` iff every still-retained
-        worker refused because a render is in flight (in-use): a KNOWN-safe, definitely-retryable state
-        (refcounts correct, mapping retained) — the caller retries later / picks another victim WITHOUT
-        degrading. Returns `_DetachResult.QUARANTINED` iff it had to be quarantined: a live worker may still
+        tensors freed → safe to drop its bookkeeping). Returns `_DetachResult.BUSY` when workers refuse
+        because a render is in flight (in-use), after restoring any released mappings to the old generation:
+        the caller retries later / picks another victim WITHOUT degrading a coherent fleet.
+        Returns `_DetachResult.QUARANTINED` iff it had to be quarantined: a live worker may still
         map it for an *uncertain* reason (lost/timed-out ack, crash, or an ownership invariant failure), so its
         owner tensors stay referenced (no use-after-free) and the pool is marked degraded (the wired callback
         tears the fleet down for a nonzero supervisor restart). Shared by eviction, partial-attach rollback,
@@ -1534,13 +1969,32 @@ class SceneCoordinator:
                     self._mark_degraded_locked(reason)
                 log.error(f"scene residency terminal action: quarantine {scene_id!r} (invariant); reason={reason}")
                 return _DetachResult.QUARANTINED
-            # If EVERY still-retained worker is BUSY (an explicit in-use refusal — the F001 orphaned-render
-            # case), this is NOT detach uncertainty: refcounts are correct and the mapping is intentionally
-            # kept. Do NOT retry-spin (a rapid retry cannot change an in-flight render) and do NOT degrade —
-            # return BUSY so eviction picks another victim or fails the requester retryable while the fleet
-            # stays SERVING. This is the fix for the escalation Wave 1a's report flagged: without it, three
-            # rapid busy refusals would (mis)quarantine + degrade the whole fleet on one orphaned render.
-            if all(is_busy for _index, _exc, is_busy in retained):
+            # Explicit BUSY refusals are retryable, but released workers must map the old generation again
+            # before it becomes routable. Any uncertain error still follows the bounded quarantine path.
+            only_busy_errors = all(is_busy for _index, exc, _retained, is_busy in outcomes if exc is not None)
+            if only_busy_errors and all(is_busy for _index, _exc, is_busy in retained):
+                if len(retained) != len(outcomes):
+                    with self._lock:
+                        artifact_path = self._registry.artifact_path_locked(scene_id)
+                        edit_journal = self._edit_journals.get(scene_id, ())
+                        was_routable = scene_id in self._evicting
+                    # Recovery is for eviction/edit of a previously coherent generation, never a failed
+                    # first attach. The retained BUSY refs keep the old owner tensors alive throughout.
+                    if was_routable and artifact_path is not None:
+                        try:
+                            self._attach_all(scene_id, artifact_path, edit_journal)
+                        except Exception as exc:
+                            if is_fatal_worker_exception(exc):
+                                raise
+                            reason = (
+                                f"scene {scene_id!r} BUSY detach recovery could not restore the old generation: "
+                                f"{exc!r}; retaining owner tensors until fleet reap"
+                            )
+                            with self._lock:
+                                self._mark_degraded_locked(reason)
+                            return _DetachResult.QUARANTINED
+                    else:
+                        continue  # Cannot prove the full old generation; retry detach, then quarantine.
                 busy_detail = "; ".join(f"worker {index}: {exc!r}" for index, exc, _busy in retained)
                 log.info(
                     f"scene {scene_id!r} detach deferred (attempt {attempt}/{attempts}): a render is still in "
@@ -1564,7 +2018,7 @@ class SceneCoordinator:
         log.error(f"scene residency terminal action: quarantine {scene_id!r}; reason={reason}")
         return _DetachResult.QUARANTINED
 
-    def _attach_all(self, scene_id: str, artifact_path: str) -> None:
+    def _attach_all(self, scene_id: str, artifact_path: str, edit_journal: "tuple[bytes, ...]" = ()) -> None:
         # Fan the attach out to every worker in parallel (so the barrier is one worker-load wide, not N), then
         # raise on any failure. Rollback of the succeeded/uncertain attachments is NOT done here: it is the
         # single centralized `_detach_release_or_quarantine` path driven by `ensure_attached`'s failure
@@ -1572,26 +2026,39 @@ class SceneCoordinator:
         if not self._channels:
             return
         errors: list[Exception] = []
-        with futures.ThreadPoolExecutor(max_workers=len(self._channels)) as pool:
+        fatal_exit = False
+        pool = futures.ThreadPoolExecutor(max_workers=len(self._channels))
+        try:
             future_to_channel = {
-                pool.submit(channel.attach, scene_id, artifact_path): channel for channel in self._channels
+                pool.submit(channel.attach, scene_id, artifact_path, edit_journal=edit_journal): channel
+                for channel in self._channels
             }
             for future in futures.as_completed(future_to_channel):
                 try:
                     future.result()
                 except Exception as exc:  # noqa: BLE001 - aggregate all worker failures; cleanup is centralized
+                    if is_fatal_worker_exception(exc):
+                        # Fatal owner errors bypass the ordinary all-worker barrier and rollback. In particular,
+                        # do not wait behind another worker's attach-ack timeout before the outer interceptor can
+                        # mark the owner unhealthy, drain the proxy, reap workers, and exit without CUDA cleanup.
+                        fatal_exit = True
+                        raise
                     errors.append(exc)
+        finally:
+            pool.shutdown(wait=not fatal_exit, cancel_futures=fatal_exit)
         if errors:
             raise SceneAttachError(f"scene {scene_id!r} failed to attach on {len(errors)} worker(s): {errors}")
 
-    def _load_owner(self, scene_id: str, artifact_path: str) -> Any:
+    def _load_owner(self, scene_id: str, artifact_path: str, edit_journal: "tuple[bytes, ...]" = ()) -> Any:
         """Translate only the injected artifact/backend loader boundary into a scene-domain error.
 
         Registry publication happens in ``OwnerSceneRegistry.ensure_loaded`` after this method returns and is
         intentionally outside this boundary: bookkeeping/invariant defects must remain loud internal errors.
         """
         try:
-            return self._loader(scene_id, artifact_path)
+            owner = self._loader(scene_id, artifact_path)
+            _replay_edit_journal(owner, edit_journal)
+            return owner
         except Exception as exc:
             raise SceneLoadError(f"scene {scene_id!r} failed to load from artifact {artifact_path!r}: {exc}") from exc
 
@@ -2104,20 +2571,12 @@ def validate_multiproc_admission(
     return None
 
 
-def validate_multiproc_harmonizer(grpc_config: GrpcServerConfig) -> "str | None":
-    """Reject the temporal harmonizer in multiprocess mode.
+def validate_multiproc_features(grpc_config: GrpcServerConfig) -> "str | None":
+    """Return an error for unsupported pool features, or None when valid.
 
-    Temporal-harmonizer sessions are per-process state (a frame-history dict inside one service
-    instance): the round-robin proxy would create a session on one worker and land subsequent
-    renders on others, returning NOT_FOUND or silently corrupting the temporal conditioning.
-    The stateless ``--enable-harmonizer`` IS supported — each worker applies it per frame — so
-    only the temporal variant is refused. Returns an error message, or ``None`` when valid, from
-    the same contract as `validate_multiproc_admission` (Click raises `click.UsageError`,
-    `run_drop_in` raises `ValueError`).
-
-    ``enable_harmonizer_temporal`` is a real `GrpcServerConfig` field (default False); the
-    ``getattr`` stays only so programmatic callers may pass a config-like object without the field
-    (treated as disabled).
+    The pool cannot route temporal sessions or enforce camera-only mode. Missing
+    fields on config-like objects are treated as disabled. The CLI raises
+    ``click.UsageError`` for the returned error; ``run_drop_in`` raises ``ValueError``.
     """
     if getattr(grpc_config, "enable_harmonizer_temporal", False):
         return (
@@ -2126,6 +2585,8 @@ def validate_multiproc_harmonizer(grpc_config: GrpcServerConfig) -> "str | None"
             "single-process serving for temporal harmonization (the stateless --enable-harmonizer "
             "works with the pool)."
         )
+    if getattr(grpc_config, "camera_only", False):
+        return "--camera-only is supported only with --multiproc-workers=0"
     return None
 
 
@@ -2308,10 +2769,16 @@ class RenderProxy(SensorsimServiceServicer):
         except ScenePoolDegradedError as exc:
             # The scene control plane is degraded and the fleet is restarting; fail bounded rather
             # than routing/over-admitting on an uncertain fleet.
+            if is_fatal_worker_exception(exc):
+                raise
             _fail(grpc.StatusCode.UNAVAILABLE, str(exc))
         except SceneLoadError as exc:
+            if is_fatal_worker_exception(exc):
+                raise
             _fail(grpc.StatusCode.UNAVAILABLE, str(exc))
         except SceneAttachError as exc:
+            if is_fatal_worker_exception(exc):
+                raise
             _fail(grpc.StatusCode.UNAVAILABLE, str(exc))
         except SceneBudgetError as exc:
             _fail(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
@@ -2332,6 +2799,36 @@ class RenderProxy(SensorsimServiceServicer):
         if not callable(is_active):
             return False
         return not is_active()
+
+    @classmethod
+    def _edit_wait_policy(cls, context) -> BackendCacheWaitPolicy:
+        """Preserve single-process edit semantics while a multiprocess transition is queued.
+
+        A client deadline/cancellation stops the request before detach or journal publication. Once those
+        mutations begin, the coordinator runs the transition to completion rather than interrupting a
+        partially detached fleet.
+        """
+
+        def should_continue() -> bool:
+            remaining = cls._client_timeout(context)
+            return (remaining is None or remaining > 0) and not cls._client_cancelled(context)
+
+        def abort_reason() -> CacheWaitAbortedReason:
+            remaining = cls._client_timeout(context)
+            if remaining is not None and remaining <= 0:
+                return CacheWaitAbortedReason.DEADLINE_EXCEEDED
+            return CacheWaitAbortedReason.CANCELLED
+
+        return BackendCacheWaitPolicy(should_continue=should_continue, abort_reason=abort_reason)
+
+    @staticmethod
+    def _abort_edit_wait(context, exc: CacheWaitAbortedError) -> None:
+        code = (
+            grpc.StatusCode.CANCELLED
+            if exc.reason == CacheWaitAbortedReason.CANCELLED
+            else grpc.StatusCode.DEADLINE_EXCEEDED
+        )
+        context.abort(code, str(exc))
 
     def _try_admit(self, context=None) -> bool:
         """Acquire an in-flight render slot, waiting up to `admission_timeout_s` (0 = don't wait). Returns
@@ -2441,6 +2938,23 @@ class RenderProxy(SensorsimServiceServicer):
             return None  # inf-future sentinel / no real deadline -> no downstream deadline
         return remaining
 
+    @staticmethod
+    def _correlation_metadata(context) -> tuple[tuple[str, str], ...]:
+        """Return only safe request-correlation headers for the worker hop."""
+
+        if context is None:
+            return ()
+        invocation_metadata = getattr(context, "invocation_metadata", None)
+        if not callable(invocation_metadata):
+            return ()
+        forwarded = []
+        for item in invocation_metadata() or ():
+            key = str(item[0]).casefold()
+            value = item[1]
+            if key in _CORRELATION_ID_HEADERS and isinstance(value, str):
+                forwarded.append((key, value))
+        return tuple(forwarded)
+
     def _invoke(self, method, request, context):
         """Forward one unary RPC to a worker stub with deadline + cancellation propagation, **raising** any
         downstream `grpc.RpcError` (the caller decides whether to relay it as a typed abort or fold it into a
@@ -2457,9 +2971,13 @@ class RenderProxy(SensorsimServiceServicer):
         test doubles expose a plain callable and fall back to a blocking call, carrying the ``timeout`` kwarg
         only when a deadline exists (a no-deadline forward passes no ``timeout``)."""
         timeout = self._client_timeout(context)
+        metadata = self._correlation_metadata(context)
         future_call = getattr(method, "future", None)
         if callable(future_call):
-            call = future_call(request, timeout=timeout)
+            call_kwargs: dict[str, Any] = {"timeout": timeout}
+            if metadata:
+                call_kwargs["metadata"] = metadata
+            call = future_call(request, **call_kwargs)
             if context is not None:
                 add_callback = getattr(context, "add_callback", None)
                 if callable(add_callback):
@@ -2480,9 +2998,14 @@ class RenderProxy(SensorsimServiceServicer):
                 ) from exc
         # Test-double fallback: a plain callable with no future API. Only pass timeout= when the client set a
         # deadline, so a no-deadline forward is a single-argument call.
-        if timeout is None:
+        if timeout is None and not metadata:
             return method(request)
-        return method(request, timeout=timeout)
+        call_kwargs = {}
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+        if metadata:
+            call_kwargs["metadata"] = metadata
+        return method(request, **call_kwargs)
 
     def _forward(self, method, request, context):
         """`_invoke` + typed relay: forward the RPC and, on a downstream `grpc.RpcError`, relay the worker's
@@ -2507,6 +3030,9 @@ class RenderProxy(SensorsimServiceServicer):
             # typed UNIMPLEMENTED the dedicated IPC RPCs give, rather than forwarding to
             # an arbitrary worker and letting it fail with an opaque "session not found".
             context.abort(grpc.StatusCode.UNIMPLEMENTED, self._CUDA_IPC_MULTIPROC_UNSUPPORTED)
+        if getattr(request, "use_rdma", False):
+            # Likewise open_rdma_session is always refused here, so no rdma_session_id is valid.
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, self._RDMA_MULTIPROC_UNSUPPORTED)
         with self._scene_lease(self._lease_scene_id(request), context):  # attach barrier + lease
             with self._admission(context):
                 return self._forward(self._next_stub().render_rgb, request, context)
@@ -2523,6 +3049,8 @@ class RenderProxy(SensorsimServiceServicer):
             # Same reasoning as render_rgb: open_ipc_session is always refused under
             # multi-process serving, so ipc_session_id can never be valid here.
             context.abort(grpc.StatusCode.UNIMPLEMENTED, self._CUDA_IPC_MULTIPROC_UNSUPPORTED)
+        if getattr(request, "use_rdma", False):
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, self._RDMA_MULTIPROC_UNSUPPORTED)
         with self._scene_lease(self._lease_scene_id(request), context):
             with self._admission(context):
                 return self._forward(self._next_stub().render_camera, request, context)
@@ -2577,6 +3105,14 @@ class RenderProxy(SensorsimServiceServicer):
                     grpc.StatusCode.UNIMPLEMENTED,
                     f"{self._CUDA_IPC_MULTIPROC_UNSUPPORTED} (item[{index}] {item.camera_name!r}); "
                     f"use {single_item_rpc} for CUDA IPC delivery of a single camera at a time.",
+                )
+                raise  # unreachable, but needed for mypy
+            # RDMA is refused for the same reason (open_rdma_session is refused here too), and
+            # single-process batch RPCs don't support it either.
+            if getattr(item.request, "use_rdma", False):
+                context.abort(
+                    grpc.StatusCode.UNIMPLEMENTED,
+                    f"{self._RDMA_MULTIPROC_UNSUPPORTED} (item[{index}] {item.camera_name!r}).",
                 )
                 raise  # unreachable, but needed for mypy
 
@@ -2713,6 +3249,24 @@ class RenderProxy(SensorsimServiceServicer):
         with self._scene_lease(self._lease_scene_id(request), context):  # attach + hold across the forward
             return self._forward(self._stubs[0].get_available_cameras, request, context)
 
+    def get_lidar_firing_pattern(self, request, context):
+        """Forward pattern discovery to worker zero while holding a scene lease.
+
+        Args:
+            request: Pattern lookup identifying the scene, lidar, and optional phase or ID.
+            context: Server RPC context carrying deadline, cancellation, and error status.
+
+        Returns:
+            The worker's firing-pattern response without changing its array encoding.
+
+        Raises:
+            Exception: ``context.abort`` terminates the RPC if scene acquisition fails
+                or the worker returns an error, preserving the corresponding gRPC status.
+            grpc.RpcError: If a worker call fails and no abort-capable context is supplied.
+        """
+        with self._scene_lease(self._lease_scene_id(request), context):  # attach + hold across the forward
+            return self._forward(self._stubs[0].get_lidar_firing_pattern, request, context)
+
     def get_available_trajectories(self, request, context):
         with self._scene_lease(self._lease_scene_id(request), context):
             return self._forward(self._stubs[0].get_available_trajectories, request, context)
@@ -2738,11 +3292,20 @@ class RenderProxy(SensorsimServiceServicer):
         forwarded = self._forward(self._stubs[0].get_server_config, request, context)
         server_config = dict(forwarded.server_config)
         server_config["serving.mode"] = "multiprocess"
+        server_config["cuda_ipc.camera_batch"] = "False"
+        server_config["cuda_ipc.event_ordered"] = "False"
+        server_config["scene_prefetch.enabled"] = "False"
         server_config["multiproc.workers"] = str(len(self._stubs))
         return sensorsim_pb2.ServerConfig(server_config=server_config)
 
     def get_available_ego_masks(self, request, context):
         return self._forward(self._stubs[0].get_available_ego_masks, request, context)
+
+    def prefetch_scene(self, request, context):
+        context.abort(
+            grpc.StatusCode.FAILED_PRECONDITION,
+            "scene prefetch is supported only by single-process serve-grpc",
+        )
 
     def shut_down(self, request, context):
         """Graceful fleet shutdown: signal the owner main loop to stop the proxy + tear down the workers.
@@ -2756,32 +3319,70 @@ class RenderProxy(SensorsimServiceServicer):
         return common_pb2.Empty()
 
     def edit_assets(self, request, context):
-        """Editing is not supported with multi-process serving.
+        """Apply the legacy edit interface through a scene-local all-worker rebuild.
 
-        Kept as an explicit override (rather than falling through to the base servicer, which would return a
-        typed UNIMPLEMENTED status) so a client that only branches on ``response.success`` still sees a clean
-        in-band failure: transport ``OK`` with ``success=False``. Use single-process `serve-grpc` for in-place
-        edits.
+        This remains an in-band ``EditAssetsResponse`` like the single-process service: a failed editable
+        model, attachment barrier, or busy worker reports ``success=False`` rather than silently routing a
+        partially updated fleet. The normal pool always has a coordinator; the defensive ``None`` branch keeps
+        a manually constructed proxy from pretending it can safely mutate independent worker backends.
         """
-        return EditAssetsResponse(
-            success=False,
-            message=(
-                "UNIMPLEMENTED: editing (edit_assets) is not supported with multi-process serving "
-                "(--multiproc-workers > 0); use single-process serve-grpc for in-place edits"
-            ),
-        )
+        coordinator = self._scene_coordinator
+        if coordinator is None:
+            return EditAssetsResponse(
+                success=False,
+                message="Failed to edit assets: multi-process scene coordinator is not configured",
+            )
+        try:
+            coordinator.append_edit_assets(
+                request.scene_id,
+                request,
+                wait_policy=self._edit_wait_policy(context),
+            )
+            return EditAssetsResponse(success=True, message="Success")
+        except SceneNotKnownError as exc:
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except CacheWaitAbortedError as exc:
+            self._abort_edit_wait(context, exc)
+        except Exception as exc:
+            if is_fatal_worker_exception(exc):
+                raise
+            # Legacy edits report busy, budget, degraded-pool, load and attach failures in-band (success=False).
+            log.error("edit_assets rebuild failed for scene %r: %r", request.scene_id, exc)
+            return EditAssetsResponse(success=False, message=f"Failed to edit assets: {exc}")
 
     def restore_model_parameters(self, request, context):
-        """Editing is not supported with multi-process serving: no in-place edits can exist to restore."""
-        context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "restore_model_parameters is not supported with multi-process serving "
-            "(--multiproc-workers > 0): no in-place edits can exist in this mode",
-        )
+        """Restore an edited legacy alias by rebuilding its clean base generation across the pool."""
+        coordinator = self._scene_coordinator
+        if coordinator is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "multi-process scene coordinator is not configured",
+            )
+        assert coordinator is not None  # `context.abort` raises; this narrows test/runtime control flow
+        try:
+            coordinator.restore_edited_scene(
+                request.scene_id,
+                wait_policy=self._edit_wait_policy(context),
+            )
+        except SceneNotKnownError as exc:
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except CacheWaitAbortedError as exc:
+            self._abort_edit_wait(context, exc)
+        except ScenePoolDegradedError as exc:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+        except SceneEditBusyError as exc:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        except SceneBudgetError as exc:
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+        except (SceneLoadError, SceneAttachError) as exc:
+            if is_fatal_worker_exception(exc):
+                raise
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+        return common_pb2.Empty()
 
     def create_harmonizer_session(self, request, context):
         """Temporal-harmonizer sessions are per-process state the proxy cannot route across the worker pool,
-        and `validate_multiproc_harmonizer` already refuses `--enable-harmonizer-temporal` at launch, so a
+        and `validate_multiproc_features` already refuses `--enable-harmonizer-temporal` at launch, so a
         session could never be valid. Abort FAILED_PRECONDITION with an actionable message — mirroring
         single-process `serve`'s `create_harmonizer_session` precondition abort — rather than falling through
         to the generated base servicer's generic UNIMPLEMENTED "Method not implemented!" (the proto comment
@@ -2821,6 +3422,27 @@ class RenderProxy(SensorsimServiceServicer):
         """No IPC session can exist under multi-process serving, so there is nothing to close."""
         context.abort(grpc.StatusCode.UNIMPLEMENTED, self._CUDA_IPC_MULTIPROC_UNSUPPORTED)
 
+    # RDMA delivery pins a client's registered buffers to one worker's queue pair, but the proxy
+    # load-balances renders across the pool and cannot guarantee a `use_rdma` render reaches that
+    # same worker. All three RDMA RPCs are therefore refused (typed UNIMPLEMENTED, not a
+    # fall-through to the base servicer's generic one) — use single-process serve-grpc for RDMA.
+    _RDMA_MULTIPROC_UNSUPPORTED = (
+        "RDMA transport is not supported with multi-process serving (--multiproc-workers > 0); the "
+        "session-to-worker buffer affinity cannot be routed across the pool — use single-process serve-grpc"
+    )
+
+    def open_rdma_session(self, request, context):
+        """RDMA delivery is not supported with multi-process serving (see the note above)."""
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, self._RDMA_MULTIPROC_UNSUPPORTED)
+
+    def register_receive_buffer(self, request, context):
+        """No RDMA session can exist under multi-process serving, so there is no buffer to register."""
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, self._RDMA_MULTIPROC_UNSUPPORTED)
+
+    def close_rdma_session(self, request, context):
+        """No RDMA session can exist under multi-process serving, so there is nothing to close."""
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, self._RDMA_MULTIPROC_UNSUPPORTED)
+
 
 @dataclass(frozen=True)
 class PostProcessConfig:
@@ -2829,6 +3451,7 @@ class PostProcessConfig:
     types so it is picklable across the `spawn` boundary."""
 
     egocar_hoods_dir: "str | None" = None
+    egocar_hood_cache_size: int = 32
     enable_harmonizer: bool = False
     harmonizer_url: str = ""
     harmonizer_cache: str = ""
@@ -2840,6 +3463,7 @@ class PostProcessConfig:
         """Mirror `serve`'s post-processing wiring (`serve.py` service ctor + `set_harmonizer`) from the config."""
         return cls(
             egocar_hoods_dir=config.egocar_hood_dir,
+            egocar_hood_cache_size=config.egocar_hood_cache_size,
             enable_harmonizer=config.enable_harmonizer,
             harmonizer_url=config.harmonizer_url,
             harmonizer_cache=config.harmonizer_cache,
@@ -2890,6 +3514,7 @@ def _worker(
     scene_ack_q=None,
 ) -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True)  # `kill -USR1 <pid>` dumps worker stacks
+    fatal_worker_interceptor = FatalWorkerExceptionInterceptor()
     service = None  # bound below once built; the finally flushes its metrics on every exit path
     exit_code = 0  # nonzero on a fault the owner must observe as WORKER_EXIT (control-plane failure / crash)
     try:
@@ -2903,6 +3528,8 @@ def _worker(
                 f"worker {worker_id}: no multiprocessing parent-process death sentinel; refusing to start "
                 "without OS owner-liveness supervision"
             )
+
+        fatal_worker_interceptor = FatalWorkerExceptionInterceptor(diagnostics=collect_cuda_worker_diagnostics())
 
         # The bootstrap scene (scene_id) is OPTIONAL. When present, request its attach from the owner
         # and build the IPC-aliased worker backend BEFORE binding the port. When absent (a zero-scene
@@ -2931,21 +3558,36 @@ def _worker(
         # One render at a time per worker: requests serialize at the gRPC layer so a preloaded (aliased)
         # backend is reused serially. The cache holds the primary scene plus any runtime-attached scenes
         # , so a render resolves its scene by id without a cache-miss re-load.
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=1), options=_CHANNEL_OPTIONS)
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=_CHANNEL_OPTIONS,
+            interceptors=[fatal_worker_interceptor],
+        )
         service = SensorSimService(
             server,
             artifacts_glob=None,
             ray_chunk_size=config.ray_chunk_size,  # honor --ray-chunk-size (OOM avoidance)
-            # Egocar hood masks (insert_ego_mask) loaded into every worker, like serve.
+            # Egocar hood masks (insert_ego_mask) listed in every worker, like serve; images decode on first use.
             egocar_hoods_dir=config.post_process.egocar_hoods_dir if config.post_process is not None else None,
+            egocar_hood_cache_size=config.post_process.egocar_hood_cache_size
+            if config.post_process is not None
+            else 32,
             cache_size=max(1, config.scene_cache_size),
             metrics_output_dir=config.metrics_output_dir,  # per-worker dir; records render_time_ms
             enable_editing_actors=config.enable_editing_actors,
             server_config=None,
+            # Only coordinator detach may remove aliased backends. Local OOM cleanup
+            # must not leave the scene table/owner advertising an evicted cache entry.
+            allow_automatic_backend_eviction=False,
+            fatal_worker_interceptor=fatal_worker_interceptor,
+        )
+        fatal_worker_interceptor.configure_shutdown(
+            mark_unhealthy=lambda: service.backend_cache.wake_waiters(),
+            stop_server=lambda grace: server.stop(grace),
         )
         # Harmonizer output filter, wired exactly as serve does (no-op when disabled). Only the
         # stateless (non-temporal) harmonizer: --enable-harmonizer-temporal is refused at multiproc
-        # launch by validate_multiproc_harmonizer, so the temporal kwargs keep their disabled defaults.
+        # launch by validate_multiproc_features, so the temporal kwargs keep their disabled defaults.
         if config.post_process is not None:
             service.set_harmonizer(
                 config.post_process.enable_harmonizer,
@@ -2998,6 +3640,7 @@ def _worker(
                     _scene_backend_builder(config.renderer_name, config.tracks_timestamp_ray_stride),
                     scene_q,
                     scene_ack_q,
+                    fatal_worker_interceptor,
                 ),
                 daemon=True,
             )
@@ -3023,16 +3666,19 @@ def _worker(
         )
         # A control-plane failure is a fault: exit nonzero so the owner observes WORKER_EXIT. An owner-directed
         # stop and stopping because the owner is gone are clean exits (0).
+        fatal_worker_interceptor.exit_if_fatal()
         exit_code = reason.exit_code
         print(f"worker {worker_id}: {reason.value}; gRPC server stopped, exiting {exit_code}", flush=True)
     except _WorkerSupervisionUnavailableError as exc:
         # Clean, expected startup refusal (no traceback): the owner surfaces this as a startup failure.
         port_q.put(("error", worker_id, str(exc)))
         exit_code = 1
-    except BaseException:
+    except BaseException as exc:
+        fatal_worker_interceptor.handle_fatal_exception(exc, operation="worker_startup_or_control")
         port_q.put(("error", worker_id, traceback.format_exc()))
         exit_code = 1
     finally:
+        fatal_worker_interceptor.exit_if_fatal()
         # The worker owns the lifecycle receiver. Close it deterministically on every startup/serve exit path
         # rather than relying on process teardown/GC to release the descriptor.
         with contextlib.suppress(Exception):
@@ -3102,6 +3748,10 @@ class WorkerPool:
     # not be confirmed: closing them before the workers are reaped could cut a still-live handler's
     # forward. `shutdown()` runs them only after every worker is proven dead. Never run on a surviving worker.
     _deferred_closers: list = field(default_factory=list)
+    fatal_worker_interceptor: FatalWorkerExceptionInterceptor = field(default_factory=FatalWorkerExceptionInterceptor)
+    _fatal_owner_shutdown: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _fatal_owner_reap_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _fatal_owner_reap_complete: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
 
     @property
     def owner_renderable(self) -> Any:
@@ -3117,7 +3767,100 @@ class WorkerPool:
         channels must not be closed out from under a possibly-live handler."""
         self._deferred_closers.append(closer)
 
+    def mark_fatal_owner_shutdown(self) -> None:
+        """Make every concurrent/future teardown retain poisoned owner CUDA state."""
+
+        self._fatal_owner_shutdown.set()
+
+    def stop_and_reap_workers_for_fatal_owner(
+        self,
+        *,
+        graceful_timeout_s: float = _SHUTDOWN_GRACE_S + 1.0,
+        terminate_timeout_s: float = 1.0,
+        kill_timeout_s: float = 1.0,
+    ) -> None:
+        """Boundedly stop/reap workers without releasing poisoned owner CUDA state.
+
+        Used only after the owner observes a fault classified by ``is_fatal_worker_exception``. Workers must be dead before
+        ``os._exit`` invalidates the CUDA IPC storage they map, but the ordinary ``shutdown`` post-reap phase
+        is also unsafe because it releases CUDA-backed owner registries in the poisoned process. This path
+        therefore sends the normal listener/lifecycle stops, escalates to SIGTERM/SIGKILL under shared
+        fleet-wide deadlines, proves every worker dead, and intentionally leaves every owner reference and
+        endpoint untouched for the imminent hard exit.
+        """
+
+        self.mark_fatal_owner_shutdown()
+        with self._fatal_owner_reap_lock:
+            if self._fatal_owner_reap_complete.is_set():
+                return
+            failures: list[tuple[str, Exception]] = []
+            for index, channel in enumerate(self.scene_channels):
+                try:
+                    channel.stop()
+                except Exception as exc:
+                    failures.append((f"scene channel {index} stop", exc))
+            for index, lifecycle_tx in enumerate(self._lifecycle_txs):
+                if lifecycle_tx is None:
+                    continue
+                proc = self._procs[index] if index < len(self._procs) else None
+                if proc is not None and _proc_provably_dead(proc):
+                    continue
+                try:
+                    send_worker_stop(lifecycle_tx)
+                except Exception as exc:
+                    failures.append((f"worker {index} lifecycle stop send", exc))
+
+            def join_until(deadline: float, label: str) -> None:
+                for index, proc in enumerate(self._procs):
+                    try:
+                        if proc.is_alive():
+                            proc.join(timeout=max(0.0, deadline - time.monotonic()))
+                    except Exception as exc:
+                        failures.append((f"worker {index} {label}", exc))
+
+            join_until(time.monotonic() + graceful_timeout_s, "graceful join")
+            for index, proc in enumerate(self._procs):
+                try:
+                    if proc.is_alive():
+                        proc.terminate()
+                except Exception as exc:
+                    failures.append((f"worker {index} terminate", exc))
+            join_until(time.monotonic() + terminate_timeout_s, "terminate join")
+            for index, proc in enumerate(self._procs):
+                try:
+                    if proc.is_alive():
+                        proc.kill()
+                except Exception as exc:
+                    failures.append((f"worker {index} kill", exc))
+            join_until(time.monotonic() + kill_timeout_s, "kill join")
+
+            unconfirmed_workers: list[int] = []
+            for index, proc in enumerate(self._procs):
+                try:
+                    alive = proc.is_alive()
+                except Exception as exc:
+                    failures.append((f"worker {index} final liveness probe", exc))
+                    unconfirmed_workers.append(index)
+                else:
+                    if alive:
+                        unconfirmed_workers.append(index)
+            if unconfirmed_workers:
+                raise RuntimeError(
+                    f"fatal owner could not prove worker(s) {unconfirmed_workers} dead; failures={failures}; "
+                    "owner CUDA references remain retained"
+                )
+            self._fatal_owner_reap_complete.set()
+            if failures:
+                log.warning(
+                    "Fatal owner reaped every worker after recoverable stop/reap failures; failures=%s; "
+                    "retaining owner CUDA references until exit",
+                    failures,
+                )
+
     def shutdown(self) -> None:
+        if self.fatal_worker_interceptor.state.is_fatal or self._fatal_owner_shutdown.is_set():
+            self.stop_and_reap_workers_for_fatal_owner()
+            return
         pre_reap_failures: list[tuple[str, Exception]] = []
         # Stop the scene-attach listeners FIRST, while the workers are still alive to drain their stop
         # sentinels, and only THEN send the lifecycle STOP that ends each worker's serve loop. If STOP went
@@ -3173,6 +3916,11 @@ class WorkerPool:
                 f"failed to prove worker(s) {unconfirmed_workers} dead; pre-reap failures={pre_reap_failures}; "
                 "retaining scene owner references for safety"
             )
+        # A fatal owner error may have arrived while ordinary teardown was already reaping the workers. Do
+        # not cross into lifecycle/registry cleanup in that case: the poisoned CUDA owner must retain every
+        # CUDA-backed reference until os._exit.
+        if self.fatal_worker_interceptor.state.is_fatal or self._fatal_owner_shutdown.is_set():
+            return
         # Every worker is provably dead. Close lifecycle transmitters first, then release owner references and
         # queue endpoints, then close deferred proxy channels. All three phases aggregate failures and continue
         # independently so a broken close never skips another post-reap resource.
@@ -3322,6 +4070,7 @@ def _spawn_worker(
     artifact_path: "Path | None",
     spawn_config: WorkerSpawnConfig,
     registry: "ModelOwnerRegistry",
+    owner_fatal_worker_interceptor: FatalWorkerExceptionInterceptor | None = None,
     on_started: "Callable[[Any, Any], None] | None" = None,
 ) -> _WorkerHandle:
     """Create one worker's queues + lifecycle channel, start its process, and register its owner-side
@@ -3333,6 +4082,11 @@ def _spawn_worker(
     from the bring-up thread pool."""
     attach_req_q, attach_resp_q, port_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
     scene_q, scene_ack_q = ctx.Queue(), ctx.Queue()
+    if owner_fatal_worker_interceptor is not None:
+        _install_fatal_queue_error_handler(scene_q, owner_fatal_worker_interceptor, operation="owner_scene_send")
+        _install_fatal_queue_error_handler(
+            attach_resp_q, owner_fatal_worker_interceptor, operation="owner_bootstrap_send"
+        )
     # One-way owner->worker lifecycle channel: the owner keeps `lifecycle_tx` to send the neutral lifecycle
     # STOP at shutdown; the worker waits on `lifecycle_rx` alongside the owner's parent-death sentinel.
     lifecycle_rx, lifecycle_tx = ctx.Pipe(duplex=False)
@@ -3507,188 +4261,241 @@ def start_worker_pool(
     attach, the workers come up scene-less, and the first scene arrives on demand (via the
     `SceneCoordinator` / `x-nre-scene-url`), mirroring single-process `serve` starting with an empty
     ``artifact_glob``. `extra_scene_artifacts` (scene_id -> artifact path) are additional **owner-loadable**
-    scenes the proxy can attach on demand via the `SceneCoordinator`. `worker_scene_cache_size` budgets how
-    many scenes each worker's BackendCache holds resident (default = the pre-known set: bootstrap + extras,
-    or just extras with no bootstrap); raise it for on-demand download
-    so runtime-attached scenes don't LRU-evict each other. `max_scenes` caps the resident scene
-    count fleet-wide and enables coordinated LRU eviction; 0 = unlimited; the worker cache is
-    sized to at least `max_scenes` so the coordinator (not the worker LRU) is what evicts.
+    scenes the proxy can attach on demand via the `SceneCoordinator`. `worker_scene_cache_size` sets the
+    initial BackendCache capacity (default = the pre-known set: bootstrap + extras, or just extras with
+    no bootstrap). The worker table grows it as needed for runtime attaches. `max_scenes` caps resident
+    scenes fleet-wide and enables coordinated LRU eviction; 0 = unlimited. Automatic worker eviction is
+    disabled, so only the coordinator evicts scenes; capacity includes headroom for put/checkin.
 
     A fully path-registered glob fleet is **zero-pinned** (every scene evictable, serve-like)."""
     _require_supported_renderer(renderer_name)  # Gsplat-only pool; fail fast before spawning workers
     extra_scene_artifacts = dict(extra_scene_artifacts or {})
-    owner_scene_registry = OwnerSceneRegistry()
-    registry = owner_scene_registry.registry
-    # Path-driven pinning: register the bootstrap's path (re-loadable ⇒ evictable) and pin nothing.
-    # (A scene with no registered path stays resident.)
-    coordinator_scene_artifacts = dict(extra_scene_artifacts)
-    pinned_scene_ids: tuple[str, ...] = ()
-    # The bootstrap scene (glob's first match) is OPTIONAL. When present, the owner loads a full
-    # Backend (not just a RenderableModel); only
-    # its model weights are exported via IPC (workers alias those). The OwnerSceneRegistry wraps the IPC
-    # registry with per-scene first-load serialization for the extras. When absent (an empty glob), skip the
-    # eager load entirely: the pool comes up scene-less and the first scene loads/attaches on demand.
-    bootstrap_scene_id: "str | None" = None
-    if artifact_path is not None:
-        artifact = Artifact(artifact_path)
-        bootstrap_scene_id = artifact.scene_id
-        owner_backend = Backend.from_artifact(
-            artifact,
-            _renderer_type(renderer_name),
-            tracks_timestamp_ray_stride,
-            backend_cache_key=_pool_backend_cache_key(bootstrap_scene_id, artifact),
-        )
-        owner_scene_registry.ensure_loaded(bootstrap_scene_id, lambda: owner_backend)  # register the bootstrap
-        coordinator_scene_artifacts.setdefault(bootstrap_scene_id, str(artifact_path))
-    # The worker BackendCache must hold the bootstrap + every scene it may attach without LRU churn (an
-    # evicted runtime scene is unrecoverable: it is not in the worker's `artifacts`, so a cache-miss can't
-    # reload it). Pre-known scenes set the floor; `worker_scene_cache_size`/`max_scenes` raise it so the
-    # coordinator's bounded eviction — not the worker's own LRU — is what drops scenes.
-    #
-    # Size it strictly ABOVE the coordinator's resident cap (`max_scenes + 1`) when eviction is on: a
-    # coordinated attach does `_WorkerSceneTable.__setitem__` = `BackendCache.put` then `checkin`, and `put`
-    # runs the worker's count-LRU while the new backend is still in-use — so the worker momentarily holds
-    # `max_scenes + 1` backends. Without the +1 headroom the worker would evict one of its own spares (a
-    # scene the coordinator still treats as attached, and which a cache-miss cannot rebuild), making the
-    # worker a second, uncoordinated eviction authority. The +1 keeps the coordinator the sole authority over
-    # coordinator-managed scenes. (With eviction off — `max_scenes <= 0`, unbounded admission — no static
-    # size can hold the invariant; `_WorkerSceneTable.__setitem__` grows the cache capacity in step with the
-    # attach stream instead.)
-    worker_eviction_headroom = max_scenes + 1 if max_scenes > 0 else 0
-    # Pre-known scenes set the cache floor: the bootstrap (1, when present) + the extras. Drop the bootstrap
-    # reservation for a zero-scene start — there is no eager scene to hold resident.
-    bootstrap_reservation = 1 if bootstrap_scene_id is not None else 0
-    scene_cache_size = max(
-        bootstrap_reservation + len(extra_scene_artifacts), worker_scene_cache_size or 1, worker_eviction_headroom
-    )
-    if bootstrap_scene_id is not None:
-        progress(
-            f"owner: loaded scene {bootstrap_scene_id!r}; spawning {num_workers} worker(s)"
-            + (f" (+{len(extra_scene_artifacts)} on-demand scene(s))" if extra_scene_artifacts else "")
-        )
-    else:
-        progress(
-            f"owner: no bootstrap scene (zero-scene startup); spawning {num_workers} worker(s)"
-            + (f" ({len(extra_scene_artifacts)} on-demand scene(s) registered)" if extra_scene_artifacts else "")
-        )
-
-    # Bundle the static per-worker spawn knobs ONCE (identical fleet-wide; `_spawn_worker` specializes only the
-    # per-worker metrics dir). `scene_cache_size` is derived from the resolved scene set just above, so this is
-    # the natural single construction point for a complete, always-valid config threaded down to every worker.
-    spawn_config = WorkerSpawnConfig(
-        renderer_name=renderer_name,
-        enable_editing_actors=enable_editing_actors,
-        metrics_output_dir=metrics_output_dir,
-        ray_chunk_size=ray_chunk_size,
-        scene_cache_size=scene_cache_size,
-        post_process=post_process,
-        tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
-    )
-
-    ctx = mp.get_context("spawn")
-    # Pre-sized + index-addressed so concurrent bring-up tasks write their own slot without a lock and the
-    # results stay ordered by worker_id (deterministic round-robin) regardless of completion order. Entries
-    # stay None for workers that never spawned (e.g. a cancelled sibling); the rollback path skips those.
-    procs: list = [None] * num_workers
-    scene_channels: list = [None] * num_workers  # SceneAttachChannel per worker (runtime attach/detach)
-    worker_addresses: list = [None] * num_workers
-    # Owner write end of each worker's one-way lifecycle channel (the neutral STOP at shutdown). Index-addressed
-    # like `procs` (and written together with it by `_record_started`), so a concurrent bring-up task writes
-    # its own slot without a lock; a never-spawned slot stays None and the shutdown path skips it.
-    lifecycle_txs: list = [None] * num_workers
-
-    def _bring_up_one(worker_id: int, cancel_event: "threading.Event") -> None:
-        # A sibling already failed (cancel set): bail before spawning, so a cancelled pool doesn't leak a
-        # process that the rollback would then have to terminate.
-        if cancel_event.is_set():
-            raise _BringupCancelled(f"worker {worker_id}: cancelled before spawn")
-
-        def _record_started(proc: Any, lifecycle_tx: Any) -> None:
-            # Record the process AND its lifecycle endpoint together (same worker slot), the instant the
-            # process starts, so a partial-startup failure never retains a process without its endpoint.
-            procs[worker_id] = proc
-            lifecycle_txs[worker_id] = lifecycle_tx
-
-        handle = _spawn_worker(
-            worker_id,
-            ctx=ctx,
-            scene_id=bootstrap_scene_id,
-            artifact_path=artifact_path,
-            spawn_config=spawn_config,
-            registry=registry,
-            on_started=_record_started,
-        )
-        # proc + lifecycle endpoint were recorded together by `_record_started` before any failure point; the
-        # scene-attach channel only exists once `_spawn_worker` returns, so record it here for teardown before
-        # the handshake below can fail.
-        scene_channels[worker_id] = handle.channel
-        worker_addresses[worker_id] = _await_worker_ready(handle, registry, bootstrap_scene_id, cancel_event, progress)
-
+    owner_fatal_worker_interceptor = FatalWorkerExceptionInterceptor(diagnostics=collect_cuda_worker_diagnostics())
     try:
-        _bring_up_pool(num_workers, max_concurrent_bringup, _bring_up_one)
-    except BaseException as startup_error:
-        # Route partial startup through the SAME reap-before-release ownership gate as a running fleet. This
-        # attempts every worker, verifies final liveness, releases bootstrap attachments/queues only after all
-        # workers are dead, and retains the partial pool inside a typed fatal error if cleanup is incomplete.
-        # Keep `_procs` and `_lifecycle_txs` index-aligned: filter them TOGETHER on the process slot (both are
-        # set atomically by `_record_started`, so a spawned slot has both), so shutdown's per-worker liveness
-        # guard pairs each lifecycle endpoint with the right process.
-        spawned = [(proc, tx) for proc, tx in zip(procs, lifecycle_txs) if proc is not None]
-        partial_pool = WorkerPool(
+        owner_scene_registry = OwnerSceneRegistry(fatal_worker_interceptor=owner_fatal_worker_interceptor)
+        registry = owner_scene_registry.registry
+        # Path-driven pinning: register the bootstrap's path (re-loadable ⇒ evictable) and pin nothing.
+        # (A scene with no registered path stays resident.)
+        coordinator_scene_artifacts = dict(extra_scene_artifacts)
+        pinned_scene_ids: tuple[str, ...] = ()
+        # The bootstrap scene (glob's first match) is OPTIONAL. When present, the owner loads a full
+        # Backend (not just a RenderableModel); only
+        # its model weights are exported via IPC (workers alias those). The OwnerSceneRegistry wraps the IPC
+        # registry with per-scene first-load serialization for the extras. When absent (an empty glob), skip the
+        # eager load entirely: the pool comes up scene-less and the first scene loads/attaches on demand.
+        bootstrap_scene_id: "str | None" = None
+        if artifact_path is not None:
+            artifact = Artifact(artifact_path)
+            bootstrap_scene_id = artifact.scene_id
+            owner_scene_registry.ensure_loaded(
+                bootstrap_scene_id,
+                lambda: Backend.from_artifact(
+                    artifact,
+                    _renderer_type(renderer_name),
+                    tracks_timestamp_ray_stride,
+                    backend_cache_key=_pool_backend_cache_key(bootstrap_scene_id, artifact),
+                ),
+            )
+            coordinator_scene_artifacts.setdefault(bootstrap_scene_id, str(artifact_path))
+        # The worker BackendCache must hold the bootstrap + every scene it may attach without LRU churn (an
+        # evicted runtime scene is unrecoverable: it is not in the worker's `artifacts`, so a cache-miss can't
+        # reload it). Pre-known scenes set the floor; `worker_scene_cache_size`/`max_scenes` raise it so the
+        # coordinator's bounded eviction — not the worker's own LRU — is what drops scenes.
+        #
+        # Size it strictly ABOVE the coordinator's resident cap (`max_scenes + 1`) when eviction is on: a
+        # coordinated attach does `_WorkerSceneTable.__setitem__` = `BackendCache.put` then `checkin`, and `put`
+        # runs the worker's count-LRU while the new backend is still in-use — so the worker momentarily holds
+        # `max_scenes + 1` backends. Without the +1 headroom the worker would evict one of its own spares (a
+        # scene the coordinator still treats as attached, and which a cache-miss cannot rebuild), making the
+        # worker a second, uncoordinated eviction authority. The +1 keeps the coordinator the sole authority over
+        # coordinator-managed scenes. (With eviction off — `max_scenes <= 0`, unbounded admission — no static
+        # size can hold the invariant; `_WorkerSceneTable.__setitem__` grows the cache capacity in step with the
+        # attach stream instead.)
+        worker_eviction_headroom = max_scenes + 1 if max_scenes > 0 else 0
+        # Pre-known scenes set the cache floor: the bootstrap (1, when present) + the extras. Drop the bootstrap
+        # reservation for a zero-scene start — there is no eager scene to hold resident.
+        bootstrap_reservation = 1 if bootstrap_scene_id is not None else 0
+        scene_cache_size = max(
+            bootstrap_reservation + len(extra_scene_artifacts), worker_scene_cache_size or 1, worker_eviction_headroom
+        )
+        if bootstrap_scene_id is not None:
+            progress(
+                f"owner: loaded scene {bootstrap_scene_id!r}; spawning {num_workers} worker(s)"
+                + (f" (+{len(extra_scene_artifacts)} on-demand scene(s))" if extra_scene_artifacts else "")
+            )
+        else:
+            progress(
+                f"owner: no bootstrap scene (zero-scene startup); spawning {num_workers} worker(s)"
+                + (f" ({len(extra_scene_artifacts)} on-demand scene(s) registered)" if extra_scene_artifacts else "")
+            )
+
+        # Bundle the static per-worker spawn knobs ONCE (identical fleet-wide; `_spawn_worker` specializes only the
+        # per-worker metrics dir). `scene_cache_size` is derived from the resolved scene set just above, so this is
+        # the natural single construction point for a complete, always-valid config threaded down to every worker.
+        spawn_config = WorkerSpawnConfig(
+            renderer_name=renderer_name,
+            enable_editing_actors=enable_editing_actors,
+            metrics_output_dir=metrics_output_dir,
+            ray_chunk_size=ray_chunk_size,
+            scene_cache_size=scene_cache_size,
+            post_process=post_process,
+            tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
+        )
+
+        ctx = mp.get_context("spawn")
+        # Pre-sized + index-addressed so concurrent bring-up tasks write their own slot without a lock and the
+        # results stay ordered by worker_id (deterministic round-robin) regardless of completion order. Entries
+        # stay None for workers that never spawned (e.g. a cancelled sibling); the rollback path skips those.
+        procs: list = [None] * num_workers
+        scene_channels: list = [None] * num_workers  # SceneAttachChannel per worker (runtime attach/detach)
+        worker_addresses: list = [None] * num_workers
+        # Owner write end of each worker's one-way lifecycle channel (the neutral STOP at shutdown). Index-addressed
+        # like `procs` (and written together with it by `_record_started`), so a concurrent bring-up task writes
+        # its own slot without a lock; a never-spawned slot stays None and the shutdown path skips it.
+        lifecycle_txs: list = [None] * num_workers
+        startup_lock = threading.Lock()
+
+        def _reap_starting_workers(_grace: float) -> None:
+            # Spawn and publication hold the same lock. Once fatal state is latched, the snapshot cannot
+            # miss an already-started process and no later bring-up can start a new IPC consumer.
+            with startup_lock:
+                spawned = [(proc, tx) for proc, tx in zip(procs, lifecycle_txs) if proc is not None]
+                partial_pool = WorkerPool(
+                    scene_id=bootstrap_scene_id,
+                    worker_addresses=[],
+                    owner_backend=None,
+                    scene_channels=[channel for channel in scene_channels if channel is not None],
+                    _procs=[proc for proc, _tx in spawned],
+                    _registry=registry,
+                    _owner_scene_registry=owner_scene_registry,
+                    _lifecycle_txs=[tx for _proc, tx in spawned],
+                    fatal_worker_interceptor=owner_fatal_worker_interceptor,
+                )
+            partial_pool.stop_and_reap_workers_for_fatal_owner(
+                graceful_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+                terminate_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+                kill_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+            )
+
+        # Bootstrap responses can fail in their CUDA tensor feeder before the completed pool exists.
+        owner_fatal_worker_interceptor.configure_shutdown(
+            mark_unhealthy=lambda: None, stop_server=_reap_starting_workers
+        )
+
+        def _bring_up_one(worker_id: int, cancel_event: "threading.Event") -> None:
+            # A sibling already failed (cancel set): bail before spawning, so a cancelled pool doesn't leak a
+            # process that the rollback would then have to terminate.
+            if cancel_event.is_set() or owner_fatal_worker_interceptor.state.is_fatal:
+                raise _BringupCancelled(f"worker {worker_id}: cancelled before spawn")
+
+            def _record_started(proc: Any, lifecycle_tx: Any) -> None:
+                # Record the process AND its lifecycle endpoint together (same worker slot), the instant the
+                # process starts, so a partial-startup failure never retains a process without its endpoint.
+                procs[worker_id] = proc
+                lifecycle_txs[worker_id] = lifecycle_tx
+
+            with startup_lock:
+                if cancel_event.is_set() or owner_fatal_worker_interceptor.state.is_fatal:
+                    raise _BringupCancelled(f"worker {worker_id}: cancelled before spawn")
+                handle = _spawn_worker(
+                    worker_id,
+                    ctx=ctx,
+                    scene_id=bootstrap_scene_id,
+                    artifact_path=artifact_path,
+                    spawn_config=spawn_config,
+                    registry=registry,
+                    owner_fatal_worker_interceptor=owner_fatal_worker_interceptor,
+                    on_started=_record_started,
+                )
+                # Publish the channel under the spawn lock, before either startup reaping or the handshake.
+                scene_channels[worker_id] = handle.channel
+            worker_addresses[worker_id] = _await_worker_ready(
+                handle, registry, bootstrap_scene_id, cancel_event, progress
+            )
+
+        try:
+            _bring_up_pool(num_workers, max_concurrent_bringup, _bring_up_one)
+        except BaseException as startup_error:
+            # Route partial startup through the SAME reap-before-release ownership gate as a running fleet. This
+            # attempts every worker, verifies final liveness, releases bootstrap attachments/queues only after all
+            # workers are dead, and retains the partial pool inside a typed fatal error if cleanup is incomplete.
+            # Keep `_procs` and `_lifecycle_txs` index-aligned: filter them TOGETHER on the process slot (both are
+            # set atomically by `_record_started`, so a spawned slot has both), so shutdown's per-worker liveness
+            # guard pairs each lifecycle endpoint with the right process.
+            spawned = [(proc, tx) for proc, tx in zip(procs, lifecycle_txs) if proc is not None]
+            partial_pool = WorkerPool(
+                scene_id=bootstrap_scene_id,
+                worker_addresses=[],
+                owner_backend=None,
+                scene_channels=[channel for channel in scene_channels if channel is not None],
+                _procs=[proc for proc, _tx in spawned],
+                _registry=registry,
+                _owner_scene_registry=owner_scene_registry,
+                _lifecycle_txs=[tx for _proc, tx in spawned],
+                fatal_worker_interceptor=owner_fatal_worker_interceptor,
+            )
+            try:
+                partial_pool.shutdown()
+            except Exception as cleanup_error:
+                raise WorkerPoolStartupCleanupError(startup_error, cleanup_error, partial_pool) from startup_error
+            raise
+
+        # The coordinator first-loads + attaches an extra scene on ALL workers before the proxy routes to it;
+        # the bootstrap (when present) is seeded as already attached (it was attached at worker startup above) —
+        # a zero-scene start seeds an empty attached set and the first scene attaches on demand. Every glob
+        # scene, including the bootstrap, has a reloadable path and `pinned_scene_ids` is empty, so no scene is
+        # held resident.
+        def _load_owner_backend(sid: str, path: str) -> "Backend":
+            # Keyed by the coordinator's routing `sid` (not `artifact.scene_id`): an extra scene may be
+            # registered under a caller-chosen id, and that id is what the proxy and workers resolve by.
+            scene_artifact = Artifact(Path(path))
+            return Backend.from_artifact(
+                scene_artifact,
+                _renderer_type(renderer_name),
+                tracks_timestamp_ray_stride,
+                backend_cache_key=_pool_backend_cache_key(sid, scene_artifact),
+            )
+
+        coordinator = SceneCoordinator(
+            owner_scene_registry,
+            scene_channels,
+            coordinator_scene_artifacts,
+            _load_owner_backend,
+            attached_scenes=(bootstrap_scene_id,) if bootstrap_scene_id is not None else (),
+            max_scenes=max_scenes,  # Coordinated LRU eviction at this resident-scene cap (0 = off)
+            pinned=pinned_scene_ids,
+        )
+
+        pool = WorkerPool(
             scene_id=bootstrap_scene_id,
-            worker_addresses=[],
+            worker_addresses=worker_addresses,
+            # No persistent owner-Backend pin — the OwnerSceneRegistry holds each scene's owner object
+            # (loaded on demand, released on eviction), so the fleet is zero-pinned.
             owner_backend=None,
-            scene_channels=[channel for channel in scene_channels if channel is not None],
-            _procs=[proc for proc, _tx in spawned],
+            coordinator=coordinator,
+            scene_channels=scene_channels,
+            _procs=procs,
             _registry=registry,
             _owner_scene_registry=owner_scene_registry,
-            _lifecycle_txs=[tx for _proc, tx in spawned],
-        )
-        try:
-            partial_pool.shutdown()
-        except Exception as cleanup_error:
-            raise WorkerPoolStartupCleanupError(startup_error, cleanup_error, partial_pool) from startup_error
-        raise
-
-    # The coordinator first-loads + attaches an extra scene on ALL workers before the proxy routes to it;
-    # the bootstrap (when present) is seeded as already attached (it was attached at worker startup above) —
-    # a zero-scene start seeds an empty attached set and the first scene attaches on demand. Every glob
-    # scene, including the bootstrap, has a reloadable path and `pinned_scene_ids` is empty, so no scene is
-    # held resident.
-    def _load_owner_backend(sid: str, path: str) -> "Backend":
-        # Keyed by the coordinator's routing `sid` (not `artifact.scene_id`): an extra scene may be
-        # registered under a caller-chosen id, and that id is what the proxy and workers resolve by.
-        scene_artifact = Artifact(Path(path))
-        return Backend.from_artifact(
-            scene_artifact,
-            _renderer_type(renderer_name),
-            tracks_timestamp_ray_stride,
-            backend_cache_key=_pool_backend_cache_key(sid, scene_artifact),
+            _lifecycle_txs=lifecycle_txs,
+            fatal_worker_interceptor=owner_fatal_worker_interceptor,
         )
 
-    coordinator = SceneCoordinator(
-        owner_scene_registry,
-        scene_channels,
-        coordinator_scene_artifacts,
-        _load_owner_backend,
-        attached_scenes=(bootstrap_scene_id,) if bootstrap_scene_id is not None else (),
-        max_scenes=max_scenes,  # Coordinated LRU eviction at this resident-scene cap (0 = off)
-        pinned=pinned_scene_ids,
-    )
+        # Startup validation can load scenes before the public proxy exists. At
+        # that point live workers may already map owner IPC tensors: reap them on
+        # owner faults before exit, retaining poisoned CUDA references.
+        owner_fatal_worker_interceptor.configure_shutdown(
+            mark_unhealthy=pool.mark_fatal_owner_shutdown,
+            stop_server=lambda grace: pool.stop_and_reap_workers_for_fatal_owner(
+                graceful_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+                terminate_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+                kill_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+            ),
+        )
+        return pool
 
-    return WorkerPool(
-        scene_id=bootstrap_scene_id,
-        worker_addresses=worker_addresses,
-        # No persistent owner-Backend pin — the OwnerSceneRegistry holds each scene's owner object
-        # (loaded on demand, released on eviction), so the fleet is zero-pinned.
-        owner_backend=None,
-        coordinator=coordinator,
-        scene_channels=scene_channels,
-        _procs=procs,
-        _registry=registry,
-        _owner_scene_registry=owner_scene_registry,
-        _lifecycle_txs=lifecycle_txs,
-    )
+    finally:
+        owner_fatal_worker_interceptor.exit_if_fatal()
 
 
 class PoolTerminalReason(enum.Enum):
@@ -3940,6 +4747,30 @@ def _drain_and_close_proxy(
     return reason, proxy_closed
 
 
+def _stop_proxy_and_reap_workers_after_owner_fatal(
+    proxy_server: grpc.Server,
+    pool: WorkerPool,
+    grace_s: float,
+) -> None:
+    """Drain the public proxy, reap IPC consumers, and leave owner CUDA state untouched."""
+
+    timed_out = False
+    try:
+        stopped = proxy_server.stop(grace_s)
+        wait = getattr(stopped, "wait", None)
+        timed_out = callable(wait) and wait(timeout=grace_s + _FATAL_OWNER_PROXY_STOP_SLACK_S) is False
+    finally:
+        # Even a failed proxy stop must attempt to reap IPC consumers before
+        # the shutdown interceptor exits the owner without CUDA cleanup.
+        pool.stop_and_reap_workers_for_fatal_owner(
+            graceful_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+            terminate_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+            kill_timeout_s=_FATAL_OWNER_REAP_STAGE_TIMEOUT_S,
+        )
+    if timed_out:
+        log.error("Timed out waiting for the fatal CUDA owner's proxy server to stop")
+
+
 def serve_proxy(
     pool: WorkerPool,
     *,
@@ -3967,140 +4798,163 @@ def serve_proxy(
     """
     # Proxy-side metrics (e2e incl. the double-hop) — separate from the workers' render_time_ms.
     proxy_metrics: "ServerMetricsManager | None" = None
-    interceptors: list = []
-    # Request handling stays free of any worker-liveness work: no heartbeat/liveness interceptor is wired
-    # here. Worker lifetime is governed only by the parent-process sentinel and the explicit lifecycle
-    # channel, so request traffic is never part of the worker lifetime contract.
-    if metrics_output_dir:
-        proxy_metrics = ServerMetricsManager(os.path.join(metrics_output_dir, "proxy"))
-        metrics_interceptor = MetricsInterceptor()
-        metrics_interceptor.set_metrics_manager(proxy_metrics)
-        interceptors.append(metrics_interceptor)
-
-    # On-demand scene download/registration via x-nre-scene-url (mirror serve's interceptor). The
-    # registrar resolves the scene to an owner-loadable artifact path + registers it with the coordinator;
-    # the render's _scene_lease (SceneCoordinator.acquire) then drives the first-load + all-worker attach barrier.
-    if pool.coordinator is not None:
-        registrar = OnDemandSceneRegistrar(pool.coordinator, scene_cache=scene_cache, downloader=downloader)
-        interceptors.append(SceneDownloadInterceptor(registrar))
-
-    proxy_server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max(8, len(pool.worker_addresses) * 2)),
-        options=_CHANNEL_OPTIONS,
-        interceptors=interceptors,
-    )
-    proxy = RenderProxy.from_addresses(
-        pool.worker_addresses,
-        max_in_flight=max_in_flight,
-        admission_timeout_s=admission_timeout_s,
-        shutdown_event=shutdown_event,
-        server_config_map=server_config_map,
-        metrics_manager=proxy_metrics,
-        scene_coordinator=pool.coordinator,
-    )
-    # Fail-closed on scene detach/attach uncertainty: if the scene control plane degrades, tear the fleet
-    # down for a supervisor restart rather than serving an over-admitting fleet. Record the typed degradation
-    # reason (not a bare/requested stop) so the launch path exits NONZERO and the supervisor restarts the
-    # pod. First reason wins.
-    if pool.coordinator is not None:
-        pool.coordinator.set_degraded_callback(
-            lambda _reason: _signal_shutdown(shutdown_event, PoolTerminalReason.SCENE_POOL_DEGRADED)
-        )
-    add_SensorsimServiceServicer_to_server(proxy, proxy_server)
-
-    # gRPC health (parity with serve-grpc): same port by default, or a dedicated server.
-    health_servicer = health.HealthServicer()
-    health_server: "grpc.Server | None" = None
-    # Bind + start under a guard: a failed port bind (add_insecure_port -> 0) or start must fail startup
-    # NONZERO with NO partial resources left behind. Clean up the proxy channels, any started server,
-    # and the metrics manager, then re-raise so the launch path exits nonzero.
+    fatal_worker_interceptor = pool.fatal_worker_interceptor
     try:
-        if proxy_server.add_insecure_port(f"{host}:{port}") == 0:
-            raise RuntimeError(f"failed to bind proxy gRPC server on {host}:{port} (port in use or unavailable)")
-        if health_port is None or health_port == port:
-            health_pb2_grpc.add_HealthServicer_to_server(health_servicer, proxy_server)
-        else:
-            health_server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-            health_pb2_grpc.add_HealthServicer_to_server(health_servicer, health_server)
-            if health_server.add_insecure_port(f"{host}:{health_port}") == 0:
-                raise RuntimeError(
-                    f"failed to bind dedicated health gRPC server on {host}:{health_port} (port in use or unavailable)"
-                )
-            health_server.start()
-        _set_proxy_health_status(health_servicer, health_pb2.HealthCheckResponse.SERVING)
-        proxy_server.start()
-    except BaseException:
-        # Confirm (bounded) that any server that may have started has actually stopped BEFORE closing the proxy
-        # channels. A bind/start failure does not prove the server has no live handler: if stop is unconfirmed,
-        # retain both server and proxy through a deferred closer and release the channels only after fleet reap.
+        # Keep this outermost so owner-side CUDA errors wrapped by the scene coordinator are still classified
+        # from their exception chain before another interceptor translates the RPC result.
+        interceptors: list = [fatal_worker_interceptor]
+        # Request handling stays free of any worker-liveness work: no heartbeat/liveness interceptor is wired
+        # here. Worker lifetime is governed only by the parent-process sentinel and the explicit lifecycle
+        # channel, so request traffic is never part of the worker lifetime contract.
+        if metrics_output_dir:
+            proxy_metrics = ServerMetricsManager(os.path.join(metrics_output_dir, "proxy"))
+            metrics_interceptor = MetricsInterceptor()
+            metrics_interceptor.set_metrics_manager(proxy_metrics)
+            interceptors.append(metrics_interceptor)
+
+        # On-demand scene download/registration via x-nre-scene-url (mirror serve's interceptor). The
+        # registrar resolves the scene to an owner-loadable artifact path + registers it with the coordinator;
+        # the render's _scene_lease (SceneCoordinator.acquire) then drives the first-load + all-worker attach barrier.
+        if pool.coordinator is not None:
+            registrar = OnDemandSceneRegistrar(pool.coordinator, scene_cache=scene_cache, downloader=downloader)
+            interceptors.append(SceneDownloadInterceptor(registrar))
+
+        proxy_server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=max(8, len(pool.worker_addresses) * 2)),
+            options=_CHANNEL_OPTIONS,
+            interceptors=interceptors,
+        )
+        proxy = RenderProxy.from_addresses(
+            pool.worker_addresses,
+            max_in_flight=max_in_flight,
+            admission_timeout_s=admission_timeout_s,
+            shutdown_event=shutdown_event,
+            server_config_map=server_config_map,
+            metrics_manager=proxy_metrics,
+            scene_coordinator=pool.coordinator,
+        )
+        # Fail-closed on scene detach/attach uncertainty: if the scene control plane degrades, tear the fleet
+        # down for a supervisor restart rather than serving an over-admitting fleet. Record the typed degradation
+        # reason (not a bare/requested stop) so the launch path exits NONZERO and the supervisor restarts the
+        # pod. First reason wins.
+        if pool.coordinator is not None:
+            pool.coordinator.set_degraded_callback(
+                lambda _reason: _signal_shutdown(shutdown_event, PoolTerminalReason.SCENE_POOL_DEGRADED)
+            )
+        add_sensorsim_servicer_to_server(proxy, proxy_server)
+
+        # gRPC health (parity with serve-grpc): same port by default, or a dedicated server.
+        health_servicer = health.HealthServicer()
+        health_server: "grpc.Server | None" = None
+
+        def mark_fatal_owner_unhealthy() -> None:
+            # Publish the no-CUDA-cleanup mode before any worker can exit and wake the normal owner loop.
+            pool.mark_fatal_owner_shutdown()
+            _set_proxy_health_status(health_servicer, health_pb2.HealthCheckResponse.NOT_SERVING)
+
+        fatal_worker_interceptor.configure_shutdown(
+            # Do not signal the normal owner teardown path: it releases CUDA-backed owner state. The fatal thread
+            # stops the public server, reaps every CUDA-IPC consumer, then calls os._exit(1), deliberately skipping
+            # unsafe Python/CUDA cleanup of the poisoned owner context.
+            mark_unhealthy=mark_fatal_owner_unhealthy,
+            stop_server=lambda grace: _stop_proxy_and_reap_workers_after_owner_fatal(proxy_server, pool, grace),
+        )
+        # Bind + start under a guard: a failed port bind (add_insecure_port -> 0) or start must fail startup
+        # NONZERO with NO partial resources left behind. Clean up the proxy channels, any started server,
+        # and the metrics manager, then re-raise so the launch path exits nonzero.
         try:
-            _stop_server_bounded(
-                proxy_server,
-                grace=None,
-                timeout_s=5.0,
-                label="partial-startup proxy server",
+            if proxy_server.add_insecure_port(f"{host}:{port}") == 0:
+                raise RuntimeError(f"failed to bind proxy gRPC server on {host}:{port} (port in use or unavailable)")
+            if health_port is None or health_port == port:
+                health_pb2_grpc.add_HealthServicer_to_server(health_servicer, proxy_server)
+            else:
+                health_server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+                health_pb2_grpc.add_HealthServicer_to_server(health_servicer, health_server)
+                if health_server.add_insecure_port(f"{host}:{health_port}") == 0:
+                    raise RuntimeError(
+                        f"failed to bind dedicated health gRPC server on {host}:{health_port} (port in use or unavailable)"
+                    )
+                health_server.start()
+            fatal_worker_interceptor.state.publish_readiness(
+                lambda: _set_proxy_health_status(health_servicer, health_pb2.HealthCheckResponse.SERVING)
             )
-        except Exception as exc:
-            log.error(f"partial-startup proxy stop unconfirmed; deferring channel close until post-reap: {exc!r}")
-            pool.defer_close(
-                functools.partial(
-                    _close_proxy_after_reap,
-                    proxy_server,
-                    proxy,
-                    label="partial-startup proxy server",
-                )
-            )
-        else:
-            try:
-                proxy.close()  # confirmed stopped -> safe to close channels immediately
-            except Exception as exc:
-                log.error(f"partial-startup proxy close failed; deferring retry until post-reap: {exc!r}")
-                pool.defer_close(proxy.close)
-        if health_server is not None:
+            proxy_server.start()
+        except BaseException:
+            fatal_worker_interceptor.exit_if_fatal()
+            # Confirm (bounded) that any server that may have started has actually stopped BEFORE closing the proxy
+            # channels. A bind/start failure does not prove the server has no live handler: if stop is unconfirmed,
+            # retain both server and proxy through a deferred closer and release the channels only after fleet reap.
             try:
                 _stop_server_bounded(
-                    health_server,
+                    proxy_server,
                     grace=None,
                     timeout_s=5.0,
-                    label="partial-startup dedicated health server",
+                    label="partial-startup proxy server",
                 )
             except Exception as exc:
-                log.error(f"partial-startup health stop unconfirmed; deferring retry until post-reap: {exc!r}")
+                log.error(f"partial-startup proxy stop unconfirmed; deferring channel close until post-reap: {exc!r}")
                 pool.defer_close(
                     functools.partial(
-                        _stop_health_after_reap,
-                        health_server,
-                        label="partial-startup dedicated health server",
+                        _close_proxy_after_reap,
+                        proxy_server,
+                        proxy,
+                        label="partial-startup proxy server",
                     )
                 )
+            else:
+                try:
+                    proxy.close()  # confirmed stopped -> safe to close channels immediately
+                except Exception as exc:
+                    log.error(f"partial-startup proxy close failed; deferring retry until post-reap: {exc!r}")
+                    pool.defer_close(proxy.close)
+            if health_server is not None:
+                try:
+                    _stop_server_bounded(
+                        health_server,
+                        grace=None,
+                        timeout_s=5.0,
+                        label="partial-startup dedicated health server",
+                    )
+                except Exception as exc:
+                    log.error(f"partial-startup health stop unconfirmed; deferring retry until post-reap: {exc!r}")
+                    pool.defer_close(
+                        functools.partial(
+                            _stop_health_after_reap,
+                            health_server,
+                            label="partial-startup dedicated health server",
+                        )
+                    )
+            if proxy_metrics is not None:
+                with contextlib.suppress(Exception):
+                    proxy_metrics.shutdown()  # flush metrics on every partial-startup failure
+            raise
+
+        health_note = "" if (health_port is None or health_port == port) else f" + health on {health_port}"
+        progress(f"Serving on {host}:{port} (proxy over {len(pool.worker_addresses)} worker(s)){health_note}")
+
+        # Keep the owner alive (workers map its weights); exit on a worker death or a shut_down RPC. The pool
+        # tears down whole on any worker exit (see `_await_pool_shutdown`'s operational contract).
+        reason = _await_pool_shutdown(pool, shutdown_event)
+        fatal_worker_interceptor.exit_if_fatal()
+        progress(f"{reason.value}; shutting down")
+        # Stop advertising every name registered above before the grace drain. Updating only the aggregate empty
+        # name leaves clients that probe the concrete service routing to a degraded/draining fleet.
+        _set_proxy_health_status(health_servicer, health_pb2.HealthCheckResponse.NOT_SERVING)
+        # Deterministic drain: confirm the proxy stopped before closing worker channels; escalate to
+        # a nonzero control-plane reason (retaining channels) if it cannot be confirmed.
+        reason, _ = _drain_and_close_proxy(
+            proxy_server,
+            proxy,
+            health_server,
+            reason,
+            progress=progress,
+            defer_close=pool.defer_close,
+        )
         if proxy_metrics is not None:
-            with contextlib.suppress(Exception):
-                proxy_metrics.shutdown()  # flush metrics on every partial-startup failure
-        raise
-
-    health_note = "" if (health_port is None or health_port == port) else f" + health on {health_port}"
-    progress(f"Serving on {host}:{port} (proxy over {len(pool.worker_addresses)} worker(s)){health_note}")
-
-    # Keep the owner alive (workers map its weights); exit on a worker death or a shut_down RPC. The pool
-    # tears down whole on any worker exit (see `_await_pool_shutdown`'s operational contract).
-    reason = _await_pool_shutdown(pool, shutdown_event)
-    progress(f"{reason.value}; shutting down")
-    # Stop advertising every name registered above before the grace drain. Updating only the aggregate empty
-    # name leaves clients that probe the concrete service routing to a degraded/draining fleet.
-    _set_proxy_health_status(health_servicer, health_pb2.HealthCheckResponse.NOT_SERVING)
-    # Deterministic drain: confirm the proxy stopped before closing worker channels; escalate to
-    # a nonzero control-plane reason (retaining channels) if it cannot be confirmed.
-    reason, _ = _drain_and_close_proxy(
-        proxy_server,
-        proxy,
-        health_server,
-        reason,
-        progress=progress,
-        defer_close=pool.defer_close,
-    )
-    if proxy_metrics is not None:
-        proxy_metrics.shutdown()  # flush proxy metrics.yaml
-    return reason
+            proxy_metrics.shutdown()  # flush proxy metrics.yaml
+        return reason
+    finally:
+        fatal_worker_interceptor.exit_if_fatal()
 
 
 def _plan_glob_scenes(
@@ -4198,6 +5052,7 @@ def _multiproc_server_config_map(
     config_map.update(
         {
             "serving.mode": "multiprocess",
+            "scene_prefetch.enabled": "False",
             "multiproc.workers": str(num_workers),
             "multiproc.renderer": renderer_name,  # effective (default -> gsplat)
             "multiproc.mps_active": _b(mps_is_active),
@@ -4247,9 +5102,9 @@ def run_drop_in(
     )
     if admission_error is not None:
         raise ValueError(admission_error)
-    harmonizer_error = validate_multiproc_harmonizer(grpc_config)
-    if harmonizer_error is not None:
-        raise ValueError(harmonizer_error)
+    feature_error = validate_multiproc_features(grpc_config)
+    if feature_error is not None:
+        raise ValueError(feature_error)
     # A glob may match N artifacts; the first is the eager bootstrap, the rest are registered as
     # owner-loadable scenes served lazily by scene_id (no header), like serve. An empty/absent glob is a
     # valid zero-startup-scene launch: bootstrap_path is None and the pool comes up scene-less.
@@ -4297,9 +5152,8 @@ def run_drop_in(
         enable_editing_actors=grpc_config.enable_editing_actors,
         # Register every other glob scene as owner-loadable (served lazily by scene_id).
         extra_scene_artifacts=extra_scene_artifacts,
-        # Cap resident scenes at cache_size (drop-in parity with serve's BackendCache LRU) and
-        # size each worker's cache to match, so the coordinator's coordinated eviction — not the worker LRU
-        # — bounds memory; idle LRU scenes are evicted (workers detach, owner releases) above the cap.
+        # Cap resident scenes at cache_size and set initial worker capacity. Automatic worker eviction is
+        # disabled; the coordinator retires idle LRU scenes (workers detach, owner releases) above the cap.
         worker_scene_cache_size=grpc_config.cache_size,
         max_scenes=grpc_config.cache_size,
         # Egocar hood masks + Harmonizer/Difix, wired into every worker exactly as serve.
@@ -4314,79 +5168,85 @@ def run_drop_in(
         tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
         progress=print,
     )
-    # Wire the on-disk download cache's eviction to the coordinator so evicting a remote scene's cached file
-    # invalidates its reload mapping: an ID-only request for it then returns NOT_FOUND (never UNKNOWN
-    # from a vanished file). Local file:// scenes are permanent registrations and are unaffected.
-    coordinator = getattr(pool, "coordinator", None)
-    if coordinator is not None:
-        scene_cache.set_on_evict(coordinator.handle_cache_eviction)
-
-    # Honor test_scenes_are_valid in multiprocess mode: before the proxy becomes SERVING, sequentially
-    # load + attach every lazily-registered startup glob scene through the real owner/coordinator/all-worker
-    # barrier. Any failure tears the partial fleet down and exits startup nonzero (no partially validated
-    # proxy serves). The eager bootstrap (if any) is already loaded + attached on every worker by
-    # start_worker_pool, so it is validated by that eager startup and is not re-driven here; this list is the
-    # on-demand extras only (an empty glob -> [] -> a clean zero-scene no-op). On-demand
-    # (x-nre-scene-url) scenes validate on their first scene-using RPC.
-    startup_scene_ids = list(extra_scene_artifacts)
-    validated_startup_scenes = 0
-    if grpc_config.test_scenes_are_valid:
-        try:
-            validated_startup_scenes = _validate_startup_scenes(coordinator, startup_scene_ids, progress=print)
-        except BaseException as exc:
-            print(f"multiproc: startup scene validation failed ({exc!r}); tearing down the fleet")
-            pool.shutdown()
-            raise
-
-    # Effective config + runtime status surfaced via get_server_config.
-    config_map = _multiproc_server_config_map(
-        grpc_config,
-        num_workers=num_workers,
-        renderer_name=renderer_name,
-        max_concurrent_bringup=max_concurrent_bringup,
-        max_in_flight=max_in_flight,
-        admission_timeout_s=admission_timeout_s,
-        startup_scenes=len(startup_scene_ids),
-        validated_startup_scenes=validated_startup_scenes,
-        download_cache_size=download_cache_size,
-        tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
-    )
-    shutdown = PoolShutdown()
-    # Default to a clean (requested) stop so a KeyboardInterrupt before serve_proxy returns exits 0.
-    reason = PoolTerminalReason.REQUESTED
     try:
-        reason = serve_proxy(
-            pool,
-            host=grpc_config.host or "localhost",
-            port=grpc_config.port,
-            shutdown_event=shutdown,
-            health_port=grpc_config.health_port,
-            # Admission (bounds active downstream renders), threaded without
-            # renaming from serve-grpc → run_drop_in → serve_proxy → RenderProxy.
+        # Wire the on-disk download cache's eviction to the coordinator so evicting a remote scene's cached file
+        # invalidates its reload mapping: an ID-only request for it then returns NOT_FOUND (never UNKNOWN
+        # from a vanished file). Local file:// scenes are permanent registrations and are unaffected.
+        coordinator = getattr(pool, "coordinator", None)
+        if coordinator is not None:
+            scene_cache.set_on_evict(coordinator.handle_cache_eviction)
+
+        # Honor test_scenes_are_valid in multiprocess mode: before the proxy becomes SERVING, sequentially
+        # load + attach every lazily-registered startup glob scene through the real owner/coordinator/all-worker
+        # barrier. Any failure tears the partial fleet down and exits startup nonzero (no partially validated
+        # proxy serves). The eager bootstrap (if any) is already loaded + attached on every worker by
+        # start_worker_pool, so it is validated by that eager startup and is not re-driven here; this list is the
+        # on-demand extras only (an empty glob -> [] -> a clean zero-scene no-op). On-demand
+        # (x-nre-scene-url) scenes validate on their first scene-using RPC.
+        startup_scene_ids = list(extra_scene_artifacts)
+        validated_startup_scenes = 0
+        if grpc_config.test_scenes_are_valid:
+            try:
+                validated_startup_scenes = _validate_startup_scenes(coordinator, startup_scene_ids, progress=print)
+            except BaseException as exc:
+                pool.fatal_worker_interceptor.handle_fatal_exception(exc, operation="startup_scene_validation")
+                pool.fatal_worker_interceptor.exit_if_fatal()
+                print(f"multiproc: startup scene validation failed ({exc!r}); tearing down the fleet")
+                pool.shutdown()
+                raise
+
+        # Effective config + runtime status surfaced via get_server_config.
+        config_map = _multiproc_server_config_map(
+            grpc_config,
+            num_workers=num_workers,
+            renderer_name=renderer_name,
+            max_concurrent_bringup=max_concurrent_bringup,
             max_in_flight=max_in_flight,
             admission_timeout_s=admission_timeout_s,
-            server_config_map=config_map,
-            metrics_output_dir=metrics_dir,
-            scene_cache=scene_cache,  # Remote x-nre-scene-url downloads
-            downloader=downloader,
-            progress=print,
+            startup_scenes=len(startup_scene_ids),
+            validated_startup_scenes=validated_startup_scenes,
+            download_cache_size=download_cache_size,
+            tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
         )
-    except KeyboardInterrupt:
-        print("interrupted; shutting down")  # compatibility: exit 0, but this bypasses the normal proxy drain
+        shutdown = PoolShutdown()
+        # Default to a clean (requested) stop so a KeyboardInterrupt before serve_proxy returns exits 0.
+        reason = PoolTerminalReason.REQUESTED
+        try:
+            reason = serve_proxy(
+                pool,
+                host=grpc_config.host or "localhost",
+                port=grpc_config.port,
+                shutdown_event=shutdown,
+                health_port=grpc_config.health_port,
+                # Admission (bounds active downstream renders), threaded without
+                # renaming from serve-grpc → run_drop_in → serve_proxy → RenderProxy.
+                max_in_flight=max_in_flight,
+                admission_timeout_s=admission_timeout_s,
+                server_config_map=config_map,
+                metrics_output_dir=metrics_dir,
+                scene_cache=scene_cache,  # Remote x-nre-scene-url downloads
+                downloader=downloader,
+                progress=print,
+            )
+        except KeyboardInterrupt:
+            print("interrupted; shutting down")  # compatibility: exit 0, but this bypasses the normal proxy drain
+        finally:
+            pool.fatal_worker_interceptor.exit_if_fatal()
+            pool.shutdown()
+            # Pool the workers' render_time_ms + the proxy's e2e into one metrics.yaml the bench reads.
+            if metrics_dir:
+                sources = [_worker_metrics_dir(metrics_dir, i) for i in range(num_workers)] + [
+                    os.path.join(metrics_dir, "proxy")
+                ]
+                if merge_metrics_yaml(metrics_dir, sources):
+                    print(f"merged worker+proxy metrics -> {os.path.join(metrics_dir, 'metrics.yaml')}")
+        # Map the typed terminal reason to an exit code: worker death / scene-pool degradation is nonzero so a
+        # supervisor restarts the pod; a requested shutdown is zero.
+        if not reason.is_clean:
+            print(f"multiproc: exiting nonzero ({reason.value}) so the supervisor restarts the fleet")
+        return reason.exit_code
     finally:
-        pool.shutdown()
-        # Pool the workers' render_time_ms + the proxy's e2e into one metrics.yaml the bench reads.
-        if metrics_dir:
-            sources = [_worker_metrics_dir(metrics_dir, i) for i in range(num_workers)] + [
-                os.path.join(metrics_dir, "proxy")
-            ]
-            if merge_metrics_yaml(metrics_dir, sources):
-                print(f"merged worker+proxy metrics -> {os.path.join(metrics_dir, 'metrics.yaml')}")
-    # Map the typed terminal reason to an exit code: worker death / scene-pool degradation is nonzero so a
-    # supervisor restarts the pod; a requested shutdown is zero.
-    if not reason.is_clean:
-        print(f"multiproc: exiting nonzero ({reason.value}) so the supervisor restarts the fleet")
-    return reason.exit_code
+        pool.fatal_worker_interceptor.exit_if_fatal()
 
 
 def main() -> int:
@@ -4482,6 +5342,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("interrupted; shutting down")  # compatibility: exit 0, but this bypasses the normal proxy drain
     finally:
+        pool.fatal_worker_interceptor.exit_if_fatal()
         pool.shutdown()
     # Nonzero exit on worker death / scene-pool degradation so a supervisor restarts the fleet.
     if not reason.is_clean:

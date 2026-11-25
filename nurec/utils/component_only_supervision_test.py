@@ -124,7 +124,7 @@ class TestComponentCameraSupervisionMask(TestCase):
 
 def _probe_bundle(sampled_pixels: Any = None) -> tuple[SupervisedCameraSamplers, Any, Any]:
     if sampled_pixels is None:
-        sampled_pixels = RectSubsampled(
+        sampled_pixels = RectSubsampled.from_subsample(
             i=0,
             j=0,
             height=1,

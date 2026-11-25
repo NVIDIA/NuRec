@@ -30,9 +30,10 @@ py_library(
     name = "pylib",
     srcs = [
         "__init__.py",
+        "accumulator_module.py",
         "base_losses.py",
+        "fused_loss_inputs.py",
         "loss_fns.py",
-        "losses_module.py",
         "primitive_losses.py",
         "registry.py",
         "render_losses.py",
@@ -47,6 +48,7 @@ py_library(
         "//nurec/libs/losses/functional:pylib",
         "//nurec/libs/losses/models/lambda_schedulers:pylib",
         "//nurec/libs/losses/models/reduce_functions:pylib",
+        "//nurec/libs/losses/orchestration:pylib_config",
         "//nurec/libs/slang_gaussians:pylib",
         "//nurec/models:pylib",
         "//nurec/models/base:pylib",
@@ -63,6 +65,9 @@ py_library(
 py_library(
     name = "utils_only",
     srcs = ["utils.py"],
+    visibility = [
+        "//:core_package_group",
+    ],
     deps = [
         "//nurec/instant_nurec/models:pylib",
         "//nurec/libs/losses/functional:pylib",
@@ -74,7 +79,7 @@ py_library(
 )
 
 # ``loss_fns`` + ``registry`` without ``__init__.py`` so tests can import ``loss_fns.ssim``
-# without pulling ``ModuleLosses`` and its heavy model/rendering deps.
+# without pulling the package's model/rendering dependencies.
 py_library(
     name = "loss_fns_only",
     testonly = True,
@@ -125,6 +130,7 @@ pytest_test(
     srcs = ["render_losses_test.py"],
     deps = [
         ":pylib",
+        "//nurec/libs/losses/orchestration:pylib",
         pip_requirement("omegaconf"),
     ],
 )
@@ -142,13 +148,29 @@ pytest_test(
 
 pytest_test(
     name = "losses_module_test",
-    size = "large",
     srcs = ["losses_module_test.py"],
     deps = [
         ":pylib",
         "//nurec/config:pylib",
         "//nurec/libs/losses/orchestration:pylib",
-        pip_requirement("numpy"),
-        pip_requirement("omegaconf"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "losses_module_accumulator_test",
+    srcs = ["losses_module_accumulator_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "accumulator_module_test",
+    srcs = ["accumulator_module_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/libs/losses/orchestration:pylib",
     ],
 )

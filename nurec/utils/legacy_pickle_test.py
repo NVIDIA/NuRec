@@ -93,6 +93,13 @@ class TorchLoadRemapTest(unittest.TestCase):
         with self.assertRaises(pickle.UnpicklingError):
             torch.load(self.tmp.name, weights_only=True)
 
+    def test_default_load_rejects_pickled_objects(self) -> None:
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
+            os.environ.pop("TORCH_FORCE_WEIGHTS_ONLY_LOAD", None)
+            with self.assertRaises(pickle.UnpicklingError):
+                torch.load(self.tmp.name)
+
     def test_forced_weights_only_env_is_untouched(self) -> None:
         with mock.patch.dict(os.environ, {"TORCH_FORCE_WEIGHTS_ONLY_LOAD": "1"}, clear=False):
             os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)

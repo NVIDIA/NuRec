@@ -46,7 +46,7 @@ diff --git a/python/private/stage1_bootstrap_template.sh b/python/private/stage1
 index 4374ff9..1a05052 100644
 --- a/python/private/stage1_bootstrap_template.sh
 +++ b/python/private/stage1_bootstrap_template.sh
-@@ -133,6 +133,123 @@ if [[ -n "$RULES_PYTHON_TESTING_TELL_RUNFILES_ROOT" ]]; then
+@@ -133,6 +133,125 @@ if [[ -n "$RULES_PYTHON_TESTING_TELL_RUNFILES_ROOT" ]]; then
    export RULES_PYTHON_TESTING_RUNFILES_ROOT="$RUNFILES_DIR"
  fi
  
@@ -85,6 +85,8 @@ index 4374ff9..1a05052 100644
 +    export TRITON_OVERRIDE_ARCH="${TRITON_OVERRIDE_ARCH:-sm100}"
 +    export TRITON_OVERRIDE_SM_ARCH="${TRITON_OVERRIDE_SM_ARCH:-sm_100}"
 +    export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS="${TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS:-ATEN}"
++    # The pinned cuDNN builds no SDPA execution plan here; let torch pick flash or memory-efficient attention.
++    export TORCH_CUDNN_SDPA_DEPRIORITIZED="${TORCH_CUDNN_SDPA_DEPRIORITIZED:-1}"
 +  fi
 +  unset _compute_cap _sm_cap
 +fi
@@ -302,3 +304,181 @@ index f445ad2..bc297cb 100644
      print_verbose("runfiles root:", runfiles_root)
  
      runfiles_envkey, runfiles_envvalue = runfiles_envvar(runfiles_root)
+diff --git a/python/private/venv_runfiles.bzl b/python/private/venv_runfiles.bzl
+--- a/python/private/venv_runfiles.bzl
++++ b/python/private/venv_runfiles.bzl
+@@ -1,6 +1,7 @@
+ """Code for constructing venvs."""
+ 
+ load("@bazel_skylib//lib:paths.bzl", "paths")
++load(":attributes.bzl", "PycCollectionAttr")
+ load(
+     ":common.bzl",
+     "ExplicitSymlink",
+@@ -57,7 +58,7 @@
+         ],
+     ).to_list()
+ 
+-    link_map = build_link_map(ctx, entries)
++    link_map = build_link_map(ctx, entries, pyc_index = _index_pyc_files(ctx, deps))
+     venv_files = []
+     runfiles_symlinks = {}
+     explicit_symlinks = []
+@@ -126,7 +127,7 @@
+     )
+ 
+ # Visible for testing
+-def build_link_map(ctx, entries, return_conflicts = False):
++def build_link_map(ctx, entries, return_conflicts = False, pyc_index = {}):
+     """Compute the mapping of venv paths to their backing objects.
+ 
+     Args:
+@@ -136,6 +137,9 @@
+         return_conflicts: {type}`bool`. Only present for testing. If True,
+             also return a list of the groups that had overlapping paths and had
+             to be resolved and merged.
++        pyc_index: {type}`dict[str, list[File]]` pyc files to expose next to
++            the `.py` files that are linked individually, see
++            `_index_pyc_files` (NuRec patch).
+ 
+     Returns:
+         {type}`dict[str, dict[str, str|File]]` Mappings of venv paths to their
+@@ -170,6 +174,9 @@
+         # dict[str kind-relative path, str|File link_to]
+         keep_kind_link_map = {}
+ 
++        # NuRec patch: the `.py` files linked individually, see `_collect_py_source`.
++        py_sources = {}
++
+         groups = _group_venv_path_entries(entries)
+ 
+         for group in groups:
+@@ -180,13 +187,15 @@
+                     keep_kind_link_map[entry.venv_path] = entry.link_to_file
+                 else:
+                     keep_kind_link_map[entry.venv_path] = entry.link_to_path
++                _collect_py_source(py_sources, entry.venv_path, entry.link_to_path)
+             else:
+                 if return_conflicts:
+                     conflicts.append(group)
+ 
+                 # Merge a group of overlapping prefixes
+-                _merge_venv_path_group(ctx, group, keep_kind_link_map)
++                _merge_venv_path_group(ctx, group, keep_kind_link_map, py_sources)
+ 
++        _link_pyc_files(keep_kind_link_map, py_sources, pyc_index)
+         keep_link_map[kind] = keep_kind_link_map
+     if return_conflicts:
+         return keep_link_map, conflicts
+@@ -228,7 +237,85 @@
+ 
+     return groups
+ 
+-def _merge_venv_path_group(ctx, group, keep_map):
++def _index_pyc_files(ctx, deps):
++    """Maps each `__pycache__` directory of `deps` (runfiles-root path) to its pyc files.
++
++    NuRec patch. Covers the pyc files the binary's runfiles carry, selected the
++    way `py_executable.bzl` selects them: the required ones always, the implicit
++    ones only when the binary collects pyc files.
++
++    Args:
++        ctx: {type}`ctx` current ctx.
++        deps: {type}`list[Target]` the binary's dependencies.
++
++    Returns:
++        {type}`dict[str, list[File]]` the index.
++    """
++    infos = [dep[PyInfo] for dep in deps if PyInfo in dep]
++    transitive = [info.transitive_pyc_files for info in infos]
++    if PycCollectionAttr.is_pyc_collection_enabled(ctx):
++        transitive.extend([info.transitive_implicit_pyc_files for info in infos])
++    index = {}
++    for pyc in depset(transitive = transitive).to_list():
++        pycache_dir = paths.dirname(runfiles_root_path(ctx, pyc.short_path))
++        if paths.basename(pycache_dir) == "__pycache__":
++            index.setdefault(pycache_dir, []).append(pyc)
++    return index
++
++def _collect_py_source(py_sources, venv_path, rf_root_path):
++    """Records a `.py` file that the venv links individually.
++
++    NuRec patch. Files that are not `.py` files are ignored.
++
++    Args:
++        py_sources: {type}`dict[str, dict[str, list[str]]]` the module names of
++            the `.py` files linked into each venv directory, keyed by venv
++            directory, then by the runfiles directory the files come from.
++        venv_path: {type}`str` venv path of the linked file.
++        rf_root_path: {type}`str` runfiles-root path of the linked file.
++    """
++    if not venv_path.endswith(".py"):
++        return
++    module = paths.basename(venv_path)[:-len(".py")]
++    providers = py_sources.setdefault(paths.dirname(venv_path), {})
++    providers.setdefault(paths.dirname(rf_root_path), []).append(module)
++
++def _link_pyc_files(keep_map, py_sources, pyc_index):
++    """Exposes the pyc files of the `.py` files that the venv links individually.
++
++    NuRec patch. A package that cannot be linked as one directory (e.g. because
++    it contains shared libraries) gets its files linked one by one into a real
++    venv directory. Python looks for bytecode in `__pycache__` next to the `.py`
++    it imports, i.e. inside that venv directory. When every `.py` of a venv
++    directory comes from the same runfiles directory, the `__pycache__` next to
++    them is linked there, as one directory link. When they come from several
++    (merged prefix groups, and the site-packages root where every wheel's
++    top-level modules land), a wheel's `__pycache__` may hold bytecode for a
++    module name whose `.py` was selected from another wheel, and Python would
++    run that bytecode: each selected `.py` gets the pyc files of its own
++    `__pycache__` linked one by one instead. Existing entries of `keep_map` win.
++    A directory link needs nothing: it exposes the runfiles `__pycache__` as is.
++
++    Args:
++        keep_map: {type}`dict[str, str|File]` the venv links to add to.
++        py_sources: {type}`dict[str, dict[str, list[str]]]` see `_collect_py_source`.
++        pyc_index: {type}`dict[str, list[File]]` see `_index_pyc_files`.
++    """
++    for venv_dir, providers in py_sources.items():
++        venv_pycache_dir = paths.join(venv_dir, "__pycache__")
++        if len(providers) == 1:
++            rf_pycache_dir = paths.join(providers.keys()[0], "__pycache__")
++            if pyc_index.get(rf_pycache_dir):
++                keep_map.setdefault(venv_pycache_dir, rf_pycache_dir)
++            continue
++        for rf_dir, modules in providers.items():
++            pyc_files = pyc_index.get(paths.join(rf_dir, "__pycache__"), [])
++            for module in modules:
++                for pyc in pyc_files:
++                    if pyc.basename.startswith(module + "."):
++                        keep_map.setdefault(paths.join(venv_pycache_dir, pyc.basename), pyc)
++
++def _merge_venv_path_group(ctx, group, keep_map, py_sources):
+     """Merges a group of overlapping prefixes.
+ 
+     Args:
+@@ -237,6 +324,8 @@
+             `venv_path` prefixes, ordered from shortest to longest path.
+         keep_map: {type}`dict[str, str|File]` files kept after merging are
+             populated into this map.
++        py_sources: {type}`dict[str, dict[str, list[str]]]` the `.py` files kept
++            are recorded into this map, see `_collect_py_source` (NuRec patch).
+     """
+ 
+     # TODO: Compute the minimum number of entries to create. This can't avoid
+@@ -257,6 +346,7 @@
+                 # For lack of a better option, first added wins.
+                 if entry.venv_path not in keep_map:
+                     keep_map[entry.venv_path] = file
++                    _collect_py_source(py_sources, entry.venv_path, rf_root_path)
+ 
+                 # Skip anything remaining: anything left is either
+                 # the same path (first set wins), a suffix (violates
+@@ -281,6 +371,7 @@
+                 # For lack of a better option, first added wins.
+                 if venv_path not in keep_map:
+                     keep_map[venv_path] = file
++                    _collect_py_source(py_sources, venv_path, rf_root_path)
+ 
+ def _get_file_venv_path(ctx, f, site_packages_root):
+     """Computes a file's venv_path if it's under the site_packages_root.

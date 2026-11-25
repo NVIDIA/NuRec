@@ -180,17 +180,16 @@ The command will:
 
 ## `export-gaussian-usd-asset`
 
-This command exports Gaussian splatting model checkpoints to USD format. It supports three USD schema types:
+This command exports Gaussian splatting model checkpoints to USD format. It supports two USD schema types:
 
-- **geompoints**: Uses `UsdGeomPoints` primitives with custom primvars for Gaussian attributes
 - **lightfield**: Uses the UsdVol ParticleField schema (`ParticleField3DGaussianSplat` or `ParticleField` with surflet API). Requires **usd-core>=26.3** for the UsdVol schema API. Supports split half-precision (geometry vs features).
+  The SH color space (`srgb_rec709_display`, or `lin_rec709_scene` when post-processing is attached) is authored as `colorSpace` metadata on each `radiance:sphericalHarmonicsCoefficients[h]` attribute, matching the pending OpenUSD ParticleField color space proposal.
 - **nrendvol** (legacy, deprecated): Writes the model as a NuRec/NRend volume (`volume.usda` + `volume.nurec`) inside the same USD asset package. Retained only so NuRec-Isaac can keep consuming assets through the NRend RTX rendering path; it is not exercised by NuRec's own rendering, which is GSplat-only. Do not pick it for new work — it will be removed once NuRec-Isaac has migrated off the NRend RTX path.
 
 The export can produce individual USD files (`.usda`, `.usdc`, `.usd`) or a packaged USDZ archive containing all assets.
 
 ### Features
 
-- **Schema Selection**: Choose between `geompoints` (legacy) or `lightfield` (modern) USD schemas
 - **Half-Precision Export**: Reduce file size using float16 attributes (LightField schema only)
 - **Rigid Track Animation**: Export tracked objects with animated transforms
 - **Deformable Gaussians**: Export models with animated positions, rotations, and scales
@@ -201,6 +200,22 @@ The export can produce individual USD files (`.usda`, `.usdc`, `.usd`) or a pack
 
 ### Usage
 
+**Export directly from a USDZ artifact:**
+
+```bash
+bazel run //:run -- export-gaussian-usd-asset \
+    --artifact-path <artifact.usdz> \
+    --output-dir <output_directory> \
+    --usd-schema lightfield \
+    --usd-format usdz \
+    -- dataset.path=<dataset_json_path>
+```
+
+The artifact's embedded `parsed_config.yaml` and `checkpoint.ckpt` are used. Hydra
+arguments after `--` can override paths such as `dataset.path`. Both the embedded
+configuration and model weights are upgraded before export; model migration uses the
+original artifact configuration.
+
 **Bazel:**
 
 ```bash
@@ -208,8 +223,10 @@ bazel run //:run -- export-gaussian-usd-asset \
     --config-name <config_name> \
     [--output-dir <output_directory>] \
     [--usd-format <usda|usdc|usd|usdz>] \
-    [--usd-schema <geompoints|lightfield|nrendvol>] \
+    [--usd-schema <lightfield|nrendvol>] \
     [--percentage-gaussians <0-100>] \
+    [--max-gaussians-per-partition <count>] \
+    [--auto-partition/--no-auto-partition] \
     [--half-precision] \
     [--force-sh-0] \
     [--apply-activation] \
@@ -218,16 +235,28 @@ bazel run //:run -- export-gaussian-usd-asset \
     [--skip-gaussian-deformation] \
     [--resample-animation/--no-resample-animation] \
     [--export-rig-trajectories/--no-export-rig-trajectories] \
+    [--export-rolling-shutter/--no-export-rolling-shutter] \
     [-- hydra_args...]
 ```
 
 **Arguments:**
 
-- `--config-name`: (Required) Hydra config to load - must contain a dataset specification and checkpoint path. Configs are resolved from the repository `configs` directory by default; absolute config file paths are also accepted.
-- `--output-dir`: Output directory path (defaults to `<checkpoint_dir>/../usd_asset`)
+- `--artifact-path`: Input artifact containing the configuration and checkpoint. Specify
+  exactly one of `--artifact-path` or `--config-name`.
+- `--config-name`: Hydra config to load - must contain a dataset specification and checkpoint path. Configs are resolved from the repository `configs` directory by default; absolute config file paths are also accepted.
+- `--output-dir`: Output directory path. Defaults to `<checkpoint_dir>/../usd_asset`
+  for config input or `<artifact_parent>/<artifact_stem>_usd_asset` for artifact input.
 - `--usd-format`: USD output format: `usda` (text), `usdc` (binary), `usd`, or `usdz` (packaged archive, default)
-- `--usd-schema`: USD schema type: `geompoints`, `lightfield` (default), or `nrendvol` (legacy, deprecated - see above)
+- `--usd-schema`: USD schema type: `lightfield` (default) or `nrendvol` (legacy, deprecated - see above)
 - `--percentage-gaussians`: Percentage of Gaussians to export, 0-100 (default: 100)
+- `--max-gaussians-per-partition`: Spatially partition Gaussian nodes into separate
+  USD layers, each containing at most this many Gaussians. With `--usd-format usdz`, each
+  partition is packaged as its own `.usdc` member so large scenes avoid a single oversized
+  ZIP member. Explicit partitioning uses a balanced spatial KD-tree; automatic safety
+  partitioning is controlled by `--auto-partition`.
+- `--auto-partition/--no-auto-partition`: Automatically choose a partition cap for USDZ
+  exports when needed. The cap respects both the OVRTX 24-bit Gaussian index limit
+  (`2^24 - 1` rows per layer) and a conservative USDZ member-size budget. Enabled by default.
 - `--half-precision`: Use half-precision (float16) attributes for reduced file size (LightField schema only)
 - `--force-sh-0`: Force SH degree to 0 (skip f_rest coefficients, export only DC color)
 - `--apply-activation`: Export post-activation parameter values (applies sigmoid/exp/normalize)
@@ -236,6 +265,7 @@ bazel run //:run -- export-gaussian-usd-asset \
 - `--skip-gaussian-deformation`: Disable Gaussian deformation animation export
 - `--resample-animation/--no-resample-animation`: Resample track timestamps to rig timestamps (default: enabled)
 - `--export-rig-trajectories/--no-export-rig-trajectories`: Include rig trajectory data (default: enabled)
+- `--export-rolling-shutter/--no-export-rolling-shutter`: Author the camera rolling shutter (`OmniRtxRollingShutterAPI`) in the rig trajectories (default: disabled). RTX applies it to animated geometry only, not to the motion of the camera or to Gaussians, and it disables the render quality accumulation of the camera, so it is not useful for Gaussian assets. Needs rig trajectories.
 
 ### Examples
 
@@ -248,6 +278,57 @@ bazel run //:run -- export-gaussian-usd-asset \
     --output-dir /output/path
 ```
 
+### Partitioning large Gaussian exports
+
+Partitioning is an export representation feature: it divides each Gaussian node into
+spatially balanced groups and authors one Gaussian USD layer per group. It is useful
+independently of USDZ packaging—for example, downstream consumers can stream or load
+the groups separately. Groups are formed with a KD-tree over Gaussian centers, and each
+Gaussian is assigned to exactly one group.
+
+To request a fixed maximum group size, use:
+
+```bash
+bazel run //:run -- export-gaussian-usd-asset \
+    --artifact-path /path/to/training.usdz \
+    --output-dir /output/path \
+    --usd-format usdz \
+    --max-gaussians-per-partition 10000000
+```
+
+For USDZ output, every partition is written as a separate `.usdc` member (for example,
+`gaussians_000.usdc`, `gaussians_001.usdc`), and `default.usda` references all members.
+For loose `.usda`/`.usdc` output, the same layers are written as separate files in the
+output directory.
+
+Automatic safety partitioning is enabled by default for USDZ (`--auto-partition`). It
+chooses a cap when a layer would exceed either of these downstream constraints:
+
+- OVRTX indexes Gaussian rows with 24 bits, so a layer may contain at most `2^24 - 1`
+  Gaussians.
+- A conservative USDZ member-size budget is used to avoid readers that cannot resolve
+  oversized ZIP/ZIP64 members. Animated deformation and temporal appearance are included
+  in the size estimate using the exported timeline. For rigid tracks, this is the union
+  of native track timestamps, or resampled timestamps clipped to each track's valid
+  range when resampling is enabled and rig timestamps are available. The estimator
+  targets 80% of a 2 GiB member budget; it is an estimate, not a measured file-size guarantee.
+
+Use `--no-auto-partition` to disable only this automatic safety behavior. Explicit
+`--max-gaussians-per-partition` remains available for general partitioning and is always
+bounded by the OVRTX index limit. An explicit cap takes precedence over automatic
+size estimation. Rigid-track nodes are partitioned by Gaussian row while
+preserving each track's transforms and visibility in every partition containing that
+track's rows.
+
+LiDAR signals with spherical harmonics are exported as view-independent values using
+only the DC coefficient. Higher-order terms are treated as zero, and the exporter logs
+a warning once per node. The `lightfield` schema exports the vertex primvar
+`primvars:lidarExtraSignals` as float3 values `[intensity, raydrop_logit_0, raydrop_logit_1]`;
+missing channels are zero-filled. SH signals evaluate the DC term as
+`0.28209479177387814 * coeff0 + 0.5`. Raydrop channels remain logits for consumers
+to convert into drop probability. Artifact exports upgrade both config and model weights
+before processing.
+
 ### PPISP integration
 
 The exporter authors PPISP (Physically Plausible Image Signal
@@ -258,7 +339,8 @@ modes are available, plus a controller path:
   `spg-runtime`) -- runtime SPG shaders vs. PPISP folded into the
   Gaussian SH coefficients.
 - `--scene-radiance-scale FLOAT` -- asset-level multiplicative
-  brightness scale baked into SH.
+  brightness scale baked into Gaussian SH and the exported background HDR texture.
+  The background DomeLight uses neutral intensity `1.0` and exposure `0.0`.
 - `--ppisp-responsivity FLOAT` -- runtime achromatic HDR
   multiplier authored on every PPISP shader's
   `inputs:responsivity` USD attribute (SPG-runtime only).
@@ -284,31 +366,30 @@ troubleshooting.
 
 ## Ground Mesh Topology
 
-Road initialization defaults to CUDA grid ground-mesh topology. Grid meshing is
-faster than the legacy scipy/Qhull Delaunay path and keeps triangles local to
-occupied BEV cells, avoiding long convex-hull bridges across unobserved
-regions. Enclosed grid holes are filled before triangle emission so exported
-road meshes remain continuous for simulation-oriented USDZ consumers.
+Road initialization defaults to scipy/Qhull Delaunay. Delaunay fills the convex
+hull, including unobserved regions between points.
 
-Restore the legacy topology in the road-initialization config:
+Opt in to CUDA grid meshing when a workflow needs local, observation-bounded
+topology:
 
 ```bash
-model.layers.road.initialization.mesh_topology=delaunay
+model.layers.road.initialization.mesh_topology=grid
 ```
 
-Choose Delaunay only for workflows that prefer fully filled convex-hull
-geometry over the grid path's local, observation-bounded topology.
+Grid meshing is faster than Delaunay and keeps triangles local to occupied BEV
+cells, so it does not bridge unobserved regions across the convex hull.
+Enclosed grid holes are filled before triangle emission.
 
 Customer-facing export commands:
 
-- `export-camera-ground-mesh` is pinned to grid. Flags are `--input`,
+- `export-camera-ground-mesh` uses Delaunay. Flags are `--input`,
   `--output`, `--road-class-id` (repeatable, default 0), and
   `--postprocess/--no-postprocess`.
-- `export-ground-mesh` still defaults to Delaunay. `--grid-hole-fill-min-neighbors`
+- `export-ground-mesh` defaults to Delaunay. `--grid-hole-fill-min-neighbors`
   (default 6, range 0–8; `0` disables filling) applies when reconstruction uses
   grid topology. A degenerate mesh (fewer than three vertices, or no triangles)
   is an error rather than an empty PLY.
-- instant-nurec USDZ ground-mesh export still pins Delaunay.
+- instant-nurec USDZ ground-mesh export pins Delaunay.
 
 See [Customize NuRec Configuration](https://docs.nvidia.com/nurec/nurec/configs.html).
 Hosted NuRec links track the latest published docs and may differ from this

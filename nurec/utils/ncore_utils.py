@@ -38,6 +38,8 @@ from nurec.utils.morph import MorphOp
 SEMANTIC_SEG_BASE_GROUP = "semantic_segmentation"
 INSTANCE_SEG_BASE_GROUP = "instance_segmentation"
 OBJECT_INSTANCE_SEG_BASE_GROUP = "object_instance_segmentation"
+SAM3_OBJECT_INSTANCE_METHOD = "sam3-objects"
+VEHICLE_LIGHT_CLASS_NAME = "vehicle_light"
 OPTICAL_FLOW_BASE_GROUP = "optical_flow"
 SCENE_FLOW_BASE_GROUP = "scene_flow"
 NORMAL_BASE_GROUP = "normal"
@@ -165,9 +167,19 @@ class AuxDataWriter:
         shard_count: int,
         # Zarr store type: either serialize as .itar archive store (default / production) or plain "directory" store (simpler for introspection / asynchronous / external setup)
         store_type: str = "itar",  # valid values: ['itar', 'directory']
-    ):
-        """
-        Instantiate aux writer and initialize the default data groups and file stores for a given sequence and sensor IDs
+    ) -> None:
+        """Initialize lazy auxiliary stores for one source shard.
+
+        Args:
+            output_dir_path: Directory receiving auxiliary stores.
+            store_base_name: Source filename prefix for generated stores.
+            sequence_id: Sequence identity recorded in store metadata.
+            shard_id: Zero-based source shard index.
+            shard_count: Total number of source shards.
+            store_type: Indexed tar archive (itar) or directory storage.
+
+        Returns:
+            None. Stores are opened only when a signal is first written.
         """
 
         self.zlib_compressor = Blosc(cname="zlib", clevel=5, shuffle=Blosc.BITSHUFFLE)
@@ -493,16 +505,9 @@ class AuxDataWriter:
         buffer cannot reveal its original packing axis; this is a producer
         contract. Camera resolution metadata may be published after the frames.
         """
-        if instance_masks.ndim != 1 or instance_masks.dtype != np.uint8:
-            raise ValueError("Instance masks must be a flat uint8 bitstream from np.packbits(masks, axis=None)")
-        camera_grp = self.get_base_group(INSTANCE_SEG_BASE_GROUP).require_group(camera_id)
-        assert isinstance(camera_grp, zarr.Group)
-
-        frame_grp = camera_grp.require_group(str(frame_timestamps_us))
-
-        frame_grp.create_dataset("instance_masks", data=instance_masks, compressor=self.zlib_compressor)
-        frame_grp.create_dataset("scores", data=scores)
-        frame_grp.create_dataset("classes", data=classes)
+        self._store_instance_segmentation(
+            INSTANCE_SEG_BASE_GROUP, camera_id, frame_timestamps_us, instance_masks, scores, classes
+        )
 
     def store_object_instance_segmentation(
         self,
@@ -512,11 +517,39 @@ class AuxDataWriter:
         scores: np.ndarray,
         classes: np.ndarray,
     ) -> None:
-        camera_grp = self.get_base_group(OBJECT_INSTANCE_SEG_BASE_GROUP).require_group(camera_id)
+        """Store object masks using the continuous packed-bitstream contract above."""
+        self._store_instance_segmentation(
+            OBJECT_INSTANCE_SEG_BASE_GROUP, camera_id, frame_timestamps_us, instance_masks, scores, classes
+        )
+
+    def _store_instance_segmentation(
+        self,
+        base_group_name: str,
+        camera_id: str,
+        frame_timestamps_us: int,
+        instance_masks: np.ndarray,
+        scores: np.ndarray,
+        classes: np.ndarray,
+    ) -> None:
+        """Validate and serialize packed instances into the selected native store.
+
+        Args:
+            base_group_name: Ordinary or object-instance auxiliary group.
+            camera_id: Camera owning the masks.
+            frame_timestamps_us: Frame identity in microseconds.
+            instance_masks: Flat uint8 bitstream from packing the complete
+                [instances, height, width] array with np.packbits(axis=None).
+            scores: Per-instance confidence values.
+            classes: Per-instance indices into the camera's thing_classes.
+
+        Raises:
+            ValueError: If masks are not a flat uint8 array; no store is opened.
+        """
+        if instance_masks.ndim != 1 or instance_masks.dtype != np.uint8:
+            raise ValueError("Instance masks must be a flat uint8 bitstream from np.packbits(masks, axis=None)")
+        camera_grp = self.get_base_group(base_group_name).require_group(camera_id)
         assert isinstance(camera_grp, zarr.Group)
-
         frame_grp = camera_grp.require_group(str(frame_timestamps_us))
-
         frame_grp.create_dataset("instance_masks", data=instance_masks, compressor=self.zlib_compressor)
         frame_grp.create_dataset("scores", data=scores)
         frame_grp.create_dataset("classes", data=classes)
@@ -735,7 +768,7 @@ class AuxDataWriter:
             ds = camera_grp[str(frame_timestamps_us)]
             w, h = camera_grp.attrs["resolution"]
 
-            instance_masks = np.unpackbits(ds["instance_masks"]).reshape(-1, h, w)
+            instance_masks = _unpack_instance_masks(np.asarray(ds["instance_masks"]), ds["scores"].shape[0], h, w)
 
             return {
                 "instance_masks": instance_masks,
@@ -743,7 +776,7 @@ class AuxDataWriter:
                 "classes": np.array(ds["classes"][...]),
             }
 
-        except Exception:
+        except KeyError:
             raise KeyError(f"instance segmentation not found for {camera_id} and timestamp {frame_timestamps_us}")
 
     def get_semantic_segmentation_meta(self, camera_id: str) -> dict:
@@ -1127,7 +1160,7 @@ class AuxShardDataLoader:
             except KeyError:
                 continue
 
-            instance_masks = np.unpackbits(ds["instance_masks"]).reshape(-1, h, w)
+            instance_masks = _unpack_instance_masks(np.asarray(ds["instance_masks"]), ds["scores"].shape[0], h, w)
 
             return {
                 "instance_masks": instance_masks,
@@ -1624,7 +1657,11 @@ class AuxDataCameraSemSegProvider(Protocol):
 
 
 def get_mask_image(
-    mask_image: PILImage.Image | None, target_mask_size: tuple[int, int], mask_override_path: str | None = None
+    mask_image: PILImage.Image | None,
+    target_mask_size: tuple[int, int],
+    mask_override_path: str | None = None,
+    *,
+    resample: PILImage.Resampling = PILImage.Resampling.BICUBIC,
 ) -> np.ndarray | None:
     """
     Returns a boolean mask for, e.g., a camera sensor, scaled to the target resolution if required.
@@ -1637,6 +1674,8 @@ def get_mask_image(
         mask_image (PILImage.Image | None): The mask image to be processed.
         target_mask_size (tuple[int, int]): The target size (width, height) to resize the mask image to.
         mask_override_path (str | None, optional): Path to an external mask image to override the sensor's default mask. Defaults to None.
+        resample: Pillow interpolation used only when resizing. Defaults to the
+            existing bicubic behavior; nearest preserves binary exclusion boundaries.
 
     Returns:
         np.ndarray | None: A boolean NumPy array representing the mask, or None if no mask image is available.
@@ -1671,9 +1710,7 @@ def get_mask_image(
             )
             mask_image = mask_image.resize(
                 (target_mask_size[0], target_mask_size[1]),
-                # bicubic is default for L / grayscale images - set it explicitly,
-                # as this is sufficient for the subsequent binarization
-                resample=PILImage.Resampling.BICUBIC,
+                resample=resample,
             )
 
         # True for parts that we want to mask out
@@ -1687,6 +1724,7 @@ def get_camera_sensor_mask(
     mask_override_path: str | None = None,
     *,
     backend: DatasetBackend,
+    resample: PILImage.Resampling = PILImage.Resampling.BICUBIC,
 ) -> np.ndarray | None:
     """
     Returns a boolean mask for a camera sensor, scaled to the sensor's resolution if required.
@@ -1698,6 +1736,9 @@ def get_camera_sensor_mask(
     Args:
         camera_sensor (ncore_data.CameraSensor | ncore_data4_compat.CameraSensorProtocol): The camera sensor  / sensor protocol providing model parameters and default mask image.
         mask_override_path (str | None, optional): Path to an external mask image to override the sensor's default mask. Defaults to None.
+        backend: Dataset backend supplying the native mask and sensor resolution.
+        resample: Pillow interpolation used only when resizing. Defaults to the
+            existing bicubic behavior; nearest preserves binary exclusion boundaries.
 
     Returns:
         np.ndarray | None: A boolean NumPy array representing the mask, or None if no mask image is available.
@@ -1712,6 +1753,7 @@ def get_camera_sensor_mask(
         camera_mask_image,
         tuple(resolution),
         mask_override_path,
+        resample=resample,
     )
 
 

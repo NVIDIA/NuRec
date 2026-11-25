@@ -7,7 +7,7 @@ import heapq
 
 import torch
 
-from gsplat.strategy import MCMCOperation, MCMCRowPlan, sample_mcmc_relocation
+from gsplat.strategy import MCMCOperation, MCMCRowPlan
 
 from nurec.models.gaussians.construction_barriers_model import ConstructionBarriersGaussianModel
 from nurec.models.gaussians.strategies.gsplat_mcmc_adapter import (
@@ -45,6 +45,76 @@ def growth_allocations(counts: list[int], cap: int, *, eligible: list[bool] | No
         if n + 1 < quotas[i]:
             heapq.heappush(candidates, (n + 1, i))
     return additions
+
+
+def _batched_topology_plan(
+    order: torch.Tensor,
+    counts: list[int],
+    opacities: torch.Tensor,
+    scales: torch.Tensor,
+    dead: torch.Tensor,
+    *,
+    binoms: torch.Tensor,
+    min_opacity: float,
+    generator: torch.Generator,
+    operation: MCMCOperation,
+    cap: int,
+) -> MCMCRowPlan | None:
+    """Build a layer-wide relocation or growth plan with track-local donors.
+
+    Args:
+        order: CUDA int64 row permutation, stably sorted by cuboid identity.
+        counts: Positive cuboid sizes partitioning ``order`` in track order.
+        opacities: Activated float32 CUDA opacities with shape ``[N]``.
+        scales: Activated float32 scales with shape ``[N, 3]`` on the same device.
+        dead: Boolean CUDA relocation mask with shape ``[N]`` in original row order.
+        binoms: Native sampler's square float32 CUDA binomial table.
+        min_opacity: Native sampler's lower source-opacity clamp.
+        generator: CUDA RNG used for donor draws.
+        operation: Relocation or addition.
+        cap: Layer capacity for addition; unused for relocation.
+
+    Returns:
+        A layer-wide topology plan, or ``None`` when no track requests valid draws.
+        Tracks without live, nonzero-weight donors retain every row and
+        consume no random draws.
+
+    Inputs are not mutated. The caller guarantees finite activated opacities in
+    [0, 1], positive finite scales and a valid binomial table, and runs under
+    ``torch.no_grad()``. Correction stays on the GPU without value readbacks.
+    CUDA uses one batched uniform draw, changing RNG consumption from native
+    multinomial. Track metadata and candidate compaction still synchronize.
+    """
+    from nurec.libs.cuboid_relocation import correct_relocation, prepare_tracks, sample_tracks
+
+    sorted_dead, group, metadata_tensor = prepare_tracks(order, counts, opacities, dead)
+    metadata = metadata_tensor.tolist()
+    candidate_counts = [size - n for size, (n, _) in zip(counts, metadata)]
+    if operation == MCMCOperation.ADDITION:
+        additions = growth_allocations(counts, cap, eligible=[n > 0 for n in candidate_counts])
+        draws = [(n, nonzero) for n, (_, nonzero) in zip(additions, metadata)]
+    else:
+        draws = metadata
+    if not any(n and nonzero for n, nonzero in draws):
+        return None
+
+    # Compact live donors once for the layer, for both growth and relocation.
+    candidates = order[~sorted_dead]
+    candidate_weights = opacities[candidates]
+    source_indices = sample_tracks(candidates, candidate_weights, candidate_counts, draws, generator)
+    keep, revised_opacities, revised_scales = correct_relocation(
+        order, sorted_dead, group, metadata_tensor, source_indices, opacities, scales, binoms, min_opacity
+    )
+    if operation == MCMCOperation.ADDITION:
+        keep.fill_(True)
+    return MCMCRowPlan(
+        operation=operation,
+        keep=keep,
+        source_indices=source_indices,
+        revised_opacities=revised_opacities,
+        revised_scales=revised_scales,
+        storage_min_opacity=float(min_opacity),
+    )
 
 
 @torch.no_grad()
@@ -88,65 +158,26 @@ def cuboid_topology(
     expected = sorted(row["track_id"] for row in model._cuboid_records)
     if group_ids.tolist() != expected:
         raise RuntimeError("A source cuboid identity disappeared before grouped topology")
-    groups = order.split(counts)
     opacities = torch.sigmoid(scene.splats["opacities"].view(-1))
     scales = torch.exp(scene.splats["scales"]).clamp_min_(torch.finfo(torch.float32).tiny)
-    keep = torch.ones(count, dtype=torch.bool, device=ids.device)
-    visibility = None if invisible_steps is None else invisible_steps[scene.id].view(-1)
+    visibility = None if invisible_steps is None or max_invisible_steps is None else invisible_steps[scene.id].view(-1)
     dead = mcmc_dead_mask(opacities, visibility, min_opacity=min_opacity, max_invisible_steps=max_invisible_steps)
-    candidates_per_group = [rows[~dead[rows]] for rows in groups]
-    relocation = operation == MCMCOperation.RELOCATION
-    if relocation:
-        additions = None
-    elif operation == MCMCOperation.ADDITION:
-        additions = growth_allocations(counts, cap, eligible=[rows.numel() > 0 for rows in candidates_per_group])
-        if not sum(additions):
-            return 0
-    else:
+    if operation not in (MCMCOperation.RELOCATION, MCMCOperation.ADDITION):
         raise ValueError("Unsupported cuboid topology operation")
-
-    sources, revised_opacities, revised_scales = [], [], []
-    for index, (rows, candidates) in enumerate(zip(groups, candidates_per_group)):
-        if candidates.numel() == 0:
-            # A weak fallback donor would be lifted by gsplat's opacity floor.
-            # Leave suppressed cuboids unchanged for both relocation and growth.
-            continue
-        if relocation:
-            dead_rows = rows[dead[rows]]
-            sample_count = dead_rows.numel()
-        else:
-            assert additions is not None
-            sample_count = additions[index]
-        if sample_count == 0:
-            continue
-        samples = sample_mcmc_relocation(
-            opacities=opacities[candidates],
-            scales=scales[candidates],
-            num_samples=sample_count,
-            binoms=binoms,
-            min_opacity=min_opacity,
-            generator=generator,
-        )
-        if samples.sampled_indices.numel() == 0:
-            # Native zero-weight behavior: retain this cuboid's existing rows.
-            continue
-        if samples.sampled_indices.numel() != sample_count:
-            raise RuntimeError("Cuboid sampler returned a partial sample")
-        sources.append(candidates[samples.sampled_indices])
-        revised_opacities.append(samples.revised_opacities)
-        revised_scales.append(samples.revised_scales)
-        if relocation:
-            keep[dead_rows] = False
-    if not sources:
-        return 0
-    plan = MCMCRowPlan(
+    plan = _batched_topology_plan(
+        order,
+        counts,
+        opacities,
+        scales,
+        dead,
+        binoms=binoms,
+        min_opacity=min_opacity,
+        generator=generator,
         operation=operation,
-        keep=keep,
-        source_indices=torch.cat(sources),
-        revised_opacities=torch.cat(revised_opacities),
-        revised_scales=torch.cat(revised_scales),
-        storage_min_opacity=float(min_opacity),
+        cap=cap,
     )
+    if plan is None:
+        return 0
     # Parameters, Adam state, track IDs and visibility all share one row map.
     _apply_and_publish(selected, owners, snapshots, plan, invisible_steps)
     return plan.source_indices.numel()

@@ -9,6 +9,10 @@ import numpy as np
 import numpy.typing as npt
 import omegaconf
 
+from nurec.config.image_resolution import (
+    parse_camera_image_resolution_config,
+    resolve_camera_image_resolution_transforms,
+)
 from nurec.datasets.samplers.base import (
     BaseCameraPixelSampler,
     CameraPixelSamplerReturn,
@@ -18,7 +22,7 @@ from nurec.utils.profiling import ScopedTimer, TimingTag
 
 
 if TYPE_CHECKING:
-    from nurec.datasets.ncore import NCORETrainDataset
+    from nurec.datasets.ncore import NCORETrainDataset  # type: ignore[import-untyped]
 
 
 class ImageCropCameraPixelSampler(BaseCameraPixelSampler):
@@ -30,7 +34,29 @@ class ImageCropCameraPixelSampler(BaseCameraPixelSampler):
         dataset: NCORETrainDataset,
     ) -> None:
         self.crop_type = config.crop_type
-        self.subsample = config.subsample
+        resolution_config = config.get("resolution")
+        image_resolution = parse_camera_image_resolution_config(
+            (None if resolution_config is None else omegaconf.OmegaConf.to_container(resolution_config, resolve=True)),
+            legacy_subsample=None,
+            field_name="dataset.samplers.batch_sampler.camera_pixel_sampler.resolution",
+        )
+        self.image_resolution_transforms_by_camera_id = resolve_camera_image_resolution_transforms(
+            image_resolution,
+            active_camera_ids=dataset.camera_ids,
+            source_resolutions={
+                camera_id: (
+                    int(camera_model.resolution[0].item()),
+                    int(camera_model.resolution[1].item()),
+                )
+                for camera_id, camera_model in dataset.datasource.camera_models.items()
+            },
+            field_name="dataset.samplers.batch_sampler.camera_pixel_sampler.resolution",
+            require_divisible=True,
+        )
+        self.image_resolution_transforms = {
+            dataset.datasource.camera_unique_ids[camera_id].id: transform
+            for camera_id, transform in self.image_resolution_transforms_by_camera_id.items()
+        }
         self.roi_lt = config.roi_lt
         self.roi_rb = config.roi_rb
         self.crop_ratio = config.crop_ratio
@@ -61,23 +87,19 @@ class ImageCropCameraPixelSampler(BaseCameraPixelSampler):
     def fixed_sampled_pixels(
         self,
         *,
+        camera_id: str,
         original_width: int,
         original_height: int,
     ) -> RectSubsampled | None:
         """Build fixed full-image geometry for metadata-only sampling."""
-        subsample = self.subsample
-        if self.crop_type != "full_image" or not isinstance(subsample, int) or subsample < 1:
+        if self.crop_type != "full_image":
             return None
-        if original_width % subsample != 0 or original_height % subsample != 0:
-            return None
-        return RectSubsampled(
-            i=0,
-            j=0,
-            height=original_height // subsample,
-            width=original_width // subsample,
-            subsample_factor=float(subsample),
-            original_width=original_width,
-            original_height=original_height,
+        image_transform = self.image_resolution_transforms_by_camera_id[camera_id]
+        assert image_transform.source_resolution == (original_width, original_height)
+        return RectSubsampled.from_image_resolution_transform(
+            image_transform,
+            output_resolution=image_transform.resized_pre_crop_resolution,
+            image_domain_offset=(0, 0),
         )
 
     @ScopedTimer("ImageCropCameraPixelSampler.sample_camera_pixels", TimingTag.DATALOADER)
@@ -98,13 +120,9 @@ class ImageCropCameraPixelSampler(BaseCameraPixelSampler):
         original_height = frame_valid_pixels_mask.shape[0]
         original_width = frame_valid_pixels_mask.shape[1]
 
-        # Assert that the subsampling factor is valid
-        assert original_width % self.subsample == 0 and original_height % self.subsample == 0, (
-            f"Subsample factor {self.subsample} invalid, resolution is {original_width}x{original_height}"
-        )
-
-        img_width = original_width // self.subsample
-        img_height = original_height // self.subsample
+        image_transform = self.image_resolution_transforms[unique_camera_id]
+        assert image_transform.source_resolution == (original_width, original_height)
+        img_width, img_height = image_transform.resized_pre_crop_resolution
 
         # Compute crop dimensions after subsampling
         crop_height = int(img_height * self.crop_height_ratio)
@@ -134,14 +152,10 @@ class ImageCropCameraPixelSampler(BaseCameraPixelSampler):
 
         # return the selected image rectangle
         return CameraPixelSamplerReturn(
-            sampled_pixels=RectSubsampled(
-                i=crop_img_lt_x,
-                j=crop_img_lt_y,
-                height=crop_height,
-                width=crop_width,
-                subsample_factor=float(self.subsample),
-                original_width=original_width,
-                original_height=original_height,
+            sampled_pixels=RectSubsampled.from_image_resolution_transform(
+                image_transform,
+                output_resolution=(crop_width, crop_height),
+                image_domain_offset=(crop_img_lt_x, crop_img_lt_y),
             ),
         )
 

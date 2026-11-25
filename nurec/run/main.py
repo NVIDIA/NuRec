@@ -6,11 +6,16 @@ import os
 import platform
 import sys
 
-from typing import Any
+from contextlib import contextmanager, nullcontext
+from typing import Any, Generator
 
 import click
 import pytorch_lightning as pl
 import torch
+
+from pytorch_lightning.plugins.precision.amp import MixedPrecision
+from pytorch_lightning.strategies import SingleDeviceStrategy, Strategy
+from torch.cuda.amp.grad_scaler import GradScaler
 
 import nurec.systems
 
@@ -18,10 +23,12 @@ from apps.viewer.lightning_viewer import maybe_create_lightning_viewer
 from nurec import __version__
 from nurec.config.nurec import NuRecConfig
 from nurec.config.parse import assert_no_out_dir_override_in_resume, dump_config, parse_typed_config
-from nurec.models.utils import MixedPrecisionNoCastPlugin
+from nurec.models.gaussians.initialization_pipeline import configure_initialization, parallel_initialization_eligible
 from nurec.systems.base import BaseSystem, DDPStrategySO
 from nurec.systems.gaussians import InProcessInstantNuRecInitializer
 from nurec.utils.callbacks import PreemptionInterruptException, make_callbacks, make_logger
+from nurec.utils.glibc_malloc import tune_glibc_malloc
+from nurec.utils.initialization import InitializationResources
 from nurec.utils.misc import rank_zero_info, rank_zero_only, unpack_optional
 from nurec.utils.prober import get_global_prober
 from nurec.utils.profiling import ScopedTimer, create_profiler
@@ -31,6 +38,8 @@ from nurec.utils.trainer import adjust_step_for_world_size
 def setup_environment_and_logger(config: NuRecConfig) -> logging.Logger:
     # Configure PyTorch matmul precision for better performance
     torch.set_float32_matmul_precision(config.matmul_precision)
+    # Reduced precision is meant for CUDA (TF32); on aarch64 it would also run CPU matmuls in bf16.
+    torch.backends.mkldnn.matmul.fp32_precision = "ieee"  # type: ignore[attr-defined]
 
     if (local_rank_env := os.environ.get("LOCAL_RANK")) is not None:
         local_rank = int(local_rank_env)
@@ -94,6 +103,83 @@ def setup_environment_and_logger(config: NuRecConfig) -> logging.Logger:
     return logger
 
 
+class _DevicePreservingStrategy(Strategy):
+    """Keep model and optimizer tensors on their devices when a run finishes."""
+
+    def teardown(self) -> None:
+        """Release plugins without offloading live tensors.
+
+        Tensor memory is released when their owners are released or the process exits.
+        Trainer still performs loop, logger, signal, and user-hook cleanup.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: If the strategy has no accelerator attached.
+        """
+        self.precision_plugin.teardown()
+        assert self.accelerator is not None
+        self.accelerator.teardown()
+        self.checkpoint_io.teardown()
+
+
+class _SingleDeviceStrategySO(SingleDeviceStrategy, _DevicePreservingStrategy):
+    """Preserve model and optimizer devices for single-device runs."""
+
+
+class _DDPDevicePreservingStrategySO(DDPStrategySO, _DevicePreservingStrategy):
+    """Run SO, DDP, and parallel cleanup before device-preserving cleanup.
+
+    The shared Strategy base places _DevicePreservingStrategy before Strategy in
+    the MRO, replacing only its final model and optimizer CPU offload.
+    """
+
+
+class MixedPrecisionNoCastPlugin(MixedPrecision):
+    """
+    This plugin uses the behavior of the original `MixedPrecision`, 
+    but only uses the grad scaler and skip the global autocasting to half precision.
+    Local half-precision casting is still possible when this plugin is enabled.
+    
+    Global autocasting to half is bad because:
+    - We would never know which module breaks or misbehaves in half precision. \
+        There will always be unknown unpredictable omission. \
+    - When we add new modules, global autocasting make it difficult to debug, \
+        while some existing modules must use grad scaler.
+    So instead, we should disable autocast globally, and only enable it locally in known modules.
+    
+    Known issues on half precision (where you should not use half):
+    - For rays, poses and coordinates, half precision introduce very large errors. We should at least use float.
+    - Some of the pytorch module is not autocast-safe (e.g. bce, exp, ...)
+    - ... TBA
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Use a smaller value of `init_scale` then the default `2**16==65536`
+        kwargs["scaler"] = GradScaler(init_scale=128.0)
+        super().__init__(*args, **kwargs)
+
+    @contextmanager
+    def forward_context(self) -> Generator[None, None, None]:
+        """Skip the global autocast in the original plugin."""
+        yield
+
+
+def cap_cpu_threads_per_rank(world_size: int, devices_per_node: int) -> None:
+    """Split the CPUs evenly between the ranks on a node, unless OMP_NUM_THREADS is already set.
+
+    Lightning starts the other ranks after rank 0 has built the system, and each rank then builds its own at the same
+    time; uncapped, every rank's CPU thread pools span all cores and the ranks can miss the process-group timeout.
+    Ranks inherit the variable.
+    """
+    if world_size <= 1 or "OMP_NUM_THREADS" in os.environ:
+        return
+    threads = max(1, len(os.sched_getaffinity(0)) // devices_per_node)
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+
+
 def launch_trainer_loop(config: NuRecConfig, system: BaseSystem, logger: logging.Logger) -> None:
     pl_logger = make_logger(config.logger)
 
@@ -123,9 +209,9 @@ def launch_trainer_loop(config: NuRecConfig, system: BaseSystem, logger: logging
         import datetime
 
         nccl_timeout = datetime.timedelta(minutes=config.trainer.nccl_timeout_minutes)
-        strategy = DDPStrategySO(find_unused_parameters=True, timeout=nccl_timeout)  # type: ignore
+        strategy = _DDPDevicePreservingStrategySO(find_unused_parameters=True, timeout=nccl_timeout)  # type: ignore
     else:
-        strategy = "auto"  # type: ignore
+        strategy = _SingleDeviceStrategySO(device=torch.device("cuda", 0))  # type: ignore
 
     trainer = pl.Trainer(
         devices=unpack_optional(config.trainer.device_count),
@@ -151,15 +237,16 @@ def launch_trainer_loop(config: NuRecConfig, system: BaseSystem, logger: logging
     if config.resume is not None and not os.path.exists(config.resume):
         raise FileNotFoundError(f"Checkpoint {config.resume=} to be resumed does not exist")
 
+    # NuRec checkpoints carry enums and RNG/loop state, which torch's weights-only default rejects.
     if "train" in config.mode or "trainval" in config.mode:
         if config.resume and not config.resume_weights_only:
-            trainer.fit(system, datamodule=system.datamodule, ckpt_path=config.resume)
+            trainer.fit(system, datamodule=system.datamodule, ckpt_path=config.resume, weights_only=False)
         else:
             trainer.fit(system, datamodule=system.datamodule)
     elif "val" in config.mode:
-        trainer.validate(system, datamodule=system.datamodule, ckpt_path=config.resume)
+        trainer.validate(system, datamodule=system.datamodule, ckpt_path=config.resume, weights_only=False)
     elif "test" in config.mode:
-        trainer.test(system, datamodule=system.datamodule, ckpt_path=config.resume)
+        trainer.test(system, datamodule=system.datamodule, ckpt_path=config.resume, weights_only=False)
 
 
 @click.command("main")
@@ -176,8 +263,15 @@ def main(
 ) -> None:
     """Main entry point for Neural Reconstruction Engine training, validation and testing"""
 
+    # The mmap threshold only applies to later allocations, so set it before initialization starts allocating.
+    tune_glibc_malloc()
     assert_no_out_dir_override_in_resume(hydra_args)
     config = parse_typed_config(config_name=config_name, hydra_args=hydra_args)
+
+    # Check the resolved path before initialization, without changing export-only config parsing.
+    # Keep the trainer-loop check in case the checkpoint disappears during startup.
+    if config.resume is not None and not os.path.exists(config.resume):
+        raise FileNotFoundError(f"Checkpoint {config.resume=} to be resumed does not exist")
 
     in_process_instant_nurec_initializer: InProcessInstantNuRecInitializer | None = None
     # Keep the instant_nurec dependency lazy so runs without in-process instant_nurec retain the existing
@@ -189,6 +283,16 @@ def main(
 
         in_process_instant_nurec_initializer = initialize_from_instant_nurec_in_memory
 
+    parallel_init = parallel_initialization_eligible(config)
+    with InitializationResources() if parallel_init else nullcontext() as resources:
+        if resources is not None:
+            configure_initialization(resources, config)
+        _run(config, in_process_instant_nurec_initializer=in_process_instant_nurec_initializer)
+
+
+def _run(
+    config: NuRecConfig, *, in_process_instant_nurec_initializer: InProcessInstantNuRecInitializer | None = None
+) -> None:
     # Save the parsed config now in case we need to verify it.
     rank_zero_only(os.makedirs)(config.config_dir, exist_ok=True)
     dump_config(os.path.join(config.config_dir, "parsed.yaml"), config)
@@ -262,6 +366,8 @@ def main(
             f"'+trainer.device_count' to the number of GPUs per node and 'trainer.num_nodes' to the number of nodes "
             f"in the command line."
         )
+
+    cap_cpu_threads_per_rank(config.trainer.world_size, unpack_optional(config.trainer.device_count))
 
     # Make the system
     checkpoint = None if (not config.resume_weights_only or not config.resume) else config.resume

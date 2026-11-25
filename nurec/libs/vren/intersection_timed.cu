@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 #include "intersection.cuh"
@@ -12,7 +12,9 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/macros/Macros.h>
 
+#include <limits>
 #include <tuple>
 
 template <typename BBoxTimed>
@@ -80,6 +82,84 @@ inline __device__ auto rolling_shutter_camera_ray_to_world(
     float3 const ray_d_world = apply_matrix(R_raytime, camera_ray);
 
     return std::make_tuple(ray_o_world, ray_d_world, relative_frame_time);
+}
+
+// Intersect one rolling-shutter camera ray with one timed cuboid track:
+// - needs N_track_poses >= 2, since hits interpolate between consecutive poses;
+// - returns the ray's entry/exit distances;
+// - .y <= 0 means no hit.
+template <typename scalar_t, typename CameraPoses, typename TrackPoses, typename CuboidDims>
+inline __device__ float2 rolling_shutter_ray_track_hit(
+    int16_t const pixel_i,
+    int16_t const pixel_j,
+    float3 const camera_ray,         // 3d ray direction in camera frame
+    CameraPoses const& camera_poses, // camera-to-world at start/end of frame, [2,7] as [t, q]
+    int64_t const camera_timestamp_start_us,
+    int64_t const camera_timestamp_end_us,
+    int32_t const w,
+    int32_t const h,
+    int32_t const shutter_type,
+    int64_t const* shared_track_timestamps_us,
+    int32_t const N_track_poses,
+    TrackPoses const& tracks_poses,
+    int32_t const track_start_idx,
+    CuboidDims const& cuboid_dims) {
+    // grab and transform camera-ray to world-ray via rolling-shutter time
+    auto const [ray_o_world, ray_d_world, relative_frame_time] = rolling_shutter_camera_ray_to_world(
+        pixel_i,
+        pixel_j,
+        camera_ray,
+        make_float3(camera_poses[0][0], camera_poses[0][1], camera_poses[0][2]),
+        make_float4(camera_poses[0][3], camera_poses[0][4], camera_poses[0][5], camera_poses[0][6]),
+        make_float3(camera_poses[1][0], camera_poses[1][1], camera_poses[1][2]),
+        make_float4(camera_poses[1][3], camera_poses[1][4], camera_poses[1][5], camera_poses[1][6]),
+        w, h, shutter_type);
+
+    // map frame-relative time to absolute time
+    auto const ray_timestamp_us = camera_timestamp_start_us + int64_t(relative_frame_time * (camera_timestamp_end_us - camera_timestamp_start_us));
+
+    // check if ray's timestamp is in the track's valid time-range and exit early if not
+    if (ray_timestamp_us < shared_track_timestamps_us[0] ||
+        shared_track_timestamps_us[N_track_poses - 1] < ray_timestamp_us)
+        return make_float2(0.f, -1.f);
+
+    // ray's time is in the tracks' valid time-range AND we have N_track_poses > 1 -> determine track poses for linear interpolation
+    auto const interpolation_end_idx   = binary_search_interp(ray_timestamp_us, shared_track_timestamps_us, N_track_poses);
+    auto const interpolation_start_idx = interpolation_end_idx - 1; // note: this is guaranteed to be in the valid range of poses due to the check above
+
+    auto const local_interpolation_start_timestamp_us = shared_track_timestamps_us[interpolation_start_idx],
+               local_interpolation_end_timestamp_us   = shared_track_timestamps_us[interpolation_end_idx];
+
+    // linear interpolation parameter [0,1]
+    auto const t_interp = scalar_t(ray_timestamp_us - local_interpolation_start_timestamp_us) / scalar_t(local_interpolation_end_timestamp_us - local_interpolation_start_timestamp_us);
+
+    // load poses to interpolate from global memory
+    auto const local_interpolation_start_pose = tracks_poses[track_start_idx + interpolation_start_idx],
+               local_interpolation_end_pose   = tracks_poses[track_start_idx + interpolation_end_idx];
+
+    // collect timed-cuboid data for intersection computation
+    auto const cuboidtimed = std::array<scalar_t, 17>{cuboid_dims[0],
+                                                      cuboid_dims[1],
+                                                      cuboid_dims[2],
+
+                                                      local_interpolation_start_pose[0],
+                                                      local_interpolation_start_pose[1],
+                                                      local_interpolation_start_pose[2],
+                                                      local_interpolation_start_pose[3],
+                                                      local_interpolation_start_pose[4],
+                                                      local_interpolation_start_pose[5],
+                                                      local_interpolation_start_pose[6],
+
+                                                      local_interpolation_end_pose[0],
+                                                      local_interpolation_end_pose[1],
+                                                      local_interpolation_end_pose[2],
+                                                      local_interpolation_end_pose[3],
+                                                      local_interpolation_end_pose[4],
+                                                      local_interpolation_end_pose[5],
+                                                      local_interpolation_end_pose[6]};
+
+    // perform time-based cuboid intersection
+    return worldray_bboxtimed_intersection(ray_o_world, ray_d_world, t_interp, cuboidtimed);
 }
 
 // Kernel / entry points for CuboidTracks APIs
@@ -693,62 +773,21 @@ __global__ void ray_cuboidtracks_rolling_shutter_intersection_kernel(
         // local ray doesn't exist
         return;
 
-    // grab and transform camera-ray to world-ray via rolling-shutter time
-    auto const [ray_o_world, ray_d_world, relative_frame_time] = rolling_shutter_camera_ray_to_world(
+    auto const t1t2 = rolling_shutter_ray_track_hit<scalar_t>(
         pixel_idxs[ray_idx][0],
         pixel_idxs[ray_idx][1],
         make_float3(camera_rays[ray_idx][0], camera_rays[ray_idx][1], camera_rays[ray_idx][2]),
-        make_float3(camera_poses[0][0], camera_poses[0][1], camera_poses[0][2]),
-        make_float4(camera_poses[0][3], camera_poses[0][4], camera_poses[0][5], camera_poses[0][6]),
-        make_float3(camera_poses[1][0], camera_poses[1][1], camera_poses[1][2]),
-        make_float4(camera_poses[1][3], camera_poses[1][4], camera_poses[1][5], camera_poses[1][6]),
-        w, h, shutter_type);
-
-    // map frame-relative time to absolute time
-    auto const ray_timestamp_us = camera_timestamp_start_us + int64_t(relative_frame_time * (camera_timestamp_end_us - camera_timestamp_start_us));
-
-    // check if ray's timestamp is in the track's valid time-range and exit early if not
-    if (ray_timestamp_us < shared_track_timestamps_us[0] ||
-        shared_track_timestamps_us[N_track_poses - 1] < ray_timestamp_us)
-        return;
-
-    // ray's time is in the tracks' valid time-range AND we have N_track_poses > 1 -> determine track poses for linear interpolation
-    auto const interpolation_end_idx   = binary_search_interp(ray_timestamp_us, shared_track_timestamps_us, N_track_poses);
-    auto const interpolation_start_idx = interpolation_end_idx - 1; // note: this is guaranteed to be in the valid range of poses due to the check above
-
-    auto const local_interpolation_start_timestamp_us = shared_track_timestamps_us[interpolation_start_idx],
-               local_interpolation_end_timestamp_us   = shared_track_timestamps_us[interpolation_end_idx];
-
-    // linear interpolation parameter [0,1]
-    auto const t_interp = scalar_t(ray_timestamp_us - local_interpolation_start_timestamp_us) / scalar_t(local_interpolation_end_timestamp_us - local_interpolation_start_timestamp_us);
-
-    // load poses to interpolate from global memory
-    auto const local_interpolation_start_pose = tracks_poses[track_start_idx + interpolation_start_idx],
-               local_interpolation_end_pose   = tracks_poses[track_start_idx + interpolation_end_idx];
-
-    // collect timed-cuboid data for intersection computation
-    auto const cuboidtimed = std::array<scalar_t, 17>{cuboids_dims[track_idx][0],
-                                                      cuboids_dims[track_idx][1],
-                                                      cuboids_dims[track_idx][2],
-
-                                                      local_interpolation_start_pose[0],
-                                                      local_interpolation_start_pose[1],
-                                                      local_interpolation_start_pose[2],
-                                                      local_interpolation_start_pose[3],
-                                                      local_interpolation_start_pose[4],
-                                                      local_interpolation_start_pose[5],
-                                                      local_interpolation_start_pose[6],
-
-                                                      local_interpolation_end_pose[0],
-                                                      local_interpolation_end_pose[1],
-                                                      local_interpolation_end_pose[2],
-                                                      local_interpolation_end_pose[3],
-                                                      local_interpolation_end_pose[4],
-                                                      local_interpolation_end_pose[5],
-                                                      local_interpolation_end_pose[6]};
-
-    // perform time-based cuboid intersection
-    auto const t1t2 = worldray_bboxtimed_intersection(ray_o_world, ray_d_world, t_interp, cuboidtimed);
+        camera_poses,
+        camera_timestamp_start_us,
+        camera_timestamp_end_us,
+        w,
+        h,
+        shutter_type,
+        shared_track_timestamps_us,
+        N_track_poses,
+        tracks_poses,
+        track_start_idx,
+        cuboids_dims[track_idx]);
 
     if (t1t2.y > 0.f) { // if ray intersects the cuboid
         auto const cnt = atomicAdd(&intersections_cnt[ray_idx], 1);
@@ -862,4 +901,139 @@ std::vector<torch::Tensor> ray_cuboidtracks_rolling_shutter_intersection_cu(
     } else {
         return {intersections_cnt, intersections_tracks_idx};
     }
+}
+
+template <typename scalar_t>
+__global__ void camera_track_intervals_kernel(
+    torch::PackedTensorAccessor32<int16_t, 2, torch::RestrictPtrTraits> const pixel_idxs, // i in [0, width-1], j in [0, height-1]
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> const camera_rays,
+    torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> const frame_poses,
+    torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> const frame_timestamps,
+    torch::PackedTensorAccessor32<float, 1, torch::RestrictPtrTraits> const report_relative_times,
+    int32_t const w,            // image resolution (width)
+    int32_t const h,            // image resolution (height)
+    int32_t const shutter_type, // ROLLING_TOP_TO_BOTTOM = 1, ROLLING_LEFT_TO_RIGHT = 2, ROLLING_BOTTOM_TO_TOP = 3,
+                                // ROLLING_RIGHT_TO_LEFT = 4, GLOBAL = 5
+
+    torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> const tracks_packinfo,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> const tracks_poses,
+    torch::PackedTensorAccessor32<int64_t, 1, torch::RestrictPtrTraits> const tracks_timestamps_us,
+    int32_t const max_poses, // timestamps that fit in shared memory
+
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> const cuboids_dims,
+
+    torch::PackedTensorAccessor32<int64_t, 3, torch::RestrictPtrTraits> intervals) {
+    auto const frame_idx                 = blockIdx.z;
+    auto const camera_poses              = frame_poses[frame_idx];
+    auto const camera_timestamp_start_us = frame_timestamps[frame_idx][0];
+    auto const camera_timestamp_end_us   = frame_timestamps[frame_idx][1];
+    auto const ray_idx                   = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const track_idx                 = blockIdx.y;
+
+    if (track_idx >= tracks_packinfo.size(0))
+        // track of block does not exist
+        return;
+
+    auto const track_packinfo  = tracks_packinfo[track_idx];
+    auto const track_start_idx = track_packinfo[0];
+    auto const N_track_poses   = track_packinfo[1];
+    auto const N_total_poses   = tracks_poses.size(0);
+
+    if (N_track_poses <= 1)
+        // track has no poses
+        return;
+
+    CUDA_KERNEL_ASSERT_MSG(track_start_idx >= 0 && N_track_poses <= max_poses && track_start_idx <= N_total_poses - N_track_poses,
+                           "track pack range exceeds max_poses or the track tensors");
+
+    // load the track's timestamps into shared memory to accelerate binary search
+    // using all threads (irrespective of whether the local ray exists)
+    extern __shared__ int64_t shared_track_timestamps_us[];
+
+    for (auto i = threadIdx.x; i < N_track_poses; i += blockDim.x)
+        shared_track_timestamps_us[i] = tracks_timestamps_us[track_start_idx + i];
+
+    __syncthreads(); // all timestamps of the block-associated track are now loaded to shared memory
+
+    if (ray_idx >= pixel_idxs.size(0))
+        // local ray doesn't exist
+        return;
+
+    auto const t1t2 = rolling_shutter_ray_track_hit<scalar_t>(
+        pixel_idxs[ray_idx][0],
+        pixel_idxs[ray_idx][1],
+        make_float3(camera_rays[ray_idx][0], camera_rays[ray_idx][1], camera_rays[ray_idx][2]),
+        camera_poses,
+        camera_timestamp_start_us,
+        camera_timestamp_end_us,
+        w,
+        h,
+        shutter_type,
+        shared_track_timestamps_us,
+        N_track_poses,
+        tracks_poses,
+        track_start_idx,
+        cuboids_dims[track_idx]);
+
+    if (t1t2.y > 0.f) {
+        // Reporting uses the caller's original-resolution shutter times, as
+        // in the legacy reduction. Intersection retains its existing w/h.
+        auto const offset    = int64_t(report_relative_times[ray_idx] * float(camera_timestamp_end_us - camera_timestamp_start_us));
+        auto const timestamp = camera_timestamp_start_us + offset;
+        atomicMin(reinterpret_cast<long long*>(&intervals[frame_idx][track_idx][0]), static_cast<long long>(timestamp));
+        atomicMax(reinterpret_cast<long long*>(&intervals[frame_idx][track_idx][1]), static_cast<long long>(timestamp));
+    }
+}
+
+// Visibility-only variant. Restrict to non-truncating inputs so every hit is retained.
+torch::Tensor camera_track_intervals_cu(
+    torch::Tensor pixels, torch::Tensor rays, torch::Tensor poses,
+    torch::Tensor timestamps, torch::Tensor relative_times,
+    torch::Tensor packinfo, torch::Tensor track_poses, torch::Tensor track_times,
+    torch::Tensor dims, int64_t width, int64_t height, int64_t shutter,
+    int64_t max_poses, int64_t max_hits) {
+    TORCH_CHECK(rays.is_cuda(), "CUDA inputs required");
+    c10::cuda::CUDAGuard device_guard(rays.device());
+    for (auto const& tensor : {pixels, rays, poses, timestamps, relative_times, packinfo, track_poses, track_times, dims}) {
+        TORCH_CHECK(tensor.device() == rays.device() && tensor.is_contiguous(), "inputs must be contiguous on the same CUDA device");
+    }
+    TORCH_CHECK(rays.scalar_type() == torch::kFloat32 && poses.scalar_type() == torch::kFloat32 &&
+                    relative_times.scalar_type() == torch::kFloat32 && track_poses.scalar_type() == torch::kFloat32 &&
+                    dims.scalar_type() == torch::kFloat32,
+                "float32 geometry required");
+    TORCH_CHECK(pixels.scalar_type() == torch::kInt16 && packinfo.scalar_type() == torch::kInt32 &&
+                    timestamps.scalar_type() == torch::kInt64 && track_times.scalar_type() == torch::kInt64,
+                "invalid index or timestamp dtype");
+    TORCH_CHECK(poses.dim() == 3 && poses.size(1) == 2 && poses.size(2) == 7, "poses must have shape [F,2,7]");
+    TORCH_CHECK(packinfo.dim() == 2 && packinfo.size(1) == 2, "packinfo must have shape [T,2]");
+    TORCH_CHECK(rays.dim() == 2 && rays.size(1) == 3, "rays must have shape [N,3]");
+    auto const frames = poses.size(0), tracks = packinfo.size(0), nrays = rays.size(0);
+    TORCH_CHECK(pixels.dim() == 2 && pixels.size(0) == nrays && pixels.size(1) == 2, "pixels must have shape [N,2]");
+    TORCH_CHECK(relative_times.dim() == 1 && relative_times.size(0) == nrays, "relative times must have shape [N]");
+    TORCH_CHECK(timestamps.dim() == 2 && timestamps.size(0) == frames && timestamps.size(1) == 2, "timestamps must have shape [F,2]");
+    TORCH_CHECK(track_poses.dim() == 2 && track_poses.size(1) == 7 && track_times.dim() == 1 && track_times.size(0) == track_poses.size(0), "invalid track pose or timestamp shape");
+    TORCH_CHECK(dims.dim() == 2 && dims.size(0) == tracks && dims.size(1) == 3, "dims must have shape [T,3]");
+    TORCH_CHECK(tracks <= max_hits && tracks <= 65535 && frames <= 65535, "truncating intersections or oversized grids require the legacy path");
+    TORCH_CHECK(width > 0 && height > 0 && max_poses >= 0 && max_poses <= std::numeric_limits<int32_t>::max(),
+                "invalid image or track size");
+    auto result = torch::full({frames, tracks, 2}, -1, timestamps.options());
+    result.select(2, 0).fill_(std::numeric_limits<int64_t>::max());
+    if (frames == 0 || tracks == 0 || nrays == 0 || max_poses == 0)
+        return result;
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    camera_track_intervals_kernel<float><<<dim3((nrays + 255) / 256, tracks, frames), 256, max_poses * sizeof(int64_t), stream>>>(
+        pixels.packed_accessor32<int16_t, 2, torch::RestrictPtrTraits>(),
+        rays.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+        poses.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+        timestamps.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
+        relative_times.packed_accessor32<float, 1, torch::RestrictPtrTraits>(),
+        width, height, shutter,
+        packinfo.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+        track_poses.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+        track_times.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
+        static_cast<int32_t>(max_poses),
+        dims.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+        result.packed_accessor32<int64_t, 3, torch::RestrictPtrTraits>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
 }

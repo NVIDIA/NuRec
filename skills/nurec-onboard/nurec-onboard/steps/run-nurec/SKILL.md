@@ -390,7 +390,7 @@ Pair the detached launch with the shared per-call polling pattern documented in 
 
 ### Interpret reconstruction output
 
-The output directory contains `parsed.yaml` (fully-resolved Hydra config), checkpoints, validation renders, and -- when validation is enabled -- a `metrics.yaml` under `val/` with per-camera rendering quality KPIs (see NuRec `docs/public/nurec/model.rst`). Read the run-wide values from its `aggregated_metrics` mapping, whose keys are prefixed with the phase: `test/psnr`, `test/ssim`, and `test/lpips`. Record all three in the step summary under the unprefixed names.
+The output directory contains `parsed.yaml` (fully-resolved Hydra config), checkpoints, validation renders, and -- when validation is enabled -- a `metrics.yaml` under `val/` with per-camera rendering quality KPIs (see the NuRec validation guide at <https://docs.nvidia.com/nurec/>). Read the run-wide values from its `aggregated_metrics` mapping, whose keys are prefixed with the phase: `test/psnr`, `test/ssim`, and `test/lpips`. Record all three in the step summary under the unprefixed names.
 
 For what each KPI measures, its scale/direction, and how to compare runs (no universal thresholds; regress against a known-good run at the same subsampling), see [diagnosis-reference.md "Rendering-quality metrics"](diagnosis-reference.md#rendering-quality-metrics).
 

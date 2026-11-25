@@ -42,6 +42,8 @@ def make(
             strict=False,
             config=config,
             map_location=torch.device("cuda"),
+            # NuRec checkpoints carry enums and RNG/loop state, which torch's weights-only default rejects.
+            weights_only=False,
             in_process_instant_nurec_initializer=in_process_instant_nurec_initializer,
         )
 

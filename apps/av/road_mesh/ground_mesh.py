@@ -1068,6 +1068,20 @@ class DominantPlaneRoadSegmenter:
         return PILImage.fromarray(image)
 
 
+def _grouped_height_medians(values: NDArray[np.float32], starts: NDArray[np.int64]) -> NDArray[np.float32]:
+    """Batch equally sized groups, preserving NumPy median arithmetic."""
+    counts = np.diff(np.r_[starts, len(values)])
+    order = np.argsort(counts, kind="stable")
+    sorted_counts = counts[order]
+    sizes, offsets = np.unique(sorted_counts, return_index=True)
+    groups = np.split(order, offsets[1:])
+    result = np.empty(len(starts), dtype=np.float32)
+    for size, group in zip(sizes, groups):
+        indices = starts[group, None] + np.arange(size)
+        result[group] = np.median(values[indices], axis=1)
+    return result
+
+
 def downsample_3d_points_on_2d_grid(
     points: NDArray[np.float32],
     cell_size: float,
@@ -1132,8 +1146,7 @@ def downsample_3d_points_on_2d_grid(
         sorted_inverse = inverse[sorting_indices]
         sorted_points_z = points[sorting_indices, 2]
         group_start_indices = np.searchsorted(sorted_inverse, np.arange(num_groups))
-        points_per_group_z = np.split(sorted_points_z, group_start_indices[1:])
-        z_per_group = np.array([np.median(g) for g in points_per_group_z], dtype=np.float32)
+        z_per_group = _grouped_height_medians(sorted_points_z, group_start_indices)
 
     # Recover (col, row) cell indices from the linear ids (cell_id = row * W + col).
     width_cells = int(cell_counts[0])
@@ -1192,6 +1205,21 @@ def downsample_3d_points_on_2d_grid_no_clamp(points: NDArray[np.float32], cell_s
     return (point_sums / point_counts[:, None]).astype(np.float32)
 
 
+# Peak memory allowed for the dense outlier filter; larger inputs take the per-vertex scan.
+_DENSE_FILTER_BYTES = 1 << 30
+
+
+def _dense_filter_bytes(grid_cells: int, n: int, radius: int) -> int:
+    """Estimate the dense filter's peak memory.
+
+    - The cell lookup table holds one int64 per grid cell.
+    - Neighbor heights hold one float64 per vertex and neighbor offset, alive four times at once:
+      the per-offset arrays, their stack, the selected rows, and the median's working copy.
+    """
+    neighbors = (2 * radius + 1) ** 2 - 1
+    return 8 * (grid_cells + 4 * n * neighbors)
+
+
 def filter_local_height_outliers(
     vertices: NDArray[np.float32],
     cell_size: float,
@@ -1199,34 +1227,82 @@ def filter_local_height_outliers(
     min_neighbors: int = 4,
     radius: int = 1,
 ) -> NDArray[np.bool_]:
-    """Identify and mark vertex spikes that deviate strongly from their BEV neighbors.
+    """Return a keep mask that drops height spikes relative to BEV neighbors.
 
-    For each vertex, look at vertices within ``radius`` cells in BEV (excluding self). If the
-    neighbor count is at least ``min_neighbors``, compute their height median and drop the
-    current vertex when ``|z - median| > threshold``. Cells with sparse neighborhoods (e.g. road
-    boundary) are kept as-is to avoid over-aggressive filtering.
-
-    Assumes ``vertices`` are placed at BEV cell centers (the output of
-    :func:`downsample_3d_points_on_2d_grid`).
+    - Neighbors are vertices within ``radius`` cells in BEV, excluding the vertex itself.
+    - A vertex is judged only with at least ``min_neighbors`` neighbors and no NaN among them; others are kept,
+      so sparse areas such as the road boundary are not over-filtered.
+    - A judged vertex is dropped when ``|z - median(neighbor z)| > threshold``.
+    - ``threshold <= 0`` keeps every vertex.
+    - Assumes at most one vertex per BEV cell, placed at the cell center.
     """
     n = len(vertices)
-    if n == 0 or threshold <= 0.0:
+    if not n or threshold <= 0:
         return np.ones(n, dtype=bool)
+    # Vertices sit at cell centers, so the offset between two of them is an integer multiple of
+    # ``cell_size`` and rounding snaps it to that integer despite float noise.
+    cells = np.round((vertices[:, :2] - vertices[:, :2].min(axis=0)) / cell_size).astype(np.int64)
+    dims = cells.max(axis=0) + 1
+    if _dense_filter_bytes(int(dims[0]) * int(dims[1]), n, radius) > _DENSE_FILTER_BYTES:
+        return _filter_local_height_outliers_sparse(vertices, cells, threshold, min_neighbors, radius)
+    return _filter_local_height_outliers_dense(vertices, cells, dims, threshold, min_neighbors, radius)
 
-    # Recover integer cell indices from XY positions. Vertices sit at cell centers, so the
-    # difference between two cell centers is exactly an integer multiple of ``cell_size`` and
-    # ``round(delta / cell_size)`` snaps to that integer modulo float noise.
-    bbox_min_xy = vertices[:, :2].min(axis=0)
-    cell_idx = np.round((vertices[:, :2] - bbox_min_xy) / cell_size).astype(np.int64)
 
+def _filter_local_height_outliers_dense(
+    vertices: NDArray[np.float32],
+    cells: NDArray[np.int64],
+    dims: NDArray[np.int64],
+    threshold: float,
+    min_neighbors: int,
+    radius: int,
+) -> NDArray[np.bool_]:
+    """Gather neighbor heights through a dense grid of vertex ids, one neighbor offset at a time."""
+    n = len(vertices)
+    lut = np.full(tuple(dims), -1, dtype=np.int64)
+    lut[cells[:, 0], cells[:, 1]] = np.arange(n)
+    values = []
+    counts = np.zeros(n, dtype=np.int64)
+    has_nan = np.zeros(n, dtype=bool)
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            if dx == dy == 0:
+                continue
+            query = cells + np.array([dx, dy])
+            valid = ((query >= 0) & (query < dims)).all(axis=1)
+            rows = np.flatnonzero(valid)
+            ids = lut[query[rows, 0], query[rows, 1]]
+            rows = rows[ids >= 0]
+            ids = ids[ids >= 0]
+            z = np.full(n, np.nan, dtype=np.float64)
+            z[rows] = vertices[ids, 2]
+            counts[rows] += 1
+            has_nan[rows] |= np.isnan(z[rows])
+            values.append(z)
+    keep = np.ones(n, dtype=bool)
+    selected = (counts >= max(1, min_neighbors)) & ~has_nan
+    if values and selected.any():
+        reference = np.nanmedian(np.stack(values, axis=1)[selected], axis=1)
+        keep[selected] = ~(np.abs(vertices[selected, 2].astype(np.float64) - reference) > threshold)
+    return keep
+
+
+def _filter_local_height_outliers_sparse(
+    vertices: NDArray[np.float32],
+    cells: NDArray[np.int64],
+    threshold: float,
+    min_neighbors: int,
+    radius: int,
+) -> NDArray[np.bool_]:
+    """Per-vertex dict scan with memory bounded by the vertex count."""
+    n = len(vertices)
     cell_to_vertex: dict = {}
     for i in range(n):
-        cell_to_vertex[(int(cell_idx[i, 0]), int(cell_idx[i, 1]))] = i
+        cell_to_vertex[(int(cells[i, 0]), int(cells[i, 1]))] = i
 
     keep = np.ones(n, dtype=bool)
     for i in range(n):
-        cx = int(cell_idx[i, 0])
-        cy = int(cell_idx[i, 1])
+        cx = int(cells[i, 0])
+        cy = int(cells[i, 1])
         neighbor_zs: List[float] = []
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):

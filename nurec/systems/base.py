@@ -14,7 +14,7 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Generator, Generic, Literal, Mapping, Tuple, TypeVar, Union, cast
+from typing import Any, Callable, Generator, Literal, Mapping, Tuple, Union, cast
 
 import numpy as np
 import point_cloud_utils as pcu
@@ -54,8 +54,10 @@ from nurec.datasets.ncore import NCOREDataSource
 from nurec.datasets.summary import DataSourceSummary
 from nurec.datasets.tracks import CuboidTracks, TrackFlags
 from nurec.harmonizer.model import HarmonizerModelFactory
-from nurec.libs.losses.orchestration.config import LossAggregatorBatchReturn, LossAggregatorReturn, LossReturnType
+from nurec.libs.losses.orchestration.config import LossResult
 from nurec.libs.losses.orchestration.loss_aggregator import LossAggregator
+from nurec.libs.losses.orchestration.loss_orchestrator import LossOrchestrator
+from nurec.lidar.firing_patterns.io import populate_firing_patterns
 from nurec.models.background import SkyEnvMapBackground
 from nurec.models.base import BaseModel
 from nurec.models.calib import BaseCalib
@@ -92,7 +94,6 @@ from nurec.utils.cuda_rng import (
 from nurec.utils.geometry import se3_matrix_to_tquat
 from nurec.utils.io.artifact_cache import ArtifactCache, publish_existing_usdz
 from nurec.utils.io.checkpoint import reduce_precision_to_fp16, upcast_fp16_to_fp32
-from nurec.utils.io.firing_patterns import populate_firing_patterns
 from nurec.utils.io.mesh import Mesh, get_usd_references, mesh_from_point_cloud, serialize_mesh, smooth_mesh
 from nurec.utils.io.metadata import get_metadata, serialize_metadata
 from nurec.utils.io.rig_trajectories import rig_trajectories_time_range, serialize_rig_trajectories
@@ -135,23 +136,6 @@ _GLOBAL_RNG_STATES_KEY = "nre.rng.global_states"
 
 def _ground_mesh_settings_from_artifact_config(ground_mesh_config: Any) -> GroundMeshReconstructionSettings:
     return GroundMeshReconstructionSettings.from_mapping(ground_mesh_config)
-
-
-def _loss_roots_by_name(
-    loss_return: LossAggregatorReturn | LossAggregatorBatchReturn,
-) -> dict[str, list[torch.Tensor]]:
-    """Group individual loss roots by stable loss name."""
-    roots_by_name: defaultdict[str, list[torch.Tensor]] = defaultdict(list)
-    loss_returns = (
-        loss_return.batch_loss_returns if isinstance(loss_return, LossAggregatorBatchReturn) else [loss_return]
-    )
-    for aggregate_return in loss_returns:
-        for name, individual_return in aggregate_return.loss_returns.items():
-            roots_by_name[name].append(individual_return.reduced_value)
-    return dict(roots_by_name)
-
-
-R = TypeVar("R")
 
 
 class DDPStrategySO(DDPStrategy):
@@ -270,7 +254,7 @@ class DDPStrategySO(DDPStrategy):
                 super().teardown()
 
     @property
-    def base_system(self) -> "BaseSystem[Any]":
+    def base_system(self) -> "BaseSystem":
         """Query the base system safely"""
         system = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
         assert isinstance(system, BaseSystem), "Model must be an instance of BaseSystem"
@@ -488,10 +472,15 @@ class DDPStrategySO(DDPStrategy):
         print_func(f"{' ' * (indent + 4)}└─{keys[-1]}")
 
 
-class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
+class BaseSystem(LightningModule, ABC):
     model: BaseModel
     config: BaseSystemConfig
     device: torch.device
+    loss: LossOrchestrator
+
+    def _create_losses(self, config: NuRecConfig) -> LossOrchestrator:
+        assert config.loss is not None
+        return LossAggregator(config.loss, config.trainer)
 
     def __init__(self, config: NuRecConfig) -> None:
         super().__init__()
@@ -546,8 +535,7 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
         warn_backward_nvtx_detail(self._backward_nvtx_detail, config.scopedtimer)
 
         self.datamodule = nurec.datamodules.make(config.datamodule.name, config)
-        assert config.loss is not None
-        self.loss = LossAggregator(config.loss, config.trainer)
+        self.loss = self._create_losses(config)
         self.training_step_outputs: defaultdict[str, list[torch.Tensor]] = defaultdict(list)
         self.validation_step_outputs: defaultdict[str, list[torch.Tensor]] = defaultdict(list)
 
@@ -649,6 +637,7 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
             # 2. Evaluate *system-level* training losses for given batch
             loss_return = self.training_losses(batch, batch_local_idx)
             self.on_training_losses_return(loss_return)
+            total_loss = loss_return.compute_total()
 
         # Broadcast exceptions raised during optimization.
         # Note: this is adding synchronization overhead, which might be significant if the
@@ -674,13 +663,13 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
             #         I don't think this is likely to happen, though (famous last words).
             # Partial test systems skip __init__, so the flag may be absent.
             backward_attribution = (
-                backward_nvtx_ranges(_loss_roots_by_name(loss_return))
+                backward_nvtx_ranges(loss_return.backward_roots())
                 if loss_backward_nvtx_active(getattr(self, "_backward_nvtx_detail", "off"))
                 else nullcontext()
             )
             with ScopedTimer("BaseSystem/training_step/manual_backward"):
                 with backward_attribution:
-                    self.manual_backward(loss_return.total_value)
+                    self.manual_backward(total_loss)
 
             # Let systems finish optimizer-specific asynchronous preparation
             # after gradients are synchronized but immediately before any
@@ -761,7 +750,7 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
         self.outer_loop_timer.start()
 
     @abstractmethod
-    def training_losses(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> LossReturnType:
+    def training_losses(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> LossResult:
         """Evaluate system-specific losses for a single training batch.
 
         Implementations may execute unconditional rank-symmetric forward
@@ -780,7 +769,7 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
         # https://github.com/Lightning-AI/pytorch-lightning/issues/17517#issuecomment-1532325528
         return self._trainer is not None
 
-    def on_training_losses_return(self, loss_return: LossReturnType) -> None:
+    def on_training_losses_return(self, loss_return: LossResult) -> None:
         """Callback for when training losses are returned."""
         pass
 
@@ -1133,7 +1122,7 @@ class BaseSystem(LightningModule, ABC, Generic[LossReturnType]):
             pass
 
 
-class BaseSystemSO(BaseSystem[LossAggregatorReturn]):
+class BaseSystemSO(BaseSystem):
     model: GaussiansComposite  # to be initialized by subclasses
     datamodule: SODataModule
     config: GaussiansSystemConfig
@@ -1317,7 +1306,20 @@ class BaseSystemSO(BaseSystem[LossAggregatorReturn]):
         return Mesh(vertices=best_mesh.vertices, faces=best_mesh.faces, colors=colors)
 
     def populate_artifact_cache(self, checkpoint: Checkpoint) -> None:
-        """Populate artifact cache fields based on available and selected entries"""
+        """Populate artifact cache fields based on available and selected entries
+
+        Args:
+            checkpoint: Model checkpoint to serialize alongside enabled artifact members.
+
+        Returns:
+            ``None``; populates the system's artifact cache, reusing entries that are
+            already present where their export path supports caching.
+
+        Raises:
+            ValueError: If enabled ground-mesh export has an unsupported sensor layout,
+                or required firing-pattern metadata, recovery, or export is invalid.
+            NotImplementedError: If the subclass does not implement checkpoint serialization.
+        """
 
         # Torch checkpoint
         if self.artifact_cache.artifact_config.checkpoint.enabled:
@@ -1651,11 +1653,13 @@ class BaseSystemSO(BaseSystem[LossAggregatorReturn]):
                     add_default_cameras=self.artifact_cache.artifact_config.rig_trajectories.add_default_cameras,
                 )
 
-            populate_firing_patterns(
-                self.artifact_cache,
-                rig_trajectories,
-                getattr(datasource, "lidar_sensors", {}),
-            )
+            if isinstance(datasource, NCOREDataSource):
+                populate_firing_patterns(
+                    self.artifact_cache,
+                    rig_trajectories,
+                    datasource.lidar_sensors,
+                    datasource.resolved_dataset,
+                )
 
     def serialize_artifact_checkpoint(self, checkpoint: Checkpoint) -> None:
         """Serialize the checkpoint for the artifact. Subclasses must override to set load_in_place and apply transforms."""

@@ -16,7 +16,7 @@ from nurec.libs.losses.models.camera_loss_masks import (
 from nurec.libs.losses.models.camera_loss_masks import (
     camera_loss_valid_mask as shared_camera_loss_valid_mask,
 )
-from nurec.libs.losses.orchestration.config import LossAggregatorReturn
+from nurec.libs.losses.orchestration.config import LossResult
 from nurec.utils.batch import CameraFrameLabels
 
 
@@ -69,7 +69,7 @@ def configured_distance_bounds_by_name(configured_losses: Iterable[Any]) -> dict
 
 
 def rescale_camera_mean_losses_to_original_valid_pixels(
-    loss_return: LossAggregatorReturn,
+    loss_return: LossResult,
     labels: CameraFrameLabels,
     context: ComponentOnlyLossNormalizationContext,
     *,
@@ -93,11 +93,11 @@ def rescale_camera_mean_losses_to_original_valid_pixels(
     )
 
     scales_by_name: dict[str, torch.Tensor] = {}
-    for loss in loss_return.loss_returns.values():
-        kind = camera_loss_kinds_by_name.get(loss.name)
+    for name in loss_return.names:
+        kind = camera_loss_kinds_by_name.get(name)
         if kind is None:
             continue
-        distance_bounds = distance_bounds_by_name.get(loss.name) if kind == CameraLossKind.DISTANCE else None
+        distance_bounds = distance_bounds_by_name.get(name) if kind == CameraLossKind.DISTANCE else None
         original_valid = camera_loss_valid_mask(
             kind,
             labels,
@@ -116,8 +116,8 @@ def rescale_camera_mean_losses_to_original_valid_pixels(
             original_count > 0,
             masked_count / original_count.clamp(min=1),
             original_count.to(torch.float32),
-        ).to(loss.reduced_value.dtype)
-        scales_by_name[loss.name] = scale
+        ).to(loss_return.weighted_value_dtype(name))
+        scales_by_name[name] = scale
 
     loss_return.rescale_reduced_values(scales_by_name)
 

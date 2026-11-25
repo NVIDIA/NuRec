@@ -5,6 +5,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import lietorch as lt
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
@@ -672,7 +673,7 @@ def test_unicycle_tracks_calib_visualizes_and_redraws_single_track() -> None:
         assert len(tracks_calib.all_connections) == 1
     finally:
         if hasattr(tracks_calib, "figure"):
-            tracks_calib_module.plt.close(tracks_calib.figure)
+            plt.close(tracks_calib.figure)
 
 
 def test_unicycle_pose_matches_lietorch_composition() -> None:

@@ -44,7 +44,6 @@ pip_compile(
     requirements_in = "requirements_3_13_x86_64.in",
     requirements_overrides = "requirements_3_13_overrides.in",
     requirements_txt = "requirements_3_13_x86_64.txt",
-    target_compatible_with = ["@platforms//cpu:x86_64"],
     visibility = [],
 )
 

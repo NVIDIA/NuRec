@@ -7,6 +7,7 @@ import grpc
 
 import nurec.grpc.protos.common_pb2 as nurec_dot_grpc_dot_protos_dot_common__pb2
 import nurec.grpc.protos.ipc_pb2 as nurec_dot_grpc_dot_protos_dot_ipc__pb2
+import nurec.grpc.protos.rdma_pb2 as nurec_dot_grpc_dot_protos_dot_rdma__pb2
 import nurec.grpc.protos.sensorsim_pb2 as nurec_dot_grpc_dot_protos_dot_sensorsim__pb2
 
 
@@ -64,10 +65,22 @@ class SensorsimServiceStub(object):
             response_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.BatchCameraRenderReturn.FromString,
             _registered_method=True,
         )
+        self.prefetch_scene = channel.unary_unary(
+            "/nurec.grpc.protos.sensorsim.SensorsimService/prefetch_scene",
+            request_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.PrefetchSceneRequest.SerializeToString,
+            response_deserializer=nurec_dot_grpc_dot_protos_dot_common__pb2.Empty.FromString,
+            _registered_method=True,
+        )
         self.render_lidar = channel.unary_unary(
             "/nurec.grpc.protos.sensorsim.SensorsimService/render_lidar",
             request_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderRequest.SerializeToString,
             response_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderReturn.FromString,
+            _registered_method=True,
+        )
+        self.get_lidar_firing_pattern = channel.unary_unary(
+            "/nurec.grpc.protos.sensorsim.SensorsimService/get_lidar_firing_pattern",
+            request_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternRequest.SerializeToString,
+            response_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternReturn.FromString,
             _registered_method=True,
         )
         self.create_harmonizer_session = channel.unary_unary(
@@ -166,6 +179,24 @@ class SensorsimServiceStub(object):
             response_deserializer=nurec_dot_grpc_dot_protos_dot_ipc__pb2.CloseIpcSessionResponse.FromString,
             _registered_method=True,
         )
+        self.open_rdma_session = channel.unary_unary(
+            "/nurec.grpc.protos.sensorsim.SensorsimService/open_rdma_session",
+            request_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionRequest.SerializeToString,
+            response_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionResponse.FromString,
+            _registered_method=True,
+        )
+        self.register_receive_buffer = channel.unary_unary(
+            "/nurec.grpc.protos.sensorsim.SensorsimService/register_receive_buffer",
+            request_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferRequest.SerializeToString,
+            response_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferResponse.FromString,
+            _registered_method=True,
+        )
+        self.close_rdma_session = channel.unary_unary(
+            "/nurec.grpc.protos.sensorsim.SensorsimService/close_rdma_session",
+            request_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionRequest.SerializeToString,
+            response_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class SensorsimServiceServicer(object):
@@ -195,8 +226,26 @@ class SensorsimServiceServicer(object):
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def prefetch_scene(self, request, context):
+        """Submit a local Gaussian scene for CPU preparation. OK means admitted, not ready.
+        If background preparation fails, a later scene request loads synchronously.
+        wait_for_capacity may wait for admission until the RPC or server deadline.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
     def render_lidar(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def get_lidar_firing_pattern(self, request, context):
+        """One firing-geometry phase of a lidar: where and when each ray is emitted. A client
+        caches each opaque pattern ID it observes; render_lidar's per-ray output echoes the
+        exact ID whose ray order indexes that frame.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
@@ -206,7 +255,8 @@ class SensorsimServiceServicer(object):
         sequence (a single trajectory). Use one session per sequence — reusing it across separate
         or interleaved sequences corrupts the temporal conditioning. Send the session's frames in
         trajectory order, one at a time (await each render before sending the next); concurrent or
-        out-of-order requests build the history wrongly and are not rejected. Returns
+        out-of-order requests build the history wrongly and are not rejected. In a batch render each
+        item names its own session; a repeated session fails the whole batch. Returns
         FAILED_PRECONDITION unless the server runs --enable-harmonizer-temporal.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -306,6 +356,27 @@ class SensorsimServiceServicer(object):
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def open_rdma_session(self, request, context):
+        """RDMA session lifecycle. After open_rdma_session + register_receive_buffer,
+        render_rgb / render_camera may be called with use_rdma=true to deliver the
+        frame via RDMA WRITE into a client buffer registered on that session.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def register_receive_buffer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def close_rdma_session(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
 
 def add_SensorsimServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -329,10 +400,20 @@ def add_SensorsimServiceServicer_to_server(servicer, server):
             request_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.BatchCameraRenderRequest.FromString,
             response_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.BatchCameraRenderReturn.SerializeToString,
         ),
+        "prefetch_scene": grpc.unary_unary_rpc_method_handler(
+            servicer.prefetch_scene,
+            request_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.PrefetchSceneRequest.FromString,
+            response_serializer=nurec_dot_grpc_dot_protos_dot_common__pb2.Empty.SerializeToString,
+        ),
         "render_lidar": grpc.unary_unary_rpc_method_handler(
             servicer.render_lidar,
             request_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderRequest.FromString,
             response_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderReturn.SerializeToString,
+        ),
+        "get_lidar_firing_pattern": grpc.unary_unary_rpc_method_handler(
+            servicer.get_lidar_firing_pattern,
+            request_deserializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternRequest.FromString,
+            response_serializer=nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternReturn.SerializeToString,
         ),
         "create_harmonizer_session": grpc.unary_unary_rpc_method_handler(
             servicer.create_harmonizer_session,
@@ -413,6 +494,21 @@ def add_SensorsimServiceServicer_to_server(servicer, server):
             servicer.close_ipc_session,
             request_deserializer=nurec_dot_grpc_dot_protos_dot_ipc__pb2.CloseIpcSessionRequest.FromString,
             response_serializer=nurec_dot_grpc_dot_protos_dot_ipc__pb2.CloseIpcSessionResponse.SerializeToString,
+        ),
+        "open_rdma_session": grpc.unary_unary_rpc_method_handler(
+            servicer.open_rdma_session,
+            request_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionRequest.FromString,
+            response_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionResponse.SerializeToString,
+        ),
+        "register_receive_buffer": grpc.unary_unary_rpc_method_handler(
+            servicer.register_receive_buffer,
+            request_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferRequest.FromString,
+            response_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferResponse.SerializeToString,
+        ),
+        "close_rdma_session": grpc.unary_unary_rpc_method_handler(
+            servicer.close_rdma_session,
+            request_deserializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionRequest.FromString,
+            response_serializer=nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionResponse.SerializeToString,
         ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -547,6 +643,36 @@ class SensorsimService(object):
         )
 
     @staticmethod
+    def prefetch_scene(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/nurec.grpc.protos.sensorsim.SensorsimService/prefetch_scene",
+            nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.PrefetchSceneRequest.SerializeToString,
+            nurec_dot_grpc_dot_protos_dot_common__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
     def render_lidar(
         request,
         target,
@@ -565,6 +691,36 @@ class SensorsimService(object):
             "/nurec.grpc.protos.sensorsim.SensorsimService/render_lidar",
             nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderRequest.SerializeToString,
             nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarRenderReturn.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def get_lidar_firing_pattern(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/nurec.grpc.protos.sensorsim.SensorsimService/get_lidar_firing_pattern",
+            nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternRequest.SerializeToString,
+            nurec_dot_grpc_dot_protos_dot_sensorsim__pb2.LidarFiringPatternReturn.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1045,6 +1201,96 @@ class SensorsimService(object):
             "/nurec.grpc.protos.sensorsim.SensorsimService/close_ipc_session",
             nurec_dot_grpc_dot_protos_dot_ipc__pb2.CloseIpcSessionRequest.SerializeToString,
             nurec_dot_grpc_dot_protos_dot_ipc__pb2.CloseIpcSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def open_rdma_session(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/nurec.grpc.protos.sensorsim.SensorsimService/open_rdma_session",
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionRequest.SerializeToString,
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.OpenRdmaSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def register_receive_buffer(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/nurec.grpc.protos.sensorsim.SensorsimService/register_receive_buffer",
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferRequest.SerializeToString,
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.RegisterReceiveBufferResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def close_rdma_session(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/nurec.grpc.protos.sensorsim.SensorsimService/close_rdma_session",
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionRequest.SerializeToString,
+            nurec_dot_grpc_dot_protos_dot_rdma__pb2.CloseRdmaSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,

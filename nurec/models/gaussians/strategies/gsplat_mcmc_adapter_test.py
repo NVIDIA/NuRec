@@ -20,6 +20,7 @@ from nurec.models.gaussians.gaussians_model import _MCMC_TO_NUREC_PARAMETER, Bas
 from nurec.models.gaussians.strategies.gsplat_mcmc_adapter import (
     add_gaussians,
     relocate_gaussians,
+    relocate_gaussians_and_reindex,
     relocate_gaussians_grouped,
 )
 from nurec.models.gaussians.strategies.selected_gaussian_nodes import SelectedGaussianNodes
@@ -208,6 +209,167 @@ def test_plan_handoff_publishes_nurec_state_and_uses_fresh_owners() -> None:
     assert second.positions is old_second and second.hooks == []
 
 
+def test_scored_addition_samples_only_positive_weight_parent() -> None:
+    _, _, selected = _selected(torch.device("cpu"))
+    weights = {
+        "first": torch.tensor([0.0, 0.0]),
+        "second": torch.tensor([0.0, 0.0, 1.0]),
+    }
+
+    with (
+        patch(
+            f"{_ADAPTER}.compute_relocation",
+            side_effect=lambda opacities, scales, *_args: (opacities, scales),
+        ),
+        patch(f"{_ADAPTER}.apply_plan", return_value=()) as apply,
+    ):
+        assert add_gaussians(
+            selected,
+            count=3,
+            binoms=_binoms(torch.device("cpu")),
+            min_opacity=0.005,
+            generator=torch.Generator().manual_seed(7),
+            invisible_steps=None,
+            source_weights_by_owner=weights,
+        )
+
+    plan = apply.call_args.args[1]
+    torch.testing.assert_close(plan.source_indices, torch.tensor([4, 4, 4]))
+    torch.testing.assert_close(plan.keep, torch.ones(5, dtype=torch.bool))
+    assert plan.operation is MCMCOperation.ADDITION
+
+
+def test_scored_relocation_masks_dead_and_ineligible_sources() -> None:
+    _, _, selected = _selected(torch.device("cpu"))
+    dead_by_owner = {
+        "first": torch.tensor([True, False]),
+        "second": torch.tensor([False, False, False]),
+    }
+    eligible_by_owner = {
+        "first": torch.tensor([True, True]),
+        "second": torch.tensor([False, False, True]),
+    }
+    weights = {
+        "first": torch.tensor([100.0, 0.0]),
+        "second": torch.tensor([100.0, 100.0, 1.0]),
+    }
+
+    with (
+        patch(
+            f"{_ADAPTER}.compute_relocation",
+            side_effect=lambda opacities, scales, *_args: (opacities, scales),
+        ),
+        patch(f"{_ADAPTER}.apply_plan", return_value=()) as apply,
+    ):
+        assert relocate_gaussians(
+            selected,
+            dead_by_owner=dead_by_owner,
+            source_eligible_by_owner=eligible_by_owner,
+            binoms=_binoms(torch.device("cpu")),
+            min_opacity=0.005,
+            generator=torch.Generator().manual_seed(11),
+            invisible_steps=None,
+            source_weights_by_owner=weights,
+        )
+
+    plan = apply.call_args.args[1]
+    torch.testing.assert_close(plan.source_indices, torch.tensor([4]))
+    torch.testing.assert_close(plan.keep, torch.tensor([False, True, True, True, True]))
+    assert plan.operation is MCMCOperation.RELOCATION
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not gsplat.has_reloc(),
+    reason="real relocation publication requires RELOC and CUDA",
+)
+def test_real_cuda_publication_reindexes_scores_before_scored_addition() -> None:
+    device = torch.device("cuda")
+    first, second, selected = _selected(device)
+    old_first_positions = first.positions
+    old_second_positions = second.positions
+    dead_by_owner = {
+        "first": torch.tensor([True, False], device=device),
+        "second": torch.tensor([False, False, False], device=device),
+    }
+    eligible_by_owner = {
+        "first": torch.tensor([False, True], device=device),
+        "second": torch.tensor([False, False, True], device=device),
+    }
+    source_weights = {
+        "first": torch.tensor([0.0, 0.0], device=device),
+        "second": torch.tensor([0.0, 0.0, 1.0], device=device),
+    }
+    pre_relocation_gradient_scores = {
+        "first": torch.tensor([10.0, 20.0], device=device),
+        "second": torch.tensor([30.0, 40.0, 50.0], device=device),
+    }
+
+    changed, reindexed_scores = relocate_gaussians_and_reindex(
+        selected,
+        dead_by_owner=dead_by_owner,
+        source_eligible_by_owner=eligible_by_owner,
+        binoms=_binoms(device),
+        min_opacity=0.005,
+        generator=torch.Generator(device=device).manual_seed(11),
+        invisible_steps=None,
+        source_weights_by_owner=source_weights,
+        reindex_values_by_owner=pre_relocation_gradient_scores,
+    )
+
+    assert changed
+    assert first.positions is not old_first_positions
+    assert second.positions is not old_second_positions
+    torch.testing.assert_close(reindexed_scores["first"], torch.tensor([20.0], device=device))
+    torch.testing.assert_close(
+        reindexed_scores["second"],
+        torch.tensor([30.0, 40.0, 50.0, 50.0], device=device),
+    )
+    assert first.get_num_gaussians() == 1
+    assert second.get_num_gaussians() == 4
+
+    assert add_gaussians(
+        SelectedGaussianNodes(selected.gaussians_nodes, exclude_layer_ids=[]),
+        count=2,
+        binoms=_binoms(device),
+        min_opacity=0.005,
+        generator=torch.Generator(device=device).manual_seed(13),
+        invisible_steps=None,
+        source_weights_by_owner={
+            "first": torch.zeros(1, device=device),
+            "second": torch.tensor([0.0, 0.0, 1.0, 1.0], device=device),
+        },
+    )
+
+    assert first.get_num_gaussians() == 1
+    assert second.get_num_gaussians() == 6
+    torch.testing.assert_close(second.row_ids[-2:], torch.tensor([12, 12], device=device))
+
+
+def test_scored_sampling_rejects_invalid_owner_weights() -> None:
+    _, _, selected = _selected(torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="keys must match"):
+        add_gaussians(
+            selected,
+            count=1,
+            binoms=_binoms(torch.device("cpu")),
+            min_opacity=0.005,
+            generator=torch.Generator(),
+            invisible_steps=None,
+            source_weights_by_owner={"first": torch.ones(2)},
+        )
+    with pytest.raises(ValueError, match="nonnegative"):
+        add_gaussians(
+            selected,
+            count=1,
+            binoms=_binoms(torch.device("cpu")),
+            min_opacity=0.005,
+            generator=torch.Generator(),
+            invisible_steps=None,
+            source_weights_by_owner={"first": torch.tensor([-1.0, 1.0]), "second": torch.ones(3)},
+        )
+
+
 def test_grouped_relocation_samples_per_group_and_publishes_once() -> None:
     device = torch.device("cpu")
     model = _Model(4, 1, device)
@@ -363,7 +525,7 @@ def test_none_plan_is_a_noop_and_publication_failure_latches_all_owners() -> Non
     assert caught.value is failure
     for model in (first, second):
         with pytest.raises(RuntimeError, match="publication previously failed"):
-            model.raise_if_mcmc_publication_failed()
+            model.raise_if_publication_failed()
 
 
 def test_apply_failure_latches_all_owners() -> None:
@@ -392,7 +554,7 @@ def test_apply_failure_latches_all_owners() -> None:
     assert caught.value is failure
     for model in (first, second):
         with pytest.raises(RuntimeError, match="publication previously failed"):
-            model.raise_if_mcmc_publication_failed()
+            model.raise_if_publication_failed()
 
 
 def test_validation_failure_does_not_latch_owners() -> None:
@@ -416,8 +578,8 @@ def test_validation_failure_does_not_latch_owners() -> None:
 
     assert caught.value is failure
     apply_plan.assert_not_called()
-    first.raise_if_mcmc_publication_failed()
-    second.raise_if_mcmc_publication_failed()
+    first.raise_if_publication_failed()
+    second.raise_if_publication_failed()
 
 
 def test_unoptimized_trainable_rows_are_published_with_requires_grad_preserved() -> None:
@@ -447,20 +609,74 @@ def test_unoptimized_trainable_rows_are_published_with_requires_grad_preserved()
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or not gsplat.has_reloc(),
+    reason="weighted-plan oracle requires RELOC and CUDA",
+)
+def test_scored_addition_matches_gsplat_opacity_sampling_oracle() -> None:
+    device = torch.device("cuda")
+    first, second, selected = _selected(device)
+    opacity_weights = {
+        "first": torch.sigmoid(first.densities).flatten(),
+        "second": torch.sigmoid(second.densities).flatten(),
+    }
+    plans: list[MCMCRowPlan] = []
+
+    def record_plan(_owners: Any, plan: MCMCRowPlan) -> tuple[()]:
+        plans.append(plan)
+        return ()
+
+    with patch(f"{_ADAPTER}.apply_plan", side_effect=record_plan):
+        assert add_gaussians(
+            selected,
+            count=5,
+            binoms=_binoms(device),
+            min_opacity=0.005,
+            generator=torch.Generator(device=device).manual_seed(23),
+            invisible_steps=None,
+        )
+        assert add_gaussians(
+            selected,
+            count=5,
+            binoms=_binoms(device),
+            min_opacity=0.005,
+            generator=torch.Generator(device=device).manual_seed(23),
+            invisible_steps=None,
+            source_weights_by_owner=opacity_weights,
+        )
+
+    original, scored = plans
+    assert scored.operation is original.operation
+    torch.testing.assert_close(scored.keep, original.keep)
+    torch.testing.assert_close(scored.source_indices, original.source_indices)
+    torch.testing.assert_close(scored.revised_opacities, original.revised_opacities)
+    torch.testing.assert_close(scored.revised_scales, original.revised_scales)
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or not gsplat.has_reloc() or not gsplat.has_adam(),
     reason="owner topology integration requires RELOC, ADAM, and CUDA",
 )
 @pytest.mark.parametrize("operation", ["addition", "relocation"])
-def test_real_owner_api_keeps_model_scene_optimizer_and_sidecars_aligned(operation: str) -> None:
+@pytest.mark.parametrize("scored", [False, True])
+def test_real_owner_api_keeps_model_scene_optimizer_and_sidecars_aligned(operation: str, scored: bool) -> None:
     device = torch.device("cuda")
     first, second, selected = _selected(device)
     visibility = _visibility(selected)
     models = {"first": first, "second": second}
     old_rows = {layer: model.row_ids.clone() for layer, model in models.items()}
+    old_visibility = {layer: values.clone() for layer, values in visibility.items()}
     for model in models.values():
         torch.stack([parameter.sum() for parameter in model.get_parameters().values()]).sum().backward()
         _optimizer(model).step()
         _optimizer(model).zero_grad()
+    source_weights = (
+        {
+            "first": torch.zeros_like(first.densities).flatten(),
+            "second": torch.sigmoid(second.densities).flatten(),
+        }
+        if scored
+        else None
+    )
 
     if operation == "addition":
         assert add_gaussians(
@@ -470,6 +686,7 @@ def test_real_owner_api_keeps_model_scene_optimizer_and_sidecars_aligned(operati
             min_opacity=0.005,
             generator=torch.Generator(device=device).manual_seed(17),
             invisible_steps=visibility,
+            source_weights_by_owner=source_weights,
         )
         assert sum(model.get_num_gaussians() for model in models.values()) == 7
     else:
@@ -487,12 +704,24 @@ def test_real_owner_api_keeps_model_scene_optimizer_and_sidecars_aligned(operati
             min_opacity=0.005,
             generator=torch.Generator(device=device).manual_seed(19),
             invisible_steps=visibility,
+            source_weights_by_owner=source_weights,
         )
         assert (first.get_num_gaussians(), second.get_num_gaussians()) == (1, 4)
 
     for layer_id, model in models.items():
         scene, optimizer = model.get_mcmc_scene(), _optimizer(model)
         assert scene is not None
+        assert len(model.validated_recycled_rows) == 1
+        owner_changed = operation == "relocation" or model.get_num_gaussians() != old_rows[layer_id].numel()
+        assert len(model.applied_row_updates) == int(owner_changed)
+        if owner_changed:
+            source_row_map, retained_count, recycled_rows = model.applied_row_updates[0]
+            torch.testing.assert_close(model.row_ids, old_rows[layer_id][source_row_map])
+            assert recycled_rows is None
+            assert torch.count_nonzero(visibility[layer_id][retained_count:]) == 0
+        else:
+            torch.testing.assert_close(model.row_ids, old_rows[layer_id])
+            torch.testing.assert_close(visibility[layer_id], old_visibility[layer_id])
         for splat_name, parameter in scene.splats.items():
             assert getattr(model, _MCMC_TO_NUREC_PARAMETER.get(splat_name, splat_name)) is parameter
             assert _has_parameter(optimizer, parameter)

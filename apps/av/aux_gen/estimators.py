@@ -27,11 +27,13 @@ from torchvision import transforms
 import ncore.data
 
 from apps.av.aux_gen.device_frame import (
+    DeviceFrameContext,
     DeviceFrameOutputSpec,
     DeviceFrameProcessor,
     DeviceFrameProcessorMetadata,
     process_device_frame_from_host,
 )
+from apps.av.aux_gen.mask2former.entropy import mask2former_postprocess
 from apps.av.aux_gen.segmentation_device_pipeline import (
     CAMERA_MASK_INPUT,
     MASK2FORMER_PROCESSOR,
@@ -53,7 +55,7 @@ from apps.av.aux_gen.segmentation_presentation import (
     save_mask2former_visualization as _save_mask2former_visualization,
 )
 from apps.av.aux_gen.trt_engine_selection import select_trt_checkpoint
-from apps.av.aux_gen.utils import LidarSpinMesh, _quantile, plot_points_on_image_with_color
+from apps.av.aux_gen.utils import LidarSpinMesh, plot_points_on_image_with_color
 from ncore.impl.common.transformations import transform_point_cloud
 from ncore.sensors import camera_model_from_parameters
 from nurec.libs.vren.ensemble import ensemble_cuda, ensemble_numba  # type: ignore
@@ -72,15 +74,13 @@ def find_network_file_path(filename: str, search_roots: Optional[List[Path]] = N
     for search_path in [
         "mmseg_repo/configs/dinov2_sam",
         "mask2former_weights/file",
-        "trt_engine_a40_x86_64/file",
-        "trt_engine_l40_x86_64/file",
-        "trt_engine_l40_aarch64/file",
-        "trt_engine_a100_x86_64/file",
-        "trt_engine_a6000_x86_64/file",
+        "trt_engine_sm80_x86_64/file",
+        "trt_engine_sm86_x86_64/file",
+        "trt_engine_sm89_x86_64/file",
+        "trt_engine_sm90_x86_64/file",
+        "trt_engine_sm103_aarch64/file",
         "trt_engine_ampereplus_x86_64/file",
         "trt_engine_ampereplus_aarch64/file",
-        "trt_engine_5880_x86_64/file",
-        "trt_engine_l4_x86_64/file",
         "sam2_egomask_weights/file",
     ]:
         # Add runfiles-based search-roots
@@ -106,19 +106,18 @@ def find_network_file_path(filename: str, search_roots: Optional[List[Path]] = N
     raise FileNotFoundError(f"Could not find file: {filename} in {default_search_roots}")
 
 
-def get_gpu_info() -> tuple[str | None, str | None]:
-    """Return the current CUDA device name and compute capability.
+def get_compute_capability() -> str | None:
+    """Return the current CUDA device compute capability.
 
     Returns:
-        The active device name and ``major.minor`` compute capability, or
-        ``(None, None)`` when CUDA is unavailable.
+        The active device compute capability as ``major.minor``, or
+        ``None`` when CUDA is unavailable.
     """
     if not torch.cuda.is_available():
-        return None, None
+        return None
     device_id = torch.cuda.current_device()
     capability = torch.cuda.get_device_capability(device_id)
-    name = torch.cuda.get_device_name(device_id)
-    return name, f"{capability[0]}.{capability[1]}"
+    return f"{capability[0]}.{capability[1]}"
 
 
 class SegmentationReturn(NamedTuple):
@@ -197,15 +196,15 @@ class Mask2FormerSegmentationEstimator(DeviceFrameProcessor):
         checkpoint_path = find_network_file_path(pretrained_checkpoint)
 
         machine = platform.machine()
-        gpu_name, sm_version = get_gpu_info()
-        trt_checkpoint = select_trt_checkpoint(gpu_name, sm_version, machine) if enable_trt else None
+        sm_version = get_compute_capability()
+        gpu_name = torch.cuda.get_device_name() if enable_trt and torch.cuda.is_available() else None
+        trt_checkpoint = select_trt_checkpoint(sm_version, machine, gpu_name) if enable_trt else None
 
         if trt_checkpoint is None:
             if enable_trt:
                 logging.warning(
-                    "TensorRT requested but no precompiled engine available for %s "
-                    "(sm_%s, %s); falling back to a slower code path.",
-                    gpu_name,
+                    "TensorRT requested but no precompiled engine available for "
+                    "sm_%s on %s; falling back to a slower code path.",
                     sm_version,
                     machine,
                 )
@@ -286,25 +285,12 @@ class Mask2FormerSegmentationEstimator(DeviceFrameProcessor):
             raise ValueError(
                 f"Mask2Former logits are on {logits_tensor.device}, but labels are on {pred_labels.device}"
             )
-        logits_tensor = logits_tensor.to(dtype=torch.float32)
-        probs = F.softmax(logits_tensor, dim=0)
-        entropy = torch.special.entr(probs).sum(dim=0)
-        quantile = 0.90
-        if entropy.numel() <= 4096**2:
-            entropy_threshold = torch.quantile(entropy, quantile)
-        else:
-            entropy_threshold = _quantile(entropy, quantile)
-
-        uncertainty_mask = entropy > entropy_threshold
-        labels_tensor = pred_labels.to(dtype=torch.uint8).squeeze(0)
-        building_id = self.stuff_classes.index("building")
-        labels_tensor[uncertainty_mask] = building_id
-
-        if self.estimate_logits:
-            logits_tensor[:, uncertainty_mask] = 0
-            logits_tensor[building_id, uncertainty_mask] = 1
-
-        return labels_tensor, logits_tensor, uncertainty_mask
+        return mask2former_postprocess(
+            logits_tensor.to(dtype=torch.float32),
+            pred_labels,
+            self.stuff_classes.index("building"),
+            self.estimate_logits,
+        )
 
     def infer_device(
         self,
@@ -403,6 +389,7 @@ class Mask2FormerSegmentationEstimator(DeviceFrameProcessor):
         outputs: Mapping[str, torch.Tensor],
         processor_inputs: Mapping[str, torch.Tensor],
         stream: torch.cuda.Stream,
+        frame: DeviceFrameContext,
     ) -> None:
         """Run Mask2Former and copy results into device-frame outputs.
 
@@ -415,6 +402,7 @@ class Mask2FormerSegmentationEstimator(DeviceFrameProcessor):
                 for the pipeline-slot lifetime.
             processor_inputs: Optional read-only CUDA inputs, including
                 ``bool[H, W]`` camera mask.
+            frame: Unused frame identity.
             stream: CUDA stream that owns inference, post-processing, and
                 output copies. The caller owns synchronization.
 
@@ -490,6 +478,7 @@ class Mask2FormerSegmentationEstimator(DeviceFrameProcessor):
                 processor_inputs=(
                     {CAMERA_MASK_INPUT: np.asarray(ego_mask, dtype=np.bool_)} if ego_mask is not None else None
                 ),
+                frame=DeviceFrameContext(0, 0, "", 0, ()),
             )
             result = SegmentationReturn(
                 semantic_seg=_labels_to_paletted_image(host_outputs[SEMANTIC_LABELS_OUTPUT]),
@@ -995,6 +984,7 @@ class PromptlessSAM2EgoMaskEstimator(DeviceFrameProcessor):
         outputs: Mapping[str, torch.Tensor],
         processor_inputs: Mapping[str, torch.Tensor],
         stream: torch.cuda.Stream,
+        frame: DeviceFrameContext,
     ) -> None:
         """Run SAM2 and copy its binary mask into device-frame output.
 
@@ -1006,6 +996,7 @@ class PromptlessSAM2EgoMaskEstimator(DeviceFrameProcessor):
                 ``uint8[H, W]`` SAM2 mask buffer.
             processor_inputs: Unused read-only processor inputs.
             stream: CUDA stream owning inference and the output copy.
+            frame: Unused frame identity.
 
         Returns:
             None. The binary mask write is enqueued on ``stream``.
@@ -1132,5 +1123,6 @@ class PromptlessSAM2EgoMaskEstimator(DeviceFrameProcessor):
             image_rgb_hwc,
             input_spec=((1, 3, height, width), torch.uint8),
             device=torch.device(self.predictor.device),
+            frame=DeviceFrameContext(0, 0, "", 0, ()),
         )
         return outputs[SAM2_MASK_OUTPUT]

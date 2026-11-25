@@ -19,7 +19,7 @@ defaults:
   - /apps/prod/options/calib: enabled
   - /apps/prod/Hyperion-8.1/options/lidar_calibration: disabled
   - /apps/prod/Hyperion-8.1/options/dynamic_rigids_track_calibration: direct # or elevation_aware_unicycle
-  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "30000"
+  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "27000"
   - /apps/prod/Hyperion-8.1/options/lidar_rays_per_train_sample: "2048"
   - /apps/prod/Hyperion-8.1/options/cuboid_track_label_sources: autolabel
   - /apps/prod/Hyperion-8.1/options/visible_track_split: pedestrians_5s
@@ -37,9 +37,10 @@ defaults:
 
   # Training strategy and optimizers.
   - /apps/AV/module_mixins/_mcmc_mixin.yaml
-  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "2000000"
-  - /apps/prod/Hyperion-8.1/options/mcmc_schedule: densify_20000_to_35000
+  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "1500000"
+  - /apps/prod/Hyperion-8.1/options/mcmc_schedule: taminggs_450_to_27000
   - /apps/prod/Hyperion-8.1/options/mcmc_excluded_layers: road_and_cones
+  - /apps/prod/Hyperion-8.1/options/strategy: taminggs_mcmc
   - /apps/prod/Hyperion-8.1/options/gaussian_optimizer: selective_adam
   - /apps/prod/Hyperion-8.1/options/road_optimizer: geometry_lrs_1e-6_1e-4
   - /apps/prod/Hyperion-8.1/options/background_optimizer: instant_nurec_position_lr_5.06e-5_albedo_lr_2.5e-4
@@ -67,7 +68,6 @@ defaults:
   - /apps/prod/Hyperion-8.1/options/runtime_gc: usage_7e-1_every_10_steps
 
   # Config-group overrides inherited from the base recipe.
-  - override /model/gaussians/strategy@model.strategy: mcmc
   - override /model/post_processing@model.post_processing.b: ppisp
   - override /model/post_processing@model.post_processing.c: null
   - override /logger: dummy

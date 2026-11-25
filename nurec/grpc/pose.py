@@ -12,6 +12,8 @@ backwards compatibility.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 
@@ -33,7 +35,12 @@ def grpc_pose_to_tquat(pose: grpc_types.Pose) -> torch.Tensor:
     Returns:
         single 7d tquat List[float]
     """
-    return torch.tensor([pose.vec.x, pose.vec.y, pose.vec.z, pose.quat.x, pose.quat.y, pose.quat.z, pose.quat.w])
+    fields = ("vec.x", "vec.y", "vec.z", "quat.x", "quat.y", "quat.z", "quat.w")
+    values = [pose.vec.x, pose.vec.y, pose.vec.z, pose.quat.x, pose.quat.y, pose.quat.z, pose.quat.w]
+    for field, value in zip(fields, values):
+        if not math.isfinite(value):
+            raise ValueError(f"Pose component {field} must be finite; got {value}")
+    return torch.tensor(values)
 
 
 def tquat_to_grpc_pose(tquat: np.ndarray | torch.Tensor) -> grpc_types.Pose:

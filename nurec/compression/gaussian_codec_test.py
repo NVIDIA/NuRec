@@ -380,14 +380,53 @@ def test_pack_invalid_args(sample_state_dict, kwargs):
         compact.pack(sample_state_dict, **kwargs)
 
 
-def test_pack_rejects_interpolated_deformation_table_state(sample_state_dict):
-    """Compact export must not reorder Gaussians without reordering table rows."""
-
+def test_pack_rejects_table_without_gaussians(sample_state_dict):
     state = dict(sample_state_dict)
     state["model.gaussians_nodes.dynamic_deformables.deformation_table.global_row_ids"] = torch.arange(4)
 
-    with pytest.raises(ValueError, match="does not support interpolated deformation tables"):
+    with pytest.raises(ValueError, match="missing supported Gaussian layer"):
         compact.pack(state, opacity_threshold=0.0, compression_level=0)
+
+
+def test_empty_table_round_trip():
+    prefix = "model.gaussians_nodes.dynamic_deformables"
+    state = {
+        prefix + ".positions": torch.empty(0, 3),
+        prefix + ".gaussian_cuboid_ids": torch.empty(0, dtype=torch.int32),
+    }
+    for name in ("global_row_ids", "storage.row_start_columns", "storage.row_end_columns", "storage.row_group_ids"):
+        state[f"{prefix}.deformation_table.{name}"] = torch.empty(0, dtype=torch.int64)
+    restored = compact.unpack(*compact.pack(state))
+    assert restored.keys() == state.keys()
+    for key in state:
+        torch.testing.assert_close(restored[key], state[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["ids", "groups", "lifetime", "column", "unknown"])
+def test_pack_rejects_inconsistent_table(invalid):
+    prefix = "model.gaussians_nodes.dynamic_deformables"
+    table = prefix + ".deformation_table."
+    state = {
+        prefix + ".positions": torch.zeros(2, 3),
+        prefix + ".gaussian_cuboid_ids": torch.tensor([0, 1]),
+        table + "global_row_ids": torch.tensor([1, 0]),
+        table + "storage.row_start_columns": torch.tensor([0, 0]),
+        table + "storage.row_end_columns": torch.tensor([0, 0]),
+        table + "storage.row_group_ids": torch.tensor([1, 0]),
+        table + "storage.columns.0.values": torch.zeros(2, 7),
+    }
+    if invalid == "ids":
+        state[table + "global_row_ids"] = torch.tensor([0, 0])
+    elif invalid == "groups":
+        state[table + "storage.row_group_ids"] = torch.tensor([0, 1])
+    elif invalid == "lifetime":
+        state[table + "storage.row_start_columns"] = torch.tensor([-1, 0])
+    elif invalid == "column":
+        state[table + "storage.columns.0.values"] = torch.zeros(1, 7)
+    else:
+        state[table + "unknown"] = torch.zeros(2)
+    with pytest.raises(ValueError, match="deformation_table"):
+        compact.pack(state)
 
 
 def test_morton_sort_rejects_nonpositive_voxel_size():
@@ -731,6 +770,17 @@ def test_pack_raises_when_dynamic_layer_culled_without_extra_state(rng, extra_st
         compact.pack(state, opacity_threshold=0.5, compression_level=0)
 
 
+def test_unpack_accepts_pre_rename_format(sample_state_dict):
+    tensors, metadata = compact.pack(sample_state_dict, opacity_threshold=0.0, compression_level=9)
+    assert metadata["compact_format"] == "nurec.gaussians.compact/v1"
+    expected = compact.unpack(tensors, metadata)
+    restored = compact.unpack(tensors, {**metadata, "compact_format": "nre.gaussians.compact/v1"})
+
+    assert restored.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(restored[key], expected[key], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -878,6 +928,34 @@ def test_pack_rejects_unknown_direct_per_gaussian_layer_tensor(sample_state_dict
     }
     with pytest.raises(ValueError, match=r"new_signal.*per-Gaussian tensor set"):
         compact.pack(state, compression_level=0)
+
+
+@pytest.mark.parametrize(
+    "n, kept_indices",
+    [(1, [0]), (3, [0, 1, 2]), (3, [0, 2]), (1, [])],
+    ids=["singleton", "sorted", "culled", "empty"],
+)
+def test_pack_preserves_object_bounds_when_object_and_gaussian_counts_match(rng, n, kept_indices):
+    prefix = "model.gaussians_nodes.dynamic_deformables"
+    positions = torch.zeros(n, 3)
+    positions[:, 0] = torch.arange(n - 1, -1, -1) * 2
+    densities = torch.full((n, 1), -10.0)
+    densities[kept_indices] = 10.0
+    extents = torch.arange(n * 3, dtype=torch.float32).reshape(n, 3) + 1
+    object_ids = torch.arange(n, dtype=torch.int32)
+    state = _layer(prefix, n, rng) | {
+        f"{prefix}.positions": positions,
+        f"{prefix}.densities": densities,
+        f"{prefix}.gaussian_cuboid_ids": object_ids,
+        f"{prefix}.aabb_extent": extents,
+    }
+
+    tensors, metadata = compact.pack(state, opacity_threshold=0.5, compression_level=0)
+    restored = compact.unpack(tensors, metadata)
+
+    torch.testing.assert_close(restored[f"{prefix}.aabb_extent"], extents, rtol=0, atol=0)
+    torch.testing.assert_close(restored[f"{prefix}.positions"], positions[kept_indices].flip(0), rtol=0, atol=0)
+    torch.testing.assert_close(restored[f"{prefix}.gaussian_cuboid_ids"], object_ids[kept_indices].flip(0))
 
 
 def test_pack_malformed_dynamic_layer_missing_positions(sample_state_dict):

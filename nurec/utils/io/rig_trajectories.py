@@ -12,12 +12,168 @@ from ncore.data import (
     FThetaCameraModelParameters,
     OpenCVFisheyeCameraModelParameters,
     OpenCVPinholeCameraModelParameters,
+    ShutterType,
 )
 from nurec.utils.io.utils import initialize_usd_stage, nurec_tf_to_usd_tf
 from nurec.utils.types import ArtifactContents, HalfClosedInterval, NamedSerialized, NamedUSDStage, RigTrajectories
 
 
-# TODO: add rolling shutter support (previously tracked on the unused ShutterType import)
+_LENS_DISTORTION_PREFIX = "omni:lensdistortion"
+_FTHETA_SCHEMA_ORDER = 5  # the OmniLensDistortionFthetaAPI schema declares k0..k4
+
+
+_PINHOLE_HORIZONTAL_APERTURE = 20.955  # USD default (mm), the focal length and vertical aperture are derived from it
+
+
+def _author_pinhole_camera_attributes(camera_prim: Usd.Prim, camera_model: OpenCVPinholeCameraModelParameters) -> None:
+    """
+    Author the standard USD camera attributes (focal length, apertures and aperture offsets) matching the pinhole
+    intrinsics, ignoring the distortion, for viewers that do not read the lens distortion schemas (e.g. the Kit
+    viewport, which would otherwise show a default 50 mm perspective camera). RTX renders use the lens distortion
+    schema instead. Only pinhole cameras can be described this way: the fisheye and FTheta cameras keep the default
+    perspective attributes.
+
+    The aperture offsets use the NCore principal point as is (pixel-corner convention, which is what the USD
+    projection expects), whereas the lens distortion schema is shifted by half a pixel to RTX's pixel-center convention.
+    """
+    width, height = (float(v) for v in camera_model.resolution.tolist())
+    fx, fy = (float(v) for v in camera_model.focal_length.tolist())
+    cx, cy = (float(v) for v in camera_model.principal_point.tolist())
+    horizontal_aperture = _PINHOLE_HORIZONTAL_APERTURE
+    focal_length = fx * horizontal_aperture / width
+    vertical_aperture = focal_length * height / fy
+    values = {
+        "focalLength": focal_length,
+        "horizontalAperture": horizontal_aperture,
+        "verticalAperture": vertical_aperture,
+        "horizontalApertureOffset": (width / 2.0 - cx) * horizontal_aperture / width,
+        "verticalApertureOffset": (cy - height / 2.0) * vertical_aperture / height,
+    }
+    for name, value in values.items():
+        camera_prim.GetAttribute(name).Set(value)
+
+
+def _author_lens_distortion(camera_prim: Usd.Prim, camera_model) -> bool:
+    """
+    Author the camera intrinsics as ``omni:lensdistortion:*`` attributes, applying the matching
+    ``OmniLensDistortion*API`` schema. Returns False for unsupported camera models.
+    """
+
+    def author(api: str, model: str, values: dict[str, tuple[Sdf.ValueTypeName, object]]) -> None:
+        camera_prim.AddAppliedSchema(api)
+        camera_prim.CreateAttribute(f"{_LENS_DISTORTION_PREFIX}:model", Sdf.ValueTypeNames.Token).Set(Vt.Token(model))
+        for name, (value_type, value) in values.items():
+            camera_prim.CreateAttribute(f"{_LENS_DISTORTION_PREFIX}:{model}:{name}", value_type).Set(value)
+
+    float_type = Sdf.ValueTypeNames.Float
+
+    def opencv_values(resolution, principal_point, focal_length, radial_coeffs):
+        # NCore's OpenCV principal point is relative to the top-left corner of the image, like the RTX one
+        values = {
+            "imageSize": (Sdf.ValueTypeNames.Int2, Gf.Vec2i(*(int(v) for v in resolution.tolist()))),
+            "fx": (float_type, focal_length.tolist()[0]),
+            "fy": (float_type, focal_length.tolist()[1]),
+            "cx": (float_type, principal_point.tolist()[0]),
+            "cy": (float_type, principal_point.tolist()[1]),
+        }
+        values.update({f"k{i + 1}": (float_type, v) for i, v in enumerate(radial_coeffs.tolist())})
+        return values
+
+    match camera_model:
+        case OpenCVPinholeCameraModelParameters(
+            resolution=resolution,
+            principal_point=principal_point,
+            focal_length=focal_length,
+            radial_coeffs=radial_coeffs,
+            tangential_coeffs=tangential_coeffs,
+            thin_prism_coeffs=thin_prism_coeffs,
+        ):
+            values = opencv_values(resolution, principal_point, focal_length, radial_coeffs)
+            values.update({f"p{i + 1}": (float_type, v) for i, v in enumerate(tangential_coeffs.tolist())})
+            values.update({f"s{i + 1}": (float_type, v) for i, v in enumerate(thin_prism_coeffs.tolist())})
+            author("OmniLensDistortionOpenCvPinholeAPI", "opencvPinhole", values)
+            _author_pinhole_camera_attributes(camera_prim, camera_model)
+
+        case OpenCVFisheyeCameraModelParameters(
+            resolution=resolution,
+            principal_point=principal_point,
+            focal_length=focal_length,
+            radial_coeffs=radial_coeffs,
+        ):
+            values = opencv_values(resolution, principal_point, focal_length, radial_coeffs)
+            author("OmniLensDistortionOpenCvFisheyeAPI", "opencvFisheye", values)
+
+        case FThetaCameraModelParameters(
+            resolution=resolution,
+            principal_point=principal_point,
+            pixeldist_to_angle_poly=pixeldist_to_angle_poly,
+            max_angle=max_angle,
+            linear_cde=linear_cde,
+            reference_poly=reference_poly,
+        ):
+            if not np.allclose(linear_cde, (1.0, 0.0, 0.0)):
+                # the RTX ftheta schema has no linear (skew) term
+                warnings.warn(f"FTheta linear_cde {linear_cde.tolist()} is not exported")
+            if reference_poly != FThetaCameraModelParameters.PolynomialType.PIXELDIST_TO_ANGLE:
+                warnings.warn(
+                    f"FTheta reference polynomial is {reference_poly.name}, the exported pixel-distance-to-angle "
+                    "polynomial is only an approximation of the model"
+                )
+            # the schema declares k0..k4 only: higher order coefficients are authored (RTX reads k5) when not zero
+            poly = pixeldist_to_angle_poly.tolist()
+            values = {
+                "nominalWidth": (float_type, float(resolution.tolist()[0])),
+                "nominalHeight": (float_type, float(resolution.tolist()[1])),
+                # NCore's FTheta principal point has pixel indices at the pixel centers, RTX's optical center is
+                # relative to the top-left corner of the image
+                "opticalCenter": (Sdf.ValueTypeNames.Float2, Gf.Vec2f(*(principal_point + 0.5).tolist())),
+                "maxFov": (float_type, 2.0 * float(np.rad2deg(max_angle))),
+            }
+            values.update(
+                {f"k{i}": (float_type, v) for i, v in enumerate(poly) if i < _FTHETA_SCHEMA_ORDER or v != 0.0}
+            )
+            author("OmniLensDistortionFthetaAPI", "ftheta", values)
+
+        case _:
+            return False
+    return True
+
+
+_ROLLING_SHUTTER_SCAN_ORDER = {
+    ShutterType.ROLLING_TOP_TO_BOTTOM: "topToBottom",
+    ShutterType.ROLLING_BOTTOM_TO_TOP: "bottomToTop",
+    ShutterType.ROLLING_LEFT_TO_RIGHT: "leftToRight",
+    ShutterType.ROLLING_RIGHT_TO_LEFT: "rightToLeft",
+}
+
+
+def _author_rolling_shutter(camera_prim: Usd.Prim, camera_model, frame_duration_us: float | None) -> None:
+    """
+    Author the camera rolling shutter as ``omni:rtx:rollingShutter:*`` attributes (``OmniRtxRollingShutterAPI``).
+
+    NCore spreads the scan lines uniformly over the frame start-to-end interval, i.e. line ``i`` is exposed at
+    ``i / (num_lines - 1)`` of the frame duration, hence ``lineOffset = frame_duration / (num_lines - 1)``.
+    Global shutter cameras, and cameras without a known frame duration, are left untouched.
+    """
+    scan_order = _ROLLING_SHUTTER_SCAN_ORDER.get(camera_model.shutter_type)
+    if scan_order is None or frame_duration_us is None or frame_duration_us <= 0:
+        return
+
+    horizontal_scan = camera_model.shutter_type in (
+        ShutterType.ROLLING_LEFT_TO_RIGHT,
+        ShutterType.ROLLING_RIGHT_TO_LEFT,
+    )
+    num_lines = int(camera_model.resolution.tolist()[0 if horizontal_scan else 1])
+    if num_lines < 2:
+        return
+
+    # rational seconds : (numerator, denominator), kept exact as (duration in us, 1e6 us/s * (num_lines - 1))
+    camera_prim.AddAppliedSchema("OmniRtxRollingShutterAPI")
+    camera_prim.CreateAttribute("omni:rtx:rollingShutter:scanOrder", Sdf.ValueTypeNames.Token).Set(Vt.Token(scan_order))
+    camera_prim.CreateAttribute("omni:rtx:rollingShutter:lineOffset", Sdf.ValueTypeNames.Double2).Set(
+        Gf.Vec2d(frame_duration_us, 1e6 * (num_lines - 1))
+    )
+    camera_prim.CreateAttribute("omni:rtx:rollingShutter:lineExposure", Sdf.ValueTypeNames.Double2).Set(Gf.Vec2d(0, 1))
 
 
 def add_default_opencv_pinhole_camera(stage: Usd.Stage, path: str, camera_name: str, extrinsics: Gf.Matrix4d):
@@ -25,7 +181,7 @@ def add_default_opencv_pinhole_camera(stage: Usd.Stage, path: str, camera_name: 
     Add a default fisheye camera to the stage from the following NCore test model :
     OpenCVPinholeCameraModelParameters(
         resolution=np.array([1920, 1280], dtype=np.uint64),
-        shutter_type=ShutterType.ROLLING_RIGHT_TO_LEFT,
+        shutter_type=ShutterType.GLOBAL,
         principal_point=np.array([935.1248081874216, 635.052474560227], dtype=np.float32),
         focal_length=np.array(
             [
@@ -50,35 +206,19 @@ def add_default_opencv_pinhole_camera(stage: Usd.Stage, path: str, camera_name: 
     )
     """
     camera_prim = stage.DefinePrim(f"{path}/{camera_name}", "Camera")
-    camera_prim.CreateAttribute("cameraProjectionType", Sdf.ValueTypeNames.Token).Set(Vt.Token("pinholeOpenCV"))
     camera_prim.GetAttribute("clippingRange").Set(Gf.Vec2f([0.001, 10000000]))
-    #
-    # intrinsics
-    #
-    # nominal resolution
-    camera_prim.CreateAttribute("fthetaWidth", Sdf.ValueTypeNames.Float).Set(1920)
-    camera_prim.CreateAttribute("fthetaHeight", Sdf.ValueTypeNames.Float).Set(1280)
-    # principal point
-    camera_prim.CreateAttribute("fthetaCx", Sdf.ValueTypeNames.Float).Set(935.1248081874216)
-    camera_prim.CreateAttribute("fthetaCy", Sdf.ValueTypeNames.Float).Set(635.052474560227)
-    # focal lenght
-    camera_prim.CreateAttribute("openCVFx", Sdf.ValueTypeNames.Float).Set(2059.0471439559833)
-    camera_prim.CreateAttribute("openCVFy", Sdf.ValueTypeNames.Float).Set(2059.0471439559833)
-    # radial coeffs
-    camera_prim.CreateAttribute("fthetaPolyA", Sdf.ValueTypeNames.Float).Set(0.04239636827428756)
-    camera_prim.CreateAttribute("fthetaPolyB", Sdf.ValueTypeNames.Float).Set(-0.34165672675852826)
-    camera_prim.CreateAttribute("fthetaPolyC", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("fthetaPolyD", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("fthetaPolyE", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("fthetaPolyF", Sdf.ValueTypeNames.Float).Set(0)
-    # tangential coeffs
-    camera_prim.CreateAttribute("p0", Sdf.ValueTypeNames.Float).Set(0.001805535524580487)
-    camera_prim.CreateAttribute("p1", Sdf.ValueTypeNames.Float).Set(-0.00005530628187935031)
-    # thin prism coeffs
-    camera_prim.CreateAttribute("s0", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("s1", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("s2", Sdf.ValueTypeNames.Float).Set(0)
-    camera_prim.CreateAttribute("s3", Sdf.ValueTypeNames.Float).Set(0)
+    _author_lens_distortion(
+        camera_prim,
+        OpenCVPinholeCameraModelParameters(
+            resolution=np.array([1920, 1280], dtype=np.uint64),
+            shutter_type=ShutterType.GLOBAL,
+            principal_point=np.array([935.1248081874216, 635.052474560227], dtype=np.float32),
+            focal_length=np.array([2059.0471439559833, 2059.0471439559833], dtype=np.float32),
+            radial_coeffs=np.array([0.04239636827428756, -0.34165672675852826, 0, 0, 0, 0], dtype=np.float32),
+            tangential_coeffs=np.array([0.001805535524580487, -0.00005530628187935031], dtype=np.float32),
+            thin_prism_coeffs=np.array([0, 0, 0, 0], dtype=np.float32),
+        ),
+    )
     #
     # extrinsics
     #
@@ -95,7 +235,7 @@ def add_default_opencv_fisheye_camera(stage: Usd.Stage, path: str, camera_name: 
     Add a default fisheye camera to the stage from the following NCore test model :
     OpenCVFisheyeCameraModelParameters(
         resolution=np.array([3840, 2160], dtype=np.uint64),
-        shutter_type=ShutterType.ROLLING_TOP_TO_BOTTOM,
+        shutter_type=ShutterType.GLOBAL,
         principal_point=np.array([1928.184506, 1083.862789], dtype=np.float32),
         focal_length=np.array(
             [
@@ -118,27 +258,18 @@ def add_default_opencv_fisheye_camera(stage: Usd.Stage, path: str, camera_name: 
     )
     """
     camera_prim = stage.DefinePrim(f"{path}/{camera_name}", "Camera")
-    camera_prim.CreateAttribute("cameraProjectionType", Sdf.ValueTypeNames.Token).Set(Vt.Token("fisheyeOpenCV"))
     camera_prim.GetAttribute("clippingRange").Set(Gf.Vec2f([0.001, 10000000]))
-    #
-    # intrinsics
-    #
-    # nominal resolution
-    camera_prim.CreateAttribute("fthetaWidth", Sdf.ValueTypeNames.Float).Set(3840)
-    camera_prim.CreateAttribute("fthetaHeight", Sdf.ValueTypeNames.Float).Set(2160)
-    # principal point
-    camera_prim.CreateAttribute("fthetaCx", Sdf.ValueTypeNames.Float).Set(1928.184506)
-    camera_prim.CreateAttribute("fthetaCy", Sdf.ValueTypeNames.Float).Set(1083.862789)
-    # focal lenght
-    camera_prim.CreateAttribute("openCVFx", Sdf.ValueTypeNames.Float).Set(1913.76478)
-    camera_prim.CreateAttribute("openCVFy", Sdf.ValueTypeNames.Float).Set(1913.99708)
-    # radial coeffs
-    camera_prim.CreateAttribute("fthetaPolyA", Sdf.ValueTypeNames.Float).Set(-0.030093122)
-    camera_prim.CreateAttribute("fthetaPolyB", Sdf.ValueTypeNames.Float).Set(-0.005103817)
-    camera_prim.CreateAttribute("fthetaPolyC", Sdf.ValueTypeNames.Float).Set(-0.000849622)
-    camera_prim.CreateAttribute("fthetaPolyD", Sdf.ValueTypeNames.Float).Set(0.001079542)
-    # max FoV
-    camera_prim.CreateAttribute("fthetaMaxFov", Sdf.ValueTypeNames.Float).Set(140)
+    _author_lens_distortion(
+        camera_prim,
+        OpenCVFisheyeCameraModelParameters(
+            resolution=np.array([3840, 2160], dtype=np.uint64),
+            shutter_type=ShutterType.GLOBAL,
+            principal_point=np.array([1928.184506, 1083.862789], dtype=np.float32),
+            focal_length=np.array([1913.76478, 1913.99708], dtype=np.float32),
+            radial_coeffs=np.array([-0.030093122, -0.005103817, -0.000849622, 0.001079542], dtype=np.float32),
+            max_angle=np.deg2rad(140 / 2),
+        ),
+    )
     #
     # extrinsics
     #
@@ -148,6 +279,13 @@ def add_default_opencv_fisheye_camera(stage: Usd.Stage, path: str, camera_name: 
     # visibility
     #
     UsdGeom.Imageable(camera_prim).CreateVisibilityAttr().Set("invisible")
+
+
+def _median_frame_duration_us(frame_timestamps_us: np.ndarray) -> float | None:
+    """Median start-to-end frame duration of the Nx2 frame timestamps, or None if there are no frames"""
+    if frame_timestamps_us.shape[0] == 0:
+        return None
+    return float(np.median(frame_timestamps_us[:, 1] - frame_timestamps_us[:, 0]))
 
 
 def rig_trajectories_time_range(rig_trajectories: RigTrajectories) -> HalfClosedInterval:
@@ -175,7 +313,15 @@ def serialize_rig_trajectories_usd(
     rig_trajectories: RigTrajectories,
     usd_timestamp_offset: int = 0,
     add_default_cameras: bool = True,
+    export_rolling_shutter: bool = False,
 ) -> Usd.Stage:
+    """
+    Serialize the rig trajectories and the camera intrinsics to a USD stage.
+
+    The rolling shutter of the cameras is only authored with ``export_rolling_shutter``: RTX applies the rolling
+    shutter to the animated geometry / materials of a scene but not to the motion of the camera, and the Gaussian
+    renderers ignore it, so it is not useful (and has been measured to degrade renders) for Gaussian assets.
+    """
     # Get the rig transforms and camera sensor parameters
     rig_transforms: dict[str, dict[float, Gf.Matrix4d]] = {}
     camera_params: dict[str, dict] = {}
@@ -196,6 +342,8 @@ def serialize_rig_trajectories_usd(
                 "rig_name": rig_name,
                 "extrinsics": camera_usd * nurec_tf_to_usd_tf(camera_data.T_sensor_rig.numpy().astype(np.double)),
                 "intrinsics": camera_data.camera_model_parameters,
+                # start-/end-of-frame timestamps in microseconds, used for the rolling shutter
+                "frame_timestamps_us": rig_trajectory.cameras_frame_timestamps_us[camera_unique_name].numpy(),
             }
 
     stage = initialize_usd_stage()
@@ -226,122 +374,14 @@ def serialize_rig_trajectories_usd(
         camera_model = params["intrinsics"]
         camera_prim = stage.DefinePrim(f"/World/{params['rig_name']}/{name}", "Camera")
         camera_prim.GetAttribute("clippingRange").Set(Gf.Vec2f([0.001, 10000000]))
-        match camera_model:
-            case OpenCVPinholeCameraModelParameters(
-                resolution=resolution,
-                principal_point=principal_point,
-                focal_length=focal_length,
-                radial_coeffs=radial_coeffs,
-                tangential_coeffs=tangential_coeffs,
-                thin_prism_coeffs=thin_prism_coeffs,
-            ):
-                camera_prim.CreateAttribute("cameraProjectionType", Sdf.ValueTypeNames.Token).Set(
-                    Vt.Token("pinholeOpenCV")
-                )
-                # nominal resolution
-                resolution_list = resolution.tolist()
-                camera_prim.CreateAttribute("fthetaWidth", Sdf.ValueTypeNames.Float).Set(resolution_list[0])
-                camera_prim.CreateAttribute("fthetaHeight", Sdf.ValueTypeNames.Float).Set(resolution_list[1])
-                # principal point
-                principal_point_list = principal_point.tolist()
-                camera_prim.CreateAttribute("fthetaCx", Sdf.ValueTypeNames.Float).Set(principal_point_list[0])
-                camera_prim.CreateAttribute("fthetaCy", Sdf.ValueTypeNames.Float).Set(principal_point_list[1])
-                # focal length
-                focal_length_list = focal_length.tolist()
-                camera_prim.CreateAttribute("openCVFx", Sdf.ValueTypeNames.Float).Set(focal_length_list[0])
-                camera_prim.CreateAttribute("openCVFy", Sdf.ValueTypeNames.Float).Set(focal_length_list[1])
-                # radial coeffs
-                radial_coeffs_list = radial_coeffs.tolist()
-                camera_prim.CreateAttribute("fthetaPolyA", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[0])
-                camera_prim.CreateAttribute("fthetaPolyB", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[1])
-                camera_prim.CreateAttribute("fthetaPolyC", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[2])
-                camera_prim.CreateAttribute("fthetaPolyD", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[3])
-                camera_prim.CreateAttribute("fthetaPolyE", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[4])
-                camera_prim.CreateAttribute("fthetaPolyF", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[5])
-                # tangential coeffs
-                tangential_coeffs_list = tangential_coeffs.tolist()
-                camera_prim.CreateAttribute("p0", Sdf.ValueTypeNames.Float).Set(tangential_coeffs_list[0])
-                camera_prim.CreateAttribute("p1", Sdf.ValueTypeNames.Float).Set(tangential_coeffs_list[1])
-                # thin prism coeffs
-                thin_prism_coeffs_list = thin_prism_coeffs.tolist()
-                camera_prim.CreateAttribute("s0", Sdf.ValueTypeNames.Float).Set(thin_prism_coeffs_list[0])
-                camera_prim.CreateAttribute("s1", Sdf.ValueTypeNames.Float).Set(thin_prism_coeffs_list[1])
-                camera_prim.CreateAttribute("s2", Sdf.ValueTypeNames.Float).Set(thin_prism_coeffs_list[2])
-
-            case OpenCVFisheyeCameraModelParameters(
-                resolution=resolution,
-                principal_point=principal_point,
-                focal_length=focal_length,
-                radial_coeffs=radial_coeffs,
-                max_angle=max_angle,
-            ):
-                camera_prim.CreateAttribute("cameraProjectionType", Sdf.ValueTypeNames.Token).Set(
-                    Vt.Token("fisheyeOpenCV")
-                )
-                # nominal resolution
-                resolution_list = resolution.tolist()
-                camera_prim.CreateAttribute("fthetaWidth", Sdf.ValueTypeNames.Float).Set(resolution_list[0])
-                camera_prim.CreateAttribute("fthetaHeight", Sdf.ValueTypeNames.Float).Set(resolution_list[1])
-                # principal point
-                principal_point_list = principal_point.tolist()
-                camera_prim.CreateAttribute("fthetaCx", Sdf.ValueTypeNames.Float).Set(principal_point_list[0])
-                camera_prim.CreateAttribute("fthetaCy", Sdf.ValueTypeNames.Float).Set(principal_point_list[1])
-                # focal lenght
-                focal_length_list = focal_length.tolist()
-                camera_prim.CreateAttribute("openCVFx", Sdf.ValueTypeNames.Float).Set(focal_length_list[0])
-                camera_prim.CreateAttribute("openCVFy", Sdf.ValueTypeNames.Float).Set(focal_length_list[1])
-                # radial coeffs
-                radial_coeffs_list = radial_coeffs.tolist()
-                camera_prim.CreateAttribute("fthetaPolyA", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[0])
-                camera_prim.CreateAttribute("fthetaPolyB", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[1])
-                camera_prim.CreateAttribute("fthetaPolyC", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[2])
-                camera_prim.CreateAttribute("fthetaPolyD", Sdf.ValueTypeNames.Float).Set(radial_coeffs_list[3])
-                # max FoV
-                camera_prim.CreateAttribute("fthetaMaxFov", Sdf.ValueTypeNames.Float).Set(2.0 * np.rad2deg(max_angle))
-
-            case FThetaCameraModelParameters(
-                resolution=resolution,
-                principal_point=principal_point,
-                pixeldist_to_angle_poly=pixeldist_to_angle_poly,
-                max_angle=max_angle,
-            ):
-                camera_prim.CreateAttribute("cameraProjectionType", Sdf.ValueTypeNames.Token).Set(
-                    Vt.Token("fisheyePolynomial")
-                )
-                # nominal resolution
-                resolution_list = resolution.tolist()
-                camera_prim.CreateAttribute("fthetaWidth", Sdf.ValueTypeNames.Float).Set(resolution_list[0])
-                camera_prim.CreateAttribute("fthetaHeight", Sdf.ValueTypeNames.Float).Set(resolution_list[1])
-                # principal point
-                principal_point_list = principal_point.tolist()
-                camera_prim.CreateAttribute("fthetaCx", Sdf.ValueTypeNames.Float).Set(principal_point_list[0])
-                camera_prim.CreateAttribute("fthetaCy", Sdf.ValueTypeNames.Float).Set(principal_point_list[1])
-                # pixeldist to angle poly
-                pixeldist_to_angle_poly_list = pixeldist_to_angle_poly.tolist()
-                camera_prim.CreateAttribute("fthetaPolyA", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[0]
-                )
-                camera_prim.CreateAttribute("fthetaPolyB", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[1]
-                )
-                camera_prim.CreateAttribute("fthetaPolyC", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[2]
-                )
-                camera_prim.CreateAttribute("fthetaPolyD", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[3]
-                )
-                camera_prim.CreateAttribute("fthetaPolyE", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[4]
-                )
-                camera_prim.CreateAttribute("fthetaPolyF", Sdf.ValueTypeNames.Float).Set(
-                    pixeldist_to_angle_poly_list[5]
-                )
-                # max angle
-                camera_prim.CreateAttribute("fthetaMaxFov", Sdf.ValueTypeNames.Float).Set(2.0 * np.rad2deg(max_angle))
-
-            case _:
-                # unsupported camera model : fallback to default
-                camera_prim.GetFocalLengthAttr().Set(value=24.0)
+        if _author_lens_distortion(camera_prim, camera_model):
+            if export_rolling_shutter:
+                frame_duration_us = _median_frame_duration_us(params["frame_timestamps_us"])
+                _author_rolling_shutter(camera_prim, camera_model, frame_duration_us)
+        else:
+            # unsupported camera model : fallback to default (intrinsics and rolling shutter are not exported)
+            warnings.warn(f"Unsupported camera model {type(camera_model).__name__} for camera '{name}'")
+            camera_prim.GetAttribute("focalLength").Set(24.0)
 
         camera_transform = UsdGeom.Xformable(camera_prim).AddTransformOp()
         camera_transform.Set(params["extrinsics"])
@@ -373,6 +413,7 @@ def serialize_rig_trajectories(
     formats: list[str] = ["json", "usda"],
     usd_timestamp_offset: int = 0,
     add_default_cameras: bool = False,
+    export_rolling_shutter: bool = False,
 ) -> ArtifactContents:
     res: ArtifactContents = []
     for file_format in formats:
@@ -392,6 +433,7 @@ def serialize_rig_trajectories(
                             rig_trajectories,
                             usd_timestamp_offset=usd_timestamp_offset,
                             add_default_cameras=add_default_cameras,
+                            export_rolling_shutter=export_rolling_shutter,
                         ),
                     )
                 )

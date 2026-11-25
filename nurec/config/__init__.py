@@ -14,6 +14,7 @@ from nurec.config.dataset import (
     ValidPixelsSceneFlowConfig,
     ValidPixelsTrafficLightConfig,
 )
+from nurec.config.image_resolution import ImageResolutionConfig
 from nurec.config.logger import DummyLoggerConfig, TensorboardLoggerConfig, WandbLoggerConfig
 from nurec.config.prober import ProberConfig
 from nurec.config.scopedtimer import ScopedTimerConfig, VerbosityLevel
@@ -37,6 +38,7 @@ __all__ = [
     "CuboidTracksConfig",
     "DummyLoggerConfig",
     "GaussiansSystemConfig",
+    "ImageResolutionConfig",
     "LidarDynamicPointsConfig",
     "LidarModelsConfig",
     "NCoreDatasetConfig",

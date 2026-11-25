@@ -94,6 +94,25 @@ class AdaptiveSequentialFrameBatchSamplerConfig(BaseFrameBatchSamplerConfig):
     max_frame_gap_timestamp_us: int = Field(
         description="Maximum gap between adjacent sampled frames in the batch, in microseconds."
     )
+    reference_camera_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional camera whose nearest real frame timestamps anchor multiview synchronization. "
+            "When set, the evenly spaced chunk timestamps are first snapped to this camera before the "
+            "nearest frame is selected independently for every camera."
+        ),
+    )
+    max_camera_timestamp_delta_us: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional maximum timestamp difference between a reference-camera frame and the nearest frame "
+            "from every requested camera. Chunk timestamps snap only to reference frames with a complete "
+            "synchronized camera set within this tolerance. If no reference frame qualifies (a constant "
+            "camera phase offset beyond the tolerance), the best-synchronized reference frames are used "
+            "instead. Requires reference_camera_id."
+        ),
+    )
 
 
 class VaryingIntervalFrameBatchSamplerConfig(BaseFrameBatchSamplerConfig):
@@ -409,6 +428,21 @@ class BaseNCoreInstantNuRecDatasetConfig(BaseConfigSchema):
         default=False,
         description="If True, cache the result of _get_loaders_and_sensors (one entry keyed by ncore_json_path). "
         "This helps cut loading time during prediction when multiple consecutive batches share the same sequence loader instance.",
+    )
+    cache_full_clip_cuboid_observations: bool = Field(
+        default=False,
+        description=(
+            "If True, cache the one-entry full-clip cuboid observation table keyed by ncore_json_path when "
+            "cuboid_tracks_params.track_extrapolate_timestamps_us is negative."
+        ),
+    )
+    cache_full_clip_cuboid_consolidation: bool = Field(
+        default=False,
+        description=(
+            "If True, cache one base-independent full-clip cuboid consolidation keyed by ncore_json_path when "
+            "cuboid_tracks_params.track_extrapolate_timestamps_us is negative. Each chunk receives fresh pose and "
+            "timestamp lists before applying its own reference transform and extrapolation."
+        ),
     )
 
     camera_id_mapping: dict[str, str] = Field(

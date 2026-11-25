@@ -18,7 +18,7 @@ from nurec.ncore_backends import (
     registered_backend_names,
     resolve_dataset,
 )
-from nurec.ncore_backends.ncore_v4 import NCORE_V4_BACKEND
+from nurec.ncore_backends.ncore_v4 import NCORE_V4_BACKEND, NCoreV4Backend
 
 
 def _write_metadata(path: Path) -> None:
@@ -140,7 +140,7 @@ def test_resolved_dataset_constructs_public_loader(tmp_path: Path) -> None:
             "SequenceComponentGroupsReader",
             return_value=component_reader,
         ) as reader_type,
-        patch.object(ncore.data.v4, "SequenceLoaderV4", return_value=sequence_loader) as loader_type,
+        patch("ncore.data.v4.SequenceLoaderV4", return_value=sequence_loader) as loader_type,
     ):
         result = resolved.create_sequence_loader()
 
@@ -164,3 +164,38 @@ def test_public_loader_is_one_sequence_part() -> None:
     assert part.base_name == "public-sequence"
     assert part.part_index == 0
     assert part.part_count == 1
+
+
+def test_absent_firing_pattern_loader_returns_none() -> None:
+    request = DatasetRequest(metadata_path=UPath("unused.json"))
+    assert NCORE_V4_BACKEND.get_lidar_firing_pattern_templates(request, "front") is None
+
+
+def test_internal_pattern_loader_is_explicit_and_idempotent() -> None:
+    loader = Mock(return_value=None)
+    backend = NCoreV4Backend()
+    backend.register_firing_pattern_loader(loader)
+    backend.register_firing_pattern_loader(loader)
+    with pytest.raises(ValueError, match="already registered"):
+        backend.register_firing_pattern_loader(Mock())
+
+
+def test_loading_a_sequence_does_not_open_pattern_components() -> None:
+    pattern_loader = Mock(side_effect=AssertionError("duplicate optional component"))
+    backend = NCoreV4Backend(pattern_loader)
+    request = DatasetRequest(metadata_path=UPath("unused.json"))
+    with (
+        patch("ncore.data.v4.SequenceComponentGroupsReader"),
+        patch("ncore.data.v4.SequenceLoaderV4") as sequence_loader,
+    ):
+        assert backend.create_sequence_loader(request, []) is sequence_loader.return_value
+    pattern_loader.assert_not_called()
+
+
+def test_backend_reads_by_dataset_and_sensor_id_without_a_sensor() -> None:
+    patterns = Mock()
+    loader = Mock(return_value=patterns)
+    backend = NCoreV4Backend(loader)
+    request = DatasetRequest(metadata_path=UPath("unused.json"))
+    assert backend.get_lidar_firing_pattern_templates(request, "front") is patterns
+    loader.assert_called_once_with(request, "front")

@@ -4,7 +4,39 @@
 import numpy as np
 import pytest
 
-from nurec.utils.ncore_utils import INSTANCE_SEG_BASE_GROUP, AuxDataWriter, AuxShardDataLoader
+from nurec.utils.ncore_utils import (
+    INSTANCE_SEG_BASE_GROUP,
+    OBJECT_INSTANCE_SEG_BASE_GROUP,
+    AuxDataWriter,
+    AuxShardDataLoader,
+)
+
+
+@pytest.mark.parametrize("store_type", ["directory", "itar"])
+def test_instance_stores_remain_separate_in_one_writer(tmp_path, store_type):
+    """Both native stores remain readable after writing through the same writer."""
+    writer = AuxDataWriter(tmp_path, "scene", "scene", 0, 1, store_type)
+    for object_instances in (False, True):
+        masks = np.array([[[object_instances, not object_instances]]], dtype=bool)
+        prefix = "object_instance" if object_instances else "instance"
+        getattr(writer, f"store_{prefix}_segmentation")(
+            "cam", 20, np.packbits(masks), np.ones(1), np.zeros(1, dtype=np.int32)
+        )
+        getattr(writer, f"store_{prefix}_meta")("cam", [2, 1], "test", "test", "", ["object"], [[255, 128, 0]])
+        group = OBJECT_INSTANCE_SEG_BASE_GROUP if object_instances else INSTANCE_SEG_BASE_GROUP
+        assert writer.get_base_group(group).name == f"/aux/{group}"
+        np.testing.assert_array_equal(getattr(writer, f"get_{prefix}_segmentation")("cam", 20)["instance_masks"], masks)
+    writer.finalize()
+    loader = AuxShardDataLoader("scene", [tmp_path / "scene.zarr"])
+    for object_instances in (False, True):
+        prefix = "object_instance" if object_instances else "instance"
+        expected = np.array([[[object_instances, not object_instances]]], dtype=bool)
+        np.testing.assert_array_equal(
+            getattr(loader, f"get_{prefix}_segmentation")("cam", 20)["instance_masks"], expected
+        )
+        suffix = "object-iseg" if object_instances else "iseg"
+        extension = ".itar" if store_type == "itar" else ""
+        assert (tmp_path / f"scene.aux.{suffix}.zarr{extension}").exists()
 
 
 @pytest.mark.parametrize("store_type", ["directory", "itar"])
@@ -70,7 +102,8 @@ def test_instance_masks_pack_across_instance_boundary(tmp_path, store_type, read
 
 @pytest.mark.parametrize("store_type", ["directory", "itar"])
 @pytest.mark.parametrize("invalid", ["per_instance", "raw", "dtype"])
-def test_instance_mask_writer_rejects_invalid_arrays(tmp_path, store_type, invalid):
+@pytest.mark.parametrize("object_instances", [False, True])
+def test_instance_mask_writer_rejects_invalid_arrays(tmp_path, store_type, invalid, object_instances):
     """Reject arrays that do not satisfy the packed-input interface."""
     masks = np.ones((2, 1, 7), dtype=np.uint8)
     if invalid == "per_instance":
@@ -80,8 +113,9 @@ def test_instance_mask_writer_rejects_invalid_arrays(tmp_path, store_type, inval
     else:
         packed = np.packbits(masks).astype(np.int32)
     writer = AuxDataWriter(tmp_path, "scene", "scene", 0, 1, store_type)
+    store = writer.store_object_instance_segmentation if object_instances else writer.store_instance_segmentation
     with pytest.raises(ValueError, match="flat uint8 bitstream"):
-        writer.store_instance_segmentation("cam", 20, packed, np.ones(2), np.zeros(2, dtype=np.int32))
+        store("cam", 20, packed, np.ones(2), np.zeros(2, dtype=np.int32))
     assert not list(tmp_path.iterdir())
 
 

@@ -10,14 +10,18 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from PIL import Image
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
 
-from ncore.data import BBox3
+import nurec.datasets.utils as utils_module
+
+from ncore.data import BBox3, FrameTimepoint, OpenCVPinholeCameraModelParameters, ShutterType
 from ncore.impl.common import transformations as ncore_transformations
+from ncore.sensors import camera_model_from_parameters
 from nurec.config import ValidPixelsFrameMaskConfig, ValidPixelsSceneFlowConfig, ValidPixelsTrafficLightConfig
 from nurec.config.dataset import CuboidTracksConfig
 from nurec.datasets.tracks import CuboidTracks, TrackFlags
@@ -25,6 +29,7 @@ from nurec.datasets.utils import (
     BBox3Provider,
     PackedMask,
     _transform_cuboid_observations_native,
+    compute_camera_visible_intervals_cuboid_tracks,
     compute_cameras_valid_pixels_frame_mask,
     compute_cuboid_tracks,
     compute_point_cloud_inside_tracks_mask,
@@ -34,8 +39,110 @@ from nurec.datasets.utils import (
     compute_valid_pixels_sceneflow,
     compute_valid_pixels_trafficlight,
     consolidate_cuboid_tracks,
+    get_sampled_pixels,
 )
+from nurec.utils.batch import RectSubsampled, generate_grid_2d_indices
 from nurec.utils.types import HalfClosedInterval, PointCloud
+
+
+def _pixel_grid(width: int, height: int) -> np.ndarray:
+    yy, xx = np.indices((height, width))
+    return np.stack((xx, yy), axis=-1).reshape(-1, 2)
+
+
+def test_get_sampled_pixels_returns_unstructured_pixels_unchanged() -> None:
+    sampled = np.array([[1, 2], [3, 4]])
+
+    pixels, half_pixel_offset = get_sampled_pixels(sampled, (6, 4), _pixel_grid(6, 4))
+
+    assert pixels is sampled
+    assert half_pixel_offset is False
+
+
+@pytest.mark.parametrize(
+    ("subsample_factor", "resolution", "crop_offset", "expected_pixels", "expected_half_pixel_offset"),
+    [
+        (
+            2.0,
+            (6, 4),
+            (1, 0),
+            [[2, 0], [4, 0], [2, 2], [4, 2]],
+            True,
+        ),
+        (
+            3.0,
+            (6, 6),
+            (0, 0),
+            [[1, 1], [4, 1], [1, 4], [4, 4]],
+            False,
+        ),
+    ],
+)
+def test_get_sampled_pixels_characterizes_structured_subsampling(
+    subsample_factor: float,
+    resolution: tuple[int, int],
+    crop_offset: tuple[int, int],
+    expected_pixels: list[list[int]],
+    expected_half_pixel_offset: bool,
+) -> None:
+    width, height = resolution
+    i, j = crop_offset
+    sampled = RectSubsampled.from_subsample(
+        original_width=width,
+        original_height=height,
+        width=2,
+        height=2,
+        i=i,
+        j=j,
+        subsample_factor=subsample_factor,
+    )
+
+    pixels, half_pixel_offset = get_sampled_pixels(sampled, resolution, _pixel_grid(width, height))
+
+    np.testing.assert_array_equal(pixels, expected_pixels)
+    assert half_pixel_offset is expected_half_pixel_offset
+
+
+def test_get_sampled_pixels_rejects_non_integer_subsample_factor() -> None:
+    sampled = RectSubsampled.from_subsample(
+        original_width=6,
+        original_height=3,
+        width=2,
+        height=2,
+        subsample_factor=1.5,
+    )
+
+    with pytest.raises(AssertionError, match="must be an integer"):
+        get_sampled_pixels(sampled, (6, 3), _pixel_grid(6, 3))
+
+
+def test_get_sampled_pixels_rejects_mismatched_camera_resolution() -> None:
+    sampled = RectSubsampled.from_subsample(
+        original_width=6,
+        original_height=4,
+        width=3,
+        height=2,
+        subsample_factor=2.0,
+    )
+
+    with pytest.raises(AssertionError, match="does not match the camera resolution"):
+        get_sampled_pixels(sampled, (8, 4), _pixel_grid(8, 4))
+
+
+def test_get_sampled_pixels_rejects_unknown_sample_type() -> None:
+    with pytest.raises(ValueError, match="Unexpected sampled pixels type"):
+        get_sampled_pixels([], (6, 4), _pixel_grid(6, 4))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("factor", [49, 93])
+def test_get_sampled_pixels_preserves_integer_stride(factor: int) -> None:
+    sampled = RectSubsampled.from_subsample(
+        original_width=factor * 2, original_height=factor, width=2, height=1, subsample_factor=float(factor)
+    )
+    pixels, half_offset = get_sampled_pixels(sampled, (factor * 2, factor), _pixel_grid(factor * 2, factor))
+    offset = (factor - 1) // 2
+    np.testing.assert_array_equal(pixels, [[offset, offset], [factor + offset, offset]])
+    assert not half_offset
 
 
 class TestPackedMask(unittest.TestCase):
@@ -576,3 +683,76 @@ class TestComputeFunctions(unittest.TestCase):
             )
             # Only points with class 0 are tested and marked as inside; class 1 always False
             torch.testing.assert_close(mask, torch.tensor([True, False, True, False], dtype=torch.bool, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires the CUDA intersection binding")
+# 15 x 11 does not divide by subsample 2 or 3.
+@pytest.mark.parametrize("width,height", [(16, 12), (15, 11)])
+@pytest.mark.parametrize("subsample", [1, 2, 3])
+def test_batched_visible_intervals_match_per_frame_path(subsample, width, height):
+    params = OpenCVPinholeCameraModelParameters(
+        resolution=np.array([width, height], dtype=np.uint64),
+        shutter_type=ShutterType.ROLLING_TOP_TO_BOTTOM,
+        principal_point=np.array([width / 2, height / 2], dtype=np.float32),
+        focal_length=np.array([12, 12], dtype=np.float32),
+        radial_coeffs=np.zeros(6, dtype=np.float32),
+        tangential_coeffs=np.zeros(2, dtype=np.float32),
+        thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+    )
+    model = camera_model_from_parameters(params)
+    pixels = generate_grid_2d_indices((width, height)).numpy()
+    rays = model.pixels_to_camera_rays(torch.from_numpy(pixels)).reshape(height, width, 3).cpu().numpy()
+
+    # More than 16 frames, so the batched path launches several chunks.
+    n_frames = 20
+
+    def poses(target, index, timepoint):
+        index = np.atleast_1d(index)
+        transforms = np.repeat(np.eye(4)[None], len(index), 0)
+        transforms[:, 0, 3] = index * 0.1 + (0.05 if timepoint == FrameTimepoint.END else 0.0)
+        return transforms if len(index) > 1 else transforms[0]
+
+    def frame_time(index, timepoint):
+        return int(index) * 100_000 + (33_333 if timepoint == FrameTimepoint.END else 0)
+
+    sensor = Mock(get_frames_T_sensor_target=poses, get_frame_timestamp_us=frame_time)
+
+    def track(x, z, times):
+        transforms = np.repeat(np.eye(4)[None], len(times), 0)
+        transforms[:, 0, 3], transforms[:, 2, 3] = x, z
+        transforms[-1, 1, 3] = 0.5
+        return transforms.astype(np.float32)
+
+    # The second track starts inside frame 10's exposure, so its intervals depend on lifetime clipping.
+    track_times = [np.array([0, 2_000_000], dtype=np.int64), np.array([1_016_000, 1_900_000], dtype=np.int64)]
+    tracks = CuboidTracks.Factory.from_numpy(
+        tracks_id=["a", "b"],
+        tracks_poses=[track(0.5, 6.0, track_times[0]), track(1.5, 8.0, track_times[1])],
+        tracks_timestamps_us=track_times,
+        tracks_label_class=["car", "car"],
+        tracks_flags=[TrackFlags(0), TrackFlags(0)],
+        cuboids_dims=[np.full(3, 3.0, dtype=np.float32), np.full(3, 2.0, dtype=np.float32)],
+        device=torch.device("cuda"),
+    )
+    common = dict(
+        cuboidtracks=tracks,
+        camera_sensors={"camera": sensor},
+        camera_models={"camera": model},
+        camera_frame_ranges={"camera": range(n_frames)},
+        cameras_all_pixels={"camera": pixels},
+        cameras_all_rays={"camera": rays},
+        subsample=subsample,
+        tqdm_disabled=True,
+    )
+    with patch(
+        "nurec.datasets.utils._camera_visible_intervals_batched",
+        wraps=utils_module._camera_visible_intervals_batched,
+    ) as batched_spy:
+        batched = compute_camera_visible_intervals_cuboid_tracks(**common)
+        # Requesting track labels forces the per-frame path.
+        per_frame = compute_camera_visible_intervals_cuboid_tracks(**common, cameras_frame_track_idxs={"camera": {}})
+    assert batched_spy.call_count == 1
+    assert len(batched) == len(per_frame) == 2
+    assert all(len(intervals) for intervals in batched)
+    for got, want in zip(batched, per_frame, strict=True):
+        np.testing.assert_array_equal(got, want)

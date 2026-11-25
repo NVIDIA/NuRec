@@ -655,7 +655,7 @@ class PPISPPostProcessing(BasePostProcessing):
 
         subsample = batch.data.camera.meta[0].subsample
         if subsample is None:
-            subsample = RectSubsampled(
+            subsample = RectSubsampled.from_subsample(
                 original_width=batch.rendering.camera.w,
                 original_height=batch.rendering.camera.h,
                 width=batch.rendering.camera.w,

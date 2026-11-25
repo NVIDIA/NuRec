@@ -28,6 +28,7 @@ from nurec.utils.batch import RenderingData
 from nurec.utils.tests import CommonTestCase
 from nurec.utils.types import (
     AABB3D,
+    CameraFrustum,
     FrameConversion,
     HalfClosedInterval,
     RigTrajectories,
@@ -483,3 +484,27 @@ class TestTimestampLayout(unittest.TestCase):
         for layout in ("columns", "global", None):
             batch = RenderingData.collate_fn([frame, replace(frame, rays_timestamp_layout=layout)])
             self.assertIsNone(batch.rays_timestamp_layout)
+
+
+class TestCameraFrustum(unittest.TestCase):
+    # Corner rays in the order the frustum expects: [0, h], [0, 0], [w, 0], [w, h].
+    directions = torch.tensor([[-1.0, 1.0, 1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0]])
+
+    def test_accepts_parallel_near_and_far_planes(self):
+        CameraFrustum(torch.cat([self.directions * 0.5, self.directions * 5.0]))
+
+    def test_rejects_tilted_far_plane(self):
+        # Far corners stay coplanar on the plane z = 5 + 0.5 x, which is not parallel to the near plane.
+        far = self.directions * (5.0 / (1.0 - 0.5 * self.directions[:, :1]))
+        with self.assertRaisesRegex(AssertionError, "not parallel"):
+            CameraFrustum(torch.cat([self.directions * 0.5, far]))
+
+    def test_batched_rejects_tilted_far_plane(self):
+        far = self.directions * (5.0 / (1.0 - 0.5 * self.directions[:, :1]))
+        corners = torch.stack(
+            [torch.cat([self.directions * 0.5, self.directions * 5.0]), torch.cat([self.directions * 0.5, far])]
+        )
+        with self.assertRaisesRegex(AssertionError, "not parallel"):
+            CameraFrustum.from_batched_corners(corners, torch.device("cpu"))
+        (frustum,) = CameraFrustum.from_batched_corners(corners[:1], torch.device("cpu"))
+        torch.testing.assert_close(frustum.normals, CameraFrustum(corners[0]).normals)

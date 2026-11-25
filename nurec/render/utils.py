@@ -8,6 +8,7 @@ import torch
 from ncore.data import ConcreteCameraModelParametersUnion
 from ncore.sensors import CameraModel, FThetaCameraModel, OpenCVFisheyeCameraModel, OpenCVPinholeCameraModel
 from nurec.libs.geometry.kernels.pose import frame_transform_poses_tquat
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.profiling import ScopedTimer
 from nurec.utils.types import FrameConversion
 
@@ -37,25 +38,15 @@ def transform_intrinsics_to_resolution(
     up to an int-rounding error.
     """
 
-    cam_width, cam_height = camera_intrinsics.resolution.astype(int).tolist()
-    req_width, req_height = resolution
-    aspect_ratio = cam_width / cam_height
-    if (req_width / cam_width) > (req_height / cam_height):
-        render_width = req_width
-        render_height = int(render_width / aspect_ratio)
-        image_scale = render_width / cam_width
-    else:
-        render_height = req_height
-        render_width = int(render_height * aspect_ratio)
-        image_scale = render_height / cam_height
-
-    # Scale the camera parameters to match the rendering output resolution.
-    camera_intrinsics = camera_intrinsics.transform(
-        image_domain_scale=image_scale,
-        new_resolution=(render_width, render_height),
+    source_resolution = (
+        int(camera_intrinsics.resolution[0]),
+        int(camera_intrinsics.resolution[1]),
     )
-    assert camera_intrinsics.resolution.astype(int).tolist() == [render_width, render_height]
-    return camera_intrinsics
+    image_transform = ImageResolutionTransform.fit_keep_aspect_ratio(
+        source_resolution,
+        resolution,
+    )
+    return image_transform.apply_to_camera_parameters(camera_intrinsics)
 
 
 def frame_transform_poses(coord_frames: FrameConversion, T_poses: torch.Tensor, is_tquat: bool) -> torch.Tensor:

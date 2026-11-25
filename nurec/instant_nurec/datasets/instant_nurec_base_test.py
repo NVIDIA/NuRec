@@ -3,7 +3,7 @@
 
 import hashlib
 
-from typing import NoReturn
+from typing import Literal, NoReturn
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -11,9 +11,14 @@ import pytest
 
 import nurec.instant_nurec.datasets.registry as registry_module
 
-from nurec.instant_nurec.config.dataset import InstantNuRecMixedDatasetConfig
+from ncore.data import OpenCVPinholeCameraModelParameters, ShutterType
+from nurec.instant_nurec.config.dataset import CameraSubsamplerConfig, InstantNuRecMixedDatasetConfig
 from nurec.instant_nurec.config.dataset import TestIndexInstantNuRecDatasetConfig as IndexDatasetConfig
-from nurec.instant_nurec.datasets.instant_nurec_base import InstantNuRecDataError, MixedInstantNuRecDataset
+from nurec.instant_nurec.datasets.instant_nurec_base import (
+    CameraSubsampler,
+    InstantNuRecDataError,
+    MixedInstantNuRecDataset,
+)
 from nurec.instant_nurec.datasets.instant_nurec_base import TestIndexInstantNuRecDataset as IndexDataset
 from nurec.instant_nurec.datasets.registry import make
 
@@ -181,3 +186,145 @@ def test_failed_dataset_retries_are_bounded_even_when_rng_repeats(
     assert error.value.__cause__.message == "No synchronized context available"
     assert attempted == list(range(expected_attempts))
     assert draw_count == expected_attempts - 1
+
+
+@pytest.fixture
+def subsampler() -> CameraSubsampler:
+    return CameraSubsampler(CameraSubsamplerConfig(frame_width=3, frame_height=3))
+
+
+def _camera_parameters(
+    resolution: tuple[int, int] = (8, 5),
+) -> OpenCVPinholeCameraModelParameters:
+    width, height = resolution
+    return OpenCVPinholeCameraModelParameters(
+        resolution=np.array(resolution, dtype=np.uint64),
+        focal_length=np.array([width / 2, height], dtype=np.float32),
+        principal_point=np.array([width / 2, height / 2], dtype=np.float32),
+        radial_coeffs=np.zeros(6, dtype=np.float32),
+        tangential_coeffs=np.zeros(2, dtype=np.float32),
+        thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+        shutter_type=ShutterType.ROLLING_TOP_TO_BOTTOM,
+    )
+
+
+def test_compute_pixel_rect_characterization(subsampler: CameraSubsampler) -> None:
+    pixel_rect, resized_pre_crop_resolution = subsampler._compute_pixel_rect(8, 5)
+
+    assert resized_pre_crop_resolution == (5, 3)
+    assert (pixel_rect.width, pixel_rect.height) == (3, 3)
+    assert (pixel_rect.i, pixel_rect.j) == (1, 0)
+    assert pixel_rect.subsample_factor == pytest.approx(5 / 3)
+    assert pixel_rect.image_transform.image_domain_scale == 0.6
+    assert pixel_rect.image_transform.resized_pre_crop_resolution == (5, 3)
+
+
+def test_apply_camera_parameters_characterization(subsampler: CameraSubsampler) -> None:
+    transformed = subsampler.apply_camera_parameters(_camera_parameters())
+
+    assert isinstance(transformed, OpenCVPinholeCameraModelParameters)
+    np.testing.assert_array_equal(transformed.resolution, [3, 3])
+    np.testing.assert_allclose(transformed.focal_length, [2.4, 3.0])
+    np.testing.assert_allclose(transformed.principal_point, [1.4, 1.5])
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "bilinear",
+            [
+                [2.7499974, 4.4999957, 6.2499943],
+                [18.749983, 20.999958, 22.249979],
+                [34.749966, 36.499966, 38.24996],
+            ],
+        ),
+        (
+            "nearest-min",
+            [
+                [2.0, 4.0, 5.0],
+                [10.0, 12.0, 13.0],
+                [26.0, 28.0, 29.0],
+            ],
+        ),
+    ],
+)
+def test_apply_depth_data_characterization(
+    subsampler: CameraSubsampler,
+    mode: Literal["bilinear", "nearest-min"],
+    expected: list[list[float]],
+) -> None:
+    depth = np.arange(1, 41, dtype=np.float32).reshape(5, 8)
+    depth[2, 3] = 0.0
+
+    resized = subsampler.apply_depth_data(depth, mode=mode)
+
+    np.testing.assert_allclose(resized, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_apply_frame_data_read_only_2d_float_characterization(subsampler: CameraSubsampler) -> None:
+    frame = np.arange(5 * 8, dtype=np.float32).reshape(5, 8)
+    frame.flags.writeable = False
+
+    resized = subsampler.apply_frame_data(frame)
+
+    np.testing.assert_allclose(
+        resized,
+        [
+            [7.7942863, 9.634285, 11.380954],
+            [22.08, 23.919998, 25.666668],
+            [32.08, 33.92, 35.666668],
+        ],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert resized.dtype == np.float32
+
+
+def test_apply_frame_data_writable_3d_integer_characterization(subsampler: CameraSubsampler) -> None:
+    frame = np.arange(5 * 8 * 3, dtype=np.uint8).reshape(5, 8, 3)
+
+    resized = subsampler.apply_frame_data(frame)
+
+    np.testing.assert_array_equal(
+        resized,
+        [
+            [[3, 4, 5], [9, 10, 11], [12, 13, 14]],
+            [[27, 28, 29], [33, 34, 35], [36, 37, 38]],
+            [[75, 76, 77], [81, 82, 83], [84, 85, 86]],
+        ],
+    )
+    assert resized.dtype == np.uint8
+
+
+def test_apply_frame_data_rejects_invalid_rank(subsampler: CameraSubsampler) -> None:
+    with pytest.raises(AssertionError):
+        subsampler.apply_frame_data(np.zeros((1, 5, 8, 3), dtype=np.uint8))
+
+
+def test_half_tie_resolution_uses_exact_canonical_resized_pre_crop_size() -> None:
+    subsampler = CameraSubsampler(CameraSubsamplerConfig(frame_width=3, frame_height=2))
+    frame = np.zeros((35, 14, 3), dtype=np.uint8)
+    depth = np.ones((35, 14), dtype=np.float32)
+
+    pixel_rect, resized_pre_crop_resolution = subsampler._compute_pixel_rect(14, 35)
+
+    assert resized_pre_crop_resolution == (3, 8)
+    assert pixel_rect.downsampled_resolution() == (3, 8)
+    assert subsampler.apply_frame_data(frame).shape == (2, 3, 3)
+    assert subsampler.apply_depth_data(depth, mode="bilinear").shape == (2, 3)
+
+
+def test_apply_timestamps_characterization(subsampler: CameraSubsampler) -> None:
+    poses = np.stack([np.eye(4), np.eye(4)])
+
+    cropped_poses, start_timestamp, end_timestamp = subsampler.apply_T_sensor_startend_timestamps(
+        poses,
+        100,
+        200,
+        _camera_parameters((5, 8)),
+    )
+
+    np.testing.assert_array_equal(cropped_poses, poses)
+    assert start_timestamp == 128
+    assert end_timestamp == 185

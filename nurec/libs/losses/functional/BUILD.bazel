@@ -10,7 +10,7 @@ py_library(
     name = "pylib",
     srcs = [
         "__init__.py",
-        "cuda_losses_function.py",
+        "cuda_losses_accumulator.py",
     ],
     deps = [
         "//nurec/models/gaussians:pylib_cc_gsplat",

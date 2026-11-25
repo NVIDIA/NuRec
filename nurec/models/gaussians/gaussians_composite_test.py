@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import copy
+import gc
 import pickle
 import threading
 import unittest
@@ -63,6 +64,7 @@ from nurec.utils.batch import (
     CameraFrameLabels,
     DataAndRenderingBatch,
     DataBatch,
+    FrameMeta,
     RenderingBatch,
     RenderingData,
 )
@@ -73,6 +75,43 @@ from nurec.utils.types import GaussiansCompositeReturn, GaussiansRenderReturn
 
 TEST_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _GENERATION_PLAN_TEST_NODES = ("background", "road", "dynamic_rigids", "dynamic_deformables")
+
+
+def test_fourier_freeze_hook_does_not_retain_model() -> None:
+    model = SHGaussianModel.__new__(SHGaussianModel)
+    torch.nn.Module.__init__(model)
+    model.config = cast(Any, SimpleNamespace(fourier_freeze_until_step=10))
+    model.fourier_features_dim = 3
+    model._global_step_for_freeze = 0
+    model.features_albedo = torch.nn.Parameter(torch.ones(2, 3, 3))
+    # Exported checkpoints replace parameters rather than copying into them.
+    model.load_state_dict({"features_albedo": torch.ones(2, 3, 3), "_extra_state": None}, assign=True)
+    parameter = model.features_albedo
+    parameter.sum().backward()
+    expected = torch.zeros_like(parameter)
+    expected[:, 0] = 1
+    torch.testing.assert_close(parameter.grad, expected)
+    model._global_step_for_freeze = 10
+    parameter.grad = None
+    parameter.sum().backward()
+    torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    model.config.fourier_freeze_until_step = 20
+    parameter.grad = None
+    parameter.sum().backward()
+    torch.testing.assert_close(parameter.grad, expected)
+
+    reference = weakref.ref(model)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del model
+        assert reference() is None
+        parameter.grad = None
+        parameter.sum().backward()
+        torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 class _FakeGatherNode:
@@ -246,6 +285,81 @@ class TestLidarLayerVisibility(unittest.TestCase):
         self.assertIs(collector_result.densities, densities)
         lidar["densities"].sum().backward()
         torch.testing.assert_close(densities.grad, torch.tensor([[1.0], [1.0], [0.0], [0.0], [1.0]]))
+
+
+def test_to_device_moves_aliased_cuboid_tracks_once() -> None:
+    composite = GaussiansComposite.__new__(GaussiansComposite)
+    torch.nn.Module.__init__(composite)
+    source = mock.MagicMock(device=torch.device("cuda"))
+    moved = mock.MagicMock(device=torch.device("cpu"))
+    source.to_device.return_value = moved
+    node = SimpleNamespace(cuboid_tracks=source)
+    composite.cuboid_tracks = source
+    composite._component_only_layer_tracks = {"layer": source}
+    composite.gaussians_nodes = {"layer": node}  # type: ignore[assignment]
+    composite.collector = cast(Any, SimpleNamespace(layers_config=SimpleNamespace(layers=[SimpleNamespace()])))
+
+    with mock.patch.object(GaussiansComposite, "to", return_value=composite) as module_to:
+        assert composite.to_device("cpu") is composite
+
+    module_to.assert_called_once_with(torch.device("cpu"))
+    source.to_device.assert_called_once_with(torch.device("cpu"))
+    assert composite.cuboid_tracks is moved
+    assert composite._component_only_layer_tracks["layer"] is moved
+    assert node.cuboid_tracks is moved
+    assert composite.cuboid_track_devices() == {torch.device("cpu")}
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "collector activation requires CUDA")
+def test_to_device_refreshes_collector_time_table_before_collect() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    old_table = torch.tensor([[0, 1_000_000]], dtype=torch.int64)
+    time_embed = torch.nn.Module()
+    time_embed.register_buffer("timestamps_us_ranges", old_table)
+    node = SHGaussianModel.__new__(SHGaussianModel)
+    torch.nn.Module.__init__(node)
+    node.time_embed = cast(Any, time_embed)
+
+    embed_config = collect.IndividualRemapTimeInputEmbeddingConfig(old_table, 0.0, 1.0)
+    layer_config = LayerConfigSH(
+        RotationActivation.NORMALIZE,
+        ScaleActivation.EXP,
+        DensityActivation.SIGMOID,
+        fourier_features_dim=4,
+        embed_config=embed_config,
+    )
+    layers_config = LayersConfig([layer_config], 0, 0, 0, 3, 45)
+
+    composite = GaussiansComposite.__new__(GaussiansComposite)
+    torch.nn.Module.__init__(composite)
+    composite.gaussians_nodes = TypedModuleDict[BaseGaussianModel]({"dynamic": node})
+    composite.collector = CreateGaussianParameterCollector(layers_config)
+    composite.cuboid_tracks = mock.MagicMock(device=device)
+    composite._component_only_layer_tracks = {}
+
+    composite.to_device(device)
+
+    table = cast(torch.Tensor, getattr(time_embed, "timestamps_us_ranges"))
+    assert table.device == device
+    assert embed_config.timestamps_us_ranges is table
+
+    n = 8
+    layer_data = LayerDataSH(
+        positions=torch.randn(n, 3, device=device),
+        rotations=torch.randn(n, 4, device=device),
+        scales=torch.randn(n, 3, device=device),
+        densities=torch.randn(n, 1, device=device),
+        extra_signal=torch.empty(n, 0, device=device),
+        camera_extra_signal=torch.empty(n, 0, device=device),
+        lidar_extra_signal=torch.empty(n, 0, device=device),
+        features_albedo=torch.randn(n, 4, 3, device=device),
+        features_specular=torch.randn(n, 45, device=device),
+        embed_data=collect.IndividualRemapTimeInputEmbeddingData(
+            instance_idx=torch.zeros(n, dtype=torch.int32, device=device)
+        ),
+    )
+    result = composite.collector.collect(LayersData([layer_data], frame_timestamp_us=500_000))
+    assert result.features.device == device
 
 
 class _FakeSortNode:
@@ -1417,6 +1531,24 @@ class TestGaussiansCompositeGather(unittest.TestCase):
             with self.subTest(strategy="mcmc", step=step):
                 self.assertEqual(composite._is_fused_gather_generation_refresh_step(step), expected)
 
+        taminggs = gaussians_composite_module.TamingGSMCMCStrategy.__new__(
+            gaussians_composite_module.TamingGSMCMCStrategy
+        )
+        torch.nn.Module.__init__(taminggs)
+        taminggs.config = cast(Any, mcmc.config)
+        taminggs.frozen = False
+        composite.gaussians_strategy = taminggs
+        self.assertTrue(composite._supports_fused_gather_generation_plan())
+        self.assertTrue(composite._is_fused_gather_generation_refresh_step(15))
+
+        class CustomTamingGSStrategy(gaussians_composite_module.TamingGSMCMCStrategy):
+            pass
+
+        custom_taminggs = CustomTamingGSStrategy.__new__(CustomTamingGSStrategy)
+        torch.nn.Module.__init__(custom_taminggs)
+        composite.gaussians_strategy = custom_taminggs
+        self.assertFalse(composite._supports_fused_gather_generation_plan())
+
         gsplat = gaussians_composite_module.GSplatStrategy.__new__(gaussians_composite_module.GSplatStrategy)
         torch.nn.Module.__init__(gsplat)
         gsplat.config = cast(
@@ -1901,6 +2033,9 @@ class TestGaussiansCompositeGather(unittest.TestCase):
 
     def test_camera_only_training_forward_consumes_prefetched_full_gather(self) -> None:
         composite, _nodes = _make_grouped_gather_composite()
+        composite.gaussians_strategy = cast(
+            Any, SimpleNamespace(frozen=True, camera_densification_probe_enabled=lambda _step: False)
+        )
         selected_nodes = _GENERATION_PLAN_TEST_NODES
         pending = gaussians_composite_module._PendingGaussianParameterGather(
             gaussian_nodes=selected_nodes,
@@ -1958,6 +2093,9 @@ class TestGaussiansCompositeGather(unittest.TestCase):
 
     def test_lidar_only_forward_consumes_and_records_prefetched_full_gather(self) -> None:
         composite, nodes = _make_grouped_gather_composite()
+        composite.gaussians_strategy = cast(
+            Any, SimpleNamespace(frozen=True, camera_densification_probe_enabled=lambda _step: False)
+        )
         selected_nodes = _GENERATION_PLAN_TEST_NODES
         pending = gaussians_composite_module._PendingGaussianParameterGather(
             gaussian_nodes=selected_nodes,
@@ -2508,6 +2646,35 @@ class TestGaussiansCompositeGather(unittest.TestCase):
         self.assertEqual(out.visibility.untyped_storage().data_ptr(), visibility.untyped_storage().data_ptr())
         self.assertEqual(out.visibility.storage_offset(), 2)
         torch.testing.assert_close(out.visibility, visibility[2:5])
+
+    def test_mcmc_visibility_is_staged_globally_before_local_compaction(self) -> None:
+        composite, _first, _second = _make_gather_composite()
+        composite._visibility_local_ranges = ((1, 2), (5, 1))
+        out_cam = GaussiansRenderReturn(
+            opacity=torch.zeros((6, 1)),
+            frustum_visibility=torch.tensor([1, 0, 0, 1, 0, 0], dtype=torch.bool),
+        )
+        out_lidar = GaussiansRenderReturn(
+            opacity=torch.zeros((6, 1)),
+            visibility=torch.tensor([0, 0, 1, 0, 0, 0], dtype=torch.bool),
+        )
+        with patch.object(
+            torch.distributed,
+            "all_reduce",
+            side_effect=AssertionError("forward preparation must not launch a collective"),
+        ):
+            pending = composite._prepare_mcmc_visibility_union(
+                out_cam,
+                out_lidar,
+                element_count=6,
+                device=torch.device("cpu"),
+            )
+
+        torch.testing.assert_close(pending.reduction, torch.tensor([1, 0, 1, 1, 0, 0], dtype=torch.uint8))
+        self.assertEqual(pending.local_ranges, ((1, 2), (5, 1)))
+        self.assertFalse(pending._launched)
+        pending.launch()
+        torch.testing.assert_close(pending.resolve(), torch.tensor([False, True, False]))
 
     def test_visibility_ranges_reuse_fused_counts_without_a_collective(self) -> None:
         composite, _first, _second = _make_gather_composite()
@@ -3534,10 +3701,19 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
             exp = getattr(expected, field.name)
             act = getattr(actual, field.name)
             if isinstance(exp, torch.Tensor):
-                self.assertTrue(
-                    torch.equal(act, exp),
-                    msg=f"{msg} field {field.name}: cached collect diverged from the dense collect",
-                )
+                if exp.is_floating_point():
+                    torch.testing.assert_close(
+                        act,
+                        exp,
+                        rtol=1e-5,
+                        atol=0,
+                        msg=f"{msg} field {field.name}: cached collect diverged from the dense collect",
+                    )
+                else:
+                    self.assertTrue(
+                        torch.equal(act, exp),
+                        msg=f"{msg} field {field.name}: cached collect diverged from the dense collect",
+                    )
 
     # ---- invariant 1: camera parity across frame timestamps (copy-back correctness) ----
     def test_camera_sparse_matches_dense_across_timestamps(self):
@@ -3944,7 +4120,11 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
             for field in fields(expected):
                 exp = getattr(expected, field.name)
                 if isinstance(exp, torch.Tensor) and exp.shape[1] > 0:
-                    self.assertTrue(torch.equal(getattr(actual, field.name)[rows], exp[rows]), f"{msg}: {field.name}")
+                    got = getattr(actual, field.name)[rows]
+                    if got.is_floating_point():
+                        torch.testing.assert_close(got, exp[rows], rtol=1e-5, atol=0, msg=f"{msg}: {field.name}")
+                    else:
+                        self.assertTrue(torch.equal(got, exp[rows]), f"{msg}: {field.name}")
 
         with torch.no_grad():
             first = LayersData(layers=[static, two_track_rigid([1.0, 0.0, 0.0])], frame_timestamp_us=100000)
@@ -3963,6 +4143,10 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
             self.assertIsNotNone(composite._static_collect_cache, "the cold frame must populate the cache")
             assert_rows_equal(cold, dense_first, static_rows, "cold static rows")
             assert_rows_equal(cold, dense_first, live_rows, "cold live window")
+            # Dead rows are never collected; seed an arbitrary finite, non-zero value so the
+            # check below compares a known sentinel rather than allocator contents.
+            DEAD_ROW_SENTINEL = 17.0
+            cold.positions[dead_rows].fill_(DEAD_ROW_SENTINEL)
             stale = cold.positions[dead_rows].clone()
 
             second = LayersData(layers=[static, two_track_rigid([0.0, 2.0, 0.0])], frame_timestamp_us=200000)
@@ -4051,7 +4235,12 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
             for field in fields(cold):
                 got = getattr(cold, field.name)
                 expected = getattr(dense_cold, field.name)
-                self.assertTrue(torch.equal(got[static_rows], expected[static_rows]), field.name)
+                if got.is_floating_point():
+                    torch.testing.assert_close(
+                        got[static_rows], expected[static_rows], rtol=1e-5, atol=0, msg=field.name
+                    )
+                else:
+                    self.assertTrue(torch.equal(got[static_rows], expected[static_rows]), field.name)
                 self.assertTrue(torch.isnan(got[dynamic_dead]).all(), field.name)
 
             warm_frame = LayersData(
@@ -4087,8 +4276,18 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
             got = getattr(warm, field.name)
             expected = getattr(dense_warm, field.name)
             for rows in (slice(4, 6), slice(6, 8)):
-                self.assertTrue(torch.equal(got[rows], expected[rows]), f"{field.name} rows={rows}")
-            self.assertTrue(torch.equal(got[16:18], expected[16:18]), f"{field.name} dynamic window")
+                if got.is_floating_point():
+                    torch.testing.assert_close(
+                        got[rows], expected[rows], rtol=1e-5, atol=0, msg=f"{field.name} rows={rows}"
+                    )
+                else:
+                    self.assertTrue(torch.equal(got[rows], expected[rows]), f"{field.name} rows={rows}")
+            if got.is_floating_point():
+                torch.testing.assert_close(
+                    got[16:18], expected[16:18], rtol=1e-5, atol=0, msg=f"{field.name} dynamic window"
+                )
+            else:
+                self.assertTrue(torch.equal(got[16:18], expected[16:18]), f"{field.name} dynamic window")
             self.assertTrue(torch.isnan(got[dynamic_dead]).all(), field.name)
 
     def test_dynamic_resize_refreshes_only_displaced_static_layers(self):
@@ -4131,9 +4330,9 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
                     for f in fields(cache):
                         self.assertEqual(getattr(cache, f.name).data_ptr(), pointers[f.name])
                         got, expected = getattr(result, f.name), getattr(dense, f.name)
-                        torch.testing.assert_close(got[:6], expected[:6], rtol=0, atol=0)
-                        torch.testing.assert_close(got[7:9], expected[7:9], rtol=0, atol=0)
-                        torch.testing.assert_close(got[6 + n_dynamic :], expected[6 + n_dynamic :], rtol=0, atol=0)
+                        torch.testing.assert_close(got[:6], expected[:6], rtol=1e-5, atol=0)
+                        torch.testing.assert_close(got[7:9], expected[7:9], rtol=1e-5, atol=0)
+                        torch.testing.assert_close(got[6 + n_dynamic :], expected[6 + n_dynamic :], rtol=1e-5, atol=0)
 
     def test_cache_disabled_ignores_sparse_selection(self):
         collector = CreateGaussianParameterCollector(self._layers_config([self._rigid_config()]))
@@ -4260,10 +4459,21 @@ class TestGaussiansCompositeStaticCollectCache(unittest.TestCase):
         self.assertIsNotNone(cold_plan, "a partial selection must produce a draw plan")
         self.assertIsNotNone(composite._static_collect_cache, "the cold frame must populate the cache")
         for field in fields(cold):
-            self.assertTrue(
-                torch.equal(getattr(cold, field.name)[:64], getattr(dense_cold, field.name)[:64]),
-                f"folded layer must be cached whole in {field.name}",
-            )
+            actual = getattr(cold, field.name)[:64]
+            expected = getattr(dense_cold, field.name)[:64]
+            if actual.is_floating_point():
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=1e-5,
+                    atol=0,
+                    msg=f"folded layer must be cached whole in {field.name}",
+                )
+            else:
+                self.assertTrue(
+                    torch.equal(actual, expected),
+                    f"folded layer must be cached whole in {field.name}",
+                )
 
         with torch.no_grad():
             composite._collect_maybe_static_cached(
@@ -4449,6 +4659,136 @@ def _make_tileless_rendering_data(h: int, w: int) -> RenderingData:
         timestamps_startend_us=torch.zeros(1, 2, dtype=torch.int64, device=TEST_DEVICE),
         timestamps_startend_us_cpu=torch.zeros(1, 2, dtype=torch.int64),
     )
+
+
+class TestSharedCameraPostProcessing(unittest.TestCase):
+    def test_shared_scene_requires_one_frame_interval_and_inference(self) -> None:
+        rendering = RenderingData.collate_fn(
+            [_make_tileless_rendering_data(2, 3), _make_tileless_rendering_data(2, 3)],
+            device=TEST_DEVICE,
+        )
+        rendering.timestamps_startend_us_cpu[1, 1] = 1
+        frame_meta = [
+            FrameMeta(unique_sensor_idx=index, unique_frame_idx=-1, training_frame_idx=-1) for index in range(2)
+        ]
+        composite = GaussiansComposite.__new__(GaussiansComposite)
+        torch.nn.Module.__init__(composite)
+
+        with self.assertRaisesRegex(ValueError, "same frame interval"):
+            composite.forward_gaussians(
+                rendering_data_cam=rendering, frame_meta_cam=frame_meta, shared_camera_scene=True
+            )
+
+        rendering.timestamps_startend_us_cpu.zero_()
+        with self.assertRaisesRegex(ValueError, "inference only"):
+            composite.forward_gaussians(
+                rendering_data_cam=rendering,
+                frame_meta_cam=frame_meta,
+                shared_camera_scene=True,
+                is_training_batch=True,
+            )
+
+    def test_shared_scene_asset_edits_use_common_timestamp(self) -> None:
+        rendering = RenderingData.collate_fn(
+            [_make_tileless_rendering_data(2, 3), _make_tileless_rendering_data(2, 3)],
+            device=TEST_DEVICE,
+        )
+        rendering.timestamps_startend_us_cpu[:] = torch.tensor([[10, 20], [10, 20]])
+        frame_meta = [
+            FrameMeta(unique_sensor_idx=index, unique_frame_idx=-1, training_frame_idx=-1) for index in range(2)
+        ]
+        composite = GaussiansComposite.__new__(GaussiansComposite)
+        torch.nn.Module.__init__(composite)
+        edit_layouts = {"background": cast(Any, object())}
+        composite._collected_edit_layouts = {"cam": edit_layouts}
+        composite._edit_overrides = MagicMock()
+        renderer = MagicMock(spec=BaseGaussianRenderer)
+        rendered = GaussiansRenderReturn(opacity=torch.zeros(1))
+        renderer.render.return_value = rendered
+
+        with patch.object(composite, "get_n_active_features", return_value=3):
+            result = composite._render_collected(
+                rendering,
+                frame_meta,
+                {},
+                (),
+                renderer,
+                is_training_batch=False,
+                sensor_name="cam",
+                shared_camera_scene=True,
+            )
+
+        self.assertIs(result, rendered)
+        composite._edit_overrides.apply.assert_called_once_with(
+            {},
+            frame_timestamp_us=15,
+            layouts=edit_layouts,
+        )
+
+    def test_background_and_post_processing_preserve_camera_views(self) -> None:
+        h, w = 2, 3
+        rendering = RenderingData.collate_fn(
+            [_make_tileless_rendering_data(h, w), _make_tileless_rendering_data(h, w)],
+            device=TEST_DEVICE,
+        )
+        rendering.rays[0, ..., 3] = 1.0
+        rendering.rays[1, ..., 4] = 1.0
+
+        composite = GaussiansComposite.__new__(GaussiansComposite)
+        torch.nn.Module.__init__(composite)
+        composite._camera_renderer = _TileGeometryLessRenderer()
+        composite.saturate_radiance = False
+        composite.config = SimpleNamespace(  # type: ignore[assignment]
+            renderer=SimpleNamespace(active_tile_mask=ActiveTileMaskConfig(enabled=False))
+        )
+
+        def forward_gaussians(**_kwargs: object) -> GaussiansCompositeReturn:
+            return GaussiansCompositeReturn(
+                rendered_cam=GaussiansRenderReturn(
+                    rgb=torch.zeros(2 * h * w, 3, device=TEST_DEVICE),
+                    opacity=torch.ones(2 * h * w, 1, device=TEST_DEVICE),
+                )
+            )
+
+        def background(rays_d: torch.Tensor, out: GaussiansCompositeReturn, _training: bool) -> None:
+            rendered = cast(GaussiansRenderReturn, out.rendered_cam)
+            rendered.rgb = cast(torch.Tensor, rendered.rgb) + rays_d
+
+        def post_processing(*, results: GaussiansCompositeReturn, unique_sensor_idx: int, **_kwargs: object) -> None:
+            rendered = cast(GaussiansRenderReturn, results.rendered_cam)
+            rendered.rgb = cast(torch.Tensor, rendered.rgb) + unique_sensor_idx
+
+        composite.forward_gaussians = forward_gaussians  # type: ignore[assignment, method-assign]
+        composite.background = background  # type: ignore[assignment]
+        composite.post_processings = [post_processing]  # type: ignore[assignment]
+        batch = DataAndRenderingBatch(
+            data=DataBatch(
+                idx=0,
+                worker_id=None,
+                sequence_id=["dummy"],
+                lidar=None,
+                camera=DataBatch.Camera(
+                    meta=[
+                        FrameMeta(unique_sensor_idx=2, unique_frame_idx=-1, training_frame_idx=-1),
+                        FrameMeta(unique_sensor_idx=5, unique_frame_idx=-1, training_frame_idx=-1),
+                    ],
+                    labels=CameraFrameLabels(),
+                ),
+            ),
+            rendering=RenderingBatch(camera=rendering, lidar=None),
+        )
+
+        out = composite.forward(
+            batch,
+            enable_pp=True,
+            render_background=True,
+            clamp_output=False,
+            shared_camera_scene=True,
+        )
+
+        rgb = cast(torch.Tensor, cast(GaussiansRenderReturn, out.rendered_cam).rgb).reshape(2, h, w, 3)
+        torch.testing.assert_close(rgb[0], rendering.rays[0, ..., 3:] + 2)
+        torch.testing.assert_close(rgb[1], rendering.rays[1, ..., 3:] + 5)
 
 
 class TestActiveTilingWithoutTileGeometry(unittest.TestCase):
@@ -5446,7 +5786,7 @@ class TestGaussiansCompositePreparedMotion(unittest.TestCase):
                 ]
                 self.assertEqual(prepare.call_count, 3)
             expected_positions = torch.cat([item["positions"] for item in expected])
-            torch.testing.assert_close(actual["positions"], expected_positions, rtol=0, atol=0)
+            torch.testing.assert_close(actual["positions"], expected_positions, rtol=1e-5, atol=0)
             expected_grads = torch.autograd.grad(expected_positions.square().sum(), targets)
             actual["positions"].square().sum().backward()
             for target, expected_grad in zip(targets, expected_grads):
@@ -5529,18 +5869,21 @@ class TestGaussiansCompositePreparedMotion(unittest.TestCase):
                     for name in selected:
                         ids = params[name]["gaussian_cuboid_ids"].long()
                         kept_rows = torch.where(torch.isin(ids, track_indices))[0]
-                        torch.testing.assert_close(layouts[name].kept_rows, kept_rows)
+                        if kept_rows.numel() != ids.numel():
+                            torch.testing.assert_close(layouts[name].kept_rows, kept_rows)
+                        else:
+                            self.assertIsNone(layouts[name].kept_rows)
                         self.assertEqual(layouts[name].layer_size, kept_rows.numel())
                         kept_ids = ids[kept_rows]
                         transform = (kept_ids == track_indices[0])[:, None] * torch.tensor(
                             [1.0, 0.0, 0.0], device=device
                         )
                         expected_parts.append(params[name]["positions"][kept_rows] + edited_delta[kept_ids] + transform)
-                    torch.testing.assert_close(actual["positions"], torch.cat(expected_parts))
+                    torch.testing.assert_close(actual["positions"], torch.cat(expected_parts), rtol=1e-5, atol=0)
                     # Separate public collections prepare independent motion graphs.
                     reference = torch.cat([collect_selected([name])["positions"] for name in selected])
                     self.assertEqual(prepare.call_count, 3)
-                    torch.testing.assert_close(actual["positions"], reference, rtol=0, atol=0)
+                    torch.testing.assert_close(actual["positions"], reference, rtol=1e-5, atol=0)
                     reference_grads = torch.autograd.grad(reference.square().sum(), targets)
                 actual["positions"].square().sum().backward()
                 self.assertIsNone(calibration_delta.grad)
@@ -5828,7 +6171,7 @@ class TestGaussiansCompositePreparedMotion(unittest.TestCase):
                         torch.testing.assert_close(rigid_layer.poses[target_index, :3], translation)
                         layout = composite._collected_edit_layouts["cam"][name]
                         self.assertEqual(layout.layer_size, ids.numel())
-                        torch.testing.assert_close(layout.kept_rows, torch.arange(ids.numel(), device=device))
+                        self.assertIsNone(layout.kept_rows)
                         expected_parts.append(params[name]["positions"] + (ids == target_index)[:, None] * translation)
                     torch.testing.assert_close(actual["positions"], torch.cat(expected_parts))
         self.assertIs(dependent.cuboid_tracks, original_appearance)

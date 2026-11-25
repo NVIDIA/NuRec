@@ -12,9 +12,11 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image as PILImage
 
+from apps.av.aux_gen.device_frame import DeviceFrameContext
 from apps.av.aux_gen.device_frame_service import (
     DeviceFrameSharedArrayDescriptor,
     PendingDeviceFrame,
+    ResolvedDeviceFrame,
     SharedDeviceFrameClient,
 )
 from apps.av.aux_gen.segmentation_device_pipeline import (
@@ -57,6 +59,34 @@ class AuxiliaryFrameStatistics(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class AuxiliaryOutputIdentity:
+    """Native output identity for one source sequence part.
+
+    Attributes:
+        sequence_id: Source sequence identifier.
+        store_base_name: Native output store filename prefix.
+        shard_id: Source part index.
+        shard_count: Number of source parts.
+        store_type: Native storage format, directory or itar.
+    """
+
+    sequence_id: str
+    store_base_name: str
+    shard_id: int
+    shard_count: int
+    store_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuxiliaryFrameSelection:
+    """Explicit sampling result passed to output setup and finalization."""
+
+    sample_indices: Mapping[int, tuple[int, ...]]
+    sampled_frames: tuple[dict[str, Any], ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class AuxiliarySegmentationOutputs:
     """Describe how one extension processor's frame outputs are consumed.
@@ -71,6 +101,17 @@ class AuxiliarySegmentationOutputs:
             counters.
         create_statistics: Optional per-camera counter accumulator factory.
             Required when ``statistics_output`` is set.
+        mask_frames: Optional absolute indices selecting semantic output.
+        active_label_ids: Resolved labels per camera and absolute frame index; kept on the host.
+        instance_output_root: Optional root for native per-camera instance stores.
+        instance_classes: Ordered ``(label_id, name)`` pairs per camera; native
+            stored class indices refer to this order.
+        instance_checkpoint: Checkpoint path recorded in native instance metadata.
+        instance_dataset_name: Extension dataset name recorded in instance metadata.
+        instance_method: Extension method identifier recorded in instance metadata.
+        instance_colors: RGB colors keyed by label ID; serialized in instance_classes order.
+        instance_camera_mask_input: Optional device-input key for a separate
+            nearest-resized camera mask used by instance filtering.
     """
 
     processor_name: str
@@ -78,6 +119,46 @@ class AuxiliarySegmentationOutputs:
     mask_root: Path
     statistics_output: str | None = None
     create_statistics: Callable[[], AuxiliaryFrameStatistics] | None = None
+    mask_frames: Mapping[str, frozenset[int]] | None = None
+    active_label_ids: Mapping[str, Mapping[int, tuple[int, ...]]] = field(default_factory=dict)
+    instance_output_root: Path | None = None
+    instance_classes: Mapping[str, tuple[tuple[int, str], ...]] = field(default_factory=dict)
+    instance_camera_mask_input: str | None = None
+    instance_checkpoint: str = ""
+    instance_dataset_name: str = ""
+    instance_method: str = ""
+    instance_colors: Mapping[int, tuple[int, int, int]] = field(default_factory=dict)
+
+
+class AuxiliarySegmentationOutputHandler(Protocol):
+    """Own one run's output configuration and parent-side finalization."""
+
+    @property
+    def frame_outputs(self) -> AuxiliarySegmentationOutputs:
+        """Return this run's immutable worker output configuration.
+
+        Returns:
+            Picklable output configuration forwarded to camera workers.
+        """
+        ...
+
+    def finalize(
+        self,
+        *,
+        camera_ids: tuple[str, ...],
+        camera_statistics: tuple[Mapping[str, Any], ...],
+        processor_metadata: Mapping[str, Any],
+        wall_time_seconds: float,
+    ) -> None:
+        """Publish results after every camera worker exits.
+
+        Args:
+            camera_ids: Cameras processed in worker order.
+            camera_statistics: Accumulated per-camera extension counters.
+            processor_metadata: Model metadata reported at device readiness.
+            wall_time_seconds: Total shared-segmentation wall time.
+        """
+        ...
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -147,7 +228,7 @@ class SharedSegmentationFrameProcessor:
     def __call__(
         self,
         request_id: int,
-        _frame_timestamp_us: int,
+        frame_timestamp_us: int,
         decoded_image: Any,
         vis_path: Path | None,
     ) -> PendingSharedSegmentationFrame | None:
@@ -160,6 +241,19 @@ class SharedSegmentationFrameProcessor:
             enabled_processors=frozenset(enabled_processors),
             image=decoded_image,
             processor_inputs=self.processor_inputs,
+            frame=DeviceFrameContext(
+                self.client.worker_id,
+                request_id,
+                self.camera_id or "",
+                frame_timestamp_us,
+                (
+                    self.auxiliary_outputs.active_label_ids.get(self.camera_id or "", {}).get(
+                        self.camera_frame_range_start + request_id, ()
+                    )
+                    if self.auxiliary_outputs is not None
+                    else ()
+                ),
+            ),
         )
         if pending_frame is None:
             return None
@@ -168,9 +262,24 @@ class SharedSegmentationFrameProcessor:
             vis_path=vis_path,
         )
 
-    def resolve(self, pending_frame: PendingSharedSegmentationFrame) -> SegmentationFrameOutput:
-        """Resolve one submitted frame into host-owned segmentation outputs."""
-        resolved = self.client.resolve(
+    def resolve(
+        self, pending_frame: PendingSharedSegmentationFrame, *, resolved: ResolvedDeviceFrame | None = None
+    ) -> SegmentationFrameOutput:
+        """Resolve one submitted frame into host-owned segmentation outputs.
+
+        Args:
+            pending_frame: Request and optional visualization destination.
+            resolved: Optional already-consumed transport result, avoiding a
+                second resolve when the host also writes native instances.
+
+        Returns:
+            Host-owned segmentation arrays, optional visualization and counters.
+
+        Raises:
+            RuntimeError: If an enabled processor omits required outputs or the
+                service reports a failure.
+        """
+        resolved = resolved or self.client.resolve(
             pending_frame.device_frame,
             include_input=pending_frame.vis_path is not None,
         )
@@ -204,6 +313,12 @@ class SharedSegmentationFrameProcessor:
             source_frame_index = self.camera_frame_range_start + pending_frame.device_frame.request.request_id
             auxiliary_mask_path = self.auxiliary_outputs.mask_root / self.camera_id / f"{source_frame_index:06d}.png"
             self._accumulate_auxiliary_statistics(resolved.outputs)
+            if (
+                self.auxiliary_outputs.mask_frames is not None
+                and source_frame_index not in self.auxiliary_outputs.mask_frames.get(self.camera_id, ())
+            ):
+                auxiliary_mask = None
+                auxiliary_mask_path = None
         return SegmentationFrameOutput(
             semantic_seg=labels_to_paletted_image(labels) if labels is not None else None,
             semantic_seg_logits=semantic_seg_logits,

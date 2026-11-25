@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 
 DEFAULT_VISIBILITY = [
@@ -18,6 +18,7 @@ py_library(
     srcs = [
         "__init__.py",
         "base.py",
+        "camera_init.py",
         "labels_utils.py",
         "ncore.py",
         "registry.py",
@@ -40,6 +41,7 @@ py_library(
         pip_requirement("tqdm"),
         pip_requirement("numpy"),
         pip_requirement("torch"),
+        pip_requirement("torchvision"),
         pip_requirement("omegaconf"),
         pip_requirement("lietorch"),
         pip_requirement("pillow"),
@@ -57,6 +59,8 @@ py_library(
         "//nurec/models/gaussians:pylib_cc_gsplat",
         "//nurec/ncore_backends:pylib",
         "//nurec/utils:pylib",
+        "//nurec/utils:pylib_image_resolution",
+        "//nurec/utils:pylib_initialization",
         "//nurec/utils:pylib_morph",
         "//nurec/utils:pylib_ncore_utils",
         "//nurec/visualdebugger:pylib",
@@ -80,6 +84,7 @@ pytest_test(
     srcs = ["utils_test.py"],
     deps = [
         ":pylib",
+        "//nurec/utils:pylib_types",
     ],
 )
 
@@ -130,11 +135,13 @@ pytest_test(
     name = "ncore_test",
     srcs = ["ncore_test.py"],
     deps = [
+        ":pylib",
+        "//nurec/config:pylib_image_resolution",
+        "//nurec/datasets/samplers:pylib",
+        "//nurec/utils:pylib_image_resolution",
         pip_requirement("numpy"),
         pip_requirement("pillow"),
         pip_requirement("torch"),
-        ":pylib",
-        "//nurec/datasets/samplers:pylib",
     ],
 )
 
@@ -143,6 +150,45 @@ pytest_test(
     srcs = ["vehicle_light_test.py"],
     deps = [
         ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("opencv-python"),
+    ],
+)
+
+pytest_test(
+    name = "camera_init_test",
+    srcs = ["camera_init_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("numpy"),
+        pip_requirement("pandas"),
+        pip_requirement("torch"),
+        pip_requirement("torchvision"),
+    ],
+)
+
+py_library(
+    name = "pylib_vehicle_light_masks_to_rle",
+    srcs = ["vehicle_light_masks_to_rle.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("click"),
+    ],
+)
+
+py_binary(
+    name = "vehicle_light_masks_to_rle",
+    srcs = ["vehicle_light_masks_to_rle.py"],
+    main = "vehicle_light_masks_to_rle.py",
+    deps = [":pylib_vehicle_light_masks_to_rle"],
+)
+
+pytest_test(
+    name = "vehicle_light_masks_to_rle_test",
+    srcs = ["vehicle_light_masks_to_rle_test.py"],
+    deps = [
+        ":pylib_vehicle_light_masks_to_rle",
+        pip_requirement("click"),
         pip_requirement("numpy"),
         pip_requirement("opencv-python"),
     ],

@@ -39,6 +39,7 @@ from nurec.libs.sensors.kernels.cameras import (
     ReferencePolynomial,
     ShutterType,
     camera_rays_to_image_points,
+    camera_rays_to_world_rays_batch,
     generate_image_points,
     image_points_to_camera_rays,
     image_points_to_world_rays_shutter_pose,
@@ -1539,6 +1540,160 @@ class TestOpenCVFisheyeCameraOracle(unittest.TestCase):
                     )
 
 
+class TestOpenCVFisheyeSafeguardedInverse(unittest.TestCase):
+    """NVBug 6960391: a valid radius whose old Newton seed has zero derivative.
+
+    g(theta)=theta-theta**3/3 has an independent trigonometric inverse on [0,1].
+    These are synthetic coefficients, not the rounded customer calibration.
+    """
+
+    def make_projection(self, newton_iterations=10):
+        pp = torch.tensor([639.5, 287.5], device=device, requires_grad=True)
+        focal = torch.tensor([640.0, 640.0], device=device, requires_grad=True)
+        coefficients = torch.tensor([-1 / 3, 0.0, 0.0, 0.0], device=device, requires_grad=True)
+        projection = OpenCVFisheyeProjection.from_components(
+            principal_point=pp,
+            focal_length=focal,
+            forward_poly=coefficients,
+            resolution=torch.tensor([1280, 576], device=device),
+            max_angle=2.0,
+            newton_iterations=newton_iterations,
+            min_2d_norm=1e-8,
+        )
+        return projection, (pp, focal, coefficients)
+
+    @staticmethod
+    def analytic_rays(points, pp, focal, k1):
+        # Account for the actual float32 coefficient rather than exact -1/3.
+        uv = (points.double() - pp.double()) / focal.double()
+        radius = uv.norm(dim=-1)
+        a = -3 * k1.double()
+        theta = 2 / a.sqrt() * torch.sin(torch.asin(1.5 * radius * a.sqrt()) / 3)
+        rays = torch.cat((uv * (theta.sin() / radius)[:, None], theta.cos()[:, None]), dim=-1)
+        return rays, theta, uv
+
+    def test_singular_seed_recovers_physical_root(self):
+        # The deprecated budget is accepted for compatibility, but no longer selects a solver path.
+        previous_rays = None
+        for newton_iterations in (0, 3, 10, 20):
+            with self.subTest(newton_iterations=newton_iterations):
+                projection, (pp, focal, coefficients) = self.make_projection(newton_iterations)
+                radius = torch.tensor([0.1, 0.49999, 0.5, 0.50001, 0.6, 0.66], device=device)
+                points = pp.detach() + torch.stack((radius * focal[0].detach(), torch.zeros_like(radius)), -1)
+                rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+                expected, _, _ = self.analytic_rays(points, pp, focal, coefficients[0])
+                torch.testing.assert_close(rays.double(), expected, rtol=1e-5, atol=2e-6)
+                torch.testing.assert_close(rays.norm(dim=-1), torch.ones_like(radius), rtol=0, atol=2e-6)
+                if previous_rays is not None:
+                    torch.testing.assert_close(rays, previous_rays, rtol=0, atol=0)
+                previous_rays = rays.detach()
+
+    def test_unsafe_newton_proposal_recovers_physical_root(self):
+        projection, (pp, focal, coefficients) = self.make_projection()
+        # At radius 0.5 this seed is 0.99: inside the domain, but its first Newton step leaves it.
+        with torch.no_grad():
+            projection.approx_backward_factor.fill_(1.98)
+        points = torch.tensor([[959.5, 287.5]], device=device)
+        rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+        expected, _, _ = self.analytic_rays(points, pp, focal, coefficients[0])
+        torch.testing.assert_close(rays.double(), expected, rtol=0, atol=2e-6)
+
+    def test_near_domain_boundary_matches_analytic_inverse(self):
+        projection, (pp, focal, coefficients) = self.make_projection()
+        points = torch.tensor([[1063.5, 287.5], [1065.5, 287.5], [1066.0, 287.5]], device=device)
+        rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+        expected, _, _ = self.analytic_rays(points, pp, focal, coefficients[0])
+        # Float32 radius rounding is amplified near the stationary boundary.
+        torch.testing.assert_close(rays.double(), expected, rtol=0, atol=1e-5)
+
+    def test_poor_initial_seed_matches_independent_bisection(self):
+        pp = torch.tensor([960.0, 540.0], device=device)
+        focal = torch.tensor([1000.0, 1000.0], device=device)
+        coefficients = torch.tensor([0.1, 0.2, 0.3, 0.4], device=device)
+        projection = OpenCVFisheyeProjection.from_components(
+            principal_point=pp,
+            focal_length=focal,
+            forward_poly=coefficients,
+            resolution=torch.tensor([960, 540], device=device),
+            max_angle=np.deg2rad(70.0),
+            newton_iterations=3,
+            min_2d_norm=1e-8,
+        )
+        xx, yy = np.meshgrid(np.linspace(0.5, 959.5, 17), np.linspace(0.5, 539.5, 11))
+        points = torch.tensor(np.stack([xx.ravel(), yy.ravel()], axis=-1), device=device, dtype=torch.float32)
+        uv = (points.double() - pp.double()) / focal.double()
+        radius = uv.norm(dim=-1)
+        lower, upper = torch.zeros_like(radius), torch.full_like(radius, projection.max_angle)
+        for _ in range(64):
+            theta = 0.5 * (lower + upper)
+            projected = theta + sum(coefficients[i].double() * theta ** (2 * i + 3) for i in range(4))
+            lower, upper = torch.where(projected < radius, theta, lower), torch.where(projected < radius, upper, theta)
+        theta = 0.5 * (lower + upper)
+        expected = torch.cat([uv * (theta.sin() / radius)[:, None], theta.cos()[:, None]], dim=-1)
+        rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+        torch.testing.assert_close(rays.double(), expected, rtol=0, atol=2e-6)
+
+    def test_implicit_gradients_at_singular_seed(self):
+        projection, (pp, focal, coefficients) = self.make_projection()
+        # Include a ray near the stationary boundary, where the implicit derivative is larger.
+        points = torch.tensor([[959.5, 287.5], [831.5, 543.5], [1064.5, 287.5]], device=device, requires_grad=True)
+        weights = torch.tensor([[0.3, -0.7, 0.9], [-0.2, 0.6, 0.4], [0.1, -0.2, 0.3]], device=device)
+        rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+        (rays * weights).sum().backward()
+
+        ref_points = points.detach().double().requires_grad_()
+        ref_pp = pp.detach().double().requires_grad_()
+        ref_focal = focal.detach().double().requires_grad_()
+        ref_coefficients = coefficients.detach().double().requires_grad_()
+        ref_rays, theta, uv = self.analytic_rays(ref_points, ref_pp, ref_focal, ref_coefficients[0])
+        (ref_rays * weights.double()).sum().backward()
+        for actual, expected in ((points.grad, ref_points.grad), (pp.grad, ref_pp.grad), (focal.grad, ref_focal.grad)):
+            torch.testing.assert_close(actual.double(), expected, rtol=2e-4, atol=1e-7)
+
+        # Analytic implicit derivative for all four coefficients, including zero high-order terms.
+        theta = theta.detach()
+        uv = uv.detach()
+        ray_dtheta = torch.cat((uv / uv.norm(dim=-1)[:, None] * theta.cos()[:, None], -theta.sin()[:, None]), -1)
+        loss_dtheta = (ray_dtheta * weights.double()).sum(-1)
+        derivative = 1 + 3 * coefficients[0].detach().double() * theta**2
+        expected_coefficients = torch.stack(
+            [(-loss_dtheta * theta**power / derivative).sum() for power in (3, 5, 7, 9)]
+        )
+        torch.testing.assert_close(coefficients.grad.double(), expected_coefficients, rtol=2e-4, atol=1e-6)
+
+    def test_unsupported_radius_has_constant_finite_sentinel(self):
+        projection, leaves = self.make_projection()
+        points = torch.tensor([[1087.5, 287.5], [1279.5, 575.5]], device=device, requires_grad=True)
+        rays = image_points_to_camera_rays(points, projection, NoExternalDistortion())
+        torch.testing.assert_close(rays, torch.tensor([[0.0, 0.0, 1.0]], device=device).expand(2, -1))
+        rays.sum().backward()
+        for tensor in (points, *leaves):
+            torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
+
+    def test_forward_projection_rejects_folded_branch(self):
+        projection, _ = self.make_projection()
+        theta = torch.tensor([0.8, 1.1], device=device)
+        rays = torch.stack((theta.sin(), torch.zeros_like(theta), theta.cos()), dim=-1)
+        _, valid = camera_rays_to_image_points(rays, projection, NoExternalDistortion())
+        self.assertEqual(valid.tolist(), [True, False])
+
+    def test_full_grid_training_path_and_backward_are_finite(self):
+        projection, leaves = self.make_projection()
+        world_rays, _, _, _ = image_points_to_world_rays_shutter_pose(
+            None,
+            projection,
+            NoExternalDistortion(),
+            (1280, 576),
+            ShutterType.GLOBAL,
+            create_identity_dynamic_pose(device),
+        )
+        self.assertEqual(world_rays.shape, (737280, 6))
+        self.assertTrue(torch.isfinite(world_rays).all().item())
+        world_rays[:, 3:].mean().backward()
+        for tensor in leaves:
+            self.assertTrue(torch.isfinite(tensor.grad).all().item())
+
+
 class TestBivariateWindshieldOracle(unittest.TestCase):
     """Oracle tests for bivariate windshield distortion model."""
 
@@ -2029,6 +2184,47 @@ class TestCameraProjection(unittest.TestCase):
         directions = world_rays[:, 3:6]
         norms = directions.norm(dim=-1)
         self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=ATOL))
+
+    def test_camera_rays_to_world_rays_batch(self):
+        camera_rays = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], device=device)
+        translations = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.0, 2.0]], device=device)
+        root_half = math.sqrt(0.5)
+        rotations = torch.tensor(
+            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, root_half, root_half]],
+            device=device,
+        )
+
+        world_rays = camera_rays_to_world_rays_batch(camera_rays, translations, rotations)
+
+        expected = torch.tensor(
+            [
+                [[1.0, 2.0, 3.0, 1.0, 0.0, 0.0], [1.0, 2.0, 3.0, 0.0, 1.0, 0.0]],
+                [[-1.0, 0.0, 2.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 2.0, -1.0, 0.0, 0.0]],
+            ],
+            device=device,
+        )
+        torch.testing.assert_close(world_rays, expected, atol=ATOL, rtol=0)
+
+    def test_camera_rays_to_world_rays_batch_random(self):
+        batch, ray_count = 8, 1009
+        generator = torch.Generator(device=device).manual_seed(0)
+        camera_rays = torch.randn((ray_count, 3), device=device, generator=generator)
+        translations = torch.randn((batch, 3), device=device, generator=generator)
+        rotations = torch.nn.functional.normalize(torch.randn((batch, 4), device=device, generator=generator), dim=-1)
+
+        world_rays = camera_rays_to_world_rays_batch(camera_rays, translations, rotations)
+
+        directions = camera_rays.unsqueeze(0).expand(batch, -1, -1)
+        quaternion_xyz = rotations[:, None, :3].expand(-1, ray_count, -1)
+        cross = 2 * torch.cross(quaternion_xyz, directions, dim=-1)
+        rotated = directions + rotations[:, None, 3:] * cross + torch.cross(quaternion_xyz, cross, dim=-1)
+        expected = torch.cat((translations[:, None].expand(-1, ray_count, -1), rotated), dim=-1)
+        torch.testing.assert_close(world_rays, expected, atol=1e-5, rtol=1e-5)
+
+        noncontiguous = torch.randn((ray_count, 6), device=device)[:, ::2]
+        self.assertFalse(noncontiguous.is_contiguous())
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            camera_rays_to_world_rays_batch(noncontiguous, translations, rotations)
 
     def test_image_points_to_world_rays_shutter_pose(self):
         """Test back-projection to world rays with rolling shutter."""

@@ -55,6 +55,49 @@ def get_closest_frame_index(frame_timestamps_us: np.ndarray, target_timestamp_us
     return int(np.abs(frame_timestamps_us.astype(np.int64) - target_timestamp_us).argmin())
 
 
+# Slack above the best achievable sync delta when no reference frame meets the configured tolerance.
+# Covers timestamp jitter (tens of us) while staying far below a 30 Hz frame period.
+SYNC_FALLBACK_SLACK_US = 2_000
+
+
+def nearest_frame_signed_delta_us(camera_timestamps_us: np.ndarray, query_timestamps_us: np.ndarray) -> np.ndarray:
+    """Per query timestamp, the signed offset (camera minus query) of the camera's nearest frame."""
+    camera_timestamps_i64 = camera_timestamps_us.astype(np.int64, copy=False)
+    query_timestamps_i64 = query_timestamps_us.astype(np.int64, copy=False)
+    if len(camera_timestamps_i64) == 0:
+        raise InstantNuRecDataError("A requested camera has no frame timestamps.")
+    insertion_indices = np.searchsorted(camera_timestamps_i64, query_timestamps_i64)
+    earlier_indices = np.clip(insertion_indices - 1, 0, len(camera_timestamps_i64) - 1)
+    later_indices = np.clip(insertion_indices, 0, len(camera_timestamps_i64) - 1)
+    earlier_deltas_us = camera_timestamps_i64[earlier_indices] - query_timestamps_i64
+    later_deltas_us = camera_timestamps_i64[later_indices] - query_timestamps_i64
+    return np.where(np.abs(earlier_deltas_us) <= np.abs(later_deltas_us), earlier_deltas_us, later_deltas_us)
+
+
+def reference_max_camera_delta_us(
+    camera_frame_timestamps_us: dict[str, np.ndarray],
+    reference_timestamps_us: np.ndarray,
+) -> np.ndarray:
+    """Per reference frame, the largest distance from it to the nearest frame of any camera."""
+    max_deltas_us = np.zeros(len(reference_timestamps_us), dtype=np.int64)
+    for camera_timestamps_us in camera_frame_timestamps_us.values():
+        nearest_deltas_us = np.abs(nearest_frame_signed_delta_us(camera_timestamps_us, reference_timestamps_us))
+        np.maximum(max_deltas_us, nearest_deltas_us, out=max_deltas_us)
+    return max_deltas_us
+
+
+def synchronized_reference_mask(
+    camera_frame_timestamps_us: dict[str, np.ndarray],
+    reference_timestamps_us: np.ndarray,
+    max_camera_timestamp_delta_us: int,
+) -> np.ndarray:
+    """Mask of reference frames for which every camera has a frame within ``max_camera_timestamp_delta_us``."""
+    return (
+        reference_max_camera_delta_us(camera_frame_timestamps_us, reference_timestamps_us)
+        <= max_camera_timestamp_delta_us
+    )
+
+
 def random_valid_start_time_from_intervals(
     rng: np.random.Generator,
     intervals: list[HalfClosedInterval],
@@ -342,20 +385,9 @@ class UniformFrameBatchSampler(BaseFrameBatchSampler):
             supported_reference_timestamps_us = reference_timestamps_us
 
             if self.max_camera_timestamp_delta_us is not None:
-                reference_timestamps_i64 = reference_timestamps_us.astype(np.int64, copy=False)
-                valid_reference_mask = np.ones(len(reference_timestamps_i64), dtype=bool)
-                for camera_timestamps_us in camera_frame_timestamps_us.values():
-                    camera_timestamps_i64 = camera_timestamps_us.astype(np.int64, copy=False)
-                    if len(camera_timestamps_i64) == 0:
-                        raise InstantNuRecDataError("A requested camera has no frame timestamps.")
-                    insertion_indices = np.searchsorted(camera_timestamps_i64, reference_timestamps_i64)
-                    earlier_indices = np.clip(insertion_indices - 1, 0, len(camera_timestamps_i64) - 1)
-                    later_indices = np.clip(insertion_indices, 0, len(camera_timestamps_i64) - 1)
-                    nearest_deltas_us = np.minimum(
-                        np.abs(camera_timestamps_i64[earlier_indices] - reference_timestamps_i64),
-                        np.abs(camera_timestamps_i64[later_indices] - reference_timestamps_i64),
-                    )
-                    valid_reference_mask &= nearest_deltas_us <= self.max_camera_timestamp_delta_us
+                valid_reference_mask = synchronized_reference_mask(
+                    camera_frame_timestamps_us, reference_timestamps_us, self.max_camera_timestamp_delta_us
+                )
                 valid_reference_timestamps_us = reference_timestamps_us[valid_reference_mask]
                 if len(valid_reference_timestamps_us) == 0:
                     raise InstantNuRecDataError(
@@ -432,6 +464,10 @@ class AdaptiveSequentialFrameBatchSampler(BaseFrameBatchSampler):
         self.n_frames_per_sample: int = config.n_frames_per_sample
         self.n_samples_per_sequence: int = config.n_samples_per_sequence
         self.max_frame_gap_timestamp_us: int = config.max_frame_gap_timestamp_us
+        self.reference_camera_id: str | None = config.reference_camera_id
+        self.max_camera_timestamp_delta_us: int | None = config.max_camera_timestamp_delta_us
+        if self.max_camera_timestamp_delta_us is not None and self.reference_camera_id is None:
+            raise ValueError("max_camera_timestamp_delta_us requires reference_camera_id")
         assert self.n_frames_per_sample > 0, "n_frames_per_sample must be positive"
         assert self.n_samples_per_sequence > 0, "n_samples_per_sequence must be positive"
         assert self.max_frame_gap_timestamp_us > 0, "max_frame_gap_timestamp_us must be positive"
@@ -468,12 +504,82 @@ class AdaptiveSequentialFrameBatchSampler(BaseFrameBatchSampler):
             for frame_idx in range(self.n_frames_per_sample)
         ]
 
+        camera_phase_offsets_us: dict[str, int] = {}
+        # Snap to the reference camera's actual capture times so that cameras with small
+        # phase offsets cannot select adjacent capture cycles (see UniformFrameBatchSampler).
+        # With a timestamp tolerance, only snap to reference frames that every camera also
+        # captured, e.g. skip front-wide 30 Hz frames that fall between 15 Hz cross-camera frames.
+        if self.reference_camera_id is not None:
+            if self.reference_camera_id not in camera_frame_timestamps_us:
+                raise ValueError(
+                    f"Reference camera {self.reference_camera_id!r} is absent from the available cameras "
+                    f"{sorted(camera_frame_timestamps_us)}."
+                )
+            reference_timestamps_us = camera_frame_timestamps_us[self.reference_camera_id]
+            if self.max_camera_timestamp_delta_us is not None and len(reference_timestamps_us) > 0:
+                max_deltas_us = reference_max_camera_delta_us(camera_frame_timestamps_us, reference_timestamps_us)
+                synchronized_mask = max_deltas_us <= self.max_camera_timestamp_delta_us
+                if not synchronized_mask.any():
+                    # Some rigs keep a constant phase offset beyond the tolerance (e.g. all-30 Hz clips
+                    # with cross cameras 10-15 ms off front-wide). Prediction must not drop the clip, so
+                    # fall back to the best-synchronized reference frames it has. A constant phase offset
+                    # never exceeds half a reference period; anything larger means the camera streams do
+                    # not overlap in time, so keep rejecting the clip.
+                    best_delta_us = int(max_deltas_us.min())
+                    reference_period_us = (
+                        float(np.median(np.diff(reference_timestamps_us))) if len(reference_timestamps_us) > 1 else 0.0
+                    )
+                    max_fallback_delta_us = reference_period_us / 2 + SYNC_FALLBACK_SLACK_US
+                    if best_delta_us > max_fallback_delta_us:
+                        raise InstantNuRecDataError(
+                            f"Reference camera {self.reference_camera_id!r} has no frames with all requested cameras "
+                            f"within {self.max_camera_timestamp_delta_us} us, and the best-synchronized frame is "
+                            f"{best_delta_us} us off (more than half a reference period + slack, "
+                            f"{max_fallback_delta_us:.0f} us): camera captures do not overlap."
+                        )
+                    fallback_delta_us = best_delta_us + SYNC_FALLBACK_SLACK_US
+                    logger.warning(
+                        f"No {self.reference_camera_id!r} frame has all cameras within "
+                        f"{self.max_camera_timestamp_delta_us} us; falling back to the best-synchronized "
+                        f"frames (within {fallback_delta_us} us)."
+                    )
+                    # Near half a period a camera frame is about equally close to two reference frames, so
+                    # timing jitter would flip the nearest pick between capture cycles within a chunk. Pair
+                    # every camera at one fixed phase instead: its lower-median signed offset (always a real
+                    # offset, never the average of two cycles), keeping only the reference frames for which
+                    # every camera has a frame at that phase.
+                    reference_timestamps_us = reference_timestamps_us[max_deltas_us <= fallback_delta_us]
+                    phase_locked_mask = np.ones(len(reference_timestamps_us), dtype=bool)
+                    for camera_id, camera_timestamps_us in camera_frame_timestamps_us.items():
+                        signed_deltas_us = np.sort(
+                            nearest_frame_signed_delta_us(camera_timestamps_us, reference_timestamps_us)
+                        )
+                        camera_phase_offsets_us[camera_id] = int(signed_deltas_us[(len(signed_deltas_us) - 1) // 2])
+                        phase_locked_deltas_us = nearest_frame_signed_delta_us(
+                            camera_timestamps_us, reference_timestamps_us + camera_phase_offsets_us[camera_id]
+                        )
+                        phase_locked_mask &= np.abs(phase_locked_deltas_us) <= SYNC_FALLBACK_SLACK_US
+                    reference_timestamps_us = reference_timestamps_us[phase_locked_mask]
+                else:
+                    reference_timestamps_us = reference_timestamps_us[synchronized_mask]
+            if len(reference_timestamps_us) == 0:
+                raise InstantNuRecDataError(
+                    f"Reference camera {self.reference_camera_id!r} has no frames with all requested cameras "
+                    f"within {self.max_camera_timestamp_delta_us} us."
+                )
+            ref_frame_timestamps_us = [
+                int(reference_timestamps_us[get_closest_frame_index(reference_timestamps_us, timestamp_us)])
+                for timestamp_us in ref_frame_timestamps_us
+            ]
+
         sampled_sensor_frame_idxs: dict[str, list[int]] = {}
         for camera_id, camera_timestamps_us in camera_frame_timestamps_us.items():
             sampled_sensor_frame_idxs[camera_id] = []
             for frame_timestamp_us in ref_frame_timestamps_us:
                 sampled_sensor_frame_idxs[camera_id].append(
-                    get_closest_frame_index(camera_timestamps_us, int(frame_timestamp_us))
+                    get_closest_frame_index(
+                        camera_timestamps_us, int(frame_timestamp_us) + camera_phase_offsets_us.get(camera_id, 0)
+                    )
                 )
 
         return FrameBatchSamplerReturn(sampled_sensor_frame_idxs=sampled_sensor_frame_idxs)

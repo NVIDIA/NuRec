@@ -18,7 +18,6 @@ py_library(
         pip_requirement("cosmos-predict2"),
         pip_requirement("diffusers"),
         pip_requirement("einops"),
-        pip_requirement("flash-attn"),
         pip_requirement("numpy"),
         pip_requirement("omegaconf"),
         pip_requirement("packaging"),

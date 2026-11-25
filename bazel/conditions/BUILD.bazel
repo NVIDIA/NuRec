@@ -44,6 +44,15 @@ config_setting(
 )
 
 config_setting(
+    name = "rdma",
+    flag_values = {"//bazel/flags:rdma": "True"},
+    visibility = [
+        "//:__pkg__",
+        "//nurec/grpc:__pkg__",
+    ],
+)
+
+config_setting(
     name = "coverage_mode",
     define_values = {"cuda_coverage_dev": "true"},
     visibility = ["//visibility:public"],

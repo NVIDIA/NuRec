@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@nurec_pip_deps//:requirements.bzl", pip_requirement = "requirement")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+package(default_visibility = ["//:core_package_group"])
+
+cuda_library(
+    name = "loss_aggregation_ops_cuda",
+    srcs = ["finalize_weighted_losses.cu"],
+    hdrs = ["finalize_weighted_losses.h"],
+    copts = [
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+    ],
+    deps = ["//deps/torch:torch_headers"],
+)
+
+cc_binary(
+    name = "loss_aggregation_ops_cc",
+    srcs = ["binding.cpp"],
+    copts = [
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=libloss_aggregation_ops_cc",
+    ],
+    linkopts = [
+        "-Wl,--no-undefined",
+        "-Wl,--as-needed",
+    ],
+    linkshared = True,
+    deps = [
+        ":loss_aggregation_ops_cuda",
+        "//deps/torch:torch_headers",
+        "@nurec_pip_deps//torch:libc10",
+        "@nurec_pip_deps//torch:libc10_cuda",
+        "@nurec_pip_deps//torch:libtorch_cpu",
+        "@nurec_pip_deps//torch:libtorch_python",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)
+
+py_library(
+    name = "pylib_types",
+    srcs = ["_types.py"],
+    deps = [pip_requirement("torch")],
+)
+
+py_library(
+    name = "pylib_cc",
+    srcs = ["interface.py"],
+    data = [":loss_aggregation_ops_cc"],
+    deps = [
+        ":pylib_types",
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
+    name = "pylib",
+    srcs = [
+        "__init__.py",
+        "finalize_weighted_losses.py",
+    ],
+    deps = [
+        ":pylib_cc",
+        ":pylib_types",
+        "//nurec/utils:pylib_profiling",
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "finalize_weighted_losses_test",
+    srcs = ["finalize_weighted_losses_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)

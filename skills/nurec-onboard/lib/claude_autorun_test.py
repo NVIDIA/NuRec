@@ -162,7 +162,7 @@ class ClaudeLauncherIntegrationTest(LauncherTestBase):
         """Never silently weaken a documented digest pin to a mutable tag."""
         repository = "ghcr.io/nvidia/nurec/nurec_dev_deps"
         digest = "sha256:" + "a" * 64
-        guide = self.nre_root / "docs/basics/software.rst"
+        guide = self.software_guide
         for pin in (f"{repository}:test-release@{digest}", f"{repository}@{digest}"):
             with self.subTest(pin=pin):
                 guide.write_text(pin)
@@ -176,6 +176,24 @@ class ClaudeLauncherIntegrationTest(LauncherTestBase):
                 result = self._run("--agent", "claude", "--preflight-only")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("Pulling NuRec dev dependencies image", result.stdout)
+
+    def test_legacy_sphinx_software_guide_still_resolves(self) -> None:
+        """Checkouts from before the Fern move pin the image in docs/basics/software.rst."""
+        pin = "ghcr.io/nvidia/nurec/nurec_dev_deps:legacy-release"
+        self.software_guide.unlink()
+        legacy = self.nre_root / "docs/basics/software.rst"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(pin)
+        result = self._run("--agent", "claude", "--preflight-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"NuRec source/image pair: {self.nre_root} / {pin}", result.stdout)
+
+    def test_released_checkout_commands_use_the_built_image(self) -> None:
+        """Later commands run the image built for this checkout."""
+        result = self._run("--agent", "claude")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered = (self.workdir / "nurec-runtime.md").read_text()
+        self.assertIn("Development image: nurec_dev:onboard-", rendered)
 
     def test_public_checkout_reads_release_version(self) -> None:
         """Select the checkout's release image without docs or GitLab CI."""
@@ -206,13 +224,6 @@ class ClaudeLauncherIntegrationTest(LauncherTestBase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("bazel/version/VERSION_FILE", result.stdout + result.stderr)
                 self.assertIn("set nurec.dev_deps_image", result.stdout + result.stderr)
-
-    def test_released_checkout_commands_use_the_built_image(self) -> None:
-        """Later commands run the image built for this checkout."""
-        result = self._run("--agent", "claude")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        rendered = (self.workdir / "nurec-runtime.md").read_text()
-        self.assertIn("Development image: nurec_dev:onboard-", rendered)
 
     def test_development_checkout_uses_pinned_image_and_readonly_auth(self) -> None:
         """Build the actual development checkout, without switching to released source."""

@@ -48,9 +48,13 @@ py_library(
         "gsplat.py",
         "mcmc.py",
     ],
+    visibility = [
+        "//:core_package_group",
+    ],
     deps = [
         ":pylib_gsplat_mcmc_adapter",
         ":pylib_selected_gaussian_nodes",
+        "//nurec/libs/cuboid_relocation:pylib_cc",
         pip_requirement("nvidia-ncore"),
         pip_requirement("numpy"),
         pip_requirement("torch"),
@@ -61,6 +65,7 @@ py_library(
         "//nurec/models/gaussians:pylib",
         "//nurec/models/gaussians:pylib_cc_gsplat",
         "//nurec/utils:pylib_optim",
+        "//nurec/utils:pylib_torch_compile",
         "//nurec/utils:pylib_types",
     ],
 )
@@ -94,6 +99,11 @@ pytest_test(
     deps = [
         ":pylib",
         ":pylib_test_utils",
+        "//nurec/models/base:pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/models/gaussians:pylib_cc_gsplat",
+        "//nurec/utils:pylib_cuda_rng",
+        "//nurec/utils:pylib_geometry",
     ],
 )
 
@@ -102,7 +112,10 @@ pytest_test(
     srcs = ["mcmc_test.py"],
     deps = [
         ":pylib",
+        ":pylib_gsplat_mcmc_adapter",
+        ":pylib_selected_gaussian_nodes",
         ":pylib_test_utils",
+        pip_requirement("pydantic"),
     ],
 )
 
@@ -112,6 +125,8 @@ pytest_test(
     deps = [
         ":pylib",
         ":pylib_selected_gaussian_nodes",
+        "//nurec/config:pylib_leaf_schemas",
+        "//nurec/libs/cuboid_relocation:pylib_cc",
         "//nurec/models:pylib_nn_extensions",
         "//nurec/models/base:pylib",
         "//nurec/models/gaussians:pylib",

@@ -1,0 +1,11 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# H10 six-camera ET30X Car2Sim with model-free trajectory initialization.
+
+defaults:
+  - car2sim_6cam_unstructured_lidar
+  - override /apps/prod/Hyperion-8.1/options/background_init: lidar_rig_trajectory
+  - override /apps/prod/Hyperion-8.1/options/road_init: lidar_rig_trajectory
+  - _self_

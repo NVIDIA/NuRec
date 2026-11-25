@@ -13,6 +13,9 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 
+CONE_CLASS_NAME = "cone"
+
+
 @dataclass(frozen=True)
 class ConeInitPoints:
     """Measured cone positions in world-space metres and row-aligned uint8 RGB."""
@@ -290,13 +293,15 @@ def build_lidar_cone_init_points(source: Any, camera_id: str, lidar_id: str, dev
     aux = source.aux_loader
     if aux is None or not aux.has_object_instance_segmentation(camera_id):
         raise ValueError(
-            "Missing object instances: enable dataset.aux_data and run ncore-aux-data with --sam3-objects-checkpoint"
+            "Missing object instances: enable dataset.aux_data and run ncore-aux-data with --sam3-checkpoint and --sam3-labels-config"
         )
     meta = aux.get_object_instance_segmentation_meta(camera_id)
     if "resolution" not in meta:
         raise ValueError("Incomplete object auxiliary data: missing camera metadata")
-    if meta.get("thing_classes") != ["cone"]:
-        raise ValueError("LiDAR object initialization currently supports cone-only auxiliary instances")
+    class_names = meta.get("thing_classes", [])
+    if class_names.count(CONE_CLASS_NAME) != 1:
+        raise ValueError("LiDAR object initialization requires exactly one cone class")
+    cone_class = class_names.index(CONE_CLASS_NAME)
     timestamps = aux.get_object_instance_segmentation_timestamps(camera_id)
     if not timestamps:
         raise ValueError("No object-mask frames found")
@@ -323,11 +328,13 @@ def build_lidar_cone_init_points(source: Any, camera_id: str, lidar_id: str, dev
             or np.any(masks > 1)
             or classes.shape != (len(masks),)
             or classes.dtype.kind not in "iu"
-            or np.any(classes != 0)
+            or np.any((classes < 0) | (classes >= len(class_names)))
             or scores.shape != (len(masks),)
             or not np.isfinite(scores).all()
         ):
             raise ValueError(f"Malformed object instances at {timestamp}")
         world, xy, ranges, scan = project_scan(camera, lidar, index, tuple(meta["resolution"]), device)
-        observations.extend(frame_observations(world, xy, ranges, image, masks.astype(bool), scan))
+        observations.extend(
+            frame_observations(world, xy, ranges, image, masks[classes == cone_class].astype(bool), scan)
+        )
     return combine_tracks(merge_observations(observations))

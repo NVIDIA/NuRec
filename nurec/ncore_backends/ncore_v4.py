@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -15,6 +15,9 @@ from upath import UPath
 import ncore.data
 import ncore.data.v4
 
+from nurec.lidar.firing_patterns.schema import (
+    LidarFiringPatternTemplatesData,
+)
 from nurec.ncore_backends.interface import (
     DatasetMetadata,
     DatasetRequest,
@@ -26,8 +29,49 @@ from nurec.ncore_backends.interface import (
 from nurec.utils.ncore_types import require_concrete_lidar_parameters
 
 
+FiringPatternLoader = Callable[[DatasetRequest, str], LidarFiringPatternTemplatesData | None]
+
+
 class NCoreV4Backend:
+    """Access standard V4 datasets and optionally adapt native firing-pattern components.
+
+    Args:
+        firing_pattern_loader: Optional callable receiving a
+            dataset request and sensor ID and returning validated templates.
+            ``None`` leaves native firing-pattern discovery unconfigured.
+    """
+
     name = "ncore-v4"
+
+    def __init__(self, firing_pattern_loader: FiringPatternLoader | None = None) -> None:
+        """Configure the optional component loader without opening a dataset.
+
+        Args:
+            firing_pattern_loader: Callable reading templates for a dataset request and sensor ID,
+                or ``None`` to register it later.
+
+        Returns:
+            ``None``; stores the loader for explicit template requests.
+        """
+        self._firing_pattern_loader = firing_pattern_loader
+
+    def register_firing_pattern_loader(self, loader: FiringPatternLoader) -> None:
+        """Attach the optional firing-pattern component loader.
+
+        Args:
+            loader: Callable receiving a dataset request and sensor ID. It runs only
+                when templates are requested, never during normal sequence loading.
+
+        Returns:
+            ``None``; retains this callable for explicit template requests. Re-registering the same
+            callable is allowed.
+
+        Raises:
+            ValueError: If a different pattern loader has already been registered.
+        """
+        if self._firing_pattern_loader is not None and self._firing_pattern_loader is not loader:
+            raise ValueError("A firing-pattern loader is already registered")
+        self._firing_pattern_loader = loader
 
     def recognizes(self, manifest: JsonObject) -> bool:
         version = manifest.get("version")
@@ -74,6 +118,20 @@ class NCoreV4Backend:
         request: DatasetRequest,
         dataset_paths: Sequence[UPath],
     ) -> ncore.data.SequenceLoaderProtocol:
+        """Open standard V4 component stores without discovering firing patterns.
+
+        Args:
+            request: Dataset request controlling consolidated reads and component-group
+                names for poses, intrinsics, masks, and cuboids.
+            dataset_paths: Component-store locations resolved from the dataset manifest.
+
+        Returns:
+            The standard V4 loader. Firing-pattern components are not opened here.
+
+        Raises:
+            OSError: If component stores cannot be opened or read.
+            ValueError: If the standard V4 component configuration rejects the dataset.
+        """
         return ncore.data.v4.SequenceLoaderV4(
             ncore.data.v4.SequenceComponentGroupsReader(
                 list(dataset_paths),
@@ -121,6 +179,30 @@ class NCoreV4Backend:
         lidar_sensor: ncore.data.LidarSensorProtocol,
     ) -> dict[str, MetadataValue]:
         raise UnsupportedBackendOperationError("This backend does not provide legacy lidar model metadata")
+
+    def get_lidar_firing_pattern_templates(
+        self,
+        request: DatasetRequest,
+        sensor_id: str,
+    ) -> LidarFiringPatternTemplatesData | None:
+        """Read one sensor's optional component without constructing a lidar sensor.
+
+        Args:
+            request: Resolved V4 dataset request identifying the sequence manifest.
+            sensor_id: Native component instance name, equal to the logical lidar ID.
+
+        Returns:
+            Validated templates, or ``None`` when no component loader is configured,
+            the component is absent, or observations were insufficient for a cycle.
+
+        Raises:
+            UnsupportedBackendOperationError: If the component version is unsupported.
+            ValueError: If the component is invalid or explicitly not repeatable.
+            OSError: If the manifest or component store cannot be read.
+        """
+        if self._firing_pattern_loader is None:
+            return None
+        return self._firing_pattern_loader(request, sensor_id)
 
 
 NCORE_V4_BACKEND = NCoreV4Backend()

@@ -33,12 +33,12 @@ from nurec.utils.io.export.gaussian_export_accessor import (
     GaussianAttributes,
     ModelCapabilities,
 )
-from nurec.utils.io.export.gaussian_usd_asset import export_gaussians_as_usd_asset
+from nurec.utils.io.export.gaussian_usd_asset import USDGaussianExportCache, export_gaussians_as_usd_asset
 from nurec.utils.io.export.gaussian_usd_writer import (
-    GaussianGeomPointsWriter,
     GaussianLightFieldWriter,
     GaussianUSDSchemaType,
 )
+from nurec.utils.types import NamedUSDStage
 
 
 def _get_attr_by_suffix(prim: Usd.Prim, suffix: str) -> Optional[Usd.Attribute]:
@@ -331,6 +331,24 @@ class MockAccessor:
 
 class TestStaticGaussiansExport(unittest.TestCase):
     """Test export of static (non-animated) gaussians."""
+
+    def test_invalid_partition_is_skipped_and_valid_partition_exports(self):
+        accessor = MockAccessor(n_gaussians=4)
+        accessor.positions[0, 0] = np.nan
+        accessor.densities[1] = np.inf
+        for indices, expected_count in ((torch.tensor([0, 1]), 0), (torch.tensor([2, 3]), 2)):
+            with self.subTest(indices=indices):
+                stage = Usd.Stage.CreateInMemory()
+                info = export_gaussians_as_usd_asset(
+                    accessor=accessor,
+                    stage=stage,
+                    content_root_path="/World",
+                    schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+                    gaussian_indices_override=indices,
+                )
+                self.assertEqual(sum(prim.num_gaussians for prim in info), expected_count)
+                fields = [prim for prim in stage.Traverse() if prim.GetTypeName() == "ParticleField3DGaussianSplat"]
+                self.assertEqual(len(fields), int(expected_count > 0))
 
     def test_static_positions_exported(self):
         """Verify positions are exported correctly."""
@@ -662,10 +680,10 @@ class TestSphericalHarmonicsExport(unittest.TestCase):
 
 
 class TestColorSpaceExport(unittest.TestCase):
-    """Test USD ColorSpaceAPI application for spherical harmonics."""
+    """Test colorSpace metadata on the spherical harmonics coefficients attributes."""
 
     def test_linear_color_space_lightfield(self):
-        """Verify ColorSpaceAPI with lin_rec709_scene is applied for LightField with linear_srgb=True."""
+        """Verify lin_rec709_scene is authored on the SH coefficients for LightField with linear_srgb=True."""
         accessor = MockAccessor(
             n_gaussians=50,
             has_spherical_harmonics=True,
@@ -692,63 +710,84 @@ class TestColorSpaceExport(unittest.TestCase):
             prim = self._find_particle_field_prim(stage)
             self.assertIsNotNone(prim, "ParticleField prim should exist")
 
-            # Check ColorSpaceAPI is applied with correct value
-            color_space_attr = prim.GetAttribute("colorSpace:name")
-            self.assertTrue(color_space_attr.IsValid(), "colorSpace:name attribute should exist")
-            color_space_value = color_space_attr.Get()
+            # Color space is authored as metadata on the SH coefficients attribute
+            sh_attr = prim.GetAttribute("radiance:sphericalHarmonicsCoefficients")
+            self.assertTrue(sh_attr.IsAuthored(), "SH coefficients attribute should exist")
             self.assertEqual(
-                color_space_value,
+                sh_attr.GetColorSpace(),
                 "lin_rec709_scene",
                 "Color space should be lin_rec709_scene when linear_srgb=True",
             )
+            self.assertFalse(prim.GetAttribute("colorSpace:name").IsValid(), "No prim-level ColorSpaceAPI expected")
 
-    def test_srgb_color_space_geompoints(self):
-        """Verify ColorSpaceAPI with srgb_rec709_display is applied for GeomPoints with linear_srgb=False."""
-        accessor = MockAccessor(
-            n_gaussians=50,
-            has_spherical_harmonics=True,
-            sh_degree=2,
+    def test_srgb_color_space_half_features_lightfield(self):
+        """Verify srgb_rec709_display is authored on the half-precision SH attribute only."""
+        accessor = MockAccessor(n_gaussians=50, has_spherical_harmonics=True, sh_degree=2)
+        stage = Usd.Stage.CreateInMemory()
+        export_gaussians_as_usd_asset(
+            accessor=accessor,
+            stage=stage,
+            content_root_path="/World",
+            schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+            half_precision=True,
+        )
+        prim = self._find_particle_field_prim(stage)
+        self.assertIsNotNone(prim, "ParticleField prim should exist")
+        half_attr = prim.GetAttribute("radiance:sphericalHarmonicsCoefficientsh")
+        float_attr = prim.GetAttribute("radiance:sphericalHarmonicsCoefficients")
+        self.assertEqual(half_attr.GetColorSpace(), "srgb_rec709_display")
+        self.assertFalse(float_attr.IsAuthored(), "Float SH attribute should not be authored")
+
+    def test_srgb_color_space_default_float_lightfield(self):
+        """Verify srgb_rec709_display is authored on the float SH attribute by default."""
+        stage = Usd.Stage.CreateInMemory()
+        export_gaussians_as_usd_asset(
+            accessor=MockAccessor(n_gaussians=50, has_spherical_harmonics=True, sh_degree=2),
+            stage=stage,
+            content_root_path="/World",
+            schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+        )
+        prim = self._find_particle_field_prim(stage)
+        self.assertIsNotNone(prim, "ParticleField prim should exist")
+        self.assertEqual(
+            prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").GetColorSpace(), "srgb_rec709_display"
+        )
+        self.assertFalse(prim.GetAttribute("radiance:sphericalHarmonicsCoefficientsh").IsAuthored())
+
+    def test_color_space_planar_lightfield(self):
+        """Verify the color space is authored on the SH attribute of a planar (surflet) ParticleField."""
+        stage = Usd.Stage.CreateInMemory()
+        export_gaussians_as_usd_asset(
+            accessor=MockAccessor(n_gaussians=50, has_spherical_harmonics=True, sh_degree=2, is_planar_gaussian=True),
+            stage=stage,
+            content_root_path="/World",
+            schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+            linear_srgb=True,
+        )
+        prim = self._find_particle_field_prim(stage)
+        self.assertIsNotNone(prim, "ParticleField prim should exist")
+        self.assertEqual(prim.GetTypeName(), "ParticleField")
+        self.assertEqual(
+            prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").GetColorSpace(), "lin_rec709_scene"
         )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir) / "srgb_colorspace_test.usda"
-            stage = Usd.Stage.CreateInMemory()
-            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
-            stage.SetTimeCodesPerSecond(24.0)
-
-            export_gaussians_as_usd_asset(
-                accessor=accessor,
-                stage=stage,
-                content_root_path="/World",
-                schema_type=GaussianUSDSchemaType.GEOM_POINTS,
-                linear_srgb=False,  # Simulate no post-processing
-            )
-            stage.Export(str(output_path))
-
-            # Reload and verify
-            stage = Usd.Stage.Open(str(output_path))
-            points_prim = self._find_points_prim(stage)
-            self.assertIsNotNone(points_prim, "Points prim should exist")
-
-            # Check ColorSpaceAPI is applied with correct value
-            color_space_attr = points_prim.GetAttribute("colorSpace:name")
-            self.assertTrue(color_space_attr.IsValid(), "colorSpace:name attribute should exist")
-            color_space_value = color_space_attr.Get()
-            self.assertEqual(
-                color_space_value,
-                "srgb_rec709_display",
-                "Color space should be srgb_rec709_display when linear_srgb=False",
-            )
+    def test_no_color_space_without_spherical_harmonics(self):
+        """Verify no color space metadata is authored when the model has no SH coefficients."""
+        stage = Usd.Stage.CreateInMemory()
+        export_gaussians_as_usd_asset(
+            accessor=MockAccessor(n_gaussians=50, has_spherical_harmonics=False),
+            stage=stage,
+            content_root_path="/World",
+            schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+        )
+        prim = self._find_particle_field_prim(stage)
+        self.assertIsNotNone(prim, "ParticleField prim should exist")
+        for name in ("radiance:sphericalHarmonicsCoefficients", "radiance:sphericalHarmonicsCoefficientsh"):
+            self.assertEqual(prim.GetAttribute(name).GetColorSpace(), "")
 
     def _find_particle_field_prim(self, stage: Usd.Stage) -> Optional[Usd.Prim]:
         for prim in stage.Traverse():
-            if prim.GetTypeName() == "ParticleField3DGaussianSplat":
-                return prim
-        return None
-
-    def _find_points_prim(self, stage: Usd.Stage) -> Optional[Usd.Prim]:
-        for prim in stage.Traverse():
-            if prim.IsA(UsdGeom.Points):
+            if prim.GetTypeName() in ("ParticleField3DGaussianSplat", "ParticleField"):
                 return prim
         return None
 
@@ -758,8 +797,98 @@ class TestColorSpaceExport(unittest.TestCase):
 # =============================================================================
 
 
+class TestLidarSignalExport(unittest.TestCase):
+    def test_packed_signals_follow_partition_rows_in_both_schemas(self):
+        accessor = MockAccessor(n_gaussians=10)
+        get_attributes = accessor.get_attributes_at_timestamp
+        intensity = np.arange(10, dtype=np.float32).reshape(-1, 1)
+        logits = np.arange(20, dtype=np.float32).reshape(10, 2)
+
+        def attributes_with_lidar(timestamp_us, preactivation=False):
+            attributes, poses, visibility = get_attributes(timestamp_us, preactivation)
+            attributes.lidar_intensity = intensity
+            attributes.lidar_raydrop_logits = logits
+            return attributes, poses, visibility
+
+        accessor.get_attributes_at_timestamp = attributes_with_lidar
+        indices = torch.tensor([9, 2, 7])
+        stage = Usd.Stage.CreateInMemory()
+        export_gaussians_as_usd_asset(
+            accessor=accessor,
+            stage=stage,
+            content_root_path="/World",
+            schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+            gaussian_indices_override=indices,
+        )
+        signal_attrs = [
+            prim.GetAttribute("primvars:lidarExtraSignals")
+            for prim in stage.Traverse()
+            if prim.HasAttribute("primvars:lidarExtraSignals")
+        ]
+        self.assertEqual(len(signal_attrs), 1)
+        expected = np.concatenate([intensity, logits], axis=-1)[indices.numpy()]
+        np.testing.assert_allclose(np.asarray(signal_attrs[0].Get()), expected)
+
+
 class TestRigidTracksExport(unittest.TestCase):
     """Test export of gaussians with rigid track animations."""
+
+    def test_partitioned_tracks_preserve_rows_and_animation(self):
+        from nurec.utils.io.export.gaussian_partition import partition_gaussian_indices
+
+        timestamps = [0, 100000]
+        accessor = MockAccessor(
+            n_gaussians=12,
+            has_rigid_tracks=True,
+            track_ids=["track_A", "track_B"],
+            gaussian_track_assignments=np.arange(12, dtype=np.int32) % 2,
+            track_timestamps_us={0: timestamps, 1: timestamps},
+            track_transforms={
+                i: {t: self._make_transform(translation=[i, t / 100000, 0]) for t in timestamps} for i in range(2)
+            },
+        )
+        partitions = partition_gaussian_indices(accessor.positions, 3)
+        exported_positions = []
+        cache = USDGaussianExportCache()
+        for partition_id, indices in enumerate(partitions):
+            stage = Usd.Stage.CreateInMemory()
+            stage.SetTimeCodesPerSecond(24.0)
+            stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, "/World").GetPrim())
+            info = export_gaussians_as_usd_asset(
+                accessor=accessor,
+                stage=stage,
+                content_root_path="/World",
+                schema_type=GaussianUSDSchemaType.LIGHT_FIELD,
+                gaussian_indices_override=indices,
+            )
+            cache.add_usd_stage(NamedUSDStage(filename=f"partition_{partition_id}.usdc", stage=stage))
+            self.assertEqual(sum(p.num_gaussians for p in info), len(indices))
+            self.assertTrue(all(p.timestamps_us == timestamps for p in info))
+            for prim in stage.Traverse():
+                positions = _get_attr_by_suffix(prim, "positions")
+                if positions and positions.HasAuthoredValue():
+                    exported_positions.extend(np.asarray(positions.Get()))
+                transform = prim.GetAttribute("xformOp:transform")
+                if transform and transform.HasAuthoredValue():
+                    np.testing.assert_allclose(transform.GetTimeSamples(), [0.0, 2.4])
+                    # Translation uses USD row-vector matrix convention.
+                    np.testing.assert_allclose(np.asarray(transform.Get(2.4))[3, 1], 1.0)
+        self.assertEqual(len(exported_positions), 12)
+        np.testing.assert_allclose(
+            sorted(map(tuple, exported_positions)),
+            sorted(map(tuple, accessor.positions)),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "partitioned.usdz"
+            cache.write_to_usdz(output)
+            composed = Usd.Stage.Open(str(output))
+            positions = []
+            for prim in composed.Traverse():
+                attr = _get_attr_by_suffix(prim, "positions")
+                if attr and attr.HasAuthoredValue():
+                    positions.extend(np.asarray(attr.Get()))
+            self.assertEqual(len(positions), 12)
+            np.testing.assert_allclose(sorted(map(tuple, positions)), sorted(map(tuple, accessor.positions)))
 
     def test_create_prim_resets_nearest_appearance_state(self):
         """Reusing a writer must not carry appearance samples into a new prim."""
@@ -774,19 +903,19 @@ class TestRigidTracksExport(unittest.TestCase):
             has_temporal_appearance=True,
             sh_degree=0,
         )
-        for writer_type in (GaussianGeomPointsWriter, GaussianLightFieldWriter):
-            with self.subTest(writer_type=writer_type.__name__):
-                writer = writer_type(
-                    stage=Usd.Stage.CreateInMemory(),
-                    capabilities=capabilities,
-                    track_id="vehicle_light",
-                    track_index=0,
-                )
-                writer._appearance_time_samples["albedo"] = (24.0, np.ones((1, 3), dtype=np.float32))
+        writer = GaussianLightFieldWriter(
+            stage=Usd.Stage.CreateInMemory(),
+            capabilities=capabilities,
+            track_id="vehicle_light",
+            track_index=0,
+        )
+        writer._appearance_time_samples["albedo"] = (24.0, np.ones((1, 3), dtype=np.float32))
+        writer.lidar_extra_signal_primvar = object()  # type: ignore[assignment]
 
-                writer.create_prim(num_gaussians=1)
+        writer.create_prim(num_gaussians=1)
 
-                self.assertEqual(writer._appearance_time_samples, {})
+        self.assertEqual(writer._appearance_time_samples, {})
+        self.assertIsNone(writer.lidar_extra_signal_primvar)
 
     def test_track_hierarchy_created(self):
         """Verify separate Xform prims are created for each track."""

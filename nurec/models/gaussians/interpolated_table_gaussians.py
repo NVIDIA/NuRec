@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 
 from collections.abc import Sequence
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple, cast
 
 import torch
 
@@ -46,6 +47,8 @@ class InterpolatedDeformationTable(nn.Module):
 
     global_row_ids: torch.Tensor
     current_row_for_global_id: torch.Tensor
+    represented_track_ids: torch.Tensor
+    track_index_for_global_row: torch.Tensor
 
     def __init__(
         self,
@@ -111,6 +114,10 @@ class InterpolatedDeformationTable(nn.Module):
         self.register_buffer("global_row_ids", stable_ids.clone(), persistent=True)
         # Inverse mapping used by full-layer collection.
         self.register_buffer("current_row_for_global_id", stable_ids, persistent=False)
+        represented_tracks, track_indices = torch.unique(self.storage.row_group_ids, sorted=True, return_inverse=True)
+        self.register_buffer("represented_track_ids", represented_tracks, persistent=False)
+        self.register_buffer("track_index_for_global_row", track_indices, persistent=False)
+        self.register_load_state_dict_post_hook(InterpolatedDeformationTable._restore_row_mappings)
 
     @property
     def num_frames(self) -> int:
@@ -128,26 +135,15 @@ class InterpolatedDeformationTable(nn.Module):
     def parameter_bytes(self) -> int:
         return self.storage.parameter_bytes
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ) -> None:
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
+    @staticmethod
+    def _restore_row_mappings(module: nn.Module, _incompatible_keys: Any) -> None:
+        # Run after storage buffers have loaded, including assign=True loads
+        # whose stable row groups or device differ from construction.
+        table = cast(InterpolatedDeformationTable, module)
+        table.current_row_for_global_id = torch.argsort(table.global_row_ids)
+        table.represented_track_ids, table.track_index_for_global_row = torch.unique(
+            table.storage.row_group_ids, sorted=True, return_inverse=True
         )
-        self.current_row_for_global_id.copy_(torch.argsort(self.global_row_ids))
 
     def frame_index(self, timestamp_us: int) -> int:
         """Map a timestamp to the nearest control column."""
@@ -202,6 +198,7 @@ class InterpolatedDeformationTable(nn.Module):
         reference_positions: torch.Tensor,
         *,
         rows_were_filtered: bool,
+        compressed_row_for_global_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Scatter one compressed column into the collector's current rows."""
 
@@ -209,10 +206,22 @@ class InterpolatedDeformationTable(nn.Module):
         column = self.storage.gather_compressed_column(frame_index)
         if column.row_indices.numel() == 0:
             return residuals
+        # Frame-major row count comes from the values shape, so that half of
+        # this check is tautological; immutable lifetimes are validated on load.
         if column.values.shape != (column.row_indices.shape[0], 7):
             raise RuntimeError("deformation storage column row IDs and values do not match")
 
         if rows_were_filtered:
+            if compressed_row_for_global_id is not None:
+                # Reuse one scratch mapping across this batch's columns. The
+                # gathered indices below own storage, so later scratch writes
+                # cannot change indices saved by autograd for the value gather.
+                compressed_row_for_global_id.fill_(-1)
+                compressed_row_for_global_id[column.row_indices] = torch.arange(
+                    column.row_indices.numel(), device=column.row_indices.device
+                )
+                selected = compressed_row_for_global_id[gathered_global_row_ids.to(torch.int64)]
+                return torch.where((selected >= 0).unsqueeze(1), column.values[selected.clamp_min(0)], 0)
             output_row_for_global_id = torch.full(
                 (self.num_gaussians,),
                 -1,
@@ -231,34 +240,86 @@ class InterpolatedDeformationTable(nn.Module):
 
     def _dense_residuals_at_row_columns(
         self,
-        column_indices: torch.Tensor,
+        column_indices: tuple[torch.Tensor, ...],
         gathered_global_row_ids: torch.Tensor,
         reference_positions: torch.Tensor,
         *,
         rows_were_filtered: bool,
-    ) -> torch.Tensor:
-        """Gather the compressed columns requested by individual output rows.
+        timestamp_row_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Gather several sets of per-row columns, sharing column materialization.
 
+        Each request contains int64 columns on the Gaussian device, already
+        clamped to ``[0, num_frames)``. Normally it has one entry per Gaussian;
+        timestamp_row_indices can instead expand compact track-level requests
+        into collector rows. Results follow the request order.
         Resolved actor timestamps normally span only one or two 10 Hz control
         intervals in a rendered frame. Grouping by column retains the sparse
         frame-major hot path and touches only Parameters that contribute.
+        Built columns are per-call autograd values, never cached across calls.
+        Single-column results may alias each other; callers must use them only
+        in out-of-place operations, as forward and curvature already do.
         """
 
-        if column_indices.shape != (reference_positions.shape[0],):
-            raise ValueError("per-row deformation columns must match the collected Gaussian count")
-        result = reference_positions.new_zeros((reference_positions.shape[0], 7))
-        # ParameterDict lookup requires a host integer. Quantization happens
-        # before this synchronization, so one transfer covers every actor.
-        used_columns = torch.unique(column_indices.detach()).cpu().tolist()
-        for column_index in used_columns:
-            column_values = self._dense_residuals_at_frame(
-                int(column_index),
-                gathered_global_row_ids,
-                reference_positions,
-                rows_were_filtered=rows_were_filtered,
-            )
-            result = torch.where((column_indices == column_index).unsqueeze(1), column_values, result)
-        return result
+        request_count = reference_positions.shape[0] if timestamp_row_indices is None else column_indices[0].numel()
+        if any(indices.shape != (request_count,) for indices in column_indices):
+            raise ValueError("deformation column requests must match the timestamp count")
+        if timestamp_row_indices is not None and timestamp_row_indices.shape != (reference_positions.shape[0],):
+            raise ValueError("timestamp row indices must match the collected Gaussian count")
+        results: list[torch.Tensor | None] = [None] * len(column_indices)
+        # ModuleDict lookup requires host integers. A small fixed-size mask
+        # avoids GPU unique's dynamic output and transfers all requests once.
+        # Duplicate indices only write the same True value. Keep requests
+        # separate to preserve each result's Parameter dependencies; exact-knot
+        # laziness comes from the caller's effective_upper_indices.
+        requests = torch.zeros(
+            (len(column_indices), self.num_frames), dtype=torch.bool, device=reference_positions.device
+        )
+        requests.scatter_(1, torch.stack(column_indices), True)
+        host_requests = requests.cpu()
+        columns_per_request = host_requests.sum(dim=1).tolist()
+        # Build each column once, merge it into every request that uses it,
+        # then release it instead of retaining all dense columns until return.
+        used_requests = host_requests.t().nonzero().tolist()
+        # Full collections keep the original scatter path. Filtered queries
+        # gather only collected rows, sharing mapping allocation across columns.
+        compressed_row_for_global_id = (
+            torch.empty((self.num_gaussians,), dtype=torch.int64, device=gathered_global_row_ids.device)
+            if rows_were_filtered
+            else None
+        )
+        for column_index, pairs in itertools.groupby(used_requests, key=lambda pair: pair[0]):
+            if rows_were_filtered:
+                column_values = self._dense_residuals_at_frame(
+                    column_index,
+                    gathered_global_row_ids,
+                    reference_positions,
+                    rows_were_filtered=True,
+                    compressed_row_for_global_id=compressed_row_for_global_id,
+                )
+            else:
+                column_values = self._dense_residuals_at_frame(
+                    column_index,
+                    gathered_global_row_ids,
+                    reference_positions,
+                    rows_were_filtered=False,
+                )
+            for _, result_index in pairs:
+                if columns_per_request[result_index] == 1:
+                    results[result_index] = column_values
+                    continue
+                result = results[result_index]
+                if result is None:
+                    result = reference_positions.new_zeros((reference_positions.shape[0], 7))
+                mask = column_indices[result_index] == column_index
+                if timestamp_row_indices is not None:
+                    mask = mask[timestamp_row_indices]
+                results[result_index] = torch.where(mask.unsqueeze(1), column_values, result)
+                del result
+        return tuple(
+            result if result is not None else reference_positions.new_zeros((reference_positions.shape[0], 7))
+            for result in results
+        )
 
     @staticmethod
     def _rotation_residuals_to_quaternions(rotation_residuals: torch.Tensor) -> torch.Tensor:
@@ -269,6 +330,103 @@ class InterpolatedDeformationTable(nn.Module):
         identity = torch.zeros_like(quaternions)
         identity[:, 3] = 1.0
         return torch.where(norms > 1.0e-12, quaternions / norms.clamp_min(1.0e-12), identity)
+
+    def _interpolate_residuals(
+        self, lower: torch.Tensor, upper: torch.Tensor, alpha: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Interpolate position residuals and SLERP their normalized rotations."""
+
+        steps = alpha.to(dtype=lower.dtype)
+        positions = torch.lerp(lower[:, :3], upper[:, :3], steps.unsqueeze(1))
+        lower_quaternions = self._rotation_residuals_to_quaternions(lower[:, 3:])
+        upper_quaternions = self._rotation_residuals_to_quaternions(upper[:, 3:])
+        rotations = quat_slerp(lower_quaternions, upper_quaternions, steps)
+        rotations = torch.cat((rotations[:, :3], rotations[:, 3:] - 1.0), dim=-1)
+        return {"positions": positions, "rotations": rotations}
+
+    def evaluate_tracks(
+        self,
+        track_timestamps_us: torch.Tensor,
+        gathered_global_row_ids: torch.Tensor,
+        reference_positions: torch.Tensor,
+        *,
+        compute_curvature: bool,
+        rows_were_filtered: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], tuple[torch.Tensor, torch.Tensor] | None]:
+        """Evaluate resolved track times, sharing deformation and curvature work.
+
+        ``track_timestamps_us`` is int64 ``[num_tracks]`` on the Gaussian
+        device, indexed by the cuboid IDs used to construct the table. The
+        row-to-track mapping comes from ``storage.row_group_ids``; indexing it
+        by ``gathered_global_row_ids`` must match the collected Gaussian cuboid
+        IDs. ``rows_were_filtered=False`` requires every table row to be
+        gathered in current Gaussian order.
+
+        Full-layer collection quantizes once per represented track. Tracks
+        owning rows are evaluated even when masked or outside their lifetime
+        to preserve per-row Parameter/optimizer dependencies; tracks with no
+        rows are omitted. Filtered collection uses its exact per-row request
+        set rather than all represented tracks.
+        """
+
+        if track_timestamps_us.dtype != torch.int64 or track_timestamps_us.device != reference_positions.device:
+            raise ValueError("deformation track timestamps must be int64 on the Gaussian device")
+        if track_timestamps_us.ndim != 1:
+            raise ValueError("deformation track timestamps must have shape [num_tracks]")
+        stable_rows = gathered_global_row_ids.to(torch.int64)
+        if rows_were_filtered:
+            timestamps = track_timestamps_us[self.storage.row_group_ids[stable_rows]]
+            timestamp_row_indices = None
+        else:
+            timestamps = track_timestamps_us[self.represented_track_ids]
+            timestamp_row_indices = self.track_index_for_global_row[stable_rows]
+
+        center_indices = self.row_frame_indices(timestamps) if compute_curvature else None
+        alpha = None
+        requests: tuple[torch.Tensor, ...]
+        if self.interpolation == "nearest":
+            # Curvature's center request also supplies nearest deformations.
+            requests = (self.row_frame_indices(timestamps),) if center_indices is None else ()
+        else:
+            lower, upper, alpha = self.row_control_frame_pairs(timestamps)
+            # Exact knots must leave the following Parameter's gradient absent.
+            requests = (lower, torch.where(alpha == 0.0, lower, upper))
+        if center_indices is not None:
+            requests += (
+                (center_indices - 1).clamp_min(0),
+                center_indices,
+                (center_indices + 1).clamp_max(self.num_frames - 1),
+            )
+        values = self._dense_residuals_at_row_columns(
+            requests,
+            gathered_global_row_ids,
+            reference_positions,
+            rows_were_filtered=rows_were_filtered,
+            timestamp_row_indices=timestamp_row_indices,
+        )
+        if alpha is None:
+            nearest = values[0] if center_indices is None else values[1]
+            deformations = {"positions": nearest[:, :3], "rotations": nearest[:, 3:]}
+        else:
+            if timestamp_row_indices is not None:
+                # Cast the compact track vector before expanding to Gaussian
+                # rows; each row gets the same interpolation value without an
+                # additional full-size float64 temporary and conversion.
+                alpha = alpha.to(dtype=values[0].dtype)[timestamp_row_indices]
+            deformations = self._interpolate_residuals(values[0], values[1], alpha)
+
+        smoothness = None
+        if center_indices is not None:
+            if timestamp_row_indices is not None:
+                center_indices = center_indices[timestamp_row_indices]
+            previous, current, following = values[-3:]
+            curvature = 0.5 * (previous[:, :3] + following[:, :3]) - current[:, :3]
+            interior = (center_indices > 0) & (center_indices < self.num_frames - 1)
+            row_has_previous = self.storage.row_start_columns[stable_rows] <= center_indices - 1
+            row_has_following = self.storage.row_end_columns[stable_rows] >= center_indices + 1
+            valid = (interior & row_has_previous & row_has_following).to(reference_positions.dtype).unsqueeze(1)
+            smoothness = curvature, valid
+        return deformations, smoothness
 
     def forward(
         self,
@@ -286,8 +444,8 @@ class InterpolatedDeformationTable(nn.Module):
             if timestamp_us.shape != (reference_positions.shape[0],):
                 raise ValueError("per-row deformation timestamps must match the collected Gaussian count")
             if self.interpolation == "nearest":
-                values = self._dense_residuals_at_row_columns(
-                    self.row_frame_indices(timestamp_us),
+                (values,) = self._dense_residuals_at_row_columns(
+                    (self.row_frame_indices(timestamp_us),),
                     gathered_global_row_ids,
                     reference_positions,
                     rows_were_filtered=rows_were_filtered,
@@ -298,25 +456,13 @@ class InterpolatedDeformationTable(nn.Module):
             # Exact knots must not touch the following Parameter: keeping its
             # gradient absent preserves frame-major Adam laziness.
             effective_upper_indices = torch.where(alpha == 0.0, lower_indices, upper_indices)
-            lower = self._dense_residuals_at_row_columns(
-                lower_indices,
+            lower, upper = self._dense_residuals_at_row_columns(
+                (lower_indices, effective_upper_indices),
                 gathered_global_row_ids,
                 reference_positions,
                 rows_were_filtered=rows_were_filtered,
             )
-            upper = self._dense_residuals_at_row_columns(
-                effective_upper_indices,
-                gathered_global_row_ids,
-                reference_positions,
-                rows_were_filtered=rows_were_filtered,
-            )
-            interpolation_steps = alpha.to(dtype=lower.dtype).unsqueeze(1)
-            positions = torch.lerp(lower[:, :3], upper[:, :3], interpolation_steps)
-            lower_quaternions = self._rotation_residuals_to_quaternions(lower[:, 3:])
-            upper_quaternions = self._rotation_residuals_to_quaternions(upper[:, 3:])
-            rotations = quat_slerp(lower_quaternions, upper_quaternions, alpha.to(dtype=lower.dtype))
-            rotations = torch.cat((rotations[:, :3], rotations[:, 3:] - 1.0), dim=-1)
-            return {"positions": positions, "rotations": rotations}
+            return self._interpolate_residuals(lower, upper, alpha)
 
         if self.interpolation == "nearest":
             values = self._dense_residuals_at_frame(
@@ -363,8 +509,6 @@ class InterpolatedDeformationTable(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return position second differences and a complete-triplet mask."""
 
-        curvature = reference_positions.new_zeros((reference_positions.shape[0], 3))
-        valid = reference_positions.new_zeros((reference_positions.shape[0], 1))
         stable_rows = gathered_global_row_ids.to(torch.int64)
         if isinstance(timestamp_us, torch.Tensor):
             if timestamp_us.dtype != torch.int64 or timestamp_us.device != reference_positions.device:
@@ -372,20 +516,12 @@ class InterpolatedDeformationTable(nn.Module):
             center_indices = self.row_frame_indices(timestamp_us)
             if center_indices.shape != (reference_positions.shape[0],):
                 raise ValueError("per-row deformation timestamps must match the collected Gaussian count")
-            previous = self._dense_residuals_at_row_columns(
-                (center_indices - 1).clamp_min(0),
-                gathered_global_row_ids,
-                reference_positions,
-                rows_were_filtered=rows_were_filtered,
-            )
-            current = self._dense_residuals_at_row_columns(
-                center_indices,
-                gathered_global_row_ids,
-                reference_positions,
-                rows_were_filtered=rows_were_filtered,
-            )
-            following = self._dense_residuals_at_row_columns(
-                (center_indices + 1).clamp_max(self.num_frames - 1),
+            previous, current, following = self._dense_residuals_at_row_columns(
+                (
+                    (center_indices - 1).clamp_min(0),
+                    center_indices,
+                    (center_indices + 1).clamp_max(self.num_frames - 1),
+                ),
                 gathered_global_row_ids,
                 reference_positions,
                 rows_were_filtered=rows_were_filtered,
@@ -396,6 +532,8 @@ class InterpolatedDeformationTable(nn.Module):
         else:
             center_index = self.frame_index(timestamp_us)
             if center_index == 0 or center_index == self.num_frames - 1:
+                curvature = reference_positions.new_zeros((reference_positions.shape[0], 3))
+                valid = reference_positions.new_zeros((reference_positions.shape[0], 1))
                 return curvature, valid
             previous = self._dense_residuals_at_frame(
                 center_index - 1,
@@ -632,24 +770,19 @@ class InterpolatedTableDeformableGaussianModel(RigidGaussianModel):
                 raise RuntimeError("deformation table was not initialized")
             with ScopedTimer("InterpolatedTableDeformableGaussianModel/table"):
                 track_timestamps = context.additional_data["interpolated_track_timestamps"][0]
-                timestamp_us = track_timestamps[base_layer_data.tracks_ids]
                 rows_were_filtered = context.kept_rows is not None
-                deformations = self.deformation_table(
-                    timestamp_us,
+                deformations, smoothness_result = self.deformation_table.evaluate_tracks(
+                    track_timestamps,
                     gathered_parameters["deformation_table_global_row_ids"],
                     base_layer_data.positions,
+                    compute_curvature=context.is_training_batch and self.config.table.position_smoothness,
                     rows_were_filtered=rows_were_filtered,
                 )
                 deform_positions = deformations["positions"].to(base_layer_data.positions)
                 deform_rotations = deformations["rotations"].to(base_layer_data.rotations)
 
-                if context.is_training_batch and self.config.table.position_smoothness:
-                    smoothness, lifetime_mask = self.deformation_table.position_curvature(
-                        timestamp_us,
-                        gathered_parameters["deformation_table_global_row_ids"],
-                        base_layer_data.positions,
-                        rows_were_filtered=rows_were_filtered,
-                    )
+                if smoothness_result is not None:
+                    smoothness, lifetime_mask = smoothness_result
                     interpolated_mask = context.additional_data["interpolated_mask"][0]
                     track_mask = interpolated_mask[base_layer_data.tracks_ids].to(lifetime_mask.dtype).unsqueeze(1)
                     context.additional_data["deform_smoothness"] = (smoothness, True)

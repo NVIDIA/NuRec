@@ -7,6 +7,8 @@ These pin the behavior of the helpers extracted out of serve.py so the lightweig
 harness can import them without the GPU serving stack (finding F008).
 """
 
+import re
+
 import numpy as np
 import pytest
 
@@ -14,7 +16,7 @@ from scipy.spatial.transform import Rotation as R
 
 import nurec.grpc.protos.common_pb2 as common_pb2
 
-from nurec.grpc.pose import grpc_pose_to_torch_se3, se3_to_grpc_pose
+from nurec.grpc.pose import grpc_pose_to_torch_se3, grpc_pose_to_tquat, se3_to_grpc_pose
 
 
 def _pose(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> common_pb2.Pose:
@@ -49,3 +51,17 @@ def test_se3_to_grpc_pose_round_trips_rotation_and_translation() -> None:
         [round_tripped.quat.x, round_tripped.quat.y, round_tripped.quat.z, round_tripped.quat.w]
     ).as_matrix()
     np.testing.assert_allclose(rot_in, rot_out, atol=1e-5)
+
+
+@pytest.mark.parametrize("field", ["vec.x", "vec.y", "vec.z", "quat.x", "quat.y", "quat.z", "quat.w"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_pose_error_identifies_component_and_value(field: str, value: float) -> None:
+    pose = _pose(0, 0, 0, 0, 0, 0, 1)
+    message, component = field.split(".")
+    setattr(getattr(pose, message), component, value)
+
+    expected_error = "^" + re.escape(f"Pose component {field} must be finite; got {value}") + "$"
+    with pytest.raises(ValueError, match=expected_error):
+        grpc_pose_to_tquat(pose)
+    with pytest.raises(ValueError, match=expected_error):
+        grpc_pose_to_torch_se3(pose)

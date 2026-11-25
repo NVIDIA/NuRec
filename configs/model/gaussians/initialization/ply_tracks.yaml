@@ -13,6 +13,6 @@ fallback:
 
   num_point_cloud_points: 1_000
 
-  default_density: ${eval:'0.5 if ("${model.strategy.name}"=="mcmc") else 0.1'}
+  default_density: ${eval:'0.5 if ("${model.strategy.name}" in ["mcmc", "taminggs_mcmc"]) else 0.1'}
   default_scale: 0.1
   symmetric_axis: Y

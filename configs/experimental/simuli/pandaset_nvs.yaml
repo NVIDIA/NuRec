@@ -11,6 +11,7 @@ defaults:
   - _simuli_dynamic_mixin.yaml
   - /model/gaussians/extra_signal@model.layers.background.extra_signal: [intensity, raydrop]
   - /model/gaussians/extra_signal@model.layers.dynamic_rigids.extra_signal: [intensity, raydrop]
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_1
   - override /model/background: sky_env_map
 
 dataset:
@@ -26,7 +27,6 @@ dataset:
     batch_sampler:
       camera_pixel_sampler:
         crop_type: full_image
-        subsample: 1
       camera_frame_sampler:
         name: holdout
         # Exclude frames used during validation from the training set.

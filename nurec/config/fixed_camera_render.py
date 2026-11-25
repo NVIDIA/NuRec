@@ -3,7 +3,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
+from pydantic import model_validator
+
 from nurec.config.base_schema import BaseConfigSchema, Field
+from nurec.config.image_resolution import (
+    ImageResolutionConfig,
+    RelativeImageResolutionConfig,
+    parse_image_resolution_config,
+)
 
 
 class FixedCameraRenderConfig(BaseConfigSchema):
@@ -47,14 +57,9 @@ class FixedCameraRenderConfig(BaseConfigSchema):
             "First global_step at which to render. Schedule fires at start_step, start_step + every_n_steps, ..."
         ),
     )
-    subsample: int = Field(
-        default=2,
-        ge=1,
-        description=(
-            "Stride divisor of the camera resolution at render time. "
-            "1 = full, 2 = half, etc. Independent of "
-            "n_train_sequential_image_subsample / n_val_image_subsample."
-        ),
+    resolution: ImageResolutionConfig = Field(
+        default_factory=lambda: RelativeImageResolutionConfig(subsample=2),
+        description="Resolution of the fixed-camera render, independent of train-sequential and validation resolution.",
     )
     video_fps: int = Field(
         default=10,
@@ -67,3 +72,23 @@ class FixedCameraRenderConfig(BaseConfigSchema):
         le=100,
         description="JPEG encoder quality (1-100) passed to imageio.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_resolution(cls, values: Any) -> Any:
+        if not isinstance(values, Mapping) and not hasattr(values, "items"):
+            return values
+        normalized = dict(values)
+        unsupported_fields = {"width", "height", "keep_aspect_ratio", "allow_upsampling"} & normalized.keys()
+        if unsupported_fields:
+            raise ValueError(
+                f"Unsupported flat fixed-camera resolution fields: {sorted(unsupported_fields)}; "
+                "set these under fixed_camera_render.resolution"
+            )
+        normalized["resolution"] = parse_image_resolution_config(
+            normalized.get("resolution"),
+            legacy_subsample=normalized.pop("subsample", None),
+            field_name="fixed_camera_render",
+            default_subsample=2,
+        )
+        return normalized

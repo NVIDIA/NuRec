@@ -162,6 +162,13 @@ def add_camera_render_products(
             Gf.Vec2i(cam_info.width, cam_info.height)
         )
         render_product.CreateRelationship("camera").SetTargets([Sdf.Path(camera_path)])
+        if has_runtime_ppisp:
+            # Runtime PPISP consumes the Gaussian HDR output and produces LDR color itself, so Kit's Gaussian
+            # skip-tonemapping path must be disabled. SH-optimized exports do not call set_ppisp(), so baked PPISP
+            # assets keep the vanilla renderer setting.
+            render_product.CreateAttribute("omni:rtx:gaussian:skipTonemapping:enabled", Sdf.ValueTypeNames.Bool).Set(
+                False
+            )
 
         render_var_name = PPISP_INPUT_RENDER_VAR if has_runtime_ppisp else LDR_COLOR_RENDER_VAR
         render_var_path = f"{render_product_path}/{render_var_name}"

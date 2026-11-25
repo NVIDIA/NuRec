@@ -14,6 +14,7 @@ The end-to-end pipeline is documented once, in ``nurec/utils/edit/README.md``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import shutil
@@ -22,7 +23,7 @@ import zipfile
 
 from collections.abc import Collection
 from pathlib import Path
-from typing import Optional, cast
+from typing import Optional, Sequence, cast
 
 import click
 import torch
@@ -37,9 +38,10 @@ from nurec.utils.edit.asset_edits_schema import (
     AssetEditsDoc,
     AssetEditsError,
     EditSpec,
+    binding_key,
     load_asset_edits,
 )
-from nurec.utils.edit.layer_append import LAYER_PARAM_NAMES
+from nurec.utils.edit.layer_append import LAYER_PARAM_NAMES, layer_row_tensor_names
 from nurec.utils.edit.variant_animation import (
     VariantAnimation,
     VariantAnimationError,
@@ -52,15 +54,12 @@ log = logging.getLogger(__name__)
 
 
 def _resolve_world_to_nurec(renderable: RenderableModel, artifact: Artifact) -> FrameConversion:
-    """The artifact's world <-> NuRec frame conversion, from the model or the rig trajectories.
+    """The artifact's world-to-NuRec frame conversion: the model's own when it carries one, else
+    the rig trajectories'.
 
-    Every world-frame offset in every edit is expressed through this, so which source
-    supplied it is worth a log line rather than a silent fallback.
-
-    ``_world_to_nurec`` is private; RenderableModel exposes no accessor for it, and adding
-    one is a change to a file this feature does not otherwise touch. Reading it here is
-    safe (it is a declared attribute with a ``None`` default, so a rename fails loudly at
-    the fallback rather than silently), but it is the reason this helper logs its source.
+    Every world-frame position in every edit goes through this, so the source is logged.
+    ``RenderableModel._world_to_nurec`` is a declared attribute with a ``None`` default; the rig
+    fallback covers the ``None`` case.
     """
     world_to_nurec = getattr(renderable, "_world_to_nurec", None)
     if world_to_nurec is not None:
@@ -78,30 +77,30 @@ def _resolve_world_to_nurec(renderable: RenderableModel, artifact: Artifact) -> 
     return resolved
 
 
-def _read_variant_animations(doc: AssetEditsDoc, yaml_dir: Path) -> dict[tuple[str, str], VariantAnimation]:
-    """Read each scheduled control's USD-native variant-state animation from its asset.
+def _read_variant_animations(doc: AssetEditsDoc, assets_root: Path) -> dict[tuple[str, str], VariantAnimation]:
+    """Read each scheduled control's variant-state animation from its asset.
 
-    For every edit's control whose name matches a root variantSet on the asset, extract
-    per-state visibility animation from INSIDE the variant contents
-    (variant_animation.read_variant_animation). This is what makes the asset's own
-    animation — the same samples usdview plays — the schedule's source of truth.
-
-    Returns a ``(edit_id, control_name) -> VariantAnimation`` map for the baker. Purely
-    static variantSets (e.g. panelState) are simply absent from it; nothing is written
-    back onto the authored document.
+    For every control whose name matches a root variantSet, the per-state visibility animation is
+    read from inside the variant (``variant_animation.read_variant_animation``); the asset's own
+    animation is the schedule's source of truth. Returns ``(edit_id, control_name) ->
+    VariantAnimation``. Static variantSets (e.g. panelState) are absent. A clone of an edit reads
+    its source edit's asset, keyed under the clone's own id.
     """
     animations: dict[tuple[str, str], VariantAnimation] = {}
     for fx in doc.edits:
-        if not fx.controls:
+        appearance = doc.appearance_of(fx)
+        if not appearance.controls or not appearance.has_asset:
             continue
-        asset_path = Path(fx.asset)  # type: ignore[arg-type]
+        asset_path = Path(appearance.asset)  # type: ignore[arg-type]
         if not asset_path.is_absolute():
-            asset_path = (yaml_dir / asset_path).resolve()
+            asset_path = (assets_root / asset_path).resolve()
         if not asset_path.exists():
-            raise click.ClickException(f"asset not found: {asset_path} (edit {fx.id!r}, asset={fx.asset!r})")
-        for spec in fx.controls:
+            raise click.ClickException(
+                f"asset not found: {asset_path} (edit {appearance.id!r}, asset={appearance.asset!r})"
+            )
+        for spec in appearance.controls:
             try:
-                anim = read_variant_animation(asset_path, spec.name, root_prim_path=fx.prim_path)
+                anim = read_variant_animation(asset_path, spec.name, root_prim_path=appearance.prim_path)
             except VariantAnimationError as exc:
                 raise click.ClickException(
                     f"edit {fx.id!r} control {spec.name!r}: bad variant animation: {exc}"
@@ -128,24 +127,32 @@ def _splice_synthetic_tracks(
     *,
     track_albedo_identity: Optional[torch.Tensor] = None,
     track_scale_identity: Optional[torch.Tensor] = None,
+    row_tensor_names: Sequence[str] = tuple(LAYER_PARAM_NAMES),
 ) -> list[str]:
-    """Extend every track-count-sized checkpoint entry of ``layer_id`` for K new tracks.
+    """Extend every track-sized checkpoint entry of ``layer_id`` for the new synthetic tracks.
 
-    World binds append their synthetic tracks at the END of the layer's track list, so
-    every per-track / per-keyframe-pose tensor extends positionally: identity rows for
-    the calibration deltas (2 keyframes per synthetic track), the tracks' timestamp
-    ranges for the time embedding, and a bumped ``n_tracks`` in the layer's extra
-    state (asserted by ``RigidGaussianModel.set_extra_state`` at load). The composite's
-    persisted ``obj_track_ids`` list for the layer is extended to match.
+    Synthetic tracks append at the end of the layer's track list, so each per-track or per-pose
+    tensor extends positionally: identity calibration deltas (one per keyframe; a clone's poses
+    are already calibrated), the tracks' timestamp ranges for the time embedding, the layer's
+    ``n_tracks`` extra state, and the per-track appearance state (time-embedding parameters,
+    ``track_albedos``, ``track_scales``), which takes a clone's copied source row when present.
+    The composite's persisted ``obj_track_ids`` list is extended to match.
 
-    Pure state-dict surgery (unit-testable without a model); returns the mutated keys.
-    A final scan raises on any remaining tensor under the layer prefix whose leading
-    dimension still matches the OLD track/pose count — an unhandled track-sized tensor
-    would desynchronize silently at load, so fail the bake instead.
+    Pure state-dict surgery; returns the mutated keys. Any remaining tensor under the layer
+    prefix whose leading dimension still matches the old track or pose count raises: it would
+    desynchronize silently at load. ``row_tensor_names`` are the layer's per-Gaussian tensors
+    (``layer_row_tensor_names``), which are sized by the row count and never checked.
     """
     prefix = f"model.gaussians_nodes.{layer_id}."
     k = len(synths)
+    n_new_poses = sum(s.n_poses for s in synths)
     handled: list[str] = []
+
+    def _copied(s: SyntheticTrack, suffix: str) -> Optional[torch.Tensor]:
+        """A clone's copied per-track row for ``suffix`` (1 x ...), if it carries one."""
+        state = s.per_track_state or {}
+        row = state.get(suffix)
+        return None if row is None else row.detach().cpu()
 
     def _cat(key: str, rows: torch.Tensor, expect_n: int) -> None:
         cur = state_dict[key]
@@ -160,39 +167,48 @@ def _splice_synthetic_tracks(
     key_q = prefix + "tracks_calib.tracks_delta_q"
     key_t = prefix + "tracks_calib.tracks_delta_t"
     if key_q in state_dict:
-        _cat(key_q, torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(2 * k, 1), old_n_poses)
+        _cat(key_q, torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(n_new_poses, 1), old_n_poses)
     else:
         log.info("skipping %s: not present in original state_dict", key_q)
     if key_t in state_dict:
-        _cat(key_t, torch.zeros(2 * k, 3), old_n_poses)
+        _cat(key_t, torch.zeros(n_new_poses, 3), old_n_poses)
 
     key_ranges = prefix + "time_embed.timestamps_us_ranges"
     if key_ranges in state_dict:
-        ranges = torch.tensor([[int(s.timestamps_us[0]), int(s.timestamps_us[1])] for s in synths])
-        _cat(key_ranges, ranges, old_n_tracks)
+        rows = []
+        for s in synths:
+            copied = _copied(s, "time_embed.timestamps_us_ranges")
+            rows.append(copied.reshape(1, 2) if copied is not None else torch.tensor([list(s.timestamp_range_us)]))
+        _cat(key_ranges, torch.cat(rows, dim=0), old_n_tracks)
 
     key_u = prefix + "time_embed.u"
     if key_u in state_dict:
-        # IndividualStepTimeInputEmbedding.u is (n_tracks, n_dims, n_steps); new tracks
-        # get the same fresh linspace block __init__ would build.
+        # IndividualStepTimeInputEmbedding.u is (n_tracks, n_dims, n_steps); a new track
+        # gets the same fresh linspace block __init__ would build, a clone its source's row.
         _, n_dims, n_steps = state_dict[key_u].shape
-        fresh = (
-            torch.linspace(0.0, 1.0, n_steps * n_dims + 2)[1:-1]
-            .reshape(1, n_steps, n_dims)
-            .transpose(1, 2)
-            .repeat(k, 1, 1)
-        )
-        _cat(key_u, fresh, old_n_tracks)
+        fresh = torch.linspace(0.0, 1.0, n_steps * n_dims + 2)[1:-1].reshape(1, n_steps, n_dims).transpose(1, 2)
+        rows = []
+        for s in synths:
+            copied = _copied(s, "time_embed.u")
+            rows.append(copied.reshape(1, n_dims, n_steps) if copied is not None else fresh)
+        _cat(key_u, torch.cat(rows, dim=0), old_n_tracks)
 
     for key_suffix, identity in (("track_albedos", track_albedo_identity), ("track_scales", track_scale_identity)):
         key = prefix + key_suffix
         if key in state_dict:
-            if identity is None:
-                raise click.ClickException(
-                    f"checkpoint has {key} but no identity row was provided; cannot splice synthetic tracks"
-                )
-            row = identity.reshape((1,) + tuple(state_dict[key].shape[1:]))
-            _cat(key, row.repeat(k, *([1] * (row.ndim - 1))), old_n_tracks)
+            row_shape = (1,) + tuple(state_dict[key].shape[1:])
+            rows = []
+            for s in synths:
+                copied = _copied(s, key_suffix)
+                if copied is not None:
+                    rows.append(copied.reshape(row_shape))
+                    continue
+                if identity is None:
+                    raise click.ClickException(
+                        f"checkpoint has {key} but no identity row was provided; cannot splice synthetic tracks"
+                    )
+                rows.append(identity.reshape(row_shape))
+            _cat(key, torch.cat(rows, dim=0), old_n_tracks)
 
     key_extra = prefix + "_extra_state"
     extra = state_dict.get(key_extra)
@@ -221,7 +237,7 @@ def _splice_synthetic_tracks(
 
     # Safety net: any tensor still sized by the OLD track/pose count is a
     # track-sized entry this splice does not know about.
-    per_gaussian = {prefix + name for name in LAYER_PARAM_NAMES}
+    per_gaussian = {prefix + name for name in row_tensor_names}
     leftovers = [
         key
         for key, val in state_dict.items()
@@ -265,7 +281,7 @@ def _append_tracks_to_serialized_cuboid_tracks(
         td["tracks_poses"].append(s.pose_tquat_nurec if frame == "nurec" else s.pose_tquat_world)
         td["tracks_timestamps_us"].append([int(t) for t in s.timestamps_us])
         td["tracks_label_class"].append(s.label_class)
-        td["tracks_flags"].append("DYNAMIC")
+        td["tracks_flags"].append(s.flags)
         cd["cuboids_dims"].append(list(s.dims_nurec if frame == "nurec" else s.dims_world))
 
 
@@ -273,8 +289,9 @@ def _rewrite_track_members(zin: zipfile.ZipFile, synths: list[SyntheticTrack]) -
     """New bytes for the artifact members that persist cuboid tracks.
 
     ``datasource_summary.json`` (NuRec frame) is what the model loads tracks from at
-    inference — both ``sequence_tracks_all`` and ``sequence_tracks_dynamic`` get the
-    synthetic tracks. ``sequence_tracks.json`` (world frame) feeds bbox overlays /
+    inference: ``sequence_tracks_all`` gets every synthetic track, ``sequence_tracks_dynamic``
+    only those flagged ``DYNAMIC`` (a prop added to a static layer, or a clone of a parked
+    car, is not dynamic). ``sequence_tracks.json`` (world frame) feeds bbox overlays /
     viewer / eval tooling and is rewritten when present.
     """
     ordered = sorted(synths, key=lambda s: s.global_index)
@@ -291,7 +308,8 @@ def _rewrite_track_members(zin: zipfile.ZipFile, synths: list[SyntheticTrack]) -
     )
     dynamic_tracks = summary.get("sequence_tracks_dynamic") or {}
     if len(dynamic_tracks) == 1:
-        _append_tracks_to_serialized_cuboid_tracks(next(iter(dynamic_tracks.values())), ordered, "nurec")
+        dynamic = [s for s in ordered if "DYNAMIC" in s.flags.split("|")]
+        _append_tracks_to_serialized_cuboid_tracks(next(iter(dynamic_tracks.values())), dynamic, "nurec")
     replacements["datasource_summary.json"] = json.dumps(summary, indent=4).encode("utf-8")
 
     if "sequence_tracks.json" in zin.namelist():
@@ -310,19 +328,12 @@ def _repack_artifact(
     manifest: EditManifest,
     synthetic_tracks: list[SyntheticTrack],
 ) -> None:
-    """Copy the source USDZ to ``out_path``, replacing the checkpoint and edit manifest.
+    """Copy the source USDZ to ``out_path`` with the checkpoint and edit manifest replaced.
 
-    Every member is copied by STREAM, never through memory: at this point the process
-    already holds the materialized model on GPU and the loaded checkpoint dict on CPU, and
-    a ``BytesIO`` round trip would add two more full copies of the largest member.
-
-    Members are written through their SOURCE ``ZipInfo``, which is what carries
-    ``compress_type`` across — a USDZ requires uncompressed members, so the output
-    archive's own ``compression=ZIP_STORED`` is inert and the source metadata is what
-    actually preserves the format. The write goes to a sibling temp file and is renamed
-    only on success, so a mid-repack failure leaves no truncated artifact behind.
-    (``nurec/compression/usdz.py`` solves the same shape with private helpers; reusing them
-    would mean making them public, which is not this change's business.)
+    Members are streamed, never read into memory (the model and the checkpoint dict are already
+    resident). Each member is written through its source ``ZipInfo``, which carries the
+    uncompressed ``compress_type`` a USDZ needs. The archive is written to a sibling temp file
+    and renamed on success, so a failure leaves no truncated artifact.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(out_path.name + ".tmp")
@@ -421,14 +432,22 @@ def _validate_asset_edit_target_layers(composite: GaussiansComposite, target_lay
     default=None,
     help="Output baked USDZ. Defaults to '<input>.edits_baked.usdz' alongside the input.",
 )
+@click.option(
+    "--assets-root",
+    type=click.Path(exists=True, file_okay=False, readable=True, path_type=str),
+    default=None,
+    help=("Directory that relative 'asset' paths in the YAML resolve against. Defaults to the YAML's own directory."),
+)
 def compile_asset_edits(
     artifact_path: str,
     asset_edits_path: str,
     output: Optional[str],
+    assets_root: Optional[str],
 ) -> None:
     """Bake an asset_edits.yaml into a renderable USDZ.
 
-    Run once per authoring iteration; re-run after editing the YAML.
+    Run once per authoring iteration; re-run after editing the YAML. Every edit names
+    its operation (add / replace / clone / exclude); see the schema docstring.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -458,14 +477,18 @@ def compile_asset_edits(
     except AssetEditsError as exc:
         raise click.ClickException(f"Invalid asset_edits.yaml: {exc}")
     log.info(
-        "Parsed %d edit(s) across layer(s) %s", len(doc.edits), list(dict.fromkeys(fx.layer_id for fx in doc.edits))
+        "Parsed %d edit(s) (%s) across layer(s) %s",
+        len(doc.edits),
+        ", ".join(f"{fx.id}:{fx.op}" for fx in doc.edits),
+        list(dict.fromkeys(fx.layer_id for fx in doc.edits)),
     )
-    # SimReady asset paths in the YAML may be relative; resolve them against the YAML's directory.
-    yaml_dir = Path(asset_edits_path).resolve().parent
+    # Asset paths in the YAML may be relative; resolve them against --assets-root (default: the
+    # YAML's own directory).
+    root = Path(assets_root).resolve() if assets_root else Path(asset_edits_path).resolve().parent
 
     log.info("Loading artifact from %s", in_path)
     artifact = Artifact(in_path)
-    animations = _read_variant_animations(doc, yaml_dir)
+    animations = _read_variant_animations(doc, root)
     log.info("Constructing RenderableModel (materializes GaussiansComposite + cuboid tracks)")
     renderable = RenderableModel.load_from_artifact(artifact)
     composite = renderable._model
@@ -474,18 +497,16 @@ def compile_asset_edits(
 
     # One edit per (layer, track): the schedule registry is keyed by that pair and the
     # runtime applies a track's active aspect set to EVERY cluster on the pair, so two
-    # edits binding the same track would silently clobber each other (an edit that
-    # hides all its variant parts would leave a hole where the actor was). World binds
-    # each get their OWN synthetic track, keyed by its string id — two world edits may
-    # not claim the same track_id.
+    # edits binding the same existing track would silently clobber each other (an edit
+    # that hides all its variant parts would leave a hole where the actor was). Synthetic
+    # tracks (world binds, clones) are keyed by their string id — each is its own track.
     binding_owners: dict[tuple[str, object], list[str]] = {}
     for fx in doc.edits:
-        key = ("world", fx.bind.track_id) if fx.bind.is_world else (fx.layer_id, fx.bind.nurec_track_id)
-        binding_owners.setdefault(key, []).append(fx.id)
+        binding_owners.setdefault(binding_key(fx), []).append(fx.id)
     collisions = {k: v for k, v in binding_owners.items() if len(v) > 1}
     if collisions:
         raise click.ClickException(
-            "multiple edits bind the same (layer, nurec_track_id) or world track_id, which the schedule "
+            "multiple edits bind the same (layer, nurec_track_id) or synthetic track_id, which the schedule "
             f"registry cannot represent: {collisions}. Merge them into one edit or rebind."
         )
 
@@ -500,10 +521,11 @@ def compile_asset_edits(
     # derived from it inside AssetEditsBaker.
     world_to_nurec = _resolve_world_to_nurec(renderable, artifact)
 
-    # World binds synthesize NEW tracks spanning the artifact's rig playback window
-    # (same computation the composite uses for temporal appearance).
+    # World binds and parked clones synthesize NEW constant-pose tracks spanning the
+    # artifact's rig playback window (same computation the composite uses for temporal
+    # appearance).
     clip_window_us: Optional[tuple[int, int]] = None
-    if any(fx.bind.is_world for fx in doc.edits):
+    if doc.needs_clip_window:
         try:
             rt = RigTrajectories.from_dict(artifact.rig_trajectories)
             clip_window_us = (
@@ -511,7 +533,7 @@ def compile_asset_edits(
                 int(rt.rig_trajectories[-1].T_rig_world_timestamps_us[-1].item()),
             )
         except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
-            raise click.ClickException(f"world binds need the artifact's rig playback window: {exc}")
+            raise click.ClickException(f"world binds / parked clones need the artifact's rig playback window: {exc}")
 
     # Pre-bake per-layer track/pose counts: the checkpoint splice for synthetic tracks
     # must extend tensors relative to what the CHECKPOINT holds, not the mutated model.
@@ -524,7 +546,7 @@ def compile_asset_edits(
         if isinstance(node, RigidGaussianModel)
     }
 
-    baker = AssetEditsBaker(composite, world_to_nurec, yaml_dir, clip_window_us=clip_window_us, animations=animations)
+    baker = AssetEditsBaker(composite, world_to_nurec, root, clip_window_us=clip_window_us, animations=animations)
     try:
         # The baker raises domain errors (it must stay usable outside a CLI); this is the
         # one place that translates them into CLI failures.
@@ -534,31 +556,39 @@ def compile_asset_edits(
     manifest = baker.manifest()
     # Bind the manifest to this exact bake: its row indices address these post-bake layer
     # sizes AND this exact per-row track assignment, and serve/render refuse a mismatching
-    # checkpoint at install (EditManifest.validate_against_layers).
+    # checkpoint at install (EditManifest.validate_against_layers). Every layer the bake
+    # touched is bound, not only the ones that gained clusters: a batch of static
+    # replaces, excludes and captured clones has no cluster yet still rewrote rows.
+    bound_layers = [
+        layer_id
+        for layer_id in dict.fromkeys([*baker.baked_layers, *edits_by_layer, *manifest.layer_ids()])
+        if layer_id in composite.gaussians_nodes and isinstance(composite.gaussians_nodes[layer_id], RigidGaussianModel)
+    ]
     manifest.layer_row_counts = {
-        layer_id: int(composite.gaussians_nodes[layer_id].get_num_gaussians()) for layer_id in manifest.layer_ids()
+        layer_id: int(composite.gaussians_nodes[layer_id].get_num_gaussians()) for layer_id in bound_layers
     }
     manifest.layer_track_digest = {
         layer_id: layer_track_digest(cast(torch.Tensor, composite.gaussians_nodes[layer_id].gaussian_cuboid_ids))
-        for layer_id in manifest.layer_ids()
+        for layer_id in bound_layers
     }
 
-    # Splice updated tensors for every baked layer into the original checkpoint (minimal diff).
-    log.info("Loading original checkpoint to splice in updated tensors for layer(s) %s", list(edits_by_layer))
+    # Splice updated tensors for every baked layer (targets and their dependents) into the
+    # original checkpoint (minimal diff).
+    log.info("Loading original checkpoint to splice in updated tensors for layer(s) %s", baker.baked_layers)
     checkpoint = torch.load(artifact.checkpoint, weights_only=False, map_location="cpu")
     # weights_only=False is the repo-wide policy for trusted NuRec checkpoints (they carry
-    # OmegaConf containers; see TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD in nurec/__init__.py).
+    # OmegaConf containers).
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise click.ClickException(
             f"unsupported checkpoint format in {in_path}: expected a dict with a "
             f"'state_dict' entry, got {type(checkpoint).__name__}"
         )
     original_state_dict = checkpoint["state_dict"]
-    for layer_id in edits_by_layer:
+    for layer_id in baker.baked_layers:
         layer_node = composite.gaussians_nodes[layer_id]
         layer_state_prefix = f"model.gaussians_nodes.{layer_id}."
         spliced = 0
-        for name in LAYER_PARAM_NAMES:
+        for name in layer_row_tensor_names(layer_node):
             state_key = layer_state_prefix + name
             if state_key not in original_state_dict:
                 log.info("skipping spliced tensor %s: not present in original state_dict", state_key)
@@ -570,11 +600,17 @@ def compile_asset_edits(
             spliced += 1
         log.info("spliced %d %s tensors into the checkpoint", spliced, layer_id)
 
-    # World binds: extend every track-count-sized checkpoint entry for the synthetic
-    # tracks, so the artifact loads with the SAME per-layer track lists the bake used.
+    # Synthetic tracks (world binds, clones): extend every track-count-sized checkpoint
+    # entry, so the artifact loads with the SAME per-layer track lists the bake used. A
+    # dependent layer carries the same tracks at the same indices, with its own per-track
+    # state (a clone's copied source row, else identity / fresh rows).
     synths_by_layer: dict[str, list[SyntheticTrack]] = {}
     for synth in baker.synthetic_tracks:
         synths_by_layer.setdefault(synth.layer_id, []).append(synth)
+        for dep in synth.dependent_state:
+            synths_by_layer.setdefault(dep, []).append(
+                dataclasses.replace(synth, layer_id=dep, per_track_state=synth.dependent_state[dep], dependent_state={})
+            )
     for layer_id, synths in synths_by_layer.items():
         layer_node = composite.gaussians_nodes[layer_id]
         old_n_tracks, old_n_poses = pre_bake_counts[layer_id]
@@ -591,6 +627,7 @@ def compile_asset_edits(
             old_n_poses,
             track_albedo_identity=albedo_identity,
             track_scale_identity=scale_identity,
+            row_tensor_names=layer_row_tensor_names(layer_node),
         )
 
     checkpoint["load_in_place"] = False  # shapes changed; force reassign on load
@@ -601,6 +638,14 @@ def compile_asset_edits(
     log.info("Done.")
     log.info("  baked USDZ: %s", out_path)
     log.info("  clusters  : %s", ", ".join(c.cluster_id for c in baker.baked_clusters) or "(none)")
+    for rec in manifest.excluded_tracks:
+        log.info(
+            "  excluded  : %s track %s (%r): %d gaussian(s) hidden",
+            rec["layer_id"],
+            rec["nurec_track_id"],
+            rec["track_id_str"],
+            rec["gaussians_hidden"],
+        )
     for ctl in manifest.controls:
         log.info(
             "  control '%s' (states %s, default '%s') aspect vocabulary (SimReady name -> wire aspect):",

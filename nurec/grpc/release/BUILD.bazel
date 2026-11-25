@@ -24,6 +24,7 @@ pkg_files(
 pkg_files(
     name = "root_files",
     srcs = [
+        "LIDAR_MIGRATION.md",
         "README.md",
         "requirements.txt",
     ],

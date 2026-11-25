@@ -5,12 +5,14 @@
 
 import os
 import queue
-import time
 import traceback
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from math import prod
+from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_for_connections
+from multiprocessing.context import BaseContext
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Callable, Mapping
 
@@ -20,11 +22,17 @@ import torch
 from numpy.typing import NDArray
 
 from apps.av.aux_gen.device_frame import (
+    DeviceFrameContext,
     DeviceFrameOutputSpec,
     DeviceFramePipeline,
     DeviceFrameProcessor,
     DeviceFrameProcessorMetadata,
 )
+
+
+_QUEUE_POLL_SECONDS = 0.2
+_PENDING_REQUEST_POLL_SECONDS = 0.01
+_SHUTDOWN_RESULT_GRACE_SECONDS = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,7 +288,7 @@ class DeviceFrameSharedArray:
 
     @classmethod
     def create(cls, name: str, array: Any) -> "DeviceFrameSharedArray":
-        """Create and populate an owned static processor input.
+        """Create and populate an owned shared array, including empty results.
 
         Args:
             name: Stable semantic input name exposed to processors.
@@ -290,13 +298,11 @@ class DeviceFrameSharedArray:
             Owned shared array whose :meth:`close` unlinks its storage.
 
         Raises:
-            ValueError: If the input is empty or has an unsupported dtype.
+            ValueError: If the input has an unsupported dtype.
         """
         source = np.asarray(array)
-        if source.size == 0:
-            raise ValueError(f"Static processor input {name} must not be empty")
         dtype = _torch_dtype(source.dtype)
-        shared_memory = SharedMemory(create=True, size=source.nbytes)
+        shared_memory = SharedMemory(create=True, size=max(1, source.nbytes))
         descriptor = DeviceFrameSharedArrayDescriptor(
             name=name,
             shape=tuple(source.shape),
@@ -360,12 +366,14 @@ class DeviceFrameRequest:
         slot: Shared-memory buffers owned by the parent process.
         enabled_processors: Processor names selected for this frame.
         processor_inputs: Static shared inputs selected for this request.
+        frame: Resolved frame metadata forwarded to processors.
     """
 
     worker_id: int
     request_id: int
     slot: DeviceFrameSharedMemorySlot
     enabled_processors: frozenset[str]
+    frame: DeviceFrameContext
     processor_inputs: tuple[DeviceFrameSharedArrayDescriptor, ...] = ()
 
 
@@ -376,12 +384,14 @@ class DeviceFrameResult:
     Attributes:
         request_id: Identifier copied from the completed request.
         error: Formatted traceback on failure, otherwise ``None``.
-        output_names: Names of outputs written for this request.
+        output_names: Names of fixed outputs written for this request.
+        variable_outputs: Service-owned arrays valid until the host returns its transport slot.
     """
 
     request_id: int
     error: str | None
     output_names: tuple[str, ...] = ()
+    variable_outputs: tuple[DeviceFrameSharedArrayDescriptor, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,14 +411,61 @@ class ResolvedDeviceFrame:
 
 
 @dataclass(kw_only=True, slots=True)
+class DeviceFrameStopSignal:
+    """Wake every IPC waiter when shared frame processing stops.
+
+    The pipe stays readable after the first signal; waiters never consume its
+    byte. The event retains the service/worker shutdown interface.
+    """
+
+    reader: Connection
+    _writer: Connection
+    _event: Any
+    _lock: Any
+
+    @classmethod
+    def create(cls, ctx: BaseContext) -> "DeviceFrameStopSignal":
+        """Create a signal using the same multiprocessing context as workers.
+
+        Args:
+            ctx: Context whose processes will share the signal.
+
+        Returns:
+            A picklable, initially unset signal owned by the caller.
+        """
+        reader, writer = ctx.Pipe(duplex=False)
+        return cls(reader=reader, _writer=writer, _event=ctx.Event(), _lock=ctx.Lock())
+
+    def set(self) -> None:
+        """Publish shutdown once and wake all current and future waiters."""
+        with self._lock:
+            if not self._event.is_set():
+                # Publish shutdown before waking readers that inspect the event.
+                self._event.set()
+                self._writer.send_bytes(b"\0")
+
+    def is_set(self) -> bool:
+        """Return whether shutdown has been published."""
+        return bool(self._event.is_set())
+
+    def close(self) -> None:
+        """Close this process's pipe handles after its waiters have finished."""
+        self.reader.close()
+        self._writer.close()
+
+
+@dataclass(kw_only=True, slots=True)
 class SharedDeviceFrameClient:
-    """Submit host images to shared device-frame services and resolve outputs."""
+    """Submit host images to shared device-frame services and resolve outputs.
+
+    Blocking waits require multiprocessing queues and a DeviceFrameStopSignal.
+    """
 
     worker_id: int
     slot_queue: Any
     request_queue: Any
     result_queue: Any
-    stop_event: Any
+    stop_event: DeviceFrameStopSignal
     _shared_buffers_by_name: dict[str, DeviceFrameSharedBuffers] = field(default_factory=dict, init=False, repr=False)
     _completed_results: dict[int, DeviceFrameResult] = field(default_factory=dict, init=False, repr=False)
 
@@ -418,6 +475,8 @@ class SharedDeviceFrameClient:
         image: Any,
         enabled_processors: frozenset[str],
         processor_inputs: tuple[DeviceFrameSharedArrayDescriptor, ...] = (),
+        *,
+        frame: DeviceFrameContext,
     ) -> PendingDeviceFrame | None:
         """Copy one image into a borrowed slot and queue its descriptor.
 
@@ -426,6 +485,7 @@ class SharedDeviceFrameClient:
             image: RGB image convertible to ``uint8[H, W, 3]``.
             enabled_processors: Processor names selected for this frame.
             processor_inputs: Static shared inputs selected for this request.
+            frame: Resolved frame metadata forwarded to processors.
 
         Returns:
             Pending request retaining its slot, or ``None`` when no compatible
@@ -465,10 +525,11 @@ class SharedDeviceFrameClient:
                 slot=shared_buffers.slot,
                 enabled_processors=enabled_processors,
                 processor_inputs=processor_inputs,
+                frame=frame,
             )
             while True:
                 try:
-                    self.request_queue.put(request, timeout=0.2)
+                    self.request_queue.put(request, timeout=_QUEUE_POLL_SECONDS)
                     submitted = True
                     return PendingDeviceFrame(request=request, shared_buffers=shared_buffers)
                 except queue.Full:
@@ -503,32 +564,21 @@ class SharedDeviceFrameClient:
         shared_buffers = pending_frame.shared_buffers
         try:
             while request.request_id not in self._completed_results:
-                try:
-                    result = self.result_queue.get(timeout=0.2)
-                except queue.Empty:
-                    if not self.stop_event.is_set():
-                        continue
-                    try:
-                        result = self.result_queue.get(timeout=0.2)
-                    except queue.Empty as error:
-                        raise RuntimeError("Shared device-frame service failed while a request was pending") from error
-
-                if not isinstance(result, DeviceFrameResult):
-                    raise TypeError(f"Unexpected device-frame result type: {type(result)}")
-                if result.error is not None:
-                    raise RuntimeError(f"Shared device-frame service failed:\n{result.error}")
-                if result.request_id in self._completed_results:
-                    raise RuntimeError(f"Received duplicate device-frame result {result.request_id}")
-                self._completed_results[result.request_id] = result
+                self._receive_result()
 
             result = self._completed_results.pop(request.request_id)
             if result.request_id != request.request_id:
                 raise RuntimeError(f"Expected device-frame result {request.request_id}, received {result.request_id}")
-
             try:
                 outputs = {name: shared_buffers.output_buffers[name].copy() for name in result.output_names}
             except KeyError as error:
                 raise RuntimeError(f"Completed output {error.args[0]} has no shared-memory buffer") from error
+            for descriptor in result.variable_outputs:
+                shared_array = DeviceFrameSharedArray.attach(descriptor)
+                try:
+                    outputs[descriptor.name] = shared_array.array.copy()
+                finally:
+                    shared_array.close()
             input_image = shared_buffers.input_buffer.copy() if include_input else None
             return ResolvedDeviceFrame(
                 outputs=outputs,
@@ -536,6 +586,37 @@ class SharedDeviceFrameClient:
             )
         finally:
             self.slot_queue.put(shared_buffers.slot)
+
+    def wait_for_capacity(self) -> None:
+        """Wait for a shared slot, completion, or shutdown.
+
+        Cache completions without releasing their slots; propagate service errors.
+        """
+        wait_for_connections([self.result_queue._reader, self.slot_queue._reader, self.stop_event.reader])
+        if self.result_queue._reader.poll() or self.stop_event.is_set():
+            self._receive_result()
+
+    def _receive_result(self) -> None:
+        """Wait for and cache a completion; reject shutdown, errors, and duplicates."""
+        try:
+            result = self.result_queue.get_nowait()
+        except queue.Empty:
+            # Queue.put() can return before its feeder writes the payload.
+            if not self.stop_event.is_set():
+                wait_for_connections([self.result_queue._reader, self.stop_event.reader])
+            # Shutdown can overtake the result queue's feeder. Preserve its
+            # diagnostic payload with a bounded final receive.
+            try:
+                result = self.result_queue.get(timeout=_SHUTDOWN_RESULT_GRACE_SECONDS)
+            except queue.Empty as error:
+                raise RuntimeError("Shared device-frame service failed while waiting for progress") from error
+        if not isinstance(result, DeviceFrameResult):
+            raise TypeError(f"Unexpected device-frame result type: {type(result)}")
+        if result.error is not None:
+            raise RuntimeError(f"Shared device-frame service failed:\n{result.error}")
+        if result.request_id in self._completed_results:
+            raise RuntimeError(f"Received duplicate device-frame result {result.request_id}")
+        self._completed_results[result.request_id] = result
 
     def close(self) -> None:
         """Close every shared-memory attachment cached by this client.
@@ -638,6 +719,7 @@ def _run_device_frame_processors(
     outputs: Mapping[str, torch.Tensor],
     processor_inputs: Mapping[str, torch.Tensor],
     stream: torch.cuda.Stream,
+    variable_outputs: dict[str, torch.Tensor] | None = None,
 ) -> tuple[str, ...]:
     """Enqueue every enabled processor and return its ordered output names.
 
@@ -652,6 +734,7 @@ def _run_device_frame_processors(
         processor_inputs: Read-only CUDA tensors retaining their static shared
             input shape and dtype for the service lifetime.
         stream: CUDA stream owning all processor work.
+        variable_outputs: Collect optional variable-size device results for D2H staging.
 
     Returns:
         Stable output names to copy back after processing.
@@ -677,12 +760,20 @@ def _run_device_frame_processors(
         if missing_outputs:
             raise ValueError(f"Device processor {processor.name} has no staging for outputs {missing_outputs}")
         with _nvtx_range(f"{processor.name}/processing/{request.worker_id}/{request.request_id}"):
-            processor.process_device(
+            extra = processor.process_device(
                 image_bgr_nchw,
                 outputs=outputs,
                 processor_inputs=processor_inputs,
                 stream=stream,
+                frame=request.frame,
             )
+        if extra:
+            if variable_outputs is None:
+                raise RuntimeError("Variable processor outputs require transport staging")
+            for name, tensor in extra.items():
+                if name in outputs or name in variable_outputs:
+                    raise RuntimeError(f"Duplicate processor output {name}")
+                variable_outputs[name] = tensor
         output_names.extend(processor_outputs)
     return tuple(output_names)
 
@@ -811,6 +902,8 @@ class _DevicePipelineSlot:
     processing_done: torch.cuda.Event
     d2h_done: torch.cuda.Event
     active_output_names: tuple[str, ...] = ()
+    variable_outputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    variable_host_outputs: dict[str, torch.Tensor] = field(default_factory=dict)
     request: DeviceFrameRequest | None = None
 
     def bind(
@@ -958,7 +1051,9 @@ def run_device_frame_service_process(
     shared_input_descriptors_by_memory_name: dict[str, DeviceFrameSharedArrayDescriptor] = {}
     shared_inputs_device_by_memory_name: dict[str, torch.Tensor] = {}
     pipeline_slots: list[_DevicePipelineSlot] = []
+    # Insertion order selects the oldest submission when staging must wait.
     pipeline_slots_by_transport: dict[str, _DevicePipelineSlot] = {}
+    shared_variable_outputs: dict[str, list[DeviceFrameSharedArray]] = {}
     h2d_stream: torch.cuda.Stream
     processing_stream: torch.cuda.Stream
     d2h_stream: torch.cuda.Stream
@@ -1055,7 +1150,7 @@ def run_device_frame_service_process(
         """
         while not stop_event.is_set():
             try:
-                result_queues[worker_id].put(result, timeout=0.2)
+                result_queues[worker_id].put(result, timeout=_QUEUE_POLL_SECONDS)
                 return
             except queue.Full:
                 pass
@@ -1140,7 +1235,7 @@ def run_device_frame_service_process(
             processor_inputs_device={},
             h2d_done=torch.cuda.Event(),
             processing_done=torch.cuda.Event(),
-            d2h_done=torch.cuda.Event(),
+            d2h_done=torch.cuda.Event(blocking=True),
         )
         slot.bind(request.slot.resolution, input_shape, input_dtype, output_specs)
         pipeline_slots.append(slot)
@@ -1167,6 +1262,11 @@ def run_device_frame_service_process(
         # order, and backend dtype conversion run on CUDA below.
         np.copyto(slot.input_rgb.host.numpy(), input_buffer)
         slot.processor_inputs_device = get_processor_inputs_device(request)
+        # Transport slots are returned only after the host copies every result.
+        for shared_array in shared_variable_outputs.pop(request.slot.input_name, []):
+            shared_array.close()
+        slot.variable_outputs.clear()
+        slot.variable_host_outputs.clear()
         slot.request = request
         pipeline_slots_by_transport[request.slot.input_name] = slot
 
@@ -1205,6 +1305,7 @@ def run_device_frame_service_process(
                     {name: output.device for name, output in slot.outputs.items()},
                     slot.processor_inputs_device,
                     stream,
+                    slot.variable_outputs,
                 )
 
         def d2h_task(stream: torch.cuda.Stream) -> None:
@@ -1225,6 +1326,11 @@ def run_device_frame_service_process(
                             output.device,
                             non_blocking=True,
                         )
+
+                    for name, tensor in slot.variable_outputs.items():
+                        host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                        host.copy_(tensor, non_blocking=True)
+                        slot.variable_host_outputs[name] = host
 
         _schedule_cuda_pipeline_stages(
             h2d_stream=h2d_stream,
@@ -1270,12 +1376,17 @@ def run_device_frame_service_process(
                     raise RuntimeError(f"Completed output {output_name} has no transport staging") from error
                 np.copyto(output_buffer, output_host.numpy())
 
+            arrays = shared_variable_outputs.setdefault(request.slot.input_name, [])
+            for name, host in slot.variable_host_outputs.items():
+                arrays.append(DeviceFrameSharedArray.create(name, host.numpy()))
+
             put_result(
                 request.worker_id,
                 DeviceFrameResult(
                     request_id=request.request_id,
                     error=None,
                     output_names=slot.active_output_names,
+                    variable_outputs=tuple(array.descriptor for array in arrays),
                 ),
             )
             slot.active_output_names = ()
@@ -1320,11 +1431,13 @@ def run_device_frame_service_process(
 
             if input_closed or len(pending_slot_keys) >= max_staging_slots:
                 if pending_slot_keys and not completed_any:
-                    time.sleep(0.001)
+                    next(iter(pipeline_slots_by_transport.values())).d2h_done.synchronize()
                 continue
 
             try:
-                request = request_queue.get(timeout=0.01 if pending_slot_keys else 0.2)
+                request = request_queue.get(
+                    timeout=_PENDING_REQUEST_POLL_SECONDS if pending_slot_keys else _QUEUE_POLL_SECONDS
+                )
             except queue.Empty:
                 continue
 
@@ -1354,6 +1467,9 @@ def run_device_frame_service_process(
             shared_buffers.close()
         for shared_input in shared_inputs_by_memory_name.values():
             shared_input.close()
+        for arrays in shared_variable_outputs.values():
+            for shared_array in arrays:
+                shared_array.close()
         pipeline_slots.clear()
         pipeline_slots_by_transport.clear()
         shared_inputs_device_by_memory_name.clear()

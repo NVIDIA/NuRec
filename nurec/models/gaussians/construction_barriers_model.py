@@ -141,18 +141,18 @@ class ConstructionBarriersGaussianModel(SHGaussianModel):
                 raise ValueError("Invalid source cuboid geometry/identity for noise rejection")
             self._cuboid_constraint_cache = cached = (track_ids, centers, rotations, dimensions)
         track_ids, centers, rotations, dimensions = cached
-        # Resolve live IDs each step: topology/reordering can change row offsets.
-        rows = torch.searchsorted(track_ids, self.barrier_object_id)
-        rotation = rotations[rows]
-        local = ((self.positions - centers[rows]).unsqueeze(-1) * rotation).sum(-2)
-        delta_local = ((proposal - self.positions).unsqueeze(-1) * rotation).sum(-2)
-        half = dimensions[rows] * (0.5 * self.config.cuboid_perturbation_scale)
-        current = local.abs() - half
-        proposed = (local + delta_local).abs() - half
-        blocked = ((current < 0) & (proposed >= 0)) | ((current >= 0) & (proposed > current))
-        filtered_local = torch.where(blocked, 0, delta_local)
-        filtered_world = (rotation * filtered_local.unsqueeze(-2)).sum(-1)
-        self.positions.copy_(torch.where(blocked.any(-1)[:, None], self.positions + filtered_world, proposal))
+        from nurec.libs.cuboid_relocation import constrain_perturbation
+
+        constrain_perturbation(
+            self.positions,
+            proposal,
+            self.barrier_object_id,
+            track_ids,
+            centers,
+            rotations,
+            dimensions,
+            self.config.cuboid_perturbation_scale,
+        )
 
 
 BaseGaussianModel.register_to_gaussians_factory("construction-barriers-gaussians", ConstructionBarriersGaussianModel)

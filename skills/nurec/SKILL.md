@@ -152,7 +152,7 @@ evaluate metrics. Concrete triggers:
 1. **Set up source and dependencies.** Follow
    [references/install.md](references/install.md). Set `NUREC_SRC` and the
    release-matched `NUREC_DEV_DEPS_IMAGE`, then build `NUREC_IMAGE` with
-   `deps/docker/Dockerfile-dev.build` and `--build-arg BASE_IMAGE`. Source
+   `deps/docker/Dockerfile-dev.build` and `--build-arg NUREC_DEV_DEPS_IMAGE`. Source
    `"$NUREC_SRC/skills/nurec/scripts/nurec_dev.sh"` in each tool shell; every application command uses
    this built development image.
 2. **Validate prerequisites and build.** Run

@@ -79,6 +79,8 @@ class GaussianAttributes:
     extra_signal: Optional[np.ndarray] = None
     camera_extra_signal: Optional[np.ndarray] = None
     lidar_extra_signal: Optional[np.ndarray] = None
+    lidar_intensity: Optional[np.ndarray] = None
+    lidar_raydrop_logits: Optional[np.ndarray] = None
 
     def filter_non_finite_gaussians(self) -> Tuple["GaussianAttributes", np.ndarray]:
         """Filter out Gaussians with NaN/Inf (non-finite) values in any critical attribute.
@@ -147,6 +149,10 @@ class GaussianAttributes:
             extra_signal=self.extra_signal[valid_mask] if self.extra_signal is not None else None,
             camera_extra_signal=self.camera_extra_signal[valid_mask] if self.camera_extra_signal is not None else None,
             lidar_extra_signal=self.lidar_extra_signal[valid_mask] if self.lidar_extra_signal is not None else None,
+            lidar_intensity=self.lidar_intensity[valid_mask] if self.lidar_intensity is not None else None,
+            lidar_raydrop_logits=self.lidar_raydrop_logits[valid_mask]
+            if self.lidar_raydrop_logits is not None
+            else None,
         )
 
         return filtered, valid_mask
@@ -208,6 +214,7 @@ class GaussianExportAccessor:
             specular_dim=specular_dim,
         )
         self.collector = collect.CreateGaussianParameterCollector(layers_config)
+        self._warned_lidar_sh_export = False
 
     #
     # Basic info
@@ -315,6 +322,35 @@ class GaussianExportAccessor:
             track_visibility_mask = self._to_numpy(cast(collect.LayerDataRigid, layer_data).keep_mask)
 
         # Use collected positions/scales/densities as they include track transforms and deformations
+        lidar_extra_signal = params.get("lidar_extra_signal")
+
+        def get_lidar_signal(name: str) -> Optional[np.ndarray]:
+            if lidar_extra_signal is None or name not in self.model.lidar_extra_signal_param_infos[0]:
+                return None
+            signal_index = self.model.lidar_extra_signal_param_infos[0][name]
+            try:
+                lidar_signal_sph_dim = self.model.get_lidar_extra_signal_sph_dim()
+            except AttributeError:
+                lidar_signal_sph_degree = getattr(self.model.config.particle, "lidar_extra_signal_sph_degree", 0)
+                lidar_signal_sph_dim = (int(lidar_signal_sph_degree) + 1) ** 2
+            signal_dims = self.model.lidar_extra_signal_param_infos[1]
+            # Coefficient-major storage: [N, SH coefficients, signal channels].
+            coefficients = lidar_extra_signal.reshape(
+                lidar_extra_signal.shape[0], lidar_signal_sph_dim, sum(signal_dims)
+            )
+            signal_values = coefficients[:, 0, :]
+            if lidar_signal_sph_dim > 1:
+                if not self._warned_lidar_sh_export:
+                    log.warning(
+                        "Exporting LiDAR SH signals as view-independent intensity and raydrop: "
+                        "higher-order coefficients are ignored (treated as zero)."
+                    )
+                    self._warned_lidar_sh_export = True
+                # Match gsplat SH evaluation with clamp=False and higher bands zero.
+                signal_values = signal_values * 0.28209479177387814 + 0.5
+            signal_values = torch.split(signal_values, signal_dims, dim=-1)[signal_index]
+            return self._to_numpy(signal_values)
+
         return (
             GaussianAttributes(
                 positions=self._to_numpy(collected.positions),
@@ -323,7 +359,9 @@ class GaussianExportAccessor:
                 densities=self._to_numpy(params["densities"] if preactivation else collected.densities),
                 extra_signal=self._to_numpy_optional(params.get("extra_signal")),
                 camera_extra_signal=self._to_numpy_optional(params.get("camera_extra_signal")),
-                lidar_extra_signal=self._to_numpy_optional(params.get("lidar_extra_signal")),
+                lidar_extra_signal=self._to_numpy_optional(lidar_extra_signal),
+                lidar_intensity=get_lidar_signal("intensity"),
+                lidar_raydrop_logits=get_lidar_signal("raydrop"),
                 albedo_coefficients=self._to_numpy(collected.features[:, :3]),
                 specular_coefficients=self._to_numpy(collected.features[:, 3:]),
             ),

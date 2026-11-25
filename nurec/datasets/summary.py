@@ -193,21 +193,37 @@ class DataSourceSummary:
         json: Dict[str, Any],
         infer_missing: bool = False,
         track_split_metadata: TrackSplitMetadata | dict[str, Any] | None = None,
+        device: Optional[torch.device] = None,
     ) -> Self:
-        """
-        Used to create the summary from a dictionary, when running inference without
-        access to the dataset (i.e. instantiating just the model, not the entire system).
+        """Restore an inference summary without opening its source dataset.
 
-        Args:
-            json: (dict) serialized DatasourceSummary
-            infer_missing: (bool) if True, missing fields will be inferred from the datasource
-                (possibly setting to None if not defaults are provided). A warning will be issued.
-
-        Returns:
-            DatasourceSummary
+        Missing fields use their defaults. With ``infer_missing=True``, fields
+        without defaults become ``None``. Non-optional ``None`` values emit warnings
+        and may fail initialization checks.
+        Decode cuboid tracks on ``device``; ``None`` selects CUDA.
         """
+        if device is None:
+            state = DataSourceSummary.State.from_dict(json, infer_missing=infer_missing)
+        else:
+            data = dict(json)
+            serialized_tracks = {
+                name: data.pop(name) for name in ("sequence_tracks_all", "sequence_tracks_dynamic") if name in data
+            }
+            data.update({name: None for name in serialized_tracks})
+            state = DataSourceSummary.State.from_dict(data, infer_missing=infer_missing)
+            for name, sequences in serialized_tracks.items():
+                setattr(
+                    state,
+                    name,
+                    None
+                    if sequences is None
+                    else {
+                        sequence_id: CuboidTracks.Factory.from_serialized(tracks, device)
+                        for sequence_id, tracks in sequences.items()
+                    },
+                )
         return cls(
-            state=DataSourceSummary.State.from_dict(json, infer_missing=infer_missing),
+            state=state,
             datasource=None,
             track_split_metadata=cls._normalize_track_split_metadata(track_split_metadata),
         )

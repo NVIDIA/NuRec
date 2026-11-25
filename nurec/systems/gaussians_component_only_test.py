@@ -31,7 +31,7 @@ from nurec.datasets.ncore import NCORETrainDataset
 from nurec.libs.losses.models.camera_loss_masks import CameraLossKind
 from nurec.libs.losses.models.render_losses import LPIPSLoss
 from nurec.libs.losses.orchestration.component_only_normalization import ComponentOnlyLossNormalizationContext
-from nurec.libs.losses.orchestration.config import LossConfig, LossItemConfig
+from nurec.libs.losses.orchestration.config import LossAccumulatorReturn, LossConfig, LossItemConfig
 from nurec.libs.losses.orchestration.loss_aggregator import LossAggregator
 from nurec.systems.active_tile_mapping_prewarmer import ActiveTileMappingPrewarmer
 from nurec.systems.base import BaseSystemSO
@@ -63,6 +63,7 @@ def _bare_system() -> GaussiansSystem:
     system._active_tile_mapping_prewarmer = ActiveTileMappingPrewarmer()
     system._in_process_instant_nurec_initialized = False
     system.cached_config = _ns(in_process_instant_nurec=None)
+    system.logger_enabled = True
     system.__dict__["_device"] = torch.device("cpu")
     return system
 
@@ -587,6 +588,47 @@ class TestMaskCoverageProbe(unittest.TestCase):
         self.assertEqual(system._component_only_probe_batches_seen, system._COMPONENT_ONLY_EMPTY_PROBE_BATCHES)
         self.assertEqual(system._component_only_probe_batches_with_kept, 1)
 
+    def test_missing_visibility_is_reported_after_coverage_collective(self) -> None:
+        system = self._probe_system()
+        system.model = _ns(
+            _component_only_mask_spec=_bbox_spec(),
+            gaussians_strategy=mock.Mock(),
+            controller_distillation_active=False,
+        )
+        system._pending_selective_adam_visibility = None
+        system._pending_mcmc_visibility = None
+        system._training_harmonizer = mock.Mock(should_use_novel_view=lambda: False)
+        system._get_selective_adam_step_layers = mock.Mock(return_value=((), frozenset()))
+        system._component_only_probe_batches_seen = 15
+        system._component_only_probe_batches_with_kept = 0
+        events: list[str] = []
+
+        def fail_validation() -> None:
+            events.append("validate")
+            raise RuntimeError("missing source")
+
+        pending = _ns(require_complete_sources=fail_validation)
+        out = _ns(mcmc_visibility_union=pending)
+
+        def record_coverage(_batch, _out, _batch_idx):
+            system._record_component_only_mask_coverage(torch.ones((1, 1, 1), dtype=torch.bool))
+            return _ns()
+
+        with (
+            mock.patch.object(system, "forward", return_value=out),
+            mock.patch.object(system, "_training_losses", side_effect=record_coverage),
+            mock.patch.object(system, "_raise_if_publication_failed"),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=lambda *_args, **_kwargs: events.append("coverage_sum"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing source"):
+                system.training_losses(_ns(), 0)
+        self.assertEqual(events, ["coverage_sum", "validate"])
+
 
 class TestOnTrainStartInventory(unittest.TestCase):
     def _system(self, resume: bool) -> tuple[GaussiansSystem, mock.MagicMock]:
@@ -992,8 +1034,7 @@ class TestLossNormalizationCompatibility(unittest.TestCase):
         system.mode = "train"
         system.model = _ns(component_only=component_only, _component_only_mask_spec=object())
         system.loss = _ns(
-            losses=[_ns(name=name) for name in configured_loss_names],
-            in_cuda=_ns(losses=[]),
+            configured_losses=[_ns(name=name) for name in configured_loss_names],
         )
         return system
 
@@ -1035,6 +1076,71 @@ class TestLossNormalizationCompatibility(unittest.TestCase):
 
 
 class TestTrainingLossesAppliesMask(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_loss_logging_gate_preserves_finalization_and_weighted_values(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(logger_enabled=enabled):
+                raw = torch.tensor([2.0, 4.0, 6.0], device="cuda", requires_grad=True)
+                weights = raw.new_tensor([0.5, -2.0, 0.0])
+                result = LossAccumulatorReturn(
+                    raw * weights,
+                    {"rgb": 0, "ground": 1, "zero": 2},
+                    {"rgb": 0.5, "ground": -2.0, "zero": 0.0},
+                )
+                calibration = torch.tensor(2.0, device="cuda", requires_grad=True)
+                system = _bare_system()
+                system.logger_enabled = enabled
+                system.apply_alpha = mock.Mock()
+                system._maybe_apply_component_only_mask = mock.Mock(return_value=None)
+                system.loss = mock.Mock()
+                system.loss.return_value = result
+                system.model = _ns(calib=_ns(regularization_loss=lambda: ("calibration", calibration, 3.0)))
+                logging_fn = mock.Mock()
+                system.log = logging_fn
+                batch = _ns(data=_ns(camera=None), rendering=_ns(camera=None, lidar=None))
+
+                with (
+                    mock.patch.object(GaussiansSystem, "global_step", 0),
+                    mock.patch.object(result, "log", wraps=result.log) as log,
+                ):
+                    actual = system._training_losses(batch, _ns(), batch_local_idx=0)
+
+                self.assertIs(actual, result)
+                if not enabled:
+                    self.assertIsNone(result._finalized)
+                total = result.compute_total()
+                self.assertTrue(total.requires_grad)
+                torch.testing.assert_close(total, raw.new_tensor(-1.0))
+                logged = {
+                    call.args[0]: call.args[1]
+                    for call in logging_fn.call_args_list
+                    if call.args[0].startswith(("loss/", "train_params/"))
+                }
+                if enabled:
+                    log.assert_called_once_with(logging_fn=system.log)
+                    expected = {
+                        "loss/rgb": 1.0,
+                        "loss/ground": -8.0,
+                        "loss/zero": 0.0,
+                        "loss/calibration": 6.0,
+                        "train_params/rgb_lambda": 0.5,
+                        "train_params/ground_lambda": -2.0,
+                        "train_params/zero_lambda": 0.0,
+                        "train_params/calibration_lambda": 3.0,
+                    }
+                    self.assertEqual(set(logged), set(expected))
+                    for name, value in expected.items():
+                        if name.startswith("loss/"):
+                            torch.testing.assert_close(logged[name], raw.new_tensor(value))
+                        else:
+                            self.assertEqual(logged[name], value)
+                else:
+                    log.assert_not_called()
+                    self.assertEqual(logged, {})
+                total.backward()
+                torch.testing.assert_close(raw.grad, weights)
+                torch.testing.assert_close(calibration.grad, calibration.new_tensor(3.0))
+
     def test_mask_applied_between_alpha_and_loss(self) -> None:
         system = _bare_system()
         recorder = mock.Mock()
@@ -1058,7 +1164,7 @@ class TestTrainingLossesAppliesMask(unittest.TestCase):
         call_order = [name for name, _, _ in recorder.mock_calls if name in ("apply_alpha", "mask", "loss")]
         self.assertEqual(call_order, ["apply_alpha", "mask", "loss"])
 
-    def test_all_valid_pixels_context_rescales_after_loss(self) -> None:
+    def test_all_valid_pixels_context_rescales_before_calibration(self) -> None:
         import nurec.systems.gaussians as system_module
 
         system = _bare_system()
@@ -1067,16 +1173,22 @@ class TestTrainingLossesAppliesMask(unittest.TestCase):
         context = ComponentOnlyLossNormalizationContext.capture(flags)
         system._maybe_apply_component_only_mask = mock.MagicMock(return_value=context)
         loss_return = mock.MagicMock()
-        system.loss = mock.MagicMock(return_value=loss_return)
+        system.loss = mock.MagicMock()
+        system.loss.return_value = loss_return
         distance_loss = _ns(
             name="distance_l1_mean",
             component_only_camera_loss_kind=CameraLossKind.DISTANCE,
             min_distance=1.0,
             max_distance=80.0,
         )
-        system.loss.losses = [distance_loss]
-        system.loss.in_cuda.losses = [_ns(name="rgb_l1_mean", component_only_camera_loss_kind=CameraLossKind.RGB)]
-        system.model = _ns(calib=_ns(regularization_loss=mock.MagicMock(return_value=None)))
+        system.loss.configured_losses = [
+            distance_loss,
+            _ns(name="rgb_l1_mean", component_only_camera_loss_kind=CameraLossKind.RGB),
+        ]
+        calibration = torch.tensor(2.0, requires_grad=True)
+        system.model = _ns(
+            calib=_ns(regularization_loss=mock.MagicMock(return_value=("calibration", calibration, 3.0)))
+        )
         system.log = mock.MagicMock()
         system.config = _ns(record_quality_metrics=_ns(psnr_interval=2))
         labels = CameraFrameLabels(flags=flags)
@@ -1086,23 +1198,30 @@ class TestTrainingLossesAppliesMask(unittest.TestCase):
         )
         out = _ns()
 
+        order = mock.Mock()
+        order.attach_mock(system.loss, "loss")
+        order.attach_mock(loss_return.append_loss, "append")
         with (
             mock.patch.object(GaussiansSystem, "global_step", 1),
             mock.patch.object(system_module, "rescale_camera_mean_losses_to_original_valid_pixels") as rescale,
         ):
+            order.attach_mock(rescale, "rescale")
             actual = system._training_losses(batch, out, batch_local_idx=0)
 
         self.assertIs(actual, loss_return)
+        system.loss.assert_called_once_with(results=out, target=batch, model=system.model, step=1)
         rescale.assert_called_once_with(
             loss_return,
             labels,
             context,
-            camera_loss_kinds_by_name={
-                "distance_l1_mean": CameraLossKind.DISTANCE,
-                "rgb_l1_mean": CameraLossKind.RGB,
-            },
+            camera_loss_kinds_by_name={"distance_l1_mean": CameraLossKind.DISTANCE, "rgb_l1_mean": CameraLossKind.RGB},
             distance_bounds_by_name={"distance_l1_mean": (1.0, 80.0)},
         )
+        self.assertEqual(
+            [name for name, _, _ in order.mock_calls if name in ("loss", "rescale", "append")],
+            ["loss", "rescale", "append"],
+        )
+        loss_return.append_loss.assert_called_once_with(name="calibration", value=calibration, weight=3.0)
 
 
 class TestValidationStepAppliesMask(unittest.TestCase):
@@ -1112,7 +1231,7 @@ class TestValidationStepAppliesMask(unittest.TestCase):
         system.config.test.track_rotation.track_ids = []
         results = _ns(rendered_cam=None, rendered_lidar=None)
         system.model = _ns(
-            raise_if_mcmc_publication_failed=lambda: None,
+            raise_if_publication_failed=lambda: None,
         )
         system.forward = mock.MagicMock(return_value=results)
         system.harmonizer_config = _ns(inference=_ns(enabled=False))

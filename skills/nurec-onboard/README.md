@@ -356,7 +356,7 @@ bazel test //skills/nurec-onboard/...
 The converter template under [`ncore_template/`](ncore_template/) is a standalone Bazel module, excluded from the root workspace, that the commands above do not cover. Its end-to-end test (`ncore_example_test`) also runs the platform `validate` and `eval` binaries, which it finds through `NCORE_VALIDATE_BIN` and `NCORE_EVAL_BIN`; without them it skips those portions. To run the full template suite:
 
 ```bash
-bazel build //skills/nurec-onboard/ncore_validation:validate //skills/nurec-onboard/ncore_validation:eval
+bazel build --build_runfile_links //skills/nurec-onboard/ncore_validation:validate //skills/nurec-onboard/ncore_validation:eval
 ncore_validation_bin="$(bazel info bazel-bin)/skills/nurec-onboard/ncore_validation"
 export NCORE_VALIDATE_BIN="$ncore_validation_bin/validate"
 export NCORE_EVAL_BIN="$ncore_validation_bin/eval"

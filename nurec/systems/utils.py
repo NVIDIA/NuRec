@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,12 +13,12 @@ from nurec.datamodules.base import BaseDataModule
 
 
 if TYPE_CHECKING:
-    from nurec.libs.losses.orchestration.loss_aggregator import LossAggregator
+    from nurec.libs.losses.orchestration.loss_orchestrator import LossOrchestrator
     from nurec.models.base import BaseModel
 
 
 def update_module_step(
-    m: Union[BaseModel, LossAggregator], epoch: int, global_step: int, system, **kwargs
+    m: BaseModel | LossOrchestrator, epoch: int, global_step: int, system, **kwargs
 ) -> dict[str, torch.Tensor]:
     additional_parameters = m.update_step_train_batch_start(epoch, global_step, system, **kwargs)
     return additional_parameters

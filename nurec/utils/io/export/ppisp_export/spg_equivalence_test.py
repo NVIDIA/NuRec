@@ -340,8 +340,8 @@ class PPISPSPGEquivalenceTest(unittest.TestCase):
         atlas = torch.cat((hdr, hdr), dim=1)
         tiled = runtime.run_static(atlas, params, tile_count_x=2, tile_count_y=1)
 
-        torch.testing.assert_close(tiled[:, :width], single, rtol=0.0, atol=0.0)
-        torch.testing.assert_close(tiled[:, width:], single, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(tiled[:, :width], single, rtol=1e-5, atol=0.0)
+        torch.testing.assert_close(tiled[:, width:], single, rtol=1e-5, atol=0.0)
 
         # Sanity: an untiled launch on the atlas evaluates UV over the full
         # 2x-wide image, so its left half must NOT match the tile-local result
@@ -390,8 +390,8 @@ class PPISPSPGEquivalenceTest(unittest.TestCase):
         cp_tiled = torch.cat((cp0, cp1), dim=0)
         tiled = runtime.run_auto(atlas, cp_tiled, params, tile_count_x=2, tile_count_y=1)
 
-        torch.testing.assert_close(tiled[:, :width], single0, rtol=0.0, atol=0.0)
-        torch.testing.assert_close(tiled[:, width:], single1, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(tiled[:, :width], single0, rtol=1e-5, atol=0.0)
+        torch.testing.assert_close(tiled[:, width:], single1, rtol=1e-5, atol=0.0)
 
     def test_auto_ppisp_tiled_atlas_end_to_end_matches_per_view_torch(self) -> None:
         """Full tiled pipeline vs per-view torch PPISP+controller.

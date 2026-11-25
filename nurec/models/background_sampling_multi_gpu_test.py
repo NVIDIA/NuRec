@@ -156,8 +156,12 @@ def _coverage_ddp_worker(rank: int, init_file: str) -> None:
         expected = torch.stack(gathered).mean(dim=0)
         background = _make_cubemap_background(device)
         raw_rgb = background._sample_raw(rays)
+        # ``_track_texture_grads`` takes world-frame rays and rotates them into OpenGL itself;
+        # undo the signed permutation (exact in float32) so the coverage lands on ``rays``.
+        world_rays = torch.roll(rays * background._opengl_axis_sign, shifts=1, dims=-1)
+        assert torch.equal(background._rotate_rays_to_opengl(world_rays), rays)
 
-        background._track_texture_grads(raw_rgb, rays, 1 - weights, texture_update_mask=None, is_training=True)
+        background._track_texture_grads(raw_rgb, world_rays, 1 - weights, texture_update_mask=None, is_training=True)
 
         assert background.n_grad_updates == 2
         torch.testing.assert_close(background.texture_grads, expected, atol=2e-5, rtol=2e-5)

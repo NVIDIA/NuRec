@@ -1,0 +1,14 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model:
+  strategy:
+    add:
+      start_iteration: 450
+      end_iteration: 27000
+      frequency: 450
+    relocate:
+      start_iteration: 450
+      end_iteration: 22500
+      frequency: 450

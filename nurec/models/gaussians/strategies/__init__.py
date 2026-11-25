@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from nurec.models.gaussians.strategies.base import BaseGaussianStrategy
 from nurec.models.gaussians.strategies.gsplat import GSplatStrategy
-from nurec.models.gaussians.strategies.mcmc import MCMCStrategy
+from nurec.models.gaussians.strategies.mcmc import BaseMCMCStrategy, MCMCStrategy, TamingGSMCMCStrategy
 
 
 # These imports in __all__ are only used for documentation and shouldn't
@@ -12,5 +12,7 @@ from nurec.models.gaussians.strategies.mcmc import MCMCStrategy
 __all__ = [
     "BaseGaussianStrategy",
     "GSplatStrategy",
+    "BaseMCMCStrategy",
     "MCMCStrategy",
+    "TamingGSMCMCStrategy",
 ]

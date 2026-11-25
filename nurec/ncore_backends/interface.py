@@ -17,6 +17,8 @@ from upath import UPath
 
 import ncore.data
 
+from nurec.lidar.firing_patterns.schema import LidarFiringPatternTemplatesData
+
 
 MetadataValue = bool | float | int | str | list[float]
 JsonObject = Mapping[str, object]
@@ -110,6 +112,29 @@ class DatasetBackend(Protocol):
         self,
         lidar_sensor: ncore.data.LidarSensorProtocol,
     ) -> dict[str, MetadataValue]: ...
+
+    def get_lidar_firing_pattern_templates(
+        self,
+        request: DatasetRequest,
+        sensor_id: str,
+    ) -> LidarFiringPatternTemplatesData | None:
+        """Read native templates by dataset and sensor identifier.
+
+        Args:
+            request: Resolved dataset request identifying the sequence manifest.
+            sensor_id: Native component instance name, equal to the logical lidar ID.
+
+        Returns:
+            Validated templates, or ``None`` when the component is absent or its
+            observations are insufficient to establish a repeating cycle.
+
+        Raises:
+            UnsupportedBackendOperationError: If the backend or component version
+                does not support native firing patterns.
+            ValueError: If native data is invalid or explicitly not repeatable.
+            OSError: If the manifest or component store cannot be read.
+        """
+        ...
 
 
 class ShardDataLoaderProtocol(Protocol):

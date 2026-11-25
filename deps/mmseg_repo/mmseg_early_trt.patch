@@ -1,0 +1,125 @@
+--- a/mmseg/apis/inference.py
++++ b/mmseg/apis/inference.py
+@@ -72,43 +72,28 @@
+ 
+     init_default_scope(config.get('default_scope', 'mmseg'))
+ 
+-    model = MODELS.build(config.model)
+-    if checkpoint is not None:
+-        checkpoint = load_checkpoint(model, checkpoint, map_location='cpu')
+-        dataset_meta = checkpoint['meta'].get('dataset_meta', None)
+-        # save the dataset_meta in the model for convenience
+-        if 'dataset_meta' in checkpoint.get('meta', {}):
+-            # mmseg 1.x
+-            model.dataset_meta = dataset_meta
+-        elif 'CLASSES' in checkpoint.get('meta', {}):
+-            # < mmseg 1.x
+-            classes = checkpoint['meta']['CLASSES']
+-            palette = checkpoint['meta']['PALETTE']
+-            model.dataset_meta = {'classes': classes, 'palette': palette}
+-        else:
+-            warnings.simplefilter('once')
+-            warnings.warn('dataset_meta or class names are not saved in the '
+-                          "checkpoint's meta data, classes and palette will be"
+-                          'set according to num_classes ')
+-            num_classes = model.decode_head.num_classes
+-            dataset_name = None
+-            for name in dataset_aliases.keys():
+-                if len(get_classes(name)) == num_classes:
+-                    dataset_name = name
+-                    break
+-            if dataset_name is None:
+-                warnings.warn(
+-                    'No suitable dataset found, use Cityscapes by default')
+-                dataset_name = 'cityscapes'
+-            model.dataset_meta = {
+-                'classes': get_classes(dataset_name),
+-                'palette': get_palette(dataset_name)
+-            }
+-    model.cfg = config  # save the config in the model for convenience
+-    model.to(device)
+-    model.eval()
+-    # load trt model
++    # TensorRT inference needs only the config and checkpoint metadata. Keep
++    # checkpoint tensor storages memory-mapped on CPU and avoid constructing
++    # or uploading the unused PyTorch network.
+     if trt_checkpoint and hasattr(config, 'trt_settings'):
++        checkpoint_meta = {}
++        if checkpoint is not None:
++            # Read pickle metadata; mmap leaves unused tensor weight pages
++            # file-backed instead of reading the full checkpoint eagerly.
++            checkpoint_data = torch.load(
++                checkpoint,
++                map_location='cpu',
++                weights_only=False,
++                mmap=True,
++            )
++            checkpoint_meta = checkpoint_data.get('meta', {})
++            del checkpoint_data
++        dataset_meta = (
++            _get_dataset_meta(
++                checkpoint_meta, lambda: config.model.decode_head.num_classes)
++            if checkpoint is not None
++            else None
++        )
+         trt_model = Mask2formerInferencer(
+             engine_path=trt_checkpoint,
+             input_shape=(config.trt_settings.batch_size,
+@@ -119,9 +104,56 @@
+             is_inference=True,
+         )
+         trt_model.cfg = config
+-        trt_model.dataset_meta = model.dataset_meta
++        trt_model.dataset_meta = dataset_meta
+         return trt_model
++
++    model = MODELS.build(config.model)
++    if checkpoint is not None:
++        checkpoint = load_checkpoint(model, checkpoint, map_location='cpu')
++        model.dataset_meta = _get_dataset_meta(
++            checkpoint.get('meta', {}), lambda: model.decode_head.num_classes)
++    model.cfg = config  # save the config in the model for convenience
++    model.to(device)
++    model.eval()
+     return model
++
++
++def _get_dataset_meta(checkpoint_meta, get_num_classes):
++    """Resolve checkpoint metadata using the existing compatibility rules.
++
++    Args:
++        checkpoint_meta: Saved dataset_meta or legacy CLASSES and PALETTE.
++        get_num_classes: Class-count getter used only when metadata is absent.
++
++    Returns:
++        Saved metadata, including an explicit None, or inferred classes and
++        palette when checkpoint metadata is absent.
++    """
++    if 'dataset_meta' in checkpoint_meta:
++        # mmseg 1.x
++        return checkpoint_meta['dataset_meta']
++    if 'CLASSES' in checkpoint_meta:
++        # < mmseg 1.x
++        return {
++            'classes': checkpoint_meta['CLASSES'],
++            'palette': checkpoint_meta['PALETTE'],
++        }
++
++    warnings.simplefilter('once')
++    warnings.warn('dataset_meta or class names are not saved in the '
++                  "checkpoint's meta data, classes and palette will be"
++                  'set according to num_classes ')
++    num_classes = get_num_classes()
++    dataset_name = next(
++        (name for name in dataset_aliases
++         if len(get_classes(name)) == num_classes), None)
++    if dataset_name is None:
++        warnings.warn('No suitable dataset found, use Cityscapes by default')
++        dataset_name = 'cityscapes'
++    return {
++        'classes': get_classes(dataset_name),
++        'palette': get_palette(dataset_name),
++    }
+ 
+ 
+ ImageType = Union[str, np.ndarray, Sequence[str], Sequence[np.ndarray]]

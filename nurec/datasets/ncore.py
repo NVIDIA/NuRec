@@ -15,6 +15,7 @@ from enum import Enum, IntEnum, auto, unique
 from pathlib import Path
 from types import EllipsisType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Collection,
     Dict,
@@ -33,7 +34,6 @@ from weakref import WeakValueDictionary
 import cv2
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 import PIL.Image as PILImage
 import simplejpeg
 import torch
@@ -53,6 +53,7 @@ import nurec.utils.ncore_utils as ncore_utils
 
 from nurec.config.base_schema import PerSensor, resolve_per_sensor
 from nurec.config.dataset import LidarNominalModel, NCoreDatasetConfig
+from nurec.config.image_resolution import resolve_camera_image_resolution_transforms
 from nurec.config.nurec import NuRecConfig
 from nurec.config.sensor import LidarModelsConfig
 from nurec.datasets.base import (
@@ -62,6 +63,7 @@ from nurec.datasets.base import (
     BaseDataSource,
     RigTrajectoriesProvider,
 )
+from nurec.datasets.camera_init import CameraInitFrames
 from nurec.datasets.registry import register as register_dataset
 from nurec.datasets.samplers.base import (
     BaseBatchSampler,
@@ -117,6 +119,8 @@ from nurec.utils.geometry import (
     se3_matrix_to_tquat,
     tquat_to_se3_matrix,
 )
+from nurec.utils.image_resolution import ImageResolutionTransform, resize_image_array
+from nurec.utils.initialization import current_initialization, load_initialization_ply
 from nurec.utils.lidar_firing_lattice import FiringLatticeEstimator
 from nurec.utils.lidar_model import LidarModelBundle, get_lidar_model_parameters_with_fallbacks
 from nurec.utils.misc import (
@@ -149,6 +153,10 @@ from nurec.utils.unstructured_lidar import (
     unstructured_model_from_fov,
 )
 from nurec.visualdebugger import get_visualdebugger
+
+
+if TYPE_CHECKING:
+    import pandas as pd  # annotation only; pandas is not needed to load a dataset
 
 
 logger = logging.getLogger(__name__)
@@ -476,8 +484,8 @@ class NCOREDataset(BaseDataset):
                 # decode image data on CPU
                 frame_image_array = datasource.decode_image_cpu(
                     camera_sensor.get_frame_handle(sensor_frame_idx),
-                    # perform subsampling while decoding, if required
-                    subsample_factor=map_optional(sampled_pixels, lambda x: x.subsample_factor),
+                    # Perform resizing while decoding, if required.
+                    image_transform=sampled_pixels.image_transform if sampled_pixels is not None else None,
                 )
 
             # Note: In the case of a non-None subsampled rect we also need to
@@ -1374,8 +1382,6 @@ class NCORESequentialDataset(NCOREDataset):
         assert config.name == "ncore"
 
         # store relevant parameters from config
-        self.n_image_subsample: int
-
         camera_frame_step: int | None
         camera_exclude_frame_step: int | None
         self.camera_frames: dict[str, list[int]] = {}
@@ -1387,7 +1393,8 @@ class NCORESequentialDataset(NCOREDataset):
         self.return_camera: bool
 
         if split == "val":
-            self.n_image_subsample = config.n_val_image_subsample
+            image_resolution = config.n_val_image_resolution
+            image_resolution_field_name = "dataset.n_val_image_resolution"
             camera_frame_start = config.val_camera_frame_start
             camera_frame_step = config.val_camera_frame_step
             camera_exclude_frame_start = config.val_camera_exclude_frame_start
@@ -1399,7 +1406,8 @@ class NCORESequentialDataset(NCOREDataset):
             self.return_lidar = config.val_lidar
             self.return_camera = config.val_camera
         elif split == "train-sequential":
-            self.n_image_subsample = config.n_train_sequential_image_subsample
+            image_resolution = config.n_train_sequential_image_resolution
+            image_resolution_field_name = "dataset.n_train_sequential_image_resolution"
             camera_frame_start = config.train_sequential_camera_frame_start
             camera_frame_step = config.train_sequential_camera_frame_step
             camera_exclude_frame_start = config.train_sequential_camera_exclude_frame_start
@@ -1412,6 +1420,24 @@ class NCORESequentialDataset(NCOREDataset):
             self.return_camera = config.train_sequential_camera
         else:
             raise ValueError(f"Unexpected {split=}.")
+
+        self.image_resolution_transforms = (
+            resolve_camera_image_resolution_transforms(
+                image_resolution,
+                active_camera_ids=self.camera_ids,
+                source_resolutions={
+                    camera_id: (
+                        int(camera_model.resolution[0].item()),
+                        int(camera_model.resolution[1].item()),
+                    )
+                    for camera_id, camera_model in datasource.camera_models.items()
+                },
+                field_name=image_resolution_field_name,
+                rounding="floor",
+            )
+            if self.return_camera
+            else {}
+        )
 
         assert (camera_frame_step or camera_exclude_frame_step) and (
             (not camera_frame_step) or (not camera_exclude_frame_step)
@@ -1590,18 +1616,12 @@ class NCORESequentialDataset(NCOREDataset):
                 )
                 del T_rig_nurec, T_offset
 
+                image_transform = self.image_resolution_transforms[camera_id]
+                assert image_transform.source_resolution == (camera_width, camera_height)
                 data_camera_batch = self.get_camera_data_batch(
                     camera_id,
                     camera_frame_index,
-                    RectSubsampled(
-                        i=0,
-                        j=0,
-                        height=camera_height // self.n_image_subsample,
-                        width=camera_width // self.n_image_subsample,
-                        subsample_factor=float(self.n_image_subsample),
-                        original_width=camera_width,
-                        original_height=camera_height,
-                    ),
+                    RectSubsampled.from_image_resolution_transform(image_transform),
                 )
 
                 if T_camera_delta_rot is not None or transl_delta_m is not None:
@@ -1946,6 +1966,7 @@ class NCORETrainDataset(NCOREDataset):
             original_width, original_height = datasource.camera_model_parameters[camera_id].resolution
             original_width, original_height = int(original_width), int(original_height)
             camera_subsample = camera_pixel_sampler.fixed_sampled_pixels(
+                camera_id=camera_id,
                 original_width=original_width,
                 original_height=original_height,
             )
@@ -2127,6 +2148,13 @@ class NCORETrainDataset(NCOREDataset):
         )
 
         return DataAndRenderingBatch(data=data_batch, rendering=None)
+
+
+# Camera geometry workers inside the startup scope:
+# - preparation speeds up until each camera has its own worker, then stays flat;
+# - workers share the scope's two-thread Torch budget, so extra ones mainly overlap decoding and Python work;
+# - the pool starts threads only for queued cameras, so this cap only bounds rigs with more cameras.
+_CAMERA_WORKERS = 6
 
 
 class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
@@ -2356,6 +2384,71 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
             self.camera_mask_overrides.get(camera_id),
         )
 
+    def _prepare_camera_geometry(self, camera_id: str):
+        """Prepare one camera without mutating the shared datasource."""
+        camera_sensor = self.camera_sensors[camera_id]
+        camera_model = self.camera_models[camera_id]
+
+        # sample pixel ranges
+        w = int(camera_model.resolution[0].item())
+        h = int(camera_model.resolution[1].item())
+
+        # all pixels
+        pixels = generate_grid_2d_indices((w, h)).numpy()
+
+        # Load sources in priority order. Decoding an auxiliary ego mask is
+        # unnecessary when the dataset mask (or its override) already wins.
+        camera_mask_array: Optional[np.ndarray] = None
+        for camera_mask_source in self.camera_mask_sources:
+            if camera_mask_source == "dataset":
+                camera_mask_array = self._get_dataset_camera_mask(camera_id, camera_sensor)
+            elif camera_mask_source == "aux":
+                if self.aux_loader is not None and self.aux_loader.has_egomask(camera_id):
+                    camera_mask_array = self.aux_loader.get_egomask(camera_id, 0)
+            else:
+                raise ValueError(f"Invalid camera mask source {camera_mask_source} in config")
+            if camera_mask_array is not None:
+                break
+
+        if camera_mask_array is not None:
+            # Dilate mask boundary
+            camera_mask_array = ndimage.binary_dilation(
+                camera_mask_array, iterations=self.n_camera_mask_dilation_iterations
+            )
+
+            # Subsample valid pixels relative to mask (True for parts that we want to keep)
+            camera_valid_pixels_ego_mask = np.logical_not(cast(np.ndarray, camera_mask_array))
+        else:
+            # No mask / consider all pixels as valid
+            camera_valid_pixels_ego_mask = np.ones(
+                (int(camera_model.resolution[1].item()), int(camera_model.resolution[0].item())), dtype=bool
+            )
+
+        if self.camera_mask_border is not None and camera_id in self.camera_mask_border:
+            # top, right, bottom, left
+            camera_valid_pixels_ego_mask[: self.camera_mask_border[camera_id][0]] = False
+            camera_valid_pixels_ego_mask[:, : self.camera_mask_border[camera_id][1]] = False
+            if self.camera_mask_border[camera_id][2] != 0:
+                camera_valid_pixels_ego_mask[-self.camera_mask_border[camera_id][2] :] = False
+
+            if self.camera_mask_border[camera_id][3] != 0:
+                camera_valid_pixels_ego_mask[:, -self.camera_mask_border[camera_id][3] :] = False
+
+        ego_mask = PackedMask(camera_valid_pixels_ego_mask)
+
+        # Chunk camera projection to bound scratch memory and keep CPU work local.
+        rays = (
+            torch.cat(
+                [
+                    camera_model.pixels_to_camera_rays(pixels[first : first + 65536])
+                    for first in range(0, len(pixels), 65536)
+                ]
+            )
+            .reshape(h, w, 3)
+            .numpy()
+        )
+        return pixels, rays, compute_pixel_footprint(rays), ego_mask
+
     def _load_data(self) -> None:
         """Initializes the dataset from scratch (start-up case)"""
         # Full initial load case
@@ -2365,9 +2458,7 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
         self.camera_unique_ids: dict[str, UniqueSensorId] = {}
         self.cameras_all_pixels: dict[str, np.ndarray] = {}
         self.cameras_all_rays: dict[str, np.ndarray] = {}
-        self.cameras_all_rays_halfpixoffset: dict[str, np.ndarray] = {}
         self.cameras_all_footprints: dict[str, np.ndarray] = {}
-        self.cameras_all_footprints_halfpixoffset: dict[str, np.ndarray] = {}
         self.cameras_valid_pixels_ego_masks: dict[str, PackedMask] = {}
         self.cameras_frame_valid_pixels_masks: dict[str, dict[int, PackedMask]] = defaultdict(dict)
         self.cameras_frame_track_idxs: dict[str, dict[int, np.ndarray]] = defaultdict(dict)
@@ -2407,6 +2498,10 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                 dataset_paths=self.dataset_paths,
                 open_consolidated=self.open_consolidated,
             )
+
+        if (resources := current_initialization()) is not None:
+            for callback in resources.on_datasource_loading:
+                callback(self)
 
         ## Load sensor data and
 
@@ -2486,7 +2581,7 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                 np.deg2rad(self.camera_max_fov_deg) / 2.0, camera_model_parameter.max_angle
             )
 
-        camera_models = self.camera_models = {
+        self.camera_models = {
             camera_id: ncore.sensors.camera_model_from_parameters(
                 camera_model_parameter, device="cpu", dtype=torch.float32
             )
@@ -2499,85 +2594,18 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
             for camera_instance_idx, camera_id in enumerate(self.all_camera_ids)
         }
 
-        # determine all pixels and rays per camera
-        for camera_id in self.all_camera_ids:
-            camera_sensor = self.camera_sensors[camera_id]
-            camera_model = camera_models[camera_id]
-
-            # sample pixel ranges
-            w = int(camera_model.resolution[0].item())
-            h = int(camera_model.resolution[1].item())
-
-            # all pixels
-            self.cameras_all_pixels |= {camera_id: generate_grid_2d_indices((w, h)).numpy()}
-
-            # dataset associated mask or mask overwrite (if present)
-            dataset_camera_mask_array = self._get_dataset_camera_mask(camera_id, camera_sensor)
-
-            # aux camera mask (if enabled and present)
-            aux_camera_mask_array: Optional[np.ndarray] = None
-            if self.aux_loader is not None:
-                if self.aux_loader.has_egomask(camera_id):
-                    aux_camera_mask_array = self.aux_loader.get_egomask(camera_id, 0)  # get the aggregated ego-mask
-
-            # determine final mask to use based on priority of sources defined in config
-            camera_mask_array: Optional[np.ndarray] = None
-            for camera_mask_source in self.camera_mask_sources:
-                if camera_mask_source == "dataset":
-                    camera_mask_array = dataset_camera_mask_array
-                elif camera_mask_source == "aux":
-                    camera_mask_array = aux_camera_mask_array
-                else:
-                    raise ValueError(f"Invalid camera mask source {camera_mask_source} in config")
-
-                if camera_mask_array is not None:
-                    break  # found a valid mask from this source
-
-            if camera_mask_array is not None:
-                # Dilate mask boundary
-                camera_mask_array = ndimage.binary_dilation(
-                    camera_mask_array, iterations=self.n_camera_mask_dilation_iterations
-                )
-
-                # Subsample valid pixels relative to mask (True for parts that we want to keep)
-                camera_valid_pixels_ego_mask = np.logical_not(cast(np.ndarray, camera_mask_array))
-            else:
-                # No mask / consider all pixels as valid
-                camera_valid_pixels_ego_mask = np.ones(
-                    (int(camera_model.resolution[1].item()), int(camera_model.resolution[0].item())), dtype=bool
-                )
-
-            if self.camera_mask_border is not None and camera_id in self.camera_mask_border:
-                # top, right, bottom, left
-                camera_valid_pixels_ego_mask[: self.camera_mask_border[camera_id][0]] = False
-                camera_valid_pixels_ego_mask[:, : self.camera_mask_border[camera_id][1]] = False
-                if self.camera_mask_border[camera_id][2] != 0:
-                    camera_valid_pixels_ego_mask[-self.camera_mask_border[camera_id][2] :] = False
-
-                if self.camera_mask_border[camera_id][3] != 0:
-                    camera_valid_pixels_ego_mask[:, -self.camera_mask_border[camera_id][3] :] = False
-
-            self.cameras_valid_pixels_ego_masks |= {camera_id: PackedMask(camera_valid_pixels_ego_mask)}
-
-            # precompute all rays at pixel centers and at half-pixel offsets
-            self.cameras_all_rays |= {
-                camera_id: camera_model.pixels_to_camera_rays(self.cameras_all_pixels[camera_id])
-                .reshape(h, w, 3)
-                .numpy()
-            }
-            self.cameras_all_rays_halfpixoffset |= {
-                camera_id: camera_model.image_points_to_camera_rays(
-                    camera_model.pixels_to_image_points(self.cameras_all_pixels[camera_id]) + 0.5
-                )
-                .reshape(h, w, 3)
-                .numpy()
-            }
-
-            # Compute the footprint of the pixels at unit length
-            self.cameras_all_footprints |= {camera_id: compute_pixel_footprint(self.cameras_all_rays[camera_id])}
-            self.cameras_all_footprints_halfpixoffset |= {
-                camera_id: compute_pixel_footprint(self.cameras_all_rays_halfpixoffset[camera_id])
-            }
+        if (resources := current_initialization()) is not None:
+            # The startup scope owns these workers and the Torch thread budget they share.
+            pool = resources.executor("init-camera", _CAMERA_WORKERS)
+            prepared_cameras = list(pool.map(self._prepare_camera_geometry, self.all_camera_ids))
+        else:
+            prepared_cameras = [self._prepare_camera_geometry(camera_id) for camera_id in self.all_camera_ids]
+        # Publish in camera order.
+        for camera_id, (pixels, rays, footprints, ego_mask) in zip(self.all_camera_ids, prepared_cameras):
+            self.cameras_all_pixels[camera_id] = pixels
+            self.cameras_all_rays[camera_id] = rays
+            self.cameras_all_footprints[camera_id] = footprints
+            self.cameras_valid_pixels_ego_masks[camera_id] = ego_mask
 
         # load lidar sensors and lidar model parameters
         self._check_if_present_sensor_ids(self.all_lidar_ids, sequence_loader.lidar_ids, "lidars")
@@ -2920,6 +2948,10 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
 
         self.aabb = AABB3D.from_center_extent(center=torch.zeros(3, dtype=torch.float32), extent=extent)
 
+        if (resources := current_initialization()) is not None:
+            for callback in resources.on_datasource_ready:
+                callback(self)
+
     def _compute_cuboid_tracks(self) -> None:
         """Computes cuboid tracks for all dynamic objects in the dataset"""
         # Only compute tracks if not initialized before
@@ -3100,6 +3132,11 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
             # tracks are required for "dynamic_tracks" method
             self._compute_cuboid_tracks()
 
+        # The dynamic track set is invariant across spins. Prepare observations
+        # once and select their original row order with a NumPy timestamp mask.
+        dynamic_observations = None
+        dynamic_timestamps = None
+
         for lidar_id in self.lidar_sensors.keys():
             lidar_frame_valid_points_masks = self.lidars_frame_valid_points_masks[lidar_id]
             lidar_frame_non_dynamic_points_masks = self.lidars_frame_non_dynamic_points_masks[lidar_id]
@@ -3136,6 +3173,13 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                     case "dynamic_tracks":
                         assert self.cuboidtracks_dynamic is not None and self.cuboids_df is not None
 
+                        # LiDAR-free shards can retain empty LiDAR frame metadata.
+                        # No cuboid transforms or point-cloud reads are needed to
+                        # produce an empty per-point mask.
+                        if not visualize and lidar_sensor.get_frame_ray_bundle_count(lidar_frame_idx) == 0:
+                            lidar_frame_non_dynamic_points_masks[lidar_frame_idx] = PackedMask(np.empty(0, dtype=bool))
+                            continue
+
                         # load dynamic track observations in current frame time
                         frame_time_start = lidar_sensor.get_frame_timestamp_us(
                             lidar_frame_idx, frame_timepoint=ncore.data.FrameTimepoint.START
@@ -3143,27 +3187,26 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                         frame_time_end = lidar_sensor.get_frame_timestamp_us(
                             lidar_frame_idx, frame_timepoint=ncore.data.FrameTimepoint.END
                         )
-                        frame_cuboids_df = self.cuboids_df[
-                            (self.cuboids_df["timestamp_us"] >= frame_time_start)
-                            & (self.cuboids_df["timestamp_us"] <= frame_time_end)
-                        ]
-
-                        observation_track_ids = _get_observation_track_ids_for_dynamic_filter(
-                            self.cuboidtracks_dynamic.tracks_id,
-                            self.track_split_metadata,
-                        )
-                        dynamic_frame_cuboids_df = frame_cuboids_df[
-                            frame_cuboids_df["track_id"].isin(observation_track_ids)
-                        ]
-
-                        dynamic_cuboid_observations = []
-                        for row in dynamic_frame_cuboids_df.itertuples(index=False):
-                            row_data: dict[str, Any] = cast(Any, row)._asdict()
-                            dynamic_cuboid_observations.append(
-                                ncore.data.CuboidTrackObservation.from_dict(row_data)
-                                if isinstance(row.bbox3, dict)
-                                else ncore.data.CuboidTrackObservation(**row_data)
+                        if dynamic_observations is None:
+                            observation_track_ids = _get_observation_track_ids_for_dynamic_filter(
+                                self.cuboidtracks_dynamic.tracks_id,
+                                self.track_split_metadata,
                             )
+                            dynamic_rows = self.cuboids_df[self.cuboids_df["track_id"].isin(observation_track_ids)]
+                            dynamic_observations = [
+                                (
+                                    ncore.data.CuboidTrackObservation.from_dict(row)
+                                    if isinstance(row["bbox3"], dict)
+                                    else ncore.data.CuboidTrackObservation(**cast(dict[str, Any], row))
+                                )
+                                for row in dynamic_rows.to_dict("records")
+                            ]
+                            dynamic_timestamps = dynamic_rows["timestamp_us"].to_numpy()
+                        assert dynamic_timestamps is not None
+                        observation_indices = np.flatnonzero(
+                            (dynamic_timestamps >= frame_time_start) & (dynamic_timestamps <= frame_time_end)
+                        )
+                        dynamic_cuboid_observations = [dynamic_observations[index] for index in observation_indices]
 
                         # Default annotation - all points are non-dynamic
                         non_dynamic_point_mask = np.full(lidar_sensor.get_frame_ray_bundle_count(lidar_frame_idx), True)
@@ -3758,22 +3801,13 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
         label_idx_list = [stuff_classes[cls] for cls in rigid_cls]
         device = torch.device("cuda")
 
-        # Get the camera frusta
-        camera_frusta = [
-            (camera_frustum.to(torch.device("cuda")), timestamp_us)
-            for camera_id in visibility_check_camera_ids
-            for camera_frustum, timestamp_us in unpack_optional(
-                self.get_camera_frusta(camera_id=camera_id, far_plane_depth=max_visible_distance)
-            )
-        ]
+        camera_frusta = None
 
         # For lidar-free: load the accumulated point cloud once and transform to NuRec frame
         ply_xyz_nurec = None
         ply_segment_id = None
         if not use_lidar:
-            import point_cloud_utils as pcu
-
-            ply_data = pcu.load_triangle_mesh(point_cloud_path).vertex_data
+            ply_data = load_initialization_ply(unpack_optional(point_cloud_path)).vertex_data
             ply_xyz_world = ply_data.positions
             ply_segment_id = ply_data.custom_attributes.get("segment_id")
             assert ply_segment_id is not None, f"PLY file {point_cloud_path} does not contain segment_id attribute"
@@ -3847,7 +3881,17 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
 
             assert_default_device_on_local_rank()
 
+            if n_clusters > 0 and camera_frusta is None:
+                camera_frusta = [
+                    (camera_frustum.to(torch.device("cuda")), timestamp_us)
+                    for camera_id in visibility_check_camera_ids
+                    for camera_frustum, timestamp_us in unpack_optional(
+                        self.get_camera_frusta(camera_id=camera_id, far_plane_depth=max_visible_distance)
+                    )
+                ]
+
             for cluster_idx in range(n_clusters):
+                assert camera_frusta is not None
                 track_id = f"generated_{rigid_cls_name}_{cluster_idx}"
                 cluster_mask = cluster_labels == cluster_idx
                 cluster_points = point_cloud_xyz[cluster_mask]
@@ -4161,6 +4205,9 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
         # make sure we are initialized
         self._maybe_init_worker()
 
+        # Cuboid poses are invariant across cameras and frame visits.
+        all_cuboid_poses = None
+
         # provided samples are ordered by sensors, then chunks
         for unique_camera_id in self._sensor_ids_to_unique_ids(camera_ids, "camera"):
             aux_loader = self.aux_loader
@@ -4179,7 +4226,9 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
 
                 camera_sensor = self.camera_sensors[camera_id]
                 camera_params = camera_sensor.model_parameters
-                frame_width, frame_height = camera_params.resolution
+
+                if all_cuboid_poses is None:
+                    all_cuboid_poses = tquat_to_se3_matrix(cuboid_tracks.tracks_poses.data, unbatch=False).to(device)
 
                 all_pixels = to_torch(self.cameras_all_pixels[camera_id], device=device)
                 all_camera_rays = to_torch(
@@ -4191,122 +4240,113 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                     device=device,
                 )
 
-                for camera_frame_index in self.camera_frame_ranges[camera_id][::step_frame]:
-                    # First check if any of the cuboids exist in the current frame's timestamp range
-                    camera_frame_timestamp_start, camera_frame_timestamp_end = camera_sensor.frames_timestamps_us[
-                        camera_frame_index
-                    ]
+                with CameraInitFrames(
+                    self,
+                    camera_id,
+                    camera_sensor,
+                    cuboid_tracks,
+                    step_frame,
+                    keep_all_track_poses,
+                    return_color,
+                    device,
+                ) as frames:
+                    for camera_frame_index, cuboid_idxs, depth, frame_color in frames:
+                        if depth is None:
+                            continue
 
-                    if not keep_all_track_poses:
-                        current_cuboid_idxs = (
-                            torch.logical_and(
-                                cuboid_tracks.tracks_timestamps_us >= camera_frame_timestamp_start,
-                                cuboid_tracks.tracks_timestamps_us <= camera_frame_timestamp_end,
+                        camera_frame_timestamp_start, camera_frame_timestamp_end = camera_sensor.frames_timestamps_us[
+                            camera_frame_index
+                        ]
+                        current_cuboid_idxs = torch.from_numpy(cuboid_idxs).to(
+                            cuboid_tracks.tracks_timestamps_us.device
+                        )
+
+                        # Get existed cuboid poses and dimensions in the current frame
+                        current_cuboid_jidx = (
+                            torch.searchsorted(cuboid_tracks.tracks_packinfo[:, 0], current_cuboid_idxs, right=True) - 1
+                        )
+                        cuboid_poses = all_cuboid_poses[current_cuboid_idxs.reshape(-1)]
+                        cuboid_dim = cuboid_tracks.cuboids_dims[current_cuboid_jidx] * cuboid_dim_scale_factor
+
+                        depth = depth.reshape(-1)
+
+                        valid_depth_mask = depth > 0
+                        if not valid_depth_mask.any():
+                            continue
+
+                        depth = depth[valid_depth_mask]
+                        pixels = all_pixels[valid_depth_mask]
+                        camera_rays = all_camera_rays[valid_depth_mask]
+                        footprints = all_camera_footprints[valid_depth_mask]
+
+                        if return_color:
+                            assert frame_color is not None
+                            color = frame_color.reshape(-1, 3)
+                            color = color[valid_depth_mask]
+
+                        assert is_metric_z_depth_method(aux_loader.get_depth_meta(camera_id)["method"]), (
+                            f"{self.__class__.__name__}: assuming z-axis metric depth"
+                        )
+
+                        distance = torch.abs(depth / camera_rays[:, 2])
+                        scale = footprints * distance
+
+                        T_sensor_nurec_startend = self.world_to_nurec.transform_poses(
+                            camera_sensor.get_frames_T_sensor_target(
+                                target_node="world",
+                                frame_indices=camera_frame_index,
+                                frame_timepoint=None,  # evaluates both start/end timepoints
+                            )  # 2x4x4
+                        )
+
+                        if str(device) == "cpu":
+                            camera_model = self.camera_models[camera_id]
+                            world_rays = camera_model.pixels_to_world_rays_shutter_pose(
+                                pixels,
+                                T_sensor_nurec_startend[0],
+                                T_sensor_nurec_startend[1],
+                            ).world_rays
+                        else:
+                            camera_model = ncore.sensors.camera_model_from_parameters(camera_params, device=str(device))
+                            world_rays = image_points_to_world_rays_shutter_pose(
+                                camera_params,
+                                camera_model.pixels_to_image_points(pixels),
+                                se3_matrix_to_tquat(T_sensor_nurec_startend),
+                                torch.LongTensor([camera_frame_timestamp_start, camera_frame_timestamp_end]),
+                            ).world_rays
+
+                        # NuRec space
+                        xyz_s = world_rays[:, :3]
+                        xyz_e = world_rays[:, :3] + world_rays[:, 3:] * distance.unsqueeze(-1)
+
+                        # Spawn the points within each cuboid (in local coordinates)
+                        for cuboid_idx in range(cuboid_poses.shape[0]):
+                            cuboid_T = cuboid_poses[cuboid_idx, :, :]
+                            cuboid_extent = cuboid_dim[cuboid_idx, :3]
+
+                            xyz_e_local = (cuboid_T[:3, :3].T @ (xyz_e.T - cuboid_T[:3, 3:4])).T
+                            xyz_s_local = (cuboid_T[:3, :3].T @ (xyz_s.T - cuboid_T[:3, 3:4])).T
+                            xyz_mask = torch.all(torch.abs(xyz_e_local) < cuboid_extent / 2, dim=1)
+
+                            yield TrackPointCloud(
+                                track_id=cuboid_tracks.tracks_id[current_cuboid_jidx[cuboid_idx]],
+                                point_cloud=PointCloud(
+                                    xyz_start=xyz_s_local[xyz_mask],
+                                    xyz_end=xyz_e_local[xyz_mask],
+                                    flags=None,
+                                    color=color[xyz_mask] if return_color else None,
+                                    semantic_class_id=None,
+                                    camera_footprint_scale=scale[xyz_mask],
+                                ),
                             )
-                            .nonzero()
-                            .squeeze()
-                        )
-                    else:
-                        current_cuboid_idxs = (cuboid_tracks.tracks_timestamps_us >= 0).nonzero().squeeze()
-
-                    if current_cuboid_idxs.dim() == 0:
-                        current_cuboid_idxs = current_cuboid_idxs.unsqueeze(0).unsqueeze(1)
-
-                    if current_cuboid_idxs.numel() == 0:
-                        continue
-
-                    # Get existed cuboid poses and dimensions in the current frame
-                    current_cuboid_jidx = (
-                        torch.searchsorted(cuboid_tracks.tracks_packinfo[:, 0], current_cuboid_idxs, right=True) - 1
-                    )
-                    cuboid_poses = cuboid_tracks.tracks_poses[current_cuboid_idxs].data
-                    cuboid_poses = tquat_to_se3_matrix(cuboid_poses, unbatch=False).to(device)
-                    cuboid_dim = cuboid_tracks.cuboids_dims[current_cuboid_jidx] * cuboid_dim_scale_factor
-
-                    depth = to_torch(
-                        aux_loader.get_depth(
-                            camera_id, camera_frame_timestamp_end, (frame_width, frame_height)
-                        ).reshape(-1)
-                        * self.world_to_nurec.target_scale,
-                        device=device,
-                    )
-
-                    valid_depth_mask = depth > 0
-                    if not valid_depth_mask.any():
-                        continue
-
-                    depth = depth[valid_depth_mask]
-                    pixels = all_pixels[valid_depth_mask]
-                    camera_rays = all_camera_rays[valid_depth_mask]
-                    footprints = all_camera_footprints[valid_depth_mask]
-
-                    if return_color:
-                        color = to_torch(
-                            camera_sensor.get_frame_image_array(camera_frame_index).reshape((-1, 3)), device=device
-                        )
-                        color = color[valid_depth_mask]
-
-                    assert is_metric_z_depth_method(aux_loader.get_depth_meta(camera_id)["method"]), (
-                        f"{self.__class__.__name__}: assuming z-axis metric depth"
-                    )
-
-                    distance = torch.abs(depth / camera_rays[:, 2])
-                    scale = footprints * distance
-
-                    T_sensor_nurec_startend = self.world_to_nurec.transform_poses(
-                        camera_sensor.get_frames_T_sensor_target(
-                            target_node="world",
-                            frame_indices=camera_frame_index,
-                            frame_timepoint=None,  # evaluates both start/end timepoints
-                        )  # 2x4x4
-                    )
-
-                    if str(device) == "cpu":
-                        camera_model = self.camera_models[camera_id]
-                        world_rays = camera_model.pixels_to_world_rays_shutter_pose(
-                            pixels,
-                            T_sensor_nurec_startend[0],
-                            T_sensor_nurec_startend[1],
-                        ).world_rays
-                    else:
-                        camera_model = ncore.sensors.camera_model_from_parameters(camera_params, device=str(device))
-                        world_rays = image_points_to_world_rays_shutter_pose(
-                            camera_params,
-                            camera_model.pixels_to_image_points(pixels),
-                            se3_matrix_to_tquat(T_sensor_nurec_startend),
-                            torch.LongTensor([camera_frame_timestamp_start, camera_frame_timestamp_end]),
-                        ).world_rays
-
-                    # NuRec space
-                    xyz_s = world_rays[:, :3]
-                    xyz_e = world_rays[:, :3] + world_rays[:, 3:] * distance.unsqueeze(-1)
-
-                    # Spawn the points within each cuboid (in local coordinates)
-                    for cuboid_idx in range(cuboid_poses.shape[0]):
-                        cuboid_T = cuboid_poses[cuboid_idx, :, :]
-                        cuboid_extent = cuboid_dim[cuboid_idx, :3]
-
-                        xyz_e_local = (cuboid_T[:3, :3].T @ (xyz_e.T - cuboid_T[:3, 3:4])).T
-                        xyz_s_local = (cuboid_T[:3, :3].T @ (xyz_s.T - cuboid_T[:3, 3:4])).T
-                        xyz_mask = torch.all(torch.abs(xyz_e_local) < cuboid_extent / 2, dim=1)
-
-                        yield TrackPointCloud(
-                            track_id=cuboid_tracks.tracks_id[current_cuboid_jidx[cuboid_idx]],
-                            point_cloud=PointCloud(
-                                xyz_start=xyz_s_local[xyz_mask],
-                                xyz_end=xyz_e_local[xyz_mask],
-                                flags=None,
-                                color=color[xyz_mask] if return_color else None,
-                                semantic_class_id=None,
-                                camera_footprint_scale=scale[xyz_mask],
-                            ),
-                        )
 
     def decode_image_cpu(
-        self, image_handle: ncore.data.EncodedImageHandle, subsample_factor: float | None = None
+        self,
+        image_handle: ncore.data.EncodedImageHandle,
+        *,
+        image_transform: ImageResolutionTransform | None = None,
     ) -> np.ndarray:
-        """Decode encoded image data on CPU using enabled decoding backend and optionally subsample
-        the image by the given factor (if possible while decoding)"""
+        """Decode an image and optionally resize it with a resolved transform."""
 
         # load the encoded image data
         image_data = image_handle.get_data()
@@ -4319,14 +4359,13 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
             # decode jpeg header to obtain source resolution
             height, width, _, _ = simplejpeg.decode_jpeg_header(encoded_image := image_data.get_encoded_image_data())
 
-            if subsample_factor is not None:
-                # resize if requested and required
-                height, width = int(height), int(width)
-                assert height % subsample_factor == 0 and width % subsample_factor == 0, (
-                    f"Image dimensions ({height}x{width}) must be divisible by subsample_factor ({subsample_factor})"
+            height = int(height)
+            width = int(width)
+            if image_transform is not None:
+                assert image_transform.source_resolution == (width, height), (
+                    "Image transform source resolution does not match the encoded image"
                 )
-                height = height // subsample_factor
-                width = width // subsample_factor
+                width, height = requested_resolution = image_transform.resized_pre_crop_resolution
 
             image = simplejpeg.decode_jpeg(
                 encoded_image,
@@ -4335,16 +4374,25 @@ class NCOREDataSource(BaseDataSource, RigTrajectoriesProvider):
                 min_width=width,
                 min_height=height,
             )
-        else:
-            # fall back to ncore-internal (PIL-based) decoding and optional subsampling
-            pil_image = image_data.get_decoded_image()
-            if subsample_factor is not None and subsample_factor != 1.0:
-                # resize if requested and required
-                new_size = (
-                    int(pil_image.width // subsample_factor),
-                    int(pil_image.height // subsample_factor),
+            if image_transform is not None and (image.shape[1], image.shape[0]) != requested_resolution:
+                image = resize_image_array(
+                    image,
+                    requested_resolution,
+                    interpolation=None,
+                    use_pil_lanczos=True,
                 )
-                pil_image = pil_image.resize(new_size, resample=PILImage.Resampling.LANCZOS)
+        else:
+            # Fall back to ncore-internal (PIL-based) decoding and optional resizing.
+            pil_image = image_data.get_decoded_image()
+            if image_transform is not None:
+                assert image_transform.source_resolution == (pil_image.width, pil_image.height), (
+                    "Image transform source resolution does not match the decoded image"
+                )
+                if image_transform.resized_pre_crop_resolution != image_transform.source_resolution:
+                    pil_image = pil_image.resize(
+                        image_transform.resized_pre_crop_resolution,
+                        resample=PILImage.Resampling.LANCZOS,
+                    )
             image = np.asarray(pil_image)
 
         return image

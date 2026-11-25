@@ -36,6 +36,7 @@ from nurec.config.component_only import (
     MaskSource,
     ScopeRegion,
 )
+from nurec.datasets import vehicle_light as vehicle_light_module
 from nurec.datasets.tracks import CuboidTracks, TrackFlags
 from nurec.models.background import BaseBackground
 from nurec.models.calib import BaseCalib
@@ -109,7 +110,7 @@ def _bare(component_only: Optional[ComponentOnlyConfig] = None) -> GaussiansComp
     torch.nn.Module.__init__(model)
     model.register_load_state_dict_post_hook(model._refresh_mcmc_runtime_state_after_load)
     model.register_load_state_dict_post_hook(model._invalidate_derived_render_caches_after_load)
-    model.register_state_dict_pre_hook(model._raise_if_mcmc_publication_failed_before_state_dict)
+    model.register_state_dict_pre_hook(model._raise_if_publication_failed_before_state_dict)
     model.config = _ns(strategy=_ns(name="gsplat"))
     model.gaussians_strategy = _ns(refresh_runtime_scenes=lambda gaussians_nodes: None)
     model._fused_gather_generation_plan = None
@@ -1589,6 +1590,38 @@ class TestInitializeStrategyAppliesComponentOnly(unittest.TestCase):
         scope.assert_called_once()
         frozen.assert_called_once()
         freeze.assert_called_once()
+
+    def test_initializes_every_node_inside_one_shared_vehicle_light_frame_cache(self) -> None:
+        model = _bare(None)
+        seen: list[tuple[Any, int | None]] = []
+
+        def record_active_cache() -> None:
+            cache = vehicle_light_module._active_frame_cache.get()
+            assert cache is not None
+            seen.append((cache, cache.byte_budget))
+
+        nodes: dict[str, Any] = {}
+        for name in ("vehicle_lights", "static_vehicle_lights"):
+            node = _FakeRigidNode(_rigids_tracks())
+            node.maybe_initialize_gaussians = cast(Any, mock.MagicMock(side_effect=record_active_cache))
+            nodes[name] = node
+        model.gaussians_nodes = TypedModuleDict(nodes)
+        model.gaussians_strategy = _ns(
+            maybe_initialize_buffers=mock.MagicMock(),
+            refresh_runtime_scenes=mock.MagicMock(),
+        )
+        with (
+            mock.patch.object(model, "_apply_component_only_background_scope"),
+            mock.patch.object(model, "_apply_component_only_frozen_tracks"),
+            mock.patch.object(model, "_apply_component_only_freeze"),
+        ):
+            model.initialize_strategy_and_maybe_gaussians()
+        self.assertEqual(len(seen), 2)
+        (first_cache, first_budget), (second_cache, _) = seen
+        self.assertIs(second_cache, first_cache)
+        # A zero budget here would silently disable the cache.
+        self.assertIsNone(first_budget)
+        self.assertIsNone(vehicle_light_module._active_frame_cache.get())
 
     def test_prunes_deferred_empty_light_layer_and_rebuilds_from_unadjusted_config(self) -> None:
         model = _bare(

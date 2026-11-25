@@ -498,12 +498,11 @@ def test_z_band_falls_back_to_bev_when_elevation_is_missing(caplog) -> None:
 
 
 def test_hook_is_unreachable_under_the_lidar_road_init_config() -> None:
-    """The lidar road-init path cannot reach the exemption hook, whatever it is set to.
+    """The default lidar road-init mesh never calls the exemption hook.
 
-    lidar_ground_mesh_road.yaml is ``mesh_topology: grid`` with ``max_triangle_edge_length: null``,
-    and the long-edge filter is gated on delaunay AND a non-null threshold, so the hook has no call
-    site there. Pinned because a future change re-enabling either would silently expose the lidar
-    mesh to corridor policy. Complements the delaunay-topology check below.
+    lidar_ground_mesh_road.yaml is ``mesh_topology: delaunay`` with ``max_triangle_edge_length: null``.
+    The hook's only call site is the long-edge filter, which requires a non-null threshold.
+    Pinned so setting a threshold does not silently apply corridor policy to the lidar mesh.
     """
 
     def lidar_mesher(
@@ -516,7 +515,7 @@ def test_hook_is_unreachable_under_the_lidar_road_init_config() -> None:
             min_points_per_voxel=1,
             smoothing_passes=10,
             elevation_axis=2,
-            mesh_topology="grid",
+            mesh_topology="delaunay",
             smoothing_method="neighbor_average",
             height_statistic="mean",
             color_statistic="mean",
@@ -528,7 +527,6 @@ def test_hook_is_unreachable_under_the_lidar_road_init_config() -> None:
             protected_triangle_mask_fn=hook,
         )
 
-    # Spacing must be <= voxel_size or the grid mesher finds no occupied 2x2 block and emits nothing.
     points = _road_strip(gap_span=(10.0, 14.0), spacing_m=0.1)
 
     # reconstruct_ground_mesh_from_points and friends never pass the hook.

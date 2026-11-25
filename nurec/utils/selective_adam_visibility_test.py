@@ -1,10 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import subprocess
+import sys
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+
 import pytest
 import torch
 
 from nurec.utils.selective_adam_visibility import prepare_async_visibility_union
+from nurec.utils.trainer import BroadcastExceptions
+
+
+_COLLECTIVE_TIMEOUT_SECONDS = 20
+# Include cold Lightning imports before Gloo initialization.
+_WORKER_TIMEOUT_SECONDS = 120
 
 
 class _FakeWork:
@@ -107,6 +123,61 @@ def test_launch_and_resolve_state_machine_fails_closed() -> None:
     assert pending.resolve() is first
 
 
+@pytest.mark.parametrize(
+    "sources, element_count",
+    [([], 0), ([], 3), ([torch.zeros(2)], 0), ([torch.ones(3), torch.zeros(2)], 3)],
+)
+def test_strict_missing_or_malformed_source_fails_before_launch(sources, element_count) -> None:
+    pending = prepare_async_visibility_union(
+        sources,
+        element_count=element_count,
+        device=torch.device("cpu"),
+        local_ranges=None,
+        positive_only=False,
+    )
+    with pytest.raises(RuntimeError, match="complete global per-Gaussian signal") as error:
+        pending.require_complete_sources()
+    message = str(error.value)
+    assert ("no visibility sources" if not sources else "size mismatch") in message
+    assert f"element_count={element_count}" in message
+    assert f"source_numels={[source.numel() for source in sources]}" in message
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="multi-rank visibility launch requires CUDA")
+def test_strict_union_launches_only_visibility_collective(monkeypatch) -> None:
+    source = torch.tensor([0, 1, 0], dtype=torch.bool, device="cuda")
+    calls = []
+
+    def all_reduce(value: torch.Tensor, *, op, async_op: bool):
+        assert async_op and op == torch.distributed.ReduceOp.MAX
+        calls.append(value)
+        return _FakeWork(value, torch.ones_like(value))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: torch.distributed.Backend.NCCL)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        pending = prepare_async_visibility_union(
+            [source],
+            element_count=3,
+            device=torch.device("cuda"),
+            local_ranges=None,
+            positive_only=False,
+        )
+        pending.require_complete_sources()
+        assert not calls
+        pending.launch()
+        visibility = pending.resolve()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert len(calls) == 1 and calls[0] is pending.reduction
+    torch.testing.assert_close(visibility, torch.ones(3, device="cuda", dtype=torch.bool))
+
+
 def test_empty_global_and_owner_counts_skip_collective_when_dist_is_initialized(monkeypatch) -> None:
     pending = prepare_async_visibility_union(
         [torch.empty(0)],
@@ -133,3 +204,68 @@ def test_empty_global_and_owner_counts_skip_collective_when_dist_is_initialized(
     result = pending.resolve()
     assert result.shape == (0,)
     assert result.dtype == torch.bool
+
+
+def _strict_source_failure_worker(rank: int, init_file: str) -> None:
+    """Exercise a component-only coverage collective before strict validation."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=_COLLECTIVE_TIMEOUT_SECONDS),
+    )
+    try:
+
+        def reduce_boolean_decision(decision: bool, all: bool) -> bool:
+            assert not all
+            flag = torch.tensor(int(decision))
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            return bool(flag.item())
+
+        for failing_rank in (0, 1):
+            trainer = SimpleNamespace(
+                strategy=SimpleNamespace(reduce_boolean_decision=reduce_boolean_decision),
+                global_rank=rank,
+                should_stop=False,
+            )
+            message = "complete global per-Gaussian signal" if rank == failing_rank else "exception in another rank"
+            with pytest.raises(RuntimeError, match=message):
+                with BroadcastExceptions(cast(Any, trainer)):
+                    pending = prepare_async_visibility_union(
+                        [] if rank == failing_rank else [torch.ones(1)],
+                        element_count=1,
+                        device=torch.device("cpu"),
+                        local_ranges=None,
+                        positive_only=False,
+                    )
+                    # The 16th component-only probe reduces its coverage count
+                    # before the first forward-error gate exits.
+                    coverage = torch.tensor([int(rank == 0)])
+                    torch.distributed.all_reduce(coverage, op=torch.distributed.ReduceOp.SUM)
+                    assert coverage.item() == 1
+                    pending.require_complete_sources()
+                pending.launch()
+                pytest.fail("forward-error gate allowed visibility launch/backward after a rank failed")
+            assert trainer.should_stop
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_strict_missing_source_after_component_only_probe_aborts_both_ranks(tmp_path: Path) -> None:
+    def run_worker(rank: int) -> None:
+        result = subprocess.run(
+            [sys.executable, __file__, str(rank), str(tmp_path / "visibility-init")],
+            env=os.environ | {"PYTHONPATH": os.pathsep.join(sys.path)},
+            capture_output=True,
+            text=True,
+            timeout=_WORKER_TIMEOUT_SECONDS,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        list(workers.map(run_worker, range(2)))
+
+
+if __name__ == "__main__":
+    _strict_source_failure_worker(int(sys.argv[1]), sys.argv[2])

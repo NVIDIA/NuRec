@@ -1,0 +1,10 @@
+--- a/Src/PoissonRecon.cpp
++++ b/Src/PoissonRecon.cpp
+@@ -39,7 +39,6 @@
+ #include "FEMTree.h"
+ #include "Ply.h"
+ #include "VertexFactory.h"
+-#include "Image.h"
+ #include "RegularGrid.h"
+ #include "DataStream.imp.h"
+ 

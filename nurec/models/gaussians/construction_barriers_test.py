@@ -180,7 +180,7 @@ def make_initialized_model(
     source.sequence_loader.pose_graph.evaluate_poses.return_value = np.eye(4)
     source.aux_loader = Mock(
         has_object_instance_segmentation=Mock(return_value=True),
-        get_object_instance_segmentation_meta=Mock(return_value={"method": "sam3-objects"}),
+        get_object_instance_segmentation_meta=Mock(return_value={"method": "sam3-objects", "thing_classes": ["cone"]}),
     )
     source.configure_mock(**(source_overrides or {}))
     summary = Mock(datasource=source)
@@ -385,8 +385,8 @@ def test_lidar_unrelated_instance_masks_skip_optional_layer():
     "meta,error",
     [
         ({}, "missing 'method'"),
-        ({"method": "sam3-objects"}, "missing camera metadata"),
-        ({"method": "sam3-objects", "resolution": [20, 20], "thing_classes": ["car", "person"]}, "cone-only"),
+        ({"method": "sam3-objects", "thing_classes": ["cone"]}, "missing camera metadata"),
+        ({"method": "sam3-objects", "resolution": [20, 20], "thing_classes": ["cone", "cone"]}, "exactly one cone"),
     ],
 )
 def test_lidar_malformed_masks_still_fail(meta, error):
@@ -404,8 +404,13 @@ def test_lidar_malformed_masks_still_fail(meta, error):
         )
 
 
-def test_lidar_initialization_discovers_cone_camera_and_training_lidar():
-    metadata = {"other_cam": {"method": "mask2former"}, "cone_cam": {"method": "sam3-objects"}}
+@pytest.mark.parametrize("other_classes", [None, [], ["bollard"]])
+def test_lidar_initialization_discovers_cone_camera_and_training_lidar(other_classes):
+    metadata = {
+        "semantic_cam": {"method": "mask2former"},
+        "other_cam": {"method": "sam3-objects", **({} if other_classes is None else {"thing_classes": other_classes})},
+        "cone_cam": {"method": "sam3-objects", "thing_classes": ["cone"]},
+    }
     aux = Mock(
         has_object_instance_segmentation=Mock(side_effect=lambda camera: camera in metadata),
         get_object_instance_segmentation_meta=Mock(side_effect=metadata.__getitem__),
@@ -419,7 +424,7 @@ def test_lidar_initialization_discovers_cone_camera_and_training_lidar():
             layer_name="sh-gaussians",
             source_overrides={
                 "aux_loader": aux,
-                "train_camera_ids": ["no_masks", "other_cam", "cone_cam"],
+                "train_camera_ids": ["no_masks", "semantic_cam", "other_cam", "cone_cam"],
                 "train_lidar_ids": ["lidar_custom"],
             },
         )

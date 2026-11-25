@@ -24,6 +24,7 @@ py_library(
         pip_requirement("numpy"),
         pip_requirement("pillow"),
         pip_requirement("universal-pathlib"),
+        "//nurec/lidar/firing_patterns:schema",
     ],
 )
 
@@ -40,6 +41,7 @@ pytest_test(
     srcs = ["ncore_v4_test.py"],
     deps = [
         ":pylib",
+        pip_requirement("numpy"),
         pip_requirement("nvidia-ncore"),
         pip_requirement("universal-pathlib"),
     ],

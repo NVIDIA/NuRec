@@ -70,6 +70,7 @@ def resolve_runtime(input_path: str, enclosing_root: str) -> tuple[Path, str]:
         return source, pinned
     pins = set()
     guides = [source / "docs/basics/software.rst", source / "docs/basics/software.md"]
+    guides += sorted(source.glob("docs/fern/versions/*/pages/basics/software.mdx"))
     for path in guides:
         if path.is_file():
             pins.update(

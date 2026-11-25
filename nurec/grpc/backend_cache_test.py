@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import gc
 import threading
 import time
+import weakref
 
 from typing import Callable, List, Optional, Set, Union
 
@@ -21,11 +23,56 @@ from nurec.grpc.serve import (
     CacheFullError,
     CacheWaitAbortedError,
     CacheWaitAbortedReason,
+    ModelIncompatibilityError,
     NoSpareBackendsError,
+    _cleanup_failed_backend,
 )
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
+
+
+@pytest.mark.parametrize("explicit_cause", [False, True])
+def test_failed_backend_cleanup_releases_chained_model(explicit_cause, monkeypatch):
+    class CyclicModel:
+        def __init__(self):
+            self.hook = self.install
+
+        def install(self):
+            raise ValueError("invalid manifest")
+
+    model_refs = []
+
+    def activate():
+        model = CyclicModel()
+        model_refs.append(weakref.ref(model))
+        try:
+            model.install()
+        except ValueError as error:
+            if explicit_cause:
+                raise ModelIncompatibilityError("installation failed") from error
+            raise ModelIncompatibilityError("installation failed")
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        try:
+            activate()
+        except ModelIncompatibilityError as error:
+            context = error.__context__
+            assert model_refs[0]() is not None
+            _cleanup_failed_backend(error)
+            assert model_refs[0]() is None
+            assert error.__context__ is context
+            assert error.__cause__ is (context if explicit_cause else None)
+            assert str(error) == "installation failed"
+            assert str(context) == "invalid manifest"
+        else:
+            pytest.fail("activation did not fail")
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 @pytest.fixture
@@ -36,6 +83,7 @@ def make_backend() -> Callable[[str], Backend]:
             renderable_model=None,  # type: ignore
             camera_bank=None,  # type: ignore
             world_to_nurec=None,  # type: ignore
+            scene_time_range_us=None,  # type: ignore
             lidar_bank=None,  # type: ignore
             asset_bank=None,  # type: ignore
             source_artifact=None,  # type: ignore
@@ -84,6 +132,70 @@ def capture_cleanup(cache: BackendCache, monkeypatch) -> List[Backend]:
 
     monkeypatch.setattr(cache, "_cleanup_evicted_backends", record_cleanup)
     return cleaned_backends
+
+
+@pytest.mark.parametrize("eager_replacement", [False, True])
+def test_external_residency_blocks_automatic_eviction_but_allows_detach(make_backend, eager_replacement):
+    cache = BackendCache(maxsize=1, allow_automatic_eviction=False)
+    original = make_backend("original")
+    cache.put("original", original)
+    cache.checkin(original)
+
+    assert not cache.evict_one_spare()
+    with pytest.raises(CacheFullError):
+        cache.put("replacement", make_backend("replacement"))
+    factory_calls: list[str] = []
+
+    def replacement_factory() -> Backend:
+        factory_calls.append("replacement")
+        return make_backend("replacement")
+
+    with pytest.raises(CacheFullError):
+        cache.put_with_retries("replacement", replacement_factory, evict_replacement_before_factory=eager_replacement)
+    assert factory_calls == []
+    check_cache(cache, set(), ["original"])
+    check_no_reservations(cache)
+
+    # Explicit coordinator detach still refuses a backend a render is using.
+    assert cache.checkout("original") is original
+    with pytest.raises(BackendInUseError):
+        cache.remove_by_key("original")
+    cache.checkin(original)
+    assert cache.remove_by_key("original") is original
+    assert original.cache_key is None
+
+    replacement = make_backend("replacement")
+    cache.put("replacement", replacement)
+    cache.checkin(replacement)
+    check_cache(cache, set(), ["replacement"])
+
+
+def test_external_residency_blocks_same_scene_content_replacement(make_backend):
+    cache = BackendCache(maxsize=2, max_per_key=1, allow_automatic_eviction=False)
+    original = make_backend("scene")
+    cache.put("version-1", original)
+    cache.checkin(original)
+
+    with pytest.raises(CacheFullError):
+        cache.put("version-2", make_backend("scene"))
+    check_cache(cache, set(), ["version-1"])
+    check_no_reservations(cache)
+
+
+def test_external_residency_preserves_spares_on_construction_oom(make_backend, caplog):
+    cache = BackendCache(maxsize=2, allow_automatic_eviction=False)
+    original = make_backend("original")
+    cache.put("original", original)
+    cache.checkin(original)
+
+    def fail_loading() -> Backend:
+        raise torch.cuda.OutOfMemoryError("injected construction OOM")
+
+    with pytest.raises(NoSpareBackendsError, match="automatic eviction is disabled"):
+        cache.put_with_retries("new-scene", fail_loading, max_retries=1)
+    assert "in_use=0 spares=1 automatic_eviction=False" in caplog.text
+    check_cache(cache, set(), ["original"])
+    check_no_reservations(cache)
 
 
 class _ConcurrentAcquire:
@@ -656,7 +768,7 @@ class TestBackendCache:
         assert call_count[0] == 2  # Called twice (failed once, succeeded once)
         check_cache_size(cache, 1, 1)  # One spare evicted
 
-    def test_put_with_retries_oom_no_spares_raises(self, make_backend):
+    def test_put_with_retries_oom_no_spares_raises(self, make_backend, caplog):
         """Test put_with_retries raises NoSpareBackendsError when OOM and no spares available"""
         cache = BackendCache(maxsize=3)
 
@@ -675,8 +787,9 @@ class TestBackendCache:
             raise torch.cuda.OutOfMemoryError("Simulated OOM")
 
         # Should raise NoSpareBackendsError since no spares to evict
-        with pytest.raises(NoSpareBackendsError, match="No spare backends available to evict"):
+        with pytest.raises(NoSpareBackendsError, match="no spare backends are available to evict"):
             cache.put_with_retries("new-scene", factory_oom, enable_eviction=True)
+        assert "in_use=2 spares=0 automatic_eviction=True" in caplog.text
 
     def test_put_with_retries_oom_eviction_disabled(self, make_backend):
         """Test put_with_retries with eviction disabled still retries on OOM"""
@@ -912,6 +1025,119 @@ class TestBackendCache:
         check_cache(cache, {"scene-b"}, [])
         check_no_reservations(cache)
 
+    def test_eager_replacement_removes_spare_before_factory(self, make_backend, monkeypatch):
+        cache = BackendCache(maxsize=1, max_per_key=1)
+        claimed_spare = make_backend("scene-a")
+        cache.put("scene-a", claimed_spare)
+        cache.checkin(claimed_spare)
+        cleaned_backends = capture_cleanup(cache, monkeypatch)
+
+        def factory() -> Backend:
+            assert cache.spares == []
+            assert cleaned_backends == [claimed_spare]
+            return make_backend("scene-b")
+
+        replacement = cache.put_with_retries(
+            "scene-b",
+            factory,
+            evict_replacement_before_factory=True,
+        )
+
+        assert replacement.scene_id == "scene-b"
+        check_no_reservations(cache)
+
+    def test_eager_replacement_oom_uses_normal_eviction_retry(self, make_backend, monkeypatch):
+        cache = BackendCache(maxsize=2)
+        spares = [make_backend(scene_id) for scene_id in ("scene-a", "scene-c")]
+        for backend in spares:
+            cache.put(backend.scene_id, backend)
+            cache.checkin(backend)
+        cleaned_backends = capture_cleanup(cache, monkeypatch)
+        attempts = 0
+
+        def factory() -> Backend:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise torch.cuda.OutOfMemoryError("test OOM")
+            return make_backend("scene-b")
+
+        replacement = cache.put_with_retries(
+            "scene-b",
+            factory,
+            max_retries=2,
+            evict_replacement_before_factory=True,
+        )
+
+        assert replacement.scene_id == "scene-b"
+        assert attempts == 2
+        assert cleaned_backends == spares
+        check_cache(cache, {"scene-b"}, [])
+        check_no_reservations(cache)
+
+    def test_eager_replacement_retries_after_failed_models_are_collected(self, make_backend):
+        class CyclicModel:
+            def __init__(self):
+                self.hook = self.callback
+
+            def callback(self):
+                pass
+
+            def activate(self):
+                raise torch.cuda.OutOfMemoryError("partial model owns GPU memory")
+
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            cache = BackendCache(maxsize=1, max_per_key=1)
+            backend = make_backend("scene-a")
+            model = CyclicModel()
+            model_ref = weakref.ref(model)
+            backend.renderable_model = model  # type: ignore[assignment]
+            cache.put("scene-a", backend)
+            cache.checkin(backend)
+            del backend, model
+            attempts = 0
+            partial_ref = None
+
+            def factory() -> Backend:
+                nonlocal attempts, partial_ref
+                attempts += 1
+                if attempts == 1:
+                    partial = CyclicModel()
+                    partial_ref = weakref.ref(partial)
+                    partial.activate()
+                if model_ref() is not None or partial_ref() is not None:
+                    raise torch.cuda.OutOfMemoryError("failed models still own GPU memory")
+                return make_backend("scene-b")
+
+            replacement = cache.put_with_retries(
+                "scene-b", factory, max_retries=2, evict_replacement_before_factory=True
+            )
+            assert replacement.scene_id == "scene-b"
+            assert attempts == 2
+            check_no_reservations(cache)
+        finally:
+            if was_enabled:
+                gc.enable()
+
+    def test_eager_replacement_keeps_checked_out_spare_recoverable(self, make_backend, monkeypatch):
+        cache = BackendCache(maxsize=1, max_per_key=1)
+        claimed_spare = make_backend("scene-a")
+        cache.put("scene-a", claimed_spare)
+        cache.checkin(claimed_spare)
+        cleaned_backends = capture_cleanup(cache, monkeypatch)
+        reservation = cache.reserve("scene-b")
+        assert cache.checkout("scene-a") is claimed_spare
+
+        cache.evict_reserved_spare(reservation)
+        cache.release_reservation(reservation)
+        cache.checkin(claimed_spare)
+
+        assert cleaned_backends == []
+        check_cache(cache, set(), ["scene-a"])
+        check_no_reservations(cache)
+
     @pytest.mark.parametrize("reservation_action", ["release", "commit"])
     def test_explicit_eviction_of_claimed_spare_keeps_reservation_valid(
         self, make_backend, monkeypatch, reservation_action: str
@@ -997,11 +1223,13 @@ class TestBackendCache:
 
     @pytest.mark.parametrize("use_wait_policy", [False, True])
     def test_put_with_retries_waits_for_global_capacity_and_creates_after_checkin(
-        self, make_backend, use_wait_policy: bool
+        self, make_backend, monkeypatch, use_wait_policy: bool
     ):
         cache = BackendCache(maxsize=1, max_per_key=1)
         existing_backend = make_backend("scene-1")
         cache.put("scene-1", existing_backend)
+        # Dummy backends need no CUDA/GC cleanup; measure the capacity wakeup alone.
+        cleaned_backends = capture_cleanup(cache, monkeypatch)
 
         wait_policy = BackendCacheWaitPolicy(wait_deadline=time.monotonic() + 5.0) if use_wait_policy else None
 
@@ -1020,6 +1248,7 @@ class TestBackendCache:
         assert len(call.results) == 1
         assert call.results[0].cache_key == "scene-2"
         assert call.factory_called.is_set()
+        assert cleaned_backends == [existing_backend]
         check_cache(cache, {"scene-2"}, [])
 
     def test_put_with_retries_waits_for_per_key_capacity_and_reuses_backend(self, make_backend):
@@ -1103,6 +1332,39 @@ class TestBackendCache:
         assert exc_info.value.reason == CacheWaitAbortedReason.SERVER_TIMEOUT
         assert elapsed < BACKEND_CACHE_WAIT_POLL_S + 0.5
         assert cache.pending_global == 0
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_slow_load_oom_checks_client_not_server_deadline(self, make_backend, monkeypatch, cancelled):
+        now = [0.0]
+        monkeypatch.setattr("nurec.grpc.serve.time.monotonic", lambda: now[0])
+        cache = BackendCache(maxsize=1, max_per_key=1)
+        spare = make_backend("old")
+        cache.put("old", spare)
+        cache.checkin(spare)
+        attempts = 0
+
+        def factory() -> Backend:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                now[0] = 121.0
+                raise torch.cuda.OutOfMemoryError("slow load")
+            return make_backend("new")
+
+        policy = BackendCacheWaitPolicy(
+            should_continue=lambda: not cancelled or attempts == 0,
+            abort_reason=lambda: CacheWaitAbortedReason.DEADLINE_EXCEEDED,
+            wait_deadline=120.0,
+        )
+        if cancelled:
+            with pytest.raises(CacheWaitAbortedError) as error:
+                cache.put_with_retries("new", factory, wait_policy=policy)
+            assert error.value.reason == CacheWaitAbortedReason.DEADLINE_EXCEEDED
+            assert attempts == 1
+        else:
+            assert cache.put_with_retries("new", factory, wait_policy=policy).scene_id == "new"
+            assert attempts == 2
+        check_no_reservations(cache)
 
     def test_wait_aborts_when_should_continue_becomes_false(self, make_backend):
         cache = BackendCache(maxsize=1, max_per_key=1)
@@ -1848,6 +2110,7 @@ class TestLidarStream:
             renderable_model=self._StubModel(device),  # type: ignore[arg-type]
             camera_bank=None,  # type: ignore
             world_to_nurec=None,  # type: ignore
+            scene_time_range_us=None,  # type: ignore
             lidar_bank=None,  # type: ignore
             asset_bank=None,  # type: ignore
             source_artifact=None,  # type: ignore

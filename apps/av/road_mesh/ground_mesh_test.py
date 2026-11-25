@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import warnings
 
 from typing import Any
 from unittest.mock import MagicMock
@@ -566,6 +567,52 @@ def test_filter_local_height_outliers_disabled_with_zero_threshold() -> None:
     vertices = np.array([[0.5, 0.5, 0.0], [1.5, 0.5, 10.0]], dtype=np.float32)
     keep = filter_local_height_outliers(vertices, cell_size=1.0, threshold=0.0, min_neighbors=4)
     assert keep.all()
+
+
+def _outlier_test_cells(layout: str) -> np.ndarray:
+    if layout == "holes":
+        return np.array([(x, y) for x in range(12) for y in range(9) if (x * y) % 5], dtype=np.int64)
+    # A one-cell-wide strip leaves every vertex with at most two neighbors at radius 1.
+    return np.array([(x, 0) for x in range(15)], dtype=np.int64)
+
+
+@pytest.mark.parametrize("radius", [0, 1, 2])
+@pytest.mark.parametrize("min_neighbors", [0, 1, 4, 8])
+@pytest.mark.parametrize("layout", ["holes", "strip"])
+@pytest.mark.parametrize("nan_at", [None, "neighbor", "vertex"])
+def test_filter_local_height_outliers_backends_match(radius, min_neighbors, layout, nan_at) -> None:
+    rng = np.random.default_rng(7)
+    cells = _outlier_test_cells(layout)
+    z = rng.normal(0.0, 0.2, len(cells)).astype(np.float32)
+    z[::7] += 2.0
+    if nan_at == "neighbor":
+        z[3] = np.nan
+    elif nan_at == "vertex":
+        z[::5] = np.nan
+    vertices = np.column_stack([cells.astype(np.float32) * 0.5, z])
+    dims = cells.max(axis=0) + 1
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        # The sparse scan takes the median of an empty neighbor list when min_neighbors is 0.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        np.testing.assert_array_equal(
+            ground_mesh_module._filter_local_height_outliers_dense(vertices, cells, dims, 0.3, min_neighbors, radius),
+            ground_mesh_module._filter_local_height_outliers_sparse(vertices, cells, 0.3, min_neighbors, radius),
+        )
+
+
+@pytest.mark.parametrize("budget_offset", [0, -1])
+def test_filter_local_height_outliers_dispatch_follows_memory_budget(monkeypatch: Any, budget_offset: int) -> None:
+    cells = np.array([(x, y) for x in range(6) for y in range(5)], dtype=np.float32)
+    vertices = np.column_stack([cells, np.zeros(len(cells), dtype=np.float32)])
+    vertices[7, 2] = 2.0
+    peak = ground_mesh_module._dense_filter_bytes(6 * 5, len(cells), 1)
+    sparse = MagicMock(wraps=ground_mesh_module._filter_local_height_outliers_sparse)
+    monkeypatch.setattr(ground_mesh_module, "_filter_local_height_outliers_sparse", sparse)
+    # A budget exactly at the dense peak keeps the dense path; one byte less switches to the scan.
+    monkeypatch.setattr(ground_mesh_module, "_DENSE_FILTER_BYTES", peak + budget_offset)
+    keep = filter_local_height_outliers(vertices, cell_size=1.0, threshold=0.3, min_neighbors=4, radius=1)
+    assert sparse.called == (budget_offset < 0)
+    assert not keep[7] and keep.sum() == len(cells) - 1
 
 
 def test_filter_triangles_by_max_edge_length_drops_long() -> None:

@@ -107,6 +107,12 @@ def run_instant_nurec_prediction(
         progress_bar.update(predict_config.chunk_size)
     progress_bar.close()
 
+    if not primitives_list:
+        raise RuntimeError(
+            "Prediction produced no primitives: the dataset yielded no samples (see the "
+            "InstantNuRecDataError warnings above)."
+        )
+
     # Merge the primitives if enabled.
     if predict_config.primitive_merge.enabled:
         primitive_merge = make_primitive_merge(

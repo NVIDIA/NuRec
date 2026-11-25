@@ -7,11 +7,12 @@ from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from upath import UPath
 
-from nurec.instant_nurec.config.dataset import NCoreInstantNuRecDatasetConfig
+from nurec.instant_nurec.config.dataset import NCoreInstantNuRecCuboidTracksParamsConfig, NCoreInstantNuRecDatasetConfig
 from nurec.instant_nurec.datasets import instant_nurec_ncore
 from nurec.instant_nurec.datasets.instant_nurec_base import CameraSubsampler
 from nurec.instant_nurec.datasets.instant_nurec_ncore import NCoreInstantNuRecDataset
@@ -43,6 +44,16 @@ def _make_config(**path_config: Any) -> NCoreInstantNuRecDatasetConfig:
         **path_config,
     }
     return NCoreInstantNuRecDatasetConfig(**values)
+
+
+def _cuboid_tracks_params(track_extrapolate_timestamps_us: int) -> NCoreInstantNuRecCuboidTracksParamsConfig:
+    return NCoreInstantNuRecCuboidTracksParamsConfig(
+        lidar_id=None,
+        track_min_travel_distance_m=0.0,
+        track_min_centroid_rig_dist_m=1.0,
+        track_extrapolate_timestamps_us=track_extrapolate_timestamps_us,
+        track_label_source="AUTOLABEL",
+    )
 
 
 def _local_path_parts(path: Any) -> tuple[str, ...]:
@@ -197,6 +208,157 @@ def test_loader_resolution_reuses_backend_for_external_store_and_cache(tmp_path:
     ]
     main_loader.get_camera_sensor.assert_called_once_with("archive-main")
     external_loader.get_camera_sensor.assert_called_once_with("archive-external")
+
+
+@pytest.mark.parametrize(
+    ("cache_enabled", "track_extrapolate_timestamps_us", "expected_compute_calls"),
+    [
+        (True, -1, 1),
+        (False, -1, 2),
+        (True, 1_000_000, 2),
+    ],
+)
+def test_cuboid_observation_cache_only_reuses_full_clip_requests(
+    cache_enabled: bool,
+    track_extrapolate_timestamps_us: int,
+    expected_compute_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = NCoreInstantNuRecDataset.__new__(NCoreInstantNuRecDataset)
+    dataset.cache_full_clip_cuboid_observations = cache_enabled
+    dataset.cuboid_tracks_params = _cuboid_tracks_params(track_extrapolate_timestamps_us)
+    dataset._full_clip_cuboid_observations_cache = {}
+    sequence_loader = SimpleNamespace(sequence_id="clip-a")
+    interval = instant_nurec_ncore.HalfClosedInterval(0, 100)
+    compute_calls = 0
+
+    def compute_cuboid_df(loader: object, time_range: object, *, serialize_observation: bool) -> pd.DataFrame:
+        nonlocal compute_calls
+        compute_calls += 1
+        return pd.DataFrame({"call": [compute_calls]})
+
+    monkeypatch.setattr(instant_nurec_ncore, "compute_cuboid_df", compute_cuboid_df)
+
+    first = dataset._get_cuboid_observations(sequence_loader, interval, cache_key="/data/clip-a.json")
+    second = dataset._get_cuboid_observations(sequence_loader, interval, cache_key="/data/clip-a.json")
+
+    assert compute_calls == expected_compute_calls
+    assert (first is second) is (expected_compute_calls == 1)
+
+
+@pytest.mark.parametrize(
+    ("cache_enabled", "track_extrapolate_timestamps_us", "expected_consolidations"),
+    [
+        (True, -1, 1),
+        (False, -1, 0),
+        (True, 1_000_000, 0),
+    ],
+)
+def test_cuboid_consolidation_cache_only_reuses_full_clip_requests(
+    cache_enabled: bool,
+    track_extrapolate_timestamps_us: int,
+    expected_consolidations: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = NCoreInstantNuRecDataset.__new__(NCoreInstantNuRecDataset)
+    dataset.cache_full_clip_cuboid_consolidation = cache_enabled
+    dataset.cuboid_tracks_params = _cuboid_tracks_params(track_extrapolate_timestamps_us)
+    dataset._full_clip_cuboid_consolidation_cache = {}
+    sequence_loader = SimpleNamespace(sequence_id="clip-a")
+    cuboids_df = pd.DataFrame()
+    consolidate_calls = 0
+
+    def consolidate_cuboid_tracks(**kwargs: Any) -> dict[str, dict]:
+        nonlocal consolidate_calls
+        consolidate_calls += 1
+        assert kwargs["T_world_world_base"] is None
+        return {"track": {"call": consolidate_calls}}
+
+    monkeypatch.setattr(instant_nurec_ncore, "consolidate_cuboid_tracks", consolidate_cuboid_tracks)
+
+    first = dataset._get_canonical_cuboid_tracks(cuboids_df, sequence_loader, cache_key="/data/clip-a.json")
+    second = dataset._get_canonical_cuboid_tracks(cuboids_df, sequence_loader, cache_key="/data/clip-a.json")
+
+    assert consolidate_calls == expected_consolidations
+    if expected_consolidations:
+        assert first is second
+    else:
+        assert first is None
+        assert second is None
+
+
+def test_cuboid_observation_cache_distinguishes_manifests_with_same_sequence_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = NCoreInstantNuRecDataset.__new__(NCoreInstantNuRecDataset)
+    dataset.cache_full_clip_cuboid_observations = True
+    dataset.cuboid_tracks_params = _cuboid_tracks_params(-1)
+    dataset._full_clip_cuboid_observations_cache = {}
+    loaders = [SimpleNamespace(sequence_id="same-clip"), SimpleNamespace(sequence_id="same-clip")]
+    keys = ["/exports/v1/clip.json", "/exports/v2/clip.json"]
+    interval = instant_nurec_ncore.HalfClosedInterval(0, 100)
+    observations = [pd.DataFrame({"version": [1]}), pd.DataFrame({"version": [2]})]
+    compute = MagicMock(side_effect=[observations[0], observations[1], observations[0]])
+    monkeypatch.setattr(instant_nurec_ncore, "compute_cuboid_df", compute)
+
+    # A,A and B,B hit independently; returning to A recomputes because only the
+    # active manifest is retained, preserving the cache's bounded memory use.
+    for expected_calls, index in enumerate([0, 1, 0], start=1):
+        for _ in range(2):
+            result = dataset._get_cuboid_observations(loaders[index], interval, cache_key=keys[index])
+            assert result is observations[index]
+            assert compute.call_count == expected_calls
+            assert list(dataset._full_clip_cuboid_observations_cache) == [keys[index]]
+        assert compute.call_args.args[0] is loaders[index]
+
+
+def test_cuboid_consolidation_cache_distinguishes_manifests_with_same_sequence_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = NCoreInstantNuRecDataset.__new__(NCoreInstantNuRecDataset)
+    dataset.cache_full_clip_cuboid_consolidation = True
+    dataset.cuboid_tracks_params = _cuboid_tracks_params(-1)
+    dataset._full_clip_cuboid_consolidation_cache = {}
+    loaders = [SimpleNamespace(sequence_id="same-clip"), SimpleNamespace(sequence_id="same-clip")]
+    keys = ["/exports/v1/clip.json", "/exports/v2/clip.json"]
+    observations = [pd.DataFrame({"version": [1]}), pd.DataFrame({"version": [2]})]
+    tracks = [{"track": {"version": 1}}, {"track": {"version": 2}}]
+    consolidate = MagicMock(side_effect=[tracks[0], tracks[1], tracks[0]])
+    monkeypatch.setattr(instant_nurec_ncore, "consolidate_cuboid_tracks", consolidate)
+
+    for expected_calls, index in enumerate([0, 1, 0], start=1):
+        for _ in range(2):
+            result = dataset._get_canonical_cuboid_tracks(observations[index], loaders[index], cache_key=keys[index])
+            assert result is tracks[index]
+            assert consolidate.call_count == expected_calls
+            assert list(dataset._full_clip_cuboid_consolidation_cache) == [keys[index]]
+        assert consolidate.call_args.kwargs["sequence_loader"] is loaders[index]
+        assert consolidate.call_args.kwargs["cuboids_df"] is observations[index]
+
+
+def test_copy_cuboid_tracks_with_world_base_isolates_per_chunk_mutation() -> None:
+    canonical: dict[str, dict[str, Any]] = {
+        "track": {
+            "dimension": np.asarray([1.0, 2.0, 3.0]),
+            "label_class": 4,
+            "poses": [np.eye(4), np.eye(4)],
+            "timestamps_us": [10, 20],
+        }
+    }
+    first_base = np.eye(4)
+    first_base[0, 3] = 1.0
+    second_base = np.eye(4)
+    second_base[1, 3] = 2.0
+
+    first = NCoreInstantNuRecDataset._copy_cuboid_tracks_with_world_base(canonical, first_base)
+    second = NCoreInstantNuRecDataset._copy_cuboid_tracks_with_world_base(canonical, second_base)
+    first["track"]["poses"].append(np.eye(4))
+    first["track"]["timestamps_us"].append(30)
+
+    assert len(canonical["track"]["poses"]) == 2
+    assert len(second["track"]["poses"]) == 2
+    np.testing.assert_allclose(first["track"]["poses"][0], first_base)
+    np.testing.assert_allclose(second["track"]["poses"][0], second_base)
 
 
 @pytest.mark.parametrize("external_path", [None, "other.zarr"])

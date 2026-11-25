@@ -30,17 +30,33 @@ uint2 get_index<let N : int>(no_diff uint index)
     return uint2(index_i, index_j);
 }
 
-// Dense launches traverse one block's rows before moving to another tile.
-// Using the active width also gives a partial final block exactly one writer
-// per component.
+// Traverses one tile of consecutive launch slots (a CUDA block for dense launches,
+// a warp for segmented ones) so adjacent lanes access adjacent components: on
+// iteration `component`, lane `local` visits flat element
+// component * active_width + local of the tile's active_width-by-N sub-matrix.
+// Returns the tile-local (row, column); the caller maps the row to a tensor row.
+//
+// Callers guarantee that N > 0 and component < N; that the tile starts at a slot
+// tile_start <= tid < count, so active_width = min(tile width, count - tile_start)
+// cannot underflow; that every lane of the tile computes the same active_width; and
+// that local = tid - tile_start is a live thread for every local in
+// [0, active_width) (threads with tid >= count return before any task runs). The
+// flat elements then cover [0, N * active_width) once, so each row and component of
+// the tile, including a partial last tile, has exactly one writer.
+[ForceInline]
+uint2 get_tile_index<let N : int>(no_diff uint local, no_diff uint active_width, no_diff uint component)
+{
+    return get_index<N>(component * active_width + local);
+}
+
+// Dense launches tile by CUDA block, visiting rows
+// [block_start, block_start + active_width) before moving to another tile.
 //
 // Requires a 1-D grid and 1-D blocks, with gridDim.x == div_up(count, blockDim.x)
 // (one block per tile, no oversubscription or grid-stride loop). The launcher in
 // collector_slang.py supplies this geometry. tid must equal
 // cudaBlockIdx().x * cudaBlockDim().x + cudaThreadIdx().x and satisfy tid < count;
-// run_tasks_dense enforces this before dispatching tasks. Thus block_start < count
-// whenever this helper is reached, preventing unsigned count - block_start
-// underflow. N must be positive and component must be in [0, N).
+// run_tasks_dense enforces this before dispatching tasks.
 // Returns the (row, column) index within the count-by-N tensor for this lane
 // and component iteration.
 [ForceInline]
@@ -48,7 +64,8 @@ uint2 get_block_index<let N : int>(no_diff uint tid, no_diff uint count, no_diff
 {
     const uint block_start = cudaBlockIdx().x * cudaBlockDim().x;
     const uint active_width = min(cudaBlockDim().x, count - block_start);
-    return get_index<N>(block_start * N + component * active_width + tid - block_start);
+    const uint2 index = get_tile_index<N>(tid - block_start, active_width, component);
+    return uint2(block_start + index.x, index.y);
 }
 
 // This function passes a value through, but only optionally allows the
@@ -117,7 +134,7 @@ public struct LayerSegments
 };
 
 // Layout is specialized at compilation. Sparse tasks receive an already mapped row;
-// dense tasks keep the original coalesced component traversal.
+// both layouts share the tiled component traversal of utils::get_tile_index.
 public interface ICollectRows
 {
     uint row(uint tid);
@@ -140,7 +157,19 @@ public struct SparseRows : ICollectRows
     uint row(uint tid) { return row_index; }
     uint2 component<let N : int>(uint i, uint tid, uint count)
     {
-        return uint2(row_index, i);
+        // Tile by warp. Each lane already resolved its selected row once in the task
+        // runner; exchange those row indices instead of searching the segments again.
+        //
+        // See utils::get_tile_index for the tile traversal contract. In addition:
+        // - The 1-D launch uses blocks whose size is a multiple of the warp size.
+        // - Only the tail past count is inactive (run_tasks_segmented returns it).
+        // - Every live lane calls this together with the same i. Current callers use
+        //   uniform [ForceUnroll] loops; per-row branches could leave a source lane inactive.
+        const uint lane = WaveGetLaneIndex();
+        const uint warp_start = tid - lane;
+        const uint width = min(WaveGetLaneCount(), count - warp_start);
+        const uint2 index = utils::get_tile_index<N>(lane, width, i);
+        return uint2(WaveShuffle(row_index, index.x), index.y);
     }
 };
 
@@ -213,9 +242,9 @@ struct SigmoidFunction : IUnaryFunction
     static float apply(float x) { return sigmoid::standard(x); }
 };
 
-// Dense launches visit input rows [block_start, block_start + active_width) in
-// block-local order. Sparse launches keep the segment's mapped row/component
-// pair. Physical addresses still follow each tensor's strides.
+// Rows.component() walks a tile's components in lane order: a CUDA block for dense
+// launches, a warp of mapped rows for segmented ones (see utils::get_tile_index).
+// Physical addresses still follow each tensor's strides.
 //
 // OPTME: In the case of the pure copy, we could do vectorized float4 load.
 // Manual backward for apply_to_buffer to avoid Slang's autodiff unrolling

@@ -225,10 +225,19 @@ class MetricsSamples(BaseModel):
 
 
 class MetricsFileContent(BaseModel):
-    """A class to represent the content of a metrics file that will be saved to a file."""
+    """Store named metric samples, aggregates and collection metadata in metrics.yaml.
 
-    aggregated_metrics: MetricsAggregateDict = Field(description="Aggregated metrics")
-    metrics: MetricsSamples = Field(description="List of metrics samples")
+    Rendering timings render_time_ms, cuda_ms and frame_wall_ms share the same
+    FrameMetricSample and MetricAggregate schemas; their values are milliseconds.
+    Metric names remain extensible for quality metrics and other measurements.
+    """
+
+    aggregated_metrics: MetricsAggregateDict = Field(
+        description="Named aggregates, including render_time_ms, cuda_ms and frame_wall_ms timings in milliseconds"
+    )
+    metrics: MetricsSamples = Field(
+        description="Named samples, including render_time_ms, cuda_ms and frame_wall_ms frame timings in milliseconds"
+    )
     program_version: Version = Field(description="Version informations of the program")
     run_info: MetricsFileRunInfo = Field(description="Run informations")
     metric_metadata: Dict[str, Dict[str, Any]] = Field(

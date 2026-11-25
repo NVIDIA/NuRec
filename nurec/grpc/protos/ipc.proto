@@ -10,15 +10,23 @@ package nurec.grpc.protos.ipc;
 // For a client co-located with the server on the same node: the server allocates
 // and owns a small pool of GPU frame buffers, exports each as a cudaIpcMemHandle_t,
 // and the client opens them read-only via cudaIpcOpenMemHandle.
-// render_rgb stays a blocking RPC; the server picks which pooled buffer to render
-// into, and the client tells the server (via released_buffer_id on the next
-// request) once it is done reading a given buffer.
+// Completion is guaranteed on return unless a camera-batch session opts into
+// exported ready events. The server selects buffers; the client sends each
+// released_buffer_id once, after all GPU reads of that buffer complete.
 ////////////////////////////////////////////////////////////////////////////////
 
 message OpenIpcSessionRequest {
     uint32 requested_width        = 1;
     uint32 requested_height       = 2;
     uint32 requested_buffer_count = 3;  // e.g. 2; server rejects requests above its configured max
+    // EVENT_ORDERED is supported only by batch_render_camera. Older servers ignore
+    // this field; clients must check the accepted mode in the response.
+    IpcCompletionMode completion_mode = 4;
+}
+
+enum IpcCompletionMode {
+    COMPLETION_ON_RETURN = 0;
+    EVENT_ORDERED = 1;
 }
 
 message OpenIpcSessionResponse {
@@ -28,6 +36,12 @@ message OpenIpcSessionResponse {
     bytes device_uuid                   = 4;  // server's CUDA device UUID (cudaDeviceProp::uuid), sanity-checked before open
     uint32 actual_width                 = 5;
     uint32 actual_height                = 6;
+    IpcCompletionMode completion_mode = 7;
+    // One cudaIpcEventHandle_t per buffer in EVENT_ORDERED mode; otherwise empty.
+    // Wait on the returned buffer's event before reading its pixels.
+    repeated bytes cuda_ipc_ready_event_handles = 8;
+    string linux_boot_id = 9;
+    uint32 cuda_runtime_version = 10;
 }
 
 message CloseIpcSessionRequest {

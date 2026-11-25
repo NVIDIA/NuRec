@@ -6,8 +6,18 @@ import numpy as np
 import pytest
 import torch
 
+from nurec.grpc import ego_hood
 from nurec.grpc.ego_hood import EgocarHood, EgocarRig, EgocarRigBank
 from nurec.grpc.protos.sensorsim_pb2 import RGBRenderRequest
+
+
+@pytest.fixture
+def decoded_paths(monkeypatch):
+    """Records the path of every hood image the module decodes."""
+    paths = []
+    imread = ego_hood.iio.imread
+    monkeypatch.setattr(ego_hood.iio, "imread", lambda path: paths.append(path) or imread(path))
+    return paths
 
 
 @pytest.fixture
@@ -50,28 +60,37 @@ def test_rig_bank_dir(test_image_rgba, tmp_path):
 
 
 class TestEgocarHood:
-    def test_load_from_file(self, test_rig_bank_dir):
-        # Test creating an EgocarHood from a file
+    def test_load(self, test_rig_bank_dir):
         hood_path = test_rig_bank_dir["hood_image_path"]
-        hood = EgocarHood.load_from_file("front", "rig1", hood_path)
+        hood = EgocarHood("front", "rig1", str(hood_path))
 
         assert hood.camera_logical_id == "front"
         assert hood.rig_id == "rig1"
-        assert hood._hood_rgba.shape[0] == 4  # RGBA
-        assert hood._hood_rgba.dtype == torch.float32
-        assert torch.max(hood._hood_rgba) <= 1.0  # Normalized to [0, 1]
+
+        hood_rgba = hood.load()
+        assert hood_rgba.shape == (4, 100, 100)  # RGBA, channels first
+        assert hood_rgba.dtype == torch.float32
+        assert torch.max(hood_rgba) <= 1.0  # Normalized to [0, 1]
+
+    def test_load_rejects_non_rgba(self, tmp_path):
+        hood_path = tmp_path / "front.png"
+        iio.imwrite(hood_path, np.zeros((10, 10, 3), dtype=np.uint8))
+        hood = EgocarHood("front", "rig1", str(hood_path))
+
+        with pytest.raises(ValueError, match="front.png is not an RGBA image"):
+            hood.load()
 
     def test_draw_egocar(self, test_rig_bank_dir):
         # Test overlaying the hood on a render
         hood_path = test_rig_bank_dir["hood_image_path"]
-        hood = EgocarHood.load_from_file("front", "rig1", hood_path)
+        hood = EgocarHood("front", "rig1", str(hood_path))
 
         # Create a test render (blue background)
         render = torch.zeros(100, 100, 3, dtype=torch.float32)
         render[:, :, 2] = 1.0  # Blue background
 
         # Apply the hood to the render
-        result = hood.overlay_on_image(render)
+        result = EgocarRigBank.empty().overlay_on_image(hood, render)
 
         # The result should have red pixels where the hood was and blue pixels elsewhere
         assert result.shape == (100, 100, 3)
@@ -86,41 +105,9 @@ class TestEgocarHood:
         assert result[0, 0, 1] < 0.1  # Green channel low
         assert result[0, 0, 2] > 0.9  # Blue channel high
 
-    def test_resize_cache(self, test_rig_bank_dir, monkeypatch):
-        # Test that the resize cache works correctly
-        hood_path = test_rig_bank_dir["hood_image_path"]
-        hood = EgocarHood.load_from_file("front", "rig1", hood_path)
-
-        # Create a render with a different size
-        render1 = torch.zeros(50, 50, 3, dtype=torch.float32)
-
-        # Setup to monitor logger calls
-        logger_calls = []
-
-        def mock_info(message):
-            logger_calls.append(message)
-
-        # Patch the logger.info method
-        monkeypatch.setattr("nurec.grpc.ego_hood.logger.info", mock_info)
-
-        # First draw should update the cache
-        hood.overlay_on_image(render1)
-        assert len(logger_calls) == 1
-
-        # Cache should now be at the new size
-        assert hood._resize_cache.shape[1:3] == (50, 50)
-
-        # Clear the call log
-        logger_calls.clear()
-
-        # Second draw should use the cache
-        hood.overlay_on_image(render1)
-        assert len(logger_calls) == 0
-
-    def test_metadata(self, test_rig_bank_dir):
-        # Test that the metadata is correctly generated
-        hood_path = test_rig_bank_dir["hood_image_path"]
-        hood = EgocarHood.load_from_file("front", "rig1", hood_path)
+    def test_metadata(self):
+        # Metadata never touches the file
+        hood = EgocarHood("front", "rig1", "/nonexistent/front.png")
         metadata = hood.metadata
 
         assert metadata.ego_mask_id.camera_logical_id == "front"
@@ -128,24 +115,24 @@ class TestEgocarHood:
 
 
 class TestEgocarRig:
-    def test_load_from_dir(self, test_rig_bank_dir):
+    def test_from_dir(self, test_rig_bank_dir):
         # Test creating an EgocarRig from a directory
         rig_dir = test_rig_bank_dir["rig_dir_path"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        rig = EgocarRig.load_from_dir("test_rig", rig_dir)
+        rig = EgocarRig.from_dir("test_rig", rig_dir)
 
         assert rig.rig_id == "test_rig"
         assert len(rig._hoods) == len(camera_ids)
         for camera_id in camera_ids:
             assert camera_id in rig._hoods
 
-    def test_load_from_dir_ignores_non_png_files_and_directories(self, test_rig_bank_dir):
+    def test_from_dir_ignores_non_png_files_and_directories(self, test_rig_bank_dir):
         rig_dir = test_rig_bank_dir["rig_dir_path"]
         camera_ids = test_rig_bank_dir["camera_ids"]
         (rig_dir / "notes.txt").write_text("ignore me")
         (rig_dir / "nested.png").mkdir()
 
-        rig = EgocarRig.load_from_dir("test_rig", rig_dir)
+        rig = EgocarRig.from_dir("test_rig", rig_dir)
 
         assert len(rig._hoods) == len(camera_ids)
         assert "nested" not in rig._hoods
@@ -154,7 +141,7 @@ class TestEgocarRig:
         # Test the get method
         rig_dir = test_rig_bank_dir["rig_dir_path"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        rig = EgocarRig.load_from_dir("test_rig", rig_dir)
+        rig = EgocarRig.from_dir("test_rig", rig_dir)
 
         # Existing camera_id
         hood = rig.get(camera_ids[0])
@@ -169,7 +156,7 @@ class TestEgocarRig:
         # Test that available_metadata returns the correct list
         rig_dir = test_rig_bank_dir["rig_dir_path"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        rig = EgocarRig.load_from_dir("test_rig", rig_dir)
+        rig = EgocarRig.from_dir("test_rig", rig_dir)
 
         metadata_list = rig.available_metadata()
         assert len(metadata_list) == len(camera_ids)
@@ -180,29 +167,73 @@ class TestEgocarRig:
 
 
 class TestEgocarRigBank:
-    def test_load_from_dir(self, test_rig_bank_dir):
+    def test_from_dir(self, test_rig_bank_dir):
         # Test creating an EgocarRigBank from a directory
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         assert len(bank._rigs) == len(rig_ids)
         for rig_id in rig_ids:
             assert rig_id in bank._rigs
 
-    def test_load_from_dir_ignores_root_files(self, test_rig_bank_dir):
+    def test_from_dir_ignores_root_files(self, test_rig_bank_dir):
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         (bank_dir / ".nvcf_manifest.json").write_text("{}")
         (bank_dir / "README.txt").write_text("ignore me")
 
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         assert len(bank._rigs) == len(rig_ids)
         for rig_id in rig_ids:
             assert rig_id in bank._rigs
         assert ".nvcf_manifest.json" not in bank._rigs
         assert "README.txt" not in bank._rigs
+
+    def test_from_dir_does_not_decode(self, test_rig_bank_dir, decoded_paths):
+        bank = EgocarRigBank.from_dir(test_rig_bank_dir["base_dir"])
+
+        assert len(bank.available_metadata()) == 6
+        assert decoded_paths == []
+
+    def test_cache_reuses_resized_hood_per_size(self, test_rig_bank_dir, decoded_paths):
+        hood = EgocarHood("front", "rig1", str(test_rig_bank_dir["hood_image_path"]))
+        bank = EgocarRigBank.empty()
+
+        bank.overlay_on_image(hood, torch.zeros(50, 50, 3, dtype=torch.float32))
+        bank.overlay_on_image(hood, torch.zeros(50, 50, 3, dtype=torch.float32))
+        assert len(decoded_paths) == 1
+
+        # A new render size is a separate cache entry
+        bank.overlay_on_image(hood, torch.zeros(20, 20, 3, dtype=torch.float32))
+        assert len(decoded_paths) == 2
+
+    def test_cache_size_evicts_least_recently_used(self, test_rig_bank_dir, decoded_paths):
+        rig_ids = test_rig_bank_dir["rig_ids"]
+        camera_ids = test_rig_bank_dir["camera_ids"]
+        bank = EgocarRigBank.from_dir(test_rig_bank_dir["base_dir"], cache_size=2)
+        render = torch.zeros(20, 20, 3, dtype=torch.float32)
+
+        first = bank._rigs[rig_ids[0]].get(camera_ids[0])
+        second = bank._rigs[rig_ids[0]].get(camera_ids[1])
+        third = bank._rigs[rig_ids[1]].get(camera_ids[0])
+
+        bank.overlay_on_image(first, render)
+        bank.overlay_on_image(second, render)
+        # Re-using the first hood makes the second one the least recently used
+        bank.overlay_on_image(first, render)
+        bank.overlay_on_image(third, render)
+        assert decoded_paths == [first.path, second.path, third.path]
+
+        # The evicted hood is decoded again on its next use; the third one is still cached
+        bank.overlay_on_image(second, render)
+        bank.overlay_on_image(third, render)
+        assert decoded_paths == [first.path, second.path, third.path, second.path]
+
+    def test_cache_size_must_be_positive(self):
+        with pytest.raises(AssertionError):
+            EgocarRigBank({}, cache_size=0)
 
     def test_empty(self):
         # Test creating an empty EgocarRigBank
@@ -215,7 +246,7 @@ class TestEgocarRigBank:
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         metadata_list = bank.available_metadata()
         assert len(metadata_list) == len(rig_ids) * len(camera_ids)
@@ -225,7 +256,7 @@ class TestEgocarRigBank:
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         # Create a request with specific camera_logical_id and rig_config_id
         request = RGBRenderRequest()
@@ -242,7 +273,7 @@ class TestEgocarRigBank:
         # Test selecting a hood with nonexistent config_id
         bank_dir = test_rig_bank_dir["base_dir"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         # Create a request with nonexistent config_id
         request = RGBRenderRequest()
@@ -257,7 +288,7 @@ class TestEgocarRigBank:
         # Test selecting a hood with nonexistent camera_id
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         # Create a request with nonexistent camera_id
         request = RGBRenderRequest()
@@ -269,7 +300,7 @@ class TestEgocarRigBank:
 
     def test_select_from_request_no_use_ego_mask(self, test_rig_bank_dir):
         bank_dir = test_rig_bank_dir["base_dir"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         # Create a request with empty camera_id
         request = RGBRenderRequest()
@@ -283,7 +314,7 @@ class TestEgocarRigBank:
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         for camera_id in camera_ids:
             request = RGBRenderRequest()
@@ -301,7 +332,7 @@ class TestEgocarRigBank:
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
 
         for rig_id in rig_ids:
             request = RGBRenderRequest()
@@ -318,7 +349,7 @@ class TestEgocarRigBank:
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
         camera_ids = test_rig_bank_dir["camera_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
         logger_calls = []
 
         monkeypatch.setattr("nurec.grpc.ego_hood.logger.info", lambda message: logger_calls.append(message))
@@ -343,7 +374,7 @@ class TestEgocarRigBank:
     def test_select_from_request_logs_missing_mask_for_new_logical_camera_id(self, test_rig_bank_dir, monkeypatch):
         bank_dir = test_rig_bank_dir["base_dir"]
         rig_ids = test_rig_bank_dir["rig_ids"]
-        bank = EgocarRigBank.load_from_dir(bank_dir)
+        bank = EgocarRigBank.from_dir(bank_dir)
         logger_calls = []
 
         monkeypatch.setattr("nurec.grpc.ego_hood.logger.info", lambda message: logger_calls.append(message))
@@ -392,7 +423,7 @@ class TestEgoMaskOverlayAccuracy:
 
     def test_overlay_applies_correct_mask_per_camera(self, distinct_masks_dir):
         """Verify that after overlay, the mask region contains the correct camera-specific color."""
-        bank = EgocarRigBank.load_from_dir(distinct_masks_dir["base_dir"])
+        bank = EgocarRigBank.from_dir(distinct_masks_dir["base_dir"])
         rig_id = distinct_masks_dir["rig_id"]
 
         for camera_id, (r, g, b) in distinct_masks_dir["cameras"].items():
@@ -408,7 +439,7 @@ class TestEgoMaskOverlayAccuracy:
             hood = bank.select_from_request(request)
             assert hood is not None, f"No mask found for {camera_id}"
 
-            result = hood.overlay_on_image(rendered)
+            result = bank.overlay_on_image(hood, rendered)
 
             # Check the hood region (row 90, middle column) has the camera-specific color
             pixel = result[90, 50]
@@ -440,7 +471,7 @@ class TestEgoMaskOverlayAccuracy:
         img[80:100, :, 3] = 128  # ~50% alpha
         iio.imwrite(rig_dir / "cam_semi.png", img)
 
-        bank = EgocarRigBank.load_from_dir(tmp_path)
+        bank = EgocarRigBank.from_dir(tmp_path)
 
         # White background
         rendered = torch.ones(100, 100, 3, dtype=torch.float32)
@@ -451,7 +482,7 @@ class TestEgoMaskOverlayAccuracy:
         request.ego_mask_id.rig_config_id = rig_id
 
         hood = bank.select_from_request(request)
-        result = hood.overlay_on_image(rendered)
+        result = bank.overlay_on_image(hood, rendered)
 
         # At 50% alpha, the pixel should be a blend of mask (200/255, 0, 0) and white (1, 1, 1)
         alpha = 128 / 255.0
@@ -461,7 +492,7 @@ class TestEgoMaskOverlayAccuracy:
 
     def test_missing_camera_mask_raises_for_explicit_request(self, distinct_masks_dir):
         """Verify that an explicit mask request fails when the selected rig has no matching camera."""
-        bank = EgocarRigBank.load_from_dir(distinct_masks_dir["base_dir"])
+        bank = EgocarRigBank.from_dir(distinct_masks_dir["base_dir"])
 
         request = RGBRenderRequest()
         request.insert_ego_mask = True

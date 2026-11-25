@@ -36,6 +36,7 @@ py_library(
         "construction_barriers.py",
         "construction_barriers_model.py",
         "gaussians_model.py",
+        "initialization_pipeline.py",
         "initializations.py",
         "interpolated_table_gaussians.py",
         "renderers.py",
@@ -56,7 +57,12 @@ py_library(
         pip_requirement("lietorch"),
         pip_requirement("point-cloud-utils"),
         ":pylib_cc_gsplat",
+        "//nurec/config:pylib",
+        "//nurec/config:pylib_leaf_schemas",
+        "//nurec/config:pylib_trainer_config",
         "//nurec/datasets:pylib",
+        "//nurec/datasets:pylib_tracks",
+        "//nurec/libs/cuboid_relocation:pylib_cc",
         "//nurec/libs/geometry/kernels:pylib",
         "//nurec/libs/packed_ops:pylib_cc",
         "//nurec/models:pylib",
@@ -64,8 +70,11 @@ py_library(
         "//nurec/models/gaussians/collect:pylib",
         "//nurec/utils:pylib",
         "//nurec/utils:pylib_cached_device_tensor",
+        "//nurec/utils:pylib_initialization",
         "//nurec/utils:pylib_lidar_object_init_points",
+        "//nurec/utils:pylib_misc",
         "//nurec/utils:pylib_morton",
+        "//nurec/utils:pylib_ncore_utils",
         "//nurec/utils:pylib_optim",
         "//nurec/utils:pylib_renamed_keys",
         "//nurec/utils:pylib_tile_mask",
@@ -106,8 +115,10 @@ py_library(
         ":pylib",
         ":pylib_edit_hook",
         ":pylib_fused_parameter_gather",
+        "//nurec/datasets:pylib",
         "//nurec/models/gaussians/strategies:pylib",
         "//nurec/utils:pylib_component_only_mask",
+        "//nurec/utils:pylib_initialization",
         "//nurec/utils:pylib_selective_adam_visibility",
         pip_requirement("torch"),
     ],
@@ -174,6 +185,16 @@ pytest_test(
     ],
 )
 
+# Every layer class advances the Fourier-freeze counter and steps its owned modules once per training step.
+pytest_test(
+    name = "gaussians_model_freeze_test",
+    srcs = ["gaussians_model_freeze_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("torch"),
+    ],
+)
+
 pytest_test(
     name = "segment_plan_test",
     srcs = ["segment_plan_test.py"],
@@ -187,6 +208,18 @@ pytest_test(
 pytest_test(
     name = "interpolated_table_gaussians_test",
     srcs = ["interpolated_table_gaussians_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/compression:pylib_gaussian_codec",
+        pip_requirement("apex"),
+        pip_requirement("safetensors"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "temporal_deformation_storage_test",
+    srcs = ["temporal_deformation_storage_test.py"],
     deps = [
         ":pylib",
         pip_requirement("torch"),

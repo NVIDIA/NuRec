@@ -4,14 +4,18 @@
 """Tests for ncore_aux_data module."""
 
 import itertools
+import multiprocessing
 import pickle
+import platform
 import queue
+import signal
 import subprocess
 import sys
 import threading
 
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
 
@@ -27,41 +31,53 @@ from python.runfiles import runfiles
 from scipy.ndimage import binary_dilation, median_filter
 
 from apps.av.aux_gen.device_frame import (
+    DeviceFrameContext,
     DeviceFrameOutputSpec,
+    DeviceFramePipeline,
     DeviceFrameProcessor,
     DeviceFrameProcessorMetadata,
     process_device_frame_from_host,
+    processor_directory,
 )
 from apps.av.aux_gen.device_frame_service import (
     DeviceFrameResult,
     DeviceFrameServiceReady,
     DeviceFrameSharedArray,
     DeviceFrameSharedBuffers,
+    DeviceFrameStopSignal,
+    SharedDeviceFrameClient,
 )
 from apps.av.aux_gen.estimators import (
     Mask2FormerSegmentationEstimator,
     PromptlessSAM2EgoMaskEstimator,
     find_network_file_path,
-    get_gpu_info,
+    get_compute_capability,
 )
 from apps.av.aux_gen.ncore_aux_data import (
+    _HOST_WORKER_CANCEL_POLL_SECONDS,
+    _HOST_WORKER_UNRELEASED_STOP_WAIT_SECONDS,
+    _PROCESS_CLEANUP_GRACE_SECONDS,
     AsyncShardWriter,
     AuxDataWriter,
     DepthGenerationRequest,
     LoaderWorkerPayload,
     OpenedSequence,
+    SensorRanges,
     _merge_mask2former_outputs,
     _run_ego_mask_for_camera,
     _run_segmentation_camera_frames,
     _run_serial_mask2former_segmentation,
     _run_shared_segmentation,
     _segmentation_host_worker,
+    _segmentation_host_worker_when_ready,
     _SegmentationHostWorkerConfig,
+    _SegmentationHostWorkerReady,
     _select_ego_mask_sample_indices,
     _stop_processes_if_alive,
     _wait_for_segmentation_services,
     build_ncore_aux_data_cli,
     cli,
+    run_egomask_estimation,
 )
 from apps.av.aux_gen.segmentation_device_pipeline import (
     CAMERA_MASK_INPUT,
@@ -72,18 +88,29 @@ from apps.av.aux_gen.segmentation_device_pipeline import (
     SEMANTIC_LOGITS_OUTPUT,
     SEMANTIC_UNCERTAINTY_OUTPUT,
     SegmentationDeviceFramePipelineFactory,
+    _mask2former_output_specs,
+    _sam2_output_specs,
 )
-from apps.av.aux_gen.segmentation_presentation import is_dark_image, save_mask2former_visualization
+from apps.av.aux_gen.segmentation_presentation import (
+    is_dark_image,
+    labels_to_paletted_image,
+    save_mask2former_visualization,
+)
+from apps.av.aux_gen.segmentation_test_support import assert_segmentation_archives_match
 from apps.av.aux_gen.shared_segmentation import (
+    AuxiliaryFrameSelection,
+    AuxiliaryOutputIdentity,
     AuxiliarySegmentationOutputs,
     SegmentationFrameOutput,
     SharedSegmentationFrameProcessor,
     save_auxiliary_mask,
 )
+from apps.av.aux_gen.trt_engine_selection import TRT_CHECKPOINTS, TRT_FALLBACK_CHECKPOINTS
 
 
 RUNFILES = runfiles.Create()
 SEQUENCE = "clipgt-9048443e-c482-4228-8326-5b3dff3be711"
+_CAPACITY_WAIT_TIMEOUT_SECONDS = 10.0
 
 
 def _processor_metadata(
@@ -105,10 +132,17 @@ def test_imports():
     [
         "mask2former_dinov2_nv_private12k_backboneTTA_76000.pth",
         "sam2_hiera_l_avfinetuned_v1.pt",
+        *[engine for (_, arch), engine in TRT_CHECKPOINTS.items() if arch == platform.machine()],
+        *[engine for arch, engine in TRT_FALLBACK_CHECKPOINTS.items() if arch == platform.machine()],
     ],
 )
 def test_pretrained_checkpoint_resolves_from_http_file_runfiles(checkpoint: str) -> None:
-    assert find_network_file_path(checkpoint).is_file()
+    path = find_network_file_path(checkpoint)
+    assert path.is_file()
+    if checkpoint.endswith(".pth"):
+        metadata = torch.load(path, map_location="cpu", weights_only=False, mmap=True)["meta"]["dataset_meta"]
+        assert len(metadata["classes"]) == 20
+        assert np.asarray(metadata["palette"]).shape == (20, 3)
 
 
 def test_built_cli_forwards_configured_depth_generation() -> None:
@@ -258,6 +292,48 @@ def test_execution_mode_rejects_options_that_would_be_ignored(options: list[str]
 
     assert result.exit_code == 2
     assert message in result.output
+
+
+@pytest.mark.parametrize(
+    "bounds,expected",
+    [
+        ((20, 40), ((2, 3), (1, 2), (1, 2))),
+        ((30, 30), ((2,), (), ())),
+        ((99, 100), ((), (), ())),
+        ((-10, -1), ((), (), ())),
+        (None, ((2, 3), (0, 1, 2, 3), (0, 1, 2))),
+    ],
+)
+def test_timestamp_range_intersects_sensor_ranges(bounds, expected):
+    loader = MagicMock()
+    loader.get_camera_sensor.side_effect = lambda camera: SimpleNamespace(
+        get_frames_timestamps_us=lambda: [10, 20, 30, 40] if camera == "front" else [11, 21, 31, 41]
+    )
+    loader.get_lidar_sensor.return_value.get_frames_timestamps_us.return_value = [0, 20, 40]
+    ranges = SensorRanges(
+        camera_frame_ranges={"front": range(2, 4), "rear": range(4)}, lidar_frame_ranges={"lidar": range(3)}
+    )
+    selected = ranges.restrict_to_timestamps(loader, bounds)
+    assert (
+        tuple(
+            tuple(frames) for frames in (*selected.camera_frame_ranges.values(), *selected.lidar_frame_ranges.values())
+        )
+        == expected
+    )
+    assert ranges.camera_frame_ranges == {"front": range(2, 4), "rear": range(4)}
+
+
+def test_timestamp_range_cli():
+    with patch("apps.av.aux_gen.ncore_aux_data.ncore_aux_data") as run:
+        result = CliRunner().invoke(
+            cli, ["--output-dir=/tmp/ncore_aux_data_test", "--timestamp-range-us", "20", "40", "offset"]
+        )
+    assert result.exit_code == 0, result.output
+    assert run.call_args.args[0].timestamp_range_us == (20, 40)
+    result = CliRunner().invoke(
+        cli, ["--output-dir=/tmp/ncore_aux_data_test", "--timestamp-range-us", "40", "20", "offset"]
+    )
+    assert result.exit_code == 2 and "START must not exceed END" in result.output
 
 
 def test_visualize_accepts_parallel_mode() -> None:
@@ -577,6 +653,9 @@ def test_segmentation_service_start_failure_cleans_up_started_services() -> None
             self.exitcode = 0
 
     class FakeContext:
+        Pipe = staticmethod(multiprocessing.Pipe)
+        Lock = staticmethod(threading.Lock)
+
         def __init__(self) -> None:
             self.stop_event = threading.Event()
 
@@ -634,25 +713,71 @@ def test_segmentation_service_start_failure_cleans_up_started_services() -> None
     assert context.stop_event.is_set()
 
 
-@pytest.mark.parametrize("startup_fails", [False, True])
-@pytest.mark.parametrize("mask2former_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("startup_fails", "mask2former_enabled"),
+    list(itertools.product((None, "service", "host", "manager", "ready", "send"), (False, True)))
+    + [("shutdown", True)],
+)
 def test_shared_segmentation_extension_lifecycle_with_empty_camera(
-    startup_fails: bool, mask2former_enabled: bool
+    startup_fails: str | None, mask2former_enabled: bool
 ) -> None:
     """Forward extension state and snapshot statistics before shutting down their owner."""
     context = MagicMock()
-    context.Process.return_value.start.side_effect = OSError("stop after sampling") if startup_fails else None
+    context.Process.return_value.start.side_effect = (
+        OSError("stop after sampling") if startup_fails == "service" else None
+    )
+    if startup_fails == "host":
+        context.Process.return_value.start.side_effect = [None, OSError("stop after sampling")]
+        context.Process.return_value.is_alive.side_effect = [True, False, False, False]
+    context.Manager.side_effect = OSError("stop after sampling") if startup_fails == "manager" else None
+    if startup_fails in ("manager", "ready"):
+        context.Process.return_value.is_alive.side_effect = [True, False, False, False] * 3
     context.Process.return_value.exitcode = 0
-    context.Queue.return_value.get_nowait.side_effect = queue.Empty
     context.Event.return_value.is_set.return_value = False
     context.Process.return_value.is_alive.return_value = False
     statistics = [{"camera_id": "active", "pixels": 3}]
     expected_statistics = tuple(statistics)
     context.Manager.return_value.list.return_value = statistics
     lifecycle = MagicMock()
+    lifecycle.attach_mock(context.Process.return_value.start, "start")
+    lifecycle.attach_mock(context.Manager, "manager")
     lifecycle.attach_mock(context.Process.return_value.join, "join")
     lifecycle.attach_mock(context.Manager.return_value.shutdown, "shutdown")
     context.Manager.return_value.shutdown.side_effect = statistics.clear
+    context.Queue.side_effect = lambda **_: MagicMock(get_nowait=MagicMock(side_effect=queue.Empty))
+    ready_pipes: list[tuple[MagicMock, MagicMock]] = []
+
+    def make_pipe(*, duplex: bool) -> tuple[MagicMock, MagicMock]:
+        assert not duplex
+        if context.Pipe.call_count == 1:  # Shutdown pipe, separate from worker-ready accounting.
+            return MagicMock(), MagicMock()
+        receiver, sender = MagicMock(), MagicMock()
+        ready_pipes.append((receiver, sender))
+        if startup_fails == "send" and len(ready_pipes) == 2:
+            sender.send.side_effect = OSError("stop after sampling")
+        lifecycle.attach_mock(sender.send, "release")
+        return receiver, sender
+
+    context.Pipe.side_effect = make_pipe
+
+    if startup_fails == "shutdown":
+        # Workers finish, but the CUDA service remains alive until terminated.
+        process = context.Process.return_value
+
+        def join(timeout=None):
+            if timeout is None:
+                assert process.join.call_count <= len(ready_pipes), "Unbounded service join"
+                if process.join.call_count == len(ready_pipes):
+                    context.Event.return_value.is_set.return_value = True
+                    process.is_alive.return_value = True
+                    process.exitcode = None
+
+        def terminate():
+            process.is_alive.return_value = False
+            process.exitcode = -signal.SIGTERM
+
+        process.join.side_effect = join
+        process.terminate.side_effect = terminate
 
     camera_sensors = {}
     for camera_id, timestamps in {"empty": [], "active": [100, 200]}.items():
@@ -679,13 +804,15 @@ def test_shared_segmentation_extension_lifecycle_with_empty_camera(
         segmentation_backend="mask2former" if mask2former_enabled else "none",
     )
     auxiliary_segmentation = MagicMock()
-    auxiliary_segmentation.frame_outputs.return_value = AuxiliarySegmentationOutputs(
+    output_handler = auxiliary_segmentation.prepare_output.return_value
+    output_handler.frame_outputs = AuxiliarySegmentationOutputs(
         processor_name="extension",
         mask_output="extension_mask",
         mask_root=Path("/output/extension"),
     )
-    auxiliary_segmentation.select_camera_frames.return_value = {1: (0,)}
-    lifecycle.attach_mock(auxiliary_segmentation.finalize, "finalize")
+    selection = AuxiliaryFrameSelection({1: (0,)})
+    auxiliary_segmentation.select_camera_frames.return_value = selection
+    lifecycle.attach_mock(output_handler.finalize, "finalize")
     extension_metadata = {"model": "extension-v1"}
     ready = DeviceFrameServiceReady(
         service_id=0,
@@ -700,21 +827,37 @@ def test_shared_segmentation_extension_lifecycle_with_empty_camera(
         error=None,
     )
 
+    expected_error: type[Exception] = RuntimeError if startup_fails == "shutdown" else OSError
     with (
         patch("apps.av.aux_gen.ncore_aux_data.torch.cuda.device_count", return_value=1),
         patch("apps.av.aux_gen.ncore_aux_data.multiprocessing.get_context", return_value=context),
         patch("apps.av.aux_gen.ncore_aux_data.SegmentationDeviceFramePipelineFactory") as create_pipeline,
-        patch("apps.av.aux_gen.ncore_aux_data._wait_for_segmentation_services", return_value=ready),
-        patch("apps.av.aux_gen.ncore_aux_data.DeviceFrameSharedBuffers.create"),
-        patch("apps.av.aux_gen.ncore_aux_data.sequence_loader_shard_info", return_value=("clip", None, None)),
+        patch(
+            "apps.av.aux_gen.ncore_aux_data._wait_for_segmentation_services",
+            return_value=ready,
+            side_effect=OSError("stop after sampling") if startup_fails == "ready" else None,
+        ) as wait_for_services,
+        patch("apps.av.aux_gen.ncore_aux_data.DeviceFrameSharedBuffers.create") as create_slot,
+        patch(
+            "apps.av.aux_gen.ncore_aux_data._stop_processes_if_alive", wraps=_stop_processes_if_alive
+        ) as stop_processes,
+        patch("apps.av.aux_gen.ncore_aux_data.sequence_loader_shard_info", return_value=("clip", 0, 1)),
         patch("apps.av.aux_gen.ncore_aux_data._merge_mask2former_outputs"),
         patch("apps.av.aux_gen.ncore_aux_data.time.perf_counter", side_effect=[10.0, 12.0]),
         patch(
             "apps.av.aux_gen.ncore_aux_data._select_ego_mask_sample_indices",
             wraps=_select_ego_mask_sample_indices,
         ) as select_ego_mask_sample_indices,
-        pytest.raises(OSError, match="stop after sampling") if startup_fails else nullcontext(),
+        (
+            pytest.raises(
+                expected_error, match="exited with code" if startup_fails == "shutdown" else "stop after sampling"
+            )
+            if startup_fails
+            else nullcontext()
+        ),
     ):
+        lifecycle.attach_mock(wait_for_services, "ready")
+        lifecycle.attach_mock(create_slot, "allocate")
         _run_shared_segmentation(
             sensor_ranges,
             opened_sequence,
@@ -727,12 +870,31 @@ def test_shared_segmentation_extension_lifecycle_with_empty_camera(
         sequence_loader,
         [("empty", range(0)), ("active", range(2))],
     )
+    auxiliary_segmentation.prepare_output.assert_called_once_with(
+        AuxiliaryOutputIdentity(sequence_loader.sequence_id, "clip", 0, 1, params.zarr_store_type), selection
+    )
+    auxiliary_segmentation.processor_factory.assert_called_once_with()
     select_ego_mask_sample_indices.assert_called_once_with(
         [100, 200],
         samples_per_second=1.0,
         camera_id="active",
     )
-    context.Manager.return_value.shutdown.assert_called_once_with()
+    assert context.Manager.call_count == int(startup_fails not in ("service", "host"))
+    assert context.Manager.return_value.shutdown.call_count == int(startup_fails in (None, "ready", "send", "shutdown"))
+    worker_args = [entry.kwargs["args"] for entry in context.Process.call_args_list if "args" in entry.kwargs]
+    worker_configs = [config for config, _ in worker_args]
+    for owned_queue in {config.slot_queue for config in worker_configs}:
+        owned_queue.cancel_join_thread.assert_called_once_with()
+        owned_queue.close.assert_called_once_with()
+    for receiver, sender in ready_pipes:
+        receiver.close.assert_called_once_with()
+        sender.close.assert_called_once_with()
+    assert create_slot.call_count == (2 if startup_fails in (None, "send", "shutdown") else 0)
+    assert stop_processes.call_args_list[-2].kwargs["timeout_s"] == (
+        _HOST_WORKER_UNRELEASED_STOP_WAIT_SECONDS
+        if startup_fails not in (None, "send", "shutdown")
+        else _PROCESS_CLEANUP_GRACE_SECONDS
+    )
     create_pipeline.assert_called_once_with(
         estimate_logits=False,
         enable_trt=True,
@@ -742,27 +904,48 @@ def test_shared_segmentation_extension_lifecycle_with_empty_camera(
         auxiliary_processor=auxiliary_segmentation.processor_factory.return_value,
     )
     if startup_fails:
-        auxiliary_segmentation.finalize.assert_not_called()
+        output_handler.finalize.assert_not_called()
+        if startup_fails == "shutdown":
+            process.terminate.assert_called_once_with()
+            assert process.join.call_args.kwargs == {"timeout": _PROCESS_CLEANUP_GRACE_SECONDS}
+        if startup_fails == "send":
+            assert [sender.send.call_count for _, sender in ready_pipes] == [1, 1]
+        if startup_fails in ("host", "manager", "ready"):
+            assert context.Process.return_value.join.call_count == (1 if startup_fails == "host" else 3)
     else:
-        worker_configs = [entry.kwargs["args"][0] for entry in context.Process.call_args_list if "args" in entry.kwargs]
         assert [(config.camera_id, config.auxiliary_sample_indices) for config in worker_configs] == [
             ("empty", ()),
             ("active", (0,)),
         ]
-        assert all(
-            config.auxiliary_outputs is auxiliary_segmentation.frame_outputs.return_value for config in worker_configs
-        )
-        assert all(config.auxiliary_camera_stats is statistics for config in worker_configs)
-        auxiliary_segmentation.finalize.assert_called_once_with(
+        assert all(config.auxiliary_outputs is output_handler.frame_outputs for config in worker_configs)
+        for _, sender in ready_pipes:
+            sender.send.assert_called_once_with(
+                _SegmentationHostWorkerReady(
+                    semantic_metadata={"stuff_classes": ["road"]} if mask2former_enabled else None,
+                    sam2_metadata={"model": "sam2"},
+                    auxiliary_camera_stats=statistics,
+                )
+            )
+            assert sender.send.call_args.args[0].auxiliary_camera_stats is statistics
+        output_handler.finalize.assert_called_once_with(
             camera_ids=("empty", "active"),
             camera_statistics=expected_statistics,
             processor_metadata=extension_metadata,
             wall_time_seconds=2.0,
         )
-        assert [entry[0] for entry in lifecycle.mock_calls] == ["join", "join", "join", "shutdown", "finalize"]
+        expected = (
+            ["start"] * 3
+            + ["manager", "manager().list", "ready"]
+            + ["allocate"] * 2
+            + ["release"] * 2
+            + ["join"] * 2
+            + ["allocate().close"] * 2
+            + ["shutdown", "finalize"]
+        )
+        assert [entry[0] for entry in lifecycle.mock_calls] == expected
 
 
-def test_stop_processes_if_alive_escalates_unresponsive_process() -> None:
+def test_stop_processes_if_alive_escalates_unresponsive_process(caplog: pytest.LogCaptureFixture) -> None:
     class FakeProcess:
         name = "stuck-service"
 
@@ -786,12 +969,14 @@ def test_stop_processes_if_alive_escalates_unresponsive_process() -> None:
             self.alive = False
 
     process = FakeProcess()
+    timeout_s = 0.25
 
-    _stop_processes_if_alive([process], timeout_s=0.25)
+    _stop_processes_if_alive([process], timeout_s=timeout_s)
 
-    assert process.join_timeouts == [0.25, 0.25, 0.25]
+    assert process.join_timeouts == [timeout_s, timeout_s, timeout_s]
     assert process.terminated
     assert process.killed
+    assert f"Terminating process stuck-service after {timeout_s:g}s cleanup wait" in caplog.text
 
 
 def test_sam2_device_post_processing_matches_scipy() -> None:
@@ -824,7 +1009,9 @@ def test_process_device_frame_from_host_uses_generic_processor_contract() -> Non
             outputs,
             processor_inputs,
             stream,
+            frame,
         ) -> None:
+            assert frame == DeviceFrameContext(2, 3, camera_id="", timestamp_us=0, active_label_ids=())
             assert stream is fake_stream
             torch.testing.assert_close(processor_inputs["mask"], torch.ones((2, 3), dtype=torch.bool))
             outputs["blue"].copy_(image_bgr_nchw[0, 0])
@@ -842,6 +1029,7 @@ def test_process_device_frame_from_host_uses_generic_processor_contract() -> Non
         device=torch.device("cpu"),
         processor_inputs={"mask": np.ones((2, 3), dtype=np.bool_)},
         stream=fake_stream,
+        frame=DeviceFrameContext(2, 3, camera_id="", timestamp_us=0, active_label_ids=()),
     )
 
     fake_stream.synchronize.assert_called_once_with()
@@ -853,17 +1041,21 @@ def test_sam2_estimator_rejects_cpu_device() -> None:
         PromptlessSAM2EgoMaskEstimator(device="cpu")
 
 
-def test_get_gpu_info_uses_current_cuda_device() -> None:
+@pytest.mark.parametrize("cuda_available", [False, True])
+def test_get_compute_capability_uses_current_cuda_device(cuda_available: bool) -> None:
     with (
-        patch("apps.av.aux_gen.estimators.torch.cuda.is_available", return_value=True),
-        patch("apps.av.aux_gen.estimators.torch.cuda.current_device", return_value=3),
+        patch("apps.av.aux_gen.estimators.torch.cuda.is_available", return_value=cuda_available),
+        patch("apps.av.aux_gen.estimators.torch.cuda.current_device", return_value=3) as current_device,
         patch("apps.av.aux_gen.estimators.torch.cuda.get_device_capability", return_value=(8, 9)) as get_capability,
-        patch("apps.av.aux_gen.estimators.torch.cuda.get_device_name", return_value="GPU 3") as get_name,
     ):
-        assert get_gpu_info() == ("GPU 3", "8.9")
+        assert get_compute_capability() == ("8.9" if cuda_available else None)
 
-    get_capability.assert_called_once_with(3)
-    get_name.assert_called_once_with(3)
+    if cuda_available:
+        current_device.assert_called_once_with()
+        get_capability.assert_called_once_with(3)
+    else:
+        current_device.assert_not_called()
+        get_capability.assert_not_called()
 
 
 def test_sam2_device_inference_rejects_stream_on_another_device() -> None:
@@ -887,6 +1079,7 @@ def test_sam2_device_inference_rejects_stream_on_another_device() -> None:
             outputs={SAM2_MASK_OUTPUT: output},
             processor_inputs={},
             stream=stream,
+            frame=DeviceFrameContext(0, 0, "", 0, ()),
         )
 
 
@@ -984,6 +1177,7 @@ def test_mask2former_processor_returns_uncertainty_when_requested() -> None:
             outputs=outputs,
             processor_inputs={},
             stream=MagicMock(),
+            frame=DeviceFrameContext(0, 0, "", 0, ()),
         )
 
     torch.testing.assert_close(outputs[SEMANTIC_LABELS_OUTPUT], labels)
@@ -1159,6 +1353,7 @@ def test_sam2_device_inference_reuses_bgr_cuda_image() -> None:
         outputs={SAM2_MASK_OUTPUT: ego_mask_out},
         processor_inputs={},
         stream=stream,
+        frame=DeviceFrameContext(0, 0, "", 0, ()),
     )
     stream.synchronize()
 
@@ -1177,7 +1372,7 @@ def test_sam2_host_inference_delegates_to_device_path() -> None:
     estimator.predictor = FakePredictor()
     captured_inputs = []
 
-    def process_device(image_bgr_nchw, *, outputs, processor_inputs, stream) -> None:
+    def process_device(image_bgr_nchw, *, outputs, processor_inputs, stream, frame) -> None:
         assert not processor_inputs
         captured_inputs.append(image_bgr_nchw.clone())
         assert isinstance(stream, torch.cuda.Stream)
@@ -1495,12 +1690,23 @@ def test_save_auxiliary_mask_does_not_publish_partial_png(tmp_path: Path) -> Non
     assert not mask_path.exists()
 
 
-@pytest.mark.parametrize("sampled", [False, True])
-@pytest.mark.parametrize("has_mask", [False, True])
-def test_shared_segmentation_requires_mask_for_sampled_frames(sampled: bool, has_mask: bool) -> None:
+@pytest.mark.parametrize(
+    "sampled,has_mask,save_frame",
+    [
+        (False, False, None),
+        (False, True, None),
+        (True, False, None),
+        (True, True, None),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_shared_segmentation_requires_mask_for_sampled_frames(
+    sampled: bool, has_mask: bool, save_frame: bool | None
+) -> None:
     """Sampled frames require a mask; existing mask handling stays unchanged."""
-    mask = np.ones((2, 3), dtype=np.uint8)
-    client = MagicMock()
+    mask = np.ones((1, 1), dtype=np.uint8)
+    client = MagicMock(worker_id=2)
     client.resolve.return_value.outputs = {SEMANTIC_LABELS_OUTPUT: np.zeros_like(mask)}
     if has_mask:
         client.resolve.return_value.outputs["extension_mask"] = mask
@@ -1511,22 +1717,29 @@ def test_shared_segmentation_requires_mask_for_sampled_frames(sampled: bool, has
         stuff_colors=np.zeros((1, 3), dtype=np.uint8),
         processor_inputs=(),
         client=client,
+        include_mask2former=save_frame is None,
         auxiliary_outputs=AuxiliarySegmentationOutputs(
             processor_name="extension",
             mask_output="extension_mask",
             mask_root=Path("/output/extension"),
+            active_label_ids={"camera_front": {10: (7,)}},
+            mask_frames=None if save_frame is None else ({"camera_front": frozenset({10})} if save_frame else {}),
         ),
         auxiliary_sample_indices=frozenset({0}) if sampled else frozenset(),
         camera_id="camera_front",
         camera_frame_range_start=10,
     )
+    processor(0, 42, mask[..., None], None)
+    assert client.submit.call_args.kwargs["frame"] == DeviceFrameContext(2, 0, "camera_front", 42, (7,))
+    assert ("extension" in client.submit.call_args.kwargs["enabled_processors"]) is sampled
     if sampled and not has_mask:
         with pytest.raises(RuntimeError, match="Sampled frame omitted auxiliary mask output: extension_mask"):
             processor.resolve(pending)
     else:
         result = processor.resolve(pending)
-        assert result.auxiliary_mask is (mask if has_mask else None)
-        assert result.auxiliary_mask_path == (Path("/output/extension/camera_front/000010.png") if has_mask else None)
+        keep = has_mask and save_frame is not False
+        assert result.auxiliary_mask is (mask if keep else None)
+        assert result.auxiliary_mask_path == (Path("/output/extension/camera_front/000010.png") if keep else None)
 
 
 def test_shared_segmentation_delegates_statistics_to_the_extension() -> None:
@@ -1782,24 +1995,30 @@ def test_run_mask2former_segmentation_casts_logits_to_float16():
     np.testing.assert_array_equal(stored, logits.astype(np.float16))
 
 
-def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tmp_path: Path):
+@pytest.mark.parametrize("instances", [False, True])
+def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tmp_path: Path, instances):
     resolution = (4, 3)
     output_specs = (
         DeviceFrameOutputSpec(SEMANTIC_LABELS_OUTPUT, (3, 4), torch.uint8),
         DeviceFrameOutputSpec(SEMANTIC_UNCERTAINTY_OUTPUT, (3, 4), torch.uint8),
         DeviceFrameOutputSpec(SAM2_MASK_OUTPUT, (3, 4), torch.uint8),
+        DeviceFrameOutputSpec("extension_mask", (3, 4), torch.uint8),
     )
     shared_buffers = [
         DeviceFrameSharedBuffers.create(resolution, output_specs),
         DeviceFrameSharedBuffers.create(resolution, output_specs),
     ]
-    slot_queue: queue.Queue = queue.Queue(maxsize=2)
-    for buffers in shared_buffers:
-        slot_queue.put(buffers.slot)
+    ctx = multiprocessing.get_context("spawn")
+    slot_queue = ctx.Queue(maxsize=2)
     request_queue: queue.Queue = queue.Queue(maxsize=2)
-    result_queue: queue.Queue = queue.Queue(maxsize=2)
+    result_queue = ctx.Queue(maxsize=2)
     error_queue: queue.Queue = queue.Queue()
-    stop_event = threading.Event()
+    stop_event = DeviceFrameStopSignal.create(ctx)
+    waiting = threading.Event()
+
+    def wait(readers):
+        waiting.set()
+        return multiprocessing.connection.wait(readers)
 
     sequence_loader = MagicMock()
     sequence_loader.sequence_id = "sequence"
@@ -1819,7 +2038,34 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
     writer.output_dir_path = tmp_path
     writer.store_base_name = "base"
 
+    outputs = AuxiliarySegmentationOutputs(
+        processor_name="extension",
+        mask_output="extension_mask",
+        mask_root=tmp_path / "masks",
+        instance_output_root=tmp_path / "instances",
+        instance_classes={"camera": ((7, "first"), (9, "second"))},
+        instance_dataset_name="custom-dataset",
+        instance_method="custom-method",
+        instance_checkpoint="custom.pt",
+        instance_colors={7: (1, 2, 3), 9: (4, 5, 6)},
+        instance_camera_mask_input="extension_camera_mask",
+    )
+    original_resolve = SharedDeviceFrameClient.resolve
+
+    def resolve(client, pending, **kwargs):
+        result = original_resolve(client, pending, **kwargs)
+        if instances and "extension" in pending.request.enabled_processors:
+            result.outputs.update(
+                instance_masks_packed=np.packbits(np.ones((1, 3, 4), dtype=bool)),
+                instance_scores=np.ones(1),
+                instance_classes=np.array([9]),
+            )
+        return result
+
     def respond() -> None:
+        assert waiting.wait(_CAPACITY_WAIT_TIMEOUT_SECONDS), "Worker did not wait for capacity"
+        for buffers in shared_buffers:
+            slot_queue.put(buffers.slot)
         buffers_by_input_name = {buffers.slot.input_name: buffers for buffers in shared_buffers}
         for sample_request_id in range(2):
             request = request_queue.get(timeout=1.0)
@@ -1839,27 +2085,35 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
         requests = [request_queue.get(timeout=1.0) for _ in range(2)]
         assert [request.request_id for request in requests] == [0, 1]
         for request in requests:
-            assert request.enabled_processors == frozenset({MASK2FORMER_PROCESSOR})
-            assert len(request.processor_inputs) == 1
-            assert request.processor_inputs[0].name == CAMERA_MASK_INPUT
-            generated_mask = DeviceFrameSharedArray.attach(request.processor_inputs[0])
-            try:
-                assert generated_mask.array.dtype == np.bool_
-                np.testing.assert_array_equal(
-                    generated_mask.array,
-                    np.ones((3, 4), dtype=np.bool_),
-                )
-            finally:
-                generated_mask.close()
+            assert request.enabled_processors == frozenset(
+                {MASK2FORMER_PROCESSOR, "extension"} if instances else {MASK2FORMER_PROCESSOR}
+            )
+            assert len(request.processor_inputs) == (2 if instances else 1)
+            assert [descriptor.name for descriptor in request.processor_inputs] == (
+                [CAMERA_MASK_INPUT, "extension_camera_mask"] if instances else [CAMERA_MASK_INPUT]
+            )
+            for descriptor in request.processor_inputs:
+                generated_mask = DeviceFrameSharedArray.attach(descriptor)
+                try:
+                    assert generated_mask.array.dtype == np.bool_
+                    np.testing.assert_array_equal(
+                        generated_mask.array,
+                        np.ones((3, 4), dtype=np.bool_),
+                    )
+                finally:
+                    generated_mask.close()
             buffers = buffers_by_input_name[request.slot.input_name]
             buffers.output_buffers[SEMANTIC_LABELS_OUTPUT].fill(request.request_id)
             buffers.output_buffers[SEMANTIC_UNCERTAINTY_OUTPUT].fill(request.request_id)
+            buffers.output_buffers["extension_mask"].fill(0)
         for request in reversed(requests):
             result_queue.put(
                 DeviceFrameResult(
                     request_id=request.request_id,
                     error=None,
-                    output_names=(SEMANTIC_LABELS_OUTPUT, SEMANTIC_UNCERTAINTY_OUTPUT),
+                    output_names=(SEMANTIC_LABELS_OUTPUT, SEMANTIC_UNCERTAINTY_OUTPUT, "extension_mask")
+                    if instances
+                    else (SEMANTIC_LABELS_OUTPUT, SEMANTIC_UNCERTAINTY_OUTPUT),
                 )
             )
 
@@ -1867,6 +2121,9 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
     responder.start()
     try:
         with (
+            patch.object(SharedDeviceFrameClient, "resolve", resolve),
+            patch("apps.av.aux_gen.device_frame_service.wait_for_connections", side_effect=wait),
+            patch("apps.av.aux_gen.ncore_aux_data.time.sleep", side_effect=AssertionError("Unexpected sleep")),
             patch(
                 "apps.av.aux_gen.ncore_aux_data._open_worker_sequence",
                 return_value=(MagicMock(), sequence_loader),
@@ -1888,6 +2145,19 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
                     output_path=MagicMock(),
                     camera_id="camera",
                     camera_frame_range=range(2),
+                    resolution=resolution,
+                    visualize=True,
+                    slot_queue=slot_queue,
+                    sam2_sample_indices=(0, 1),
+                    auxiliary_outputs=outputs if instances else None,
+                    auxiliary_sample_indices=(0, 1) if instances else (),
+                    ego_mask_aggregation_method="majority",
+                    request_queue=request_queue,
+                    result_queue=result_queue,
+                    error_queue=error_queue,
+                    stop_event=stop_event,
+                ),
+                _SegmentationHostWorkerReady(
                     semantic_metadata={
                         "resolution": list(resolution),
                         "dataset_name": "test",
@@ -1896,21 +2166,13 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
                         "stuff_classes": ["background", "foreground"],
                         "stuff_colors": [[0, 0, 0], [255, 255, 255]],
                     },
-                    resolution=resolution,
-                    visualize=True,
-                    slot_queue=slot_queue,
-                    sam2_sample_indices=(0, 1),
                     sam2_metadata={
                         "dataset_name": "test",
                         "method": "sam2",
                         "pretrained_checkpoint": "sam2.pt",
                     },
-                    ego_mask_aggregation_method="majority",
-                    request_queue=request_queue,
-                    result_queue=result_queue,
-                    error_queue=error_queue,
-                    stop_event=stop_event,
-                )
+                    auxiliary_camera_stats=None,
+                ),
             )
         run_camera_frames.assert_called_once()
         responder.join(timeout=1.0)
@@ -1937,11 +2199,31 @@ def test_shared_host_worker_preserves_frame_order_and_writes_complete_outputs(tm
         np.testing.assert_array_equal(stored_ego_masks[1], np.ones((3, 4), dtype=np.uint8))
         np.testing.assert_array_equal(stored_ego_masks[2], np.ones((3, 4), dtype=np.uint8))
         writer.store_egomask_meta.assert_called_once()
-        writer.finalize.assert_called_once_with()
+        assert writer.finalize.call_args_list == [call()] * (2 if instances else 1)
+        if instances:
+            writer.store_object_instance_meta.assert_called_once_with(
+                "camera",
+                [4, 3],
+                "custom-dataset",
+                "custom-method",
+                "custom.pt",
+                ["first", "second"],
+                [[1, 2, 3], [4, 5, 6]],
+            )
+            assert writer.store_object_instance_segmentation.call_count == 2
+            for stored in writer.store_object_instance_segmentation.call_args_list:
+                np.testing.assert_array_equal(stored.args[2], np.array([255, 240], dtype=np.uint8))
+                np.testing.assert_array_equal(stored.args[-1], [1])
+        else:
+            writer.store_object_instance_meta.assert_not_called()
     finally:
         responder.join(timeout=1.0)
         for buffers in shared_buffers:
             buffers.close()
+        stop_event.close()
+        for channel in (slot_queue, result_queue):
+            channel.close()
+            channel.join_thread()
 
 
 def test_shared_host_worker_finalizes_partial_writer_after_failure() -> None:
@@ -1975,6 +2257,17 @@ def test_shared_host_worker_finalizes_partial_writer_after_failure() -> None:
                 output_path=Path("."),
                 camera_id="camera",
                 camera_frame_range=range(0),
+                resolution=(4, 3),
+                visualize=False,
+                slot_queue=queue.Queue(),
+                sam2_sample_indices=(),
+                ego_mask_aggregation_method="majority",
+                request_queue=queue.Queue(),
+                result_queue=queue.Queue(),
+                error_queue=error_queue,
+                stop_event=stop_event,
+            ),
+            _SegmentationHostWorkerReady(
                 semantic_metadata={
                     "resolution": [4, 3],
                     "dataset_name": "test",
@@ -1983,17 +2276,9 @@ def test_shared_host_worker_finalizes_partial_writer_after_failure() -> None:
                     "stuff_classes": ["background"],
                     "stuff_colors": [[0, 0, 0]],
                 },
-                resolution=(4, 3),
-                visualize=False,
-                slot_queue=queue.Queue(),
-                sam2_sample_indices=(),
                 sam2_metadata=None,
-                ego_mask_aggregation_method="majority",
-                request_queue=queue.Queue(),
-                result_queue=queue.Queue(),
-                error_queue=error_queue,
-                stop_event=stop_event,
-            )
+                auxiliary_camera_stats=None,
+            ),
         )
 
     assert stop_event.is_set()
@@ -2080,7 +2365,7 @@ def test_mask2former_device_inference_keeps_outputs_on_cuda(backend: str) -> Non
     ego_mask = torch.zeros((height, width), dtype=torch.bool, device="cuda")
     ego_mask[0, 0] = True
     backend_type_patch: Any = (
-        patch("mmseg.apis.inference.BaseSegmentor", FakePyTorchPredictor)
+        patch("mmseg.models.BaseSegmentor", FakePyTorchPredictor)
         if backend == "pytorch"
         else patch("mmseg.apis.inference.Mask2formerInferencer", FakeDevicePredictor)
     )
@@ -2093,6 +2378,7 @@ def test_mask2former_device_inference_keeps_outputs_on_cuda(backend: str) -> Non
             },
             processor_inputs={CAMERA_MASK_INPUT: ego_mask},
             stream=stream,
+            frame=DeviceFrameContext(0, 0, "", 0, ()),
         )
     stream.synchronize()
 
@@ -2224,12 +2510,248 @@ def test_mask2former_device_inference_binds_request_tensor_directly(
 @pytest.mark.parametrize(
     "range_args", [[], ["offset", "--sequence-duration-sec=0.4"], ["sensor-frames", "--main-sensor-id=cam"]]
 )
-def test_cli_forwards_instance_generation(range_args) -> None:
+def test_cli_forwards_auxiliary_segmentation(range_args) -> None:
     request = MagicMock()
     configure = MagicMock(return_value=request)
-    command = build_ncore_aux_data_cli(configure_instance_generation=configure)
+    command = build_ncore_aux_data_cli(configure_auxiliary_segmentation=configure)
     with patch("apps.av.aux_gen.ncore_aux_data.ncore_aux_data") as run:
         result = CliRunner().invoke(command, ["--output-dir=/tmp/unused", "--segmentation-backend=none", *range_args])
     assert result.exit_code == 0, result.output
     configure.assert_called_once()
-    assert run.call_args.args[5] is request
+    assert run.call_args.args[4] is request
+
+
+class _PixelPredictor:
+    """Encode frame pixels in outputs, including channel order and the supplied ego mask."""
+
+    def __init__(self, name: str, logits: bool = False):
+        self.name = name
+        self.logits = logits
+        self.resolution = [4, 3]
+
+    def metadata(self) -> DeviceFrameProcessorMetadata:
+        storage: dict[str, Any] = dict(dataset_name="test", method="pixels", pretrained_checkpoint="none")
+        if self.name == MASK2FORMER_PROCESSOR:
+            storage.update(
+                resolution=self.resolution,
+                stuff_classes=["background", "ego", "road"],
+                stuff_colors=[[0, 0, 0], [255, 0, 0], [0, 255, 0]],
+            )
+        return _processor_metadata(storage)
+
+    def output_specs(self, resolution):
+        if self.name == SAM2_PROCESSOR:
+            return _sam2_output_specs(resolution)
+        return _mask2former_output_specs(resolution, estimate_logits=self.logits, num_classes=3)
+
+    def process_device(self, image_bgr_nchw, *, outputs, processor_inputs, stream, frame):
+        with torch.cuda.stream(stream):
+            blue, green, red = image_bgr_nchw[0].unbind()
+            if self.name == SAM2_PROCESSOR:
+                outputs[SAM2_MASK_OUTPUT].copy_(red > green)
+            else:
+                labels = (blue + 2 * green + red) % 3
+                mask = processor_inputs[CAMERA_MASK_INPUT]
+                outputs[SEMANTIC_LABELS_OUTPUT].copy_(labels.masked_fill(mask, 1))
+                if self.logits:
+                    outputs[SEMANTIC_LOGITS_OUTPUT].copy_(
+                        image_bgr_nchw[0].permute(1, 2, 0).masked_fill(mask[..., None], 0)
+                    )
+
+    def set_resolution(self, resolution):
+        self.resolution = resolution
+
+    def predict(self, image, *, vis_path=None, ego_mask=None):
+        outputs = process_device_frame_from_host(
+            self,
+            np.asarray(image),
+            input_spec=((1, 3, 3, 4), torch.uint8),
+            device=torch.device("cuda"),
+            frame=DeviceFrameContext(0, 0, "", 0, ()),
+            processor_inputs={} if ego_mask is None else {CAMERA_MASK_INPUT: np.asarray(ego_mask, dtype=np.bool_)},
+        )
+        if self.name == SAM2_PROCESSOR:
+            return outputs[SAM2_MASK_OUTPUT]
+        return SegmentationFrameOutput(
+            semantic_seg=labels_to_paletted_image(outputs[SEMANTIC_LABELS_OUTPUT]),
+            semantic_seg_logits=outputs.get(SEMANTIC_LOGITS_OUTPUT),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Archive parity exercises CUDA transport")
+@pytest.mark.parametrize("seg_logits", [False, True])
+def test_segmentation_archives_match_with_pixel_predictors(
+    tmp_path: Path, seg_logits: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Three different samples exercise majority aggregation; unequal RGB channels and
+    # spatial/frame variation expose channel swaps, reordered frames and stale slots.
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data.get_camera_sensor_mask", lambda *_, **__: None)
+    pixels = np.arange(12).reshape(3, 4)
+    images = [
+        np.stack((20 + 20 * ((pixels + frame) % 3), 30 + 2 * pixels, 80 - 3 * pixels + frame), axis=-1).astype(np.uint8)
+        for frame in range(3)
+    ]
+    timestamps = [100, 200, 300]
+    handles = []
+    for image in images:
+        handle = MagicMock()
+        handle.get_data.return_value.get_decoded_image.return_value = PILImage.fromarray(image)
+        handles.append(handle)
+    frames: list[tuple[int, Any]] = list(zip(timestamps, handles))
+    camera = "camera"
+    sequence = MagicMock(sequence_id="sequence")
+    sensor = sequence.get_camera_sensor.return_value
+    sensor.frames_count = len(frames)
+    sensor.get_frames_timestamps_us.return_value = timestamps
+    sensor.get_frame_handle.side_effect = handles
+    sensor.model_parameters.resolution = np.array([4, 3])
+    semantic: Any = _PixelPredictor(MASK2FORMER_PROCESSOR, seg_logits)
+    sam2: Any = _PixelPredictor(SAM2_PROCESSOR)
+    serial, shared = tmp_path / "serial", tmp_path / "shared"
+    writer = AuxDataWriter(serial, "sequence", "sequence", 0, 1)
+    try:
+        run_egomask_estimation(sam2, writer, camera, sensor.model_parameters, frames)
+        _run_serial_mask2former_segmentation(
+            semantic,
+            writer,
+            camera,
+            sensor.model_parameters,
+            sensor,
+            frames,
+            backend=MagicMock(),
+            has_ego_mask=True,
+        )
+    finally:
+        writer.finalize()
+
+    class ThreadProcess(threading.Thread):
+        """Use the production coordinator in-process, including its exit-code checks."""
+
+        exitcode: int | None = None
+
+        def run(self):
+            try:
+                super().run()
+            finally:
+                self.exitcode = int(sys.exc_info()[0] is not None)
+
+    def thread_pipe(*, duplex: bool) -> tuple[MagicMock, MagicMock]:
+        assert not duplex
+        pending: queue.Queue[Any] = queue.Queue(maxsize=1)
+        received: list[Any] = []
+
+        def poll(timeout: float) -> bool:
+            try:
+                received.append(pending.get(timeout=timeout))
+                return True
+            except queue.Empty:
+                return False
+
+        receiver = MagicMock()
+        receiver.poll.side_effect = poll
+        receiver.recv.side_effect = received.pop
+        sender = MagicMock()
+        sender.send.side_effect = pending.put
+        return receiver, sender
+
+    ctx = multiprocessing.get_context("spawn")
+    stop = DeviceFrameStopSignal.create(ctx)
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data.DeviceFrameStopSignal.create", lambda _: stop)
+    context = MagicMock(Queue=ctx.Queue, Pipe=thread_pipe, Event=threading.Event, Process=ThreadProcess)
+    pipeline = DeviceFramePipeline(
+        input_spec=((1, 3, 3, 4), torch.uint8), processors=processor_directory(semantic, sam2)
+    )
+    factory = MagicMock(return_value=pipeline)
+    factory.output_specs.return_value = semantic.output_specs((4, 3)) + sam2.output_specs((4, 3))
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data.multiprocessing.get_context", lambda _: context)
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data.SegmentationDeviceFramePipelineFactory", lambda **_: factory)
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data._open_worker_sequence", lambda *_: (MagicMock(), sequence))
+    monkeypatch.setattr("apps.av.aux_gen.ncore_aux_data.sequence_loader_shard_info", lambda *_: ("sequence", 0, 1))
+    monkeypatch.setattr(
+        "apps.av.aux_gen.ncore_aux_data._wait_for_segmentation_services",
+        lambda *args, **kwargs: _wait_for_segmentation_services(*args, timeout_s=30, **kwargs),
+    )
+    # One visible device/service/camera forces one transport and staging slot to be reused.
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    params = MagicMock(
+        workers_per_gpu=1,
+        ego_mask=True,
+        ego_mask_camera_ids=None,
+        ego_mask_samples_per_second=20_000,  # Sample all three microsecond-spaced frames.
+        ego_mask_aggregation_method="majority",
+        segmentation_backend="mask2former",
+        seg_logits=seg_logits,
+        enable_trt=False,
+        visualize=False,
+        zarr_store_type="itar",
+    )
+    _run_shared_segmentation(
+        MagicMock(camera_frame_ranges={camera: range(3)}),
+        OpenedSequence(backend=MagicMock(), loader=sequence, worker_payload=MagicMock()),
+        params,
+        shared,
+    )
+    labels_loader, loader = assert_segmentation_archives_match(serial, shared, camera, seg_logits)
+
+    # Independent CPU oracle prevents two identically broken paths from passing parity.
+    masks = [image[..., 0] > image[..., 1] for image in images]
+    aggregate = np.sum(masks, axis=0) >= 1.5
+    np.testing.assert_array_equal(loader.get_egomask(camera, 0), aggregate)
+    assert set(labels_loader._camera_group(camera).keys()) == {str(t) for t in timestamps}
+    for timestamp, image, mask in zip(timestamps, images, masks):
+        np.testing.assert_array_equal(loader.get_egomask(camera, timestamp), mask)
+        expected = (image[..., 2] + 2 * image[..., 1] + image[..., 0]) % 3
+        expected[aggregate] = 1
+        np.testing.assert_array_equal(np.asarray(labels_loader.get_semantic_segmentation(camera, timestamp)), expected)
+        if seg_logits:
+            expected_logits = image[..., ::-1].astype(np.float16)
+            expected_logits[aggregate] = 0
+            np.testing.assert_array_equal(loader.get_semantic_logits(camera, timestamp), expected_logits)
+
+
+@pytest.mark.parametrize("cancelled", [None, "before", "waiting"])
+def test_host_worker_waits_for_metadata_or_cancellation(cancelled: str | None) -> None:
+    config = _SegmentationHostWorkerConfig(
+        worker_id=0,
+        loader_payload=MagicMock(spec=LoaderWorkerPayload),
+        zarr_store_type="itar",
+        output_path=Path("/output"),
+        camera_id="camera",
+        camera_frame_range=range(1),
+        resolution=(1, 1),
+        visualize=False,
+        slot_queue=MagicMock(),
+        sam2_sample_indices=(0,),
+        ego_mask_aggregation_method="majority",
+        request_queue=MagicMock(),
+        result_queue=MagicMock(),
+        error_queue=MagicMock(),
+        stop_event=threading.Event(),
+    )
+    ready = _SegmentationHostWorkerReady(
+        semantic_metadata={"stuff_classes": ["road"]},
+        sam2_metadata={"method": "sam2"},
+        auxiliary_camera_stats=[],
+    )
+    updates = MagicMock()
+
+    def poll_ready(timeout: float) -> bool:
+        assert timeout == _HOST_WORKER_CANCEL_POLL_SECONDS
+        if updates.poll.call_count == 1:
+            if cancelled == "waiting":
+                config.stop_event.set()
+            return False
+        return True
+
+    updates.poll.side_effect = poll_ready
+    updates.recv.return_value = ready
+    if cancelled == "before":
+        config.stop_event.set()
+    with patch("apps.av.aux_gen.ncore_aux_data._segmentation_host_worker") as run:
+        _segmentation_host_worker_when_ready(config, updates)
+    assert run.call_count == int(not cancelled)
+    assert updates.poll.call_count == {None: 2, "before": 0, "waiting": 1}[cancelled]
+    assert updates.recv.call_count == int(not cancelled)
+    updates.close.assert_called_once_with()
+    if not cancelled:
+        run.assert_called_once_with(config, ready)

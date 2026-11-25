@@ -26,10 +26,7 @@ plane_max_eval_points: 10000
 plane_min_inliers: 1000
 enable_plane_extension: false
 min_points_per_voxel: 1
-# Grid is the default road-init topology because it is fast, local to occupied BEV cells, and
-# avoids Delaunay's long convex-hull bridges. Set `mesh_topology: delaunay` to opt back into the
-# legacy compatibility path for workflows that prefer fully filled convex-hull geometry.
-mesh_topology: grid
+mesh_topology: delaunay
 smoothing_method: neighbor_average
 height_statistic: mean
 color_statistic: mean

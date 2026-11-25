@@ -108,6 +108,44 @@ def test_voxel_quantization_locks_torch_round_half_to_even_for_signed_boundaries
     assert set(representatives.tolist()) == {0, 1, 3}
 
 
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize("span", [(1 << 21) - 1, 1 << 21, 2219734])
+def test_wide_static_voxels_preserve_order_and_nearest_representative(axis: int, span: int) -> None:
+    # Reproduce the weekly failure's 2,219,734-cell span at 5 cm, including
+    # negative coordinates and points whose low Morton bits would sort first
+    # if the high bits were silently discarded.
+    xyz = torch.zeros((5, 3), dtype=torch.float64)
+    xyz[:, axis] = torch.tensor([span, 1.25, 0, 1.0, span - 1], dtype=torch.float64) * 0.05 - 12.0
+    representatives, occupied = _select_static_voxel_representatives(
+        detached_xyz=xyz,
+        flat_source_indices=torch.arange(5),
+        voxel_size_m=0.05,
+    )
+
+    assert occupied == 4
+    assert representatives.tolist() == [2, 3, 4, 0]
+
+
+def test_wide_static_voxels_interleave_high_bits_across_axes() -> None:
+    extent = 1 << 21
+    xyz = torch.tensor(
+        [[0, 0, extent], [0, extent, 0], [extent, 0, 0], [1, 0, 0], [0, 0, 0]],
+        dtype=torch.float64,
+    )
+    representatives, occupied = _select_static_voxel_representatives(
+        detached_xyz=xyz, flat_source_indices=torch.arange(5), voxel_size_m=1.0
+    )
+
+    assert occupied == 5
+    assert representatives.tolist() == [4, 3, 2, 1, 0]
+
+
+def test_static_voxels_beyond_shared_two_segment_range_still_fail() -> None:
+    xyz = torch.tensor([[0, 0, 0], [1 << 42, 0, 0]], dtype=torch.float64)
+    with pytest.raises(ValueError, match="exceeds 42-bit Morton limit"):
+        _select_static_voxel_representatives(detached_xyz=xyz, flat_source_indices=torch.arange(2), voxel_size_m=1.0)
+
+
 def test_voxel_dedup_gathers_only_representatives_and_preserves_selected_gradients() -> None:
     xyz = torch.tensor(
         [[[[[0.40, 0.0, 0.0], [0.10, 0.0, 0.0], [1.10, 0.0, 0.0], [1.40, 0.0, 0.0]]]]],

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
@@ -14,11 +14,11 @@ import point_cloud_utils as pcu
 import scipy
 import torch
 
-from poisson_recon import reconstruct_surface
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 from scipy.sparse import lil_matrix
 
 from nurec.utils.io.ply import save_ply
+from nurec.utils.io.poisson_recon import reconstruct_surface
 from nurec.utils.io.utils import USDReferences, initialize_usd_stage
 from nurec.utils.misc import unpack_optional
 from nurec.utils.types import (

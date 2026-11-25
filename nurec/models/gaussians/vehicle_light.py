@@ -46,7 +46,8 @@ def _resolve_vehicle_light_mask_inputs(config: DictConfig) -> tuple[str, str]:
     manifest_path = config.get("mask_manifest_path")
     if mask_dir is None and manifest_path is None:
         if aux_dir := config.get("sam3_aux_dir"):
-            return str(Path(aux_dir) / "masks"), str(Path(aux_dir) / "manifest.json")
+            root = Path(aux_dir)
+            return str(root / "masks"), str(root / "manifest.json")
         raise NoPointsFoundException("SAM3 mask inputs are not configured; skipping the optional vehicle-light layer")
     if not mask_dir or not manifest_path:
         raise ValueError(

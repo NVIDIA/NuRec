@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import types
 import unittest
 
+from concurrent.futures import Future
 from pathlib import Path
 from typing import NoReturn, Optional, cast
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -13,16 +16,26 @@ import torch
 
 from numpy.typing import NDArray
 from omegaconf import OmegaConf
+from scipy.spatial.transform import Rotation
 from upath import UPath
 
+import nurec.models.gaussians.initialization_pipeline as initialization_pipeline
 import nurec.models.gaussians.initializations as initializations_module
 
+from ncore.data import OpenCVPinholeCameraModelParameters, ShutterType
+from ncore.sensors import camera_model_from_parameters
 from nurec.config.model import SHGaussiansLayerConfig
 from nurec.config.trainer import TrainerConfig
 from nurec.datasets.base import BaseDataSource
 from nurec.datasets.ncore import NCOREDataSource
 from nurec.datasets.summary import DataSourceSummary
 from nurec.datasets.tracks import CuboidTracks, TrackFlags
+from nurec.models.gaussians.initialization_pipeline import (
+    acquire_initializer,
+    configure_initialization,
+    parallel_initialization_eligible,
+    prepare_camera_initializers,
+)
 from nurec.models.gaussians.initializations import (
     AccumulatedPointCloudInitialization,
     AccumulatedPointCloudInitializationBase,
@@ -42,6 +55,7 @@ from nurec.models.gaussians.initializations import (
 )
 from nurec.models.gaussians.utils import PLYGaussianLoader, write_ply_3dgs
 from nurec.utils.geometry import quat_to_so3_matrix
+from nurec.utils.initialization import InitializationResources
 from nurec.utils.types import (
     CameraFrustum,
     FrameConversion,
@@ -276,6 +290,54 @@ def _make_instant_nurec_ply_model(
         labels_to_ignore=[],
         labels_to_use=[],
     ).to(device)
+
+
+class TestSFMMultiCameraInitialization(unittest.TestCase):
+    def _inputs(self):
+        xyz = torch.tensor([[1.0, 0.0, 0.0], [9.0, 0.0, 0.0]])
+        point_cloud = PointCloud(xyz_start=xyz, xyz_end=xyz)
+        ncore_datasource = Mock(spec=NCOREDataSource)
+        summary = Mock(datasource=ncore_datasource)
+        summary.get_point_clouds.return_value = [point_cloud]
+        model = types.SimpleNamespace(
+            device=torch.device("cpu"),
+            config=types.SimpleNamespace(scale_factor=2.0),
+            init_from_positions=Mock(),
+            init_additional_buffers=Mock(),
+        )
+        return model, summary
+
+    def test_scales_use_nearest_center_across_all_cameras(self):
+        model, summary = self._inputs()
+        cameras = {}
+        for index, x in enumerate((0.0, 10.0)):
+            pose = np.eye(4, dtype=np.float32)
+            pose[0, 3] = x
+            camera = Mock(frames_count=1)
+            camera.get_frames_T_sensor_target.return_value = pose
+            cameras[str(index)] = camera
+        summary.datasource.camera_sensors = cameras
+
+        def nearest_distances(points, camera_positions):
+            return types.SimpleNamespace(
+                dists=torch.cdist(points, camera_positions).square().min(-1, keepdim=True).values
+            )
+
+        with patch.object(initializations_module, "knn_points", side_effect=nearest_distances):
+            initializations_module.SFMPointCloudInitialization.initialize_from_datasource(model, summary)
+        torch.testing.assert_close(
+            model.init_from_positions.call_args.kwargs["observation_scale"],
+            torch.full((2, 1), 2.0),
+        )
+        for camera in cameras.values():
+            camera.get_frames_T_sensor_target.assert_called_once()
+
+    def test_requires_camera_frames(self):
+        model, summary = self._inputs()
+        summary.datasource.camera_sensors = {"empty": Mock(frames_count=0)}
+        with self.assertRaisesRegex(RuntimeError, "at least one camera"):
+            initializations_module.SFMPointCloudInitialization.initialize_from_datasource(model, summary)
+        model.init_from_positions.assert_not_called()
 
 
 class TestInstantNuRecPlyInitialization(unittest.TestCase):
@@ -634,9 +696,10 @@ class TestInitializationMixin(unittest.TestCase):
             config=OmegaConf.create(
                 {
                     "num_near_points": 0,
-                    "num_far_points": 0,
+                    "num_far_points": 1,  # Frusta are only needed when random points are requested.
                     "far_radius_factor": 20.0,
                     "num_point_cloud_points": 100,
+                    "observation_scale_factor": 0.01,
                     "default_scale": 0.2,
                     "default_density": 0.5,
                     "local_debug_dir": None,
@@ -893,8 +956,8 @@ class TestAccumulatedPointCloudInitializationBase(unittest.TestCase):
             return _Mesh(pos, normals, colors, custom)
 
         # Monkeypatch
-        orig_loader = pcu.load_triangle_mesh
-        pcu.load_triangle_mesh = _fake_load_triangle_mesh
+        orig_loader = initializations_module.load_initialization_ply
+        initializations_module.load_initialization_ply = _fake_load_triangle_mesh
         try:
             # With segment_id
             xyz, normal, color, seg = AccumulatedPointCloudInitializationBase.load_ply_with_segment_id(
@@ -919,7 +982,7 @@ class TestAccumulatedPointCloudInitializationBase(unittest.TestCase):
             self.assertEqual(color2.shape, (5, 3))
             self.assertIsNone(seg2)
         finally:
-            pcu.load_triangle_mesh = orig_loader  # restore
+            initializations_module.load_initialization_ply = orig_loader  # restore
 
     def test_get_point_clouds_and_ego_poses(self):
         class _Mesh:
@@ -940,8 +1003,8 @@ class TestAccumulatedPointCloudInitializationBase(unittest.TestCase):
             return _Mesh(pos, normals, colors, seg)
 
         # Monkeypatch
-        orig_loader = pcu.load_triangle_mesh
-        pcu.load_triangle_mesh = _fake_load_triangle_mesh
+        orig_loader = initializations_module.load_initialization_ply
+        initializations_module.load_initialization_ply = _fake_load_triangle_mesh
         try:
             # Minimal subclass to access base method
             class _Accum(AccumulatedPointCloudInitializationBase):
@@ -987,7 +1050,7 @@ class TestAccumulatedPointCloudInitializationBase(unittest.TestCase):
             expected_scale = pc.xyz_end[:, 0].clamp_min(1e-7) * init_cfg.observation_scale_factor
             self.assertTrue(torch.allclose(pc.camera_footprint_scale, expected_scale, atol=1e-6))
         finally:
-            pcu.load_triangle_mesh = orig_loader  # restore
+            initializations_module.load_initialization_ply = orig_loader  # restore
 
 
 class TestDynamicTracksInitialization(unittest.TestCase):
@@ -1556,8 +1619,8 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 custom_attributes={"segment_id": seg},
             )
 
-        orig = pcu.load_triangle_mesh
-        pcu.load_triangle_mesh = lambda _path: _MeshData()
+        orig = initializations_module.load_initialization_ply
+        initializations_module.load_initialization_ply = lambda _path: _MeshData()
 
         captured_args: dict = {}
 
@@ -1616,7 +1679,7 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 expected_road_colors,
             )
         finally:
-            pcu.load_triangle_mesh = orig
+            initializations_module.load_initialization_ply = orig
             if orig_build is not None:
                 gm_mod.DelaunayElevationMeshingAlgorithm.build_mesh_from_points = orig_build
 
@@ -1632,8 +1695,8 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 custom_attributes={"segment_id": seg},
             )
 
-        orig = pcu.load_triangle_mesh
-        pcu.load_triangle_mesh = lambda _path: _MeshData()
+        orig = initializations_module.load_initialization_ply
+        initializations_module.load_initialization_ply = lambda _path: _MeshData()
         try:
             ncore_ds = _StubNcore(camera_ids=["cam0"], point_clouds=[])
             model = _make_camera_gmr_model(
@@ -1645,7 +1708,7 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 model._build_mesh_from_fused_point_cloud(ncore_ds)
         finally:
-            pcu.load_triangle_mesh = orig
+            initializations_module.load_initialization_ply = orig
 
     def test_build_mesh_too_few_road_points_raises(self):
         N = 5
@@ -1659,8 +1722,8 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 custom_attributes={"segment_id": seg},
             )
 
-        orig = pcu.load_triangle_mesh
-        pcu.load_triangle_mesh = lambda _path: _MeshData()
+        orig = initializations_module.load_initialization_ply
+        initializations_module.load_initialization_ply = lambda _path: _MeshData()
         try:
             ncore_ds = _StubNcore(camera_ids=["cam0"], point_clouds=[])
             model = _make_camera_gmr_model(
@@ -1671,7 +1734,7 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
             with self.assertRaises(ValueError):
                 model._build_mesh_from_fused_point_cloud(ncore_ds)
         finally:
-            pcu.load_triangle_mesh = orig
+            initializations_module.load_initialization_ply = orig
 
     def test_face_area_random_cell_lookup_uses_color_grid(self):
         verts = np.array([[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [0.0, 0.9, 0.0]], dtype=np.float32)
@@ -2190,6 +2253,308 @@ class TestCameraGroundMeshRoadInitialization(unittest.TestCase):
                 model.initialize_from_datasource(summary)
         finally:
             pcu.load_triangle_mesh = orig
+
+
+@pytest.mark.parametrize(
+    "override, eligible",
+    [
+        ({}, True),
+        ({"mode": "trainval"}, True),
+        ({"world_size": 2}, False),
+        ({"resume": "checkpoint"}, False),
+        ({"mode": "val"}, False),
+        ({"component_only": True}, False),
+        ({"road": "accumulated-point-cloud"}, False),
+    ],
+)
+def test_parallel_initialization_eligibility(override, eligible):
+    road = types.SimpleNamespace(
+        initialization=types.SimpleNamespace(name=override.get("road", "camera-ground-mesh-road"))
+    )
+    config = types.SimpleNamespace(
+        trainer=types.SimpleNamespace(world_size=override.get("world_size", 1)),
+        resume=override.get("resume"),
+        mode=override.get("mode", "train"),
+        component_only=types.SimpleNamespace(enabled=override.get("component_only", False)),
+        model=types.SimpleNamespace(layers={"road": road}),
+    )
+    assert parallel_initialization_eligible(config) is eligible
+
+
+def test_bev_color_lookup_matches_sparse_fallback():
+    rng = np.random.default_rng(51)
+    cells = np.array([(x, y) for x in range(9) for y in range(8) if (x + y) % 3], dtype=np.int64)
+    grid = initializations_module._BevColorGrid(
+        bbox_min_xy=np.array([-3.0, 7.0], dtype=np.float32),
+        cell_size=0.3,
+        cell_indices=cells,
+        colors=rng.integers(0, 256, size=(len(cells), 3), dtype=np.uint8),
+    )
+    points = rng.uniform([-4.0, 6.0, 0.0], [1.0, 11.0, 0.0], size=(300, 3)).astype(np.float32)
+    for radius in (0, 1, 2):
+        expected = initializations_module._lookup_bev_color_grid_sparse(points, grid, radius)
+        actual = initializations_module._lookup_bev_color_grid(points, grid, radius)
+        for x, y in zip(actual, expected):
+            np.testing.assert_array_equal(x, y, strict=True)
+
+
+@pytest.mark.parametrize("budget_offset", [0, -1])
+def test_bev_color_lookup_dispatch_follows_memory_budget(monkeypatch, budget_offset):
+    cells = np.array([(x, y) for x in range(5) for y in range(4) if (x + y) % 3], dtype=np.int64)
+    grid = initializations_module._BevColorGrid(
+        bbox_min_xy=np.zeros(2, dtype=np.float32),
+        cell_size=1.0,
+        cell_indices=cells,
+        colors=np.arange(3 * len(cells), dtype=np.uint8).reshape(-1, 3),
+    )
+    points = np.array([[x + 0.5, y + 0.5, 0.0] for x in range(5) for y in range(4)], dtype=np.float32)
+    scan = initializations_module._lookup_bev_color_grid_sparse
+    expected = scan(points, grid, 1)
+    scans = []
+
+    def counting_scan(*args):
+        scans.append(args)
+        return scan(*args)
+
+    monkeypatch.setattr(initializations_module, "_lookup_bev_color_grid_sparse", counting_scan)
+    # A budget exactly at the dense peak keeps the dense path; one byte less switches to the scan.
+    peak = initializations_module._dense_lookup_bytes(5 * 4, len(points))
+    monkeypatch.setattr(initializations_module, "_DENSE_LOOKUP_BYTES", peak + budget_offset)
+    actual = initializations_module._lookup_bev_color_grid(points, grid, 1)
+    assert bool(scans) == (budget_offset < 0)
+    for x, y in zip(actual, expected):
+        np.testing.assert_array_equal(x, y, strict=True)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_batched_frusta_and_membership_match_scalar(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    device = torch.device(device)
+    corners = torch.tensor(
+        [
+            [-1.0, -1.0, 0.1],
+            [-1.0, 1.0, 0.1],
+            [1.0, 1.0, 0.1],
+            [1.0, -1.0, 0.1],
+            [-3.0, -3.0, 5.0],
+            [-3.0, 3.0, 5.0],
+            [3.0, 3.0, 5.0],
+            [3.0, -3.0, 5.0],
+        ]
+    )
+    # Include exact boundaries and enough points to cross the scratch-memory batch.
+    generator = torch.Generator().manual_seed(72)
+    points = torch.cat([corners, torch.randn(9000, 3, generator=generator) * 5]).to(device)
+    batches = torch.stack([corners, corners + torch.tensor([4.0, 0.0, 0.0])])
+    scalar = [CameraFrustum(c.clone()).to(device) for c in batches]
+    batched = CameraFrustum.from_batched_corners(batches, device)
+    for expected, actual in zip(scalar, batched):
+        assert torch.equal(expected.corners, actual.corners)
+        assert torch.equal(expected.normals, actual.normals)
+        assert actual.edges.device == actual.planes.device == actual.corners.device
+    expected = torch.stack([frustum.points_in_frustum(points) for frustum in scalar]).any(0)
+    assert torch.equal(initializations_module._points_in_any_frustum(points, batched), expected)
+    assert not initializations_module._points_in_any_frustum(points, []).any()
+
+
+def test_batched_frusta_match_get_camera_frusta():
+    params = OpenCVPinholeCameraModelParameters(
+        resolution=np.array([16, 12], dtype=np.uint64),
+        shutter_type=ShutterType.ROLLING_TOP_TO_BOTTOM,
+        principal_point=np.array([8.0, 6.0], dtype=np.float32),
+        focal_length=np.array([10.0, 10.0], dtype=np.float32),
+        radial_coeffs=np.zeros(6, dtype=np.float32),
+        tangential_coeffs=np.zeros(2, dtype=np.float32),
+        thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+    )
+    # Start and end poses differ in rotation and translation, so the mean pose matters.
+    rotations = Rotation.from_euler("xyz", [[0.0, 0.1, 0.0], [0.05, 0.3, -0.1], [0.2, 0.0, 0.1], [0.1, -0.2, 0.3]])
+    transforms = np.repeat(np.eye(4)[None], 4, 0)
+    transforms[:, :3, :3] = rotations.as_matrix()
+    transforms[:, :3, 3] = [[0.0, 0.0, 0.0], [1.0, 0.5, 0.2], [2.0, 0.0, 0.0], [3.5, -0.5, 0.1]]
+    transforms = transforms.reshape(2, 2, 4, 4).astype(np.float32)
+
+    def poses(target_node, frame_indices, frame_timepoint):
+        return transforms[frame_indices]
+
+    ds = object.__new__(NCOREDataSource)
+    ds.camera_ids = ds.all_camera_ids = ["camera"]
+    ds.camera_sensors = {"camera": types.SimpleNamespace(get_frames_T_sensor_target=poses, get_frame_timestamp_us=int)}
+    ds.camera_models = {"camera": camera_model_from_parameters(params, device="cpu")}
+    ds.camera_frame_ranges = {"camera": range(2)}
+    ds.world_to_nurec = FrameConversion.from_origin_scale_axis(
+        target_origin=np.array([1.0, -2.0, 0.5], dtype=np.float32), target_scale=2.5, target_axis=[0, 1, 2]
+    )
+    ds._maybe_init_worker = lambda: None
+    ds._sensor_ids_to_unique_ids = lambda ids, kind: ids
+
+    summary = types.SimpleNamespace(datasource=ds, get_camera_frusta=ds.get_camera_frusta)
+    batched = initializations_module._initialization_camera_frusta(summary, 40.0, torch.device("cpu"))
+    scalar = [frustum for frustum, _ in ds.get_camera_frusta(camera_id="camera", far_plane_depth=40.0)]
+    assert len(batched) == len(scalar) == 2
+    for got, want in zip(batched, scalar, strict=True):
+        torch.testing.assert_close(got.corners, want.corners.to(got.corners.dtype))
+        torch.testing.assert_close(got.normals, want.normals.to(got.normals.dtype))
+
+
+@pytest.mark.parametrize(
+    "cameras,track_ids,steps,share",
+    [
+        ([None, None], [["dynamic"], ["static"]], [1, 1], True),
+        ([[], []], [["dynamic"], ["static"]], [1, 1], False),
+        ([None, None], [["same"], ["same"]], [1, 1], False),
+        ([None, None], [["dynamic"], ["static"]], [1, 2], False),
+    ],
+)
+def test_camera_preparation_shares_only_compatible_disjoint_layers(monkeypatch, cameras, track_ids, steps, share):
+    datasource = object.__new__(NCOREDataSource)
+    datasource.train_camera_ids = ["camera"]
+    summary = types.SimpleNamespace(datasource=datasource)
+    initializers = [
+        types.SimpleNamespace(
+            config=OmegaConf.create(
+                dict(name="camera-dynamic-tracks", camera_ids=camera, step_frame=step, keep_all_track_poses=False)
+            ),
+            prepared_camera_clouds=None,
+        )
+        for camera, step in zip(cameras, steps)
+    ]
+    requests = [
+        (initializer, summary, types.SimpleNamespace(tracks_id=ids))
+        for initializer, ids in zip(initializers, track_ids)
+    ]
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
+    with InitializationResources() as resources:
+        future = Future()
+        monkeypatch.setattr(resources, "submit", Mock(return_value=future))
+        prepare_camera_initializers(requests)
+        assert resources.submit.call_count == int(share)
+        assert all(initializer.prepared_camera_clouds is (future if share else None) for initializer in initializers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Shared camera preparation runs on a CUDA stream")
+def test_shared_camera_clouds_match_per_layer_traversal():
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def layer_tracks(ids):
+        return CuboidTracks.Factory.from_numpy(
+            tracks_id=ids,
+            tracks_poses=[np.repeat(np.eye(4, dtype=np.float32)[None], 2, 0) for _ in ids],
+            tracks_timestamps_us=[np.array([0, 1], dtype=np.int64) for _ in ids],
+            tracks_label_class=["car"] * len(ids),
+            tracks_flags=[TrackFlags(0)] * len(ids),
+            cuboids_dims=[np.ones(3, dtype=np.float32) for _ in ids],
+            device=device,
+        )
+
+    # Each track yields a cloud that depends only on its id, as a per-track traversal does.
+    def traverse(camera_ids, cuboid_tracks, step_frame, keep_all_track_poses, device):
+        for track_id in cuboid_tracks.tracks_id:
+            xyz = torch.full((int(track_id[1:]), 3), float(track_id[1:]), device=device)
+            yield TrackPointCloud(track_id=track_id, point_cloud=PointCloud(xyz_start=xyz, xyz_end=xyz))
+
+    datasource = object.__new__(NCOREDataSource)
+    datasource.get_camera_track_point_clouds = traverse
+    first, second = types.SimpleNamespace(), types.SimpleNamespace()
+    # Interleaved ids, so ownership must come from the track id rather than position.
+    group = [(first, datasource, layer_tracks(["t1", "t3"])), (second, datasource, layer_tracks(["t2"]))]
+    clouds = initialization_pipeline._shared_camera_clouds(
+        group, ("camera",), 1, False, device, torch.cuda.current_stream(device)
+    )
+    for initializer, _, tracks in group:
+        expected = list(traverse(["camera"], tracks, 1, False, device))
+        got = clouds[id(initializer)]
+        assert [cloud.track_id for cloud in got] == [cloud.track_id for cloud in expected]
+        for cloud, reference in zip(got, expected, strict=True):
+            torch.testing.assert_close(cloud.point_cloud.xyz_start, reference.point_cloud.xyz_start)
+
+    future = Future()
+    future.set_result(clouds)
+    first.prepared_camera_clouds = future
+    consumed = initializations_module.BaseInitialization._consume_prepared_camera_clouds(first)
+    assert [cloud.track_id for cloud in consumed] == ["t1", "t3"]
+    assert first.prepared_camera_clouds is None
+    assert id(first) not in clouds and id(second) in clouds
+
+
+def _configure_prepared_road(monkeypatch):
+    road_config = OmegaConf.create({"name": "camera-ground-mesh-road", "mesh_path": None, "point_cloud_path": None})
+    layer = types.SimpleNamespace(initialization=road_config, ignore_classes_from_layers=None, class_labels=["road"])
+    config = types.SimpleNamespace(model=types.SimpleNamespace(layers={"road": layer}), trainer=object())
+    compute_mesh = Mock(return_value=("mesh",))
+
+    # Stands in for the road initializer; its compute step is a call counter, so no PLY is needed.
+    def factory(name, init_config, gaussian_config, trainer_config, labels_to_ignore, labels_to_use):
+        initializer = types.SimpleNamespace(
+            config=init_config,
+            gaussian_config=gaussian_config,
+            labels_to_ignore=labels_to_ignore,
+            labels_to_use=labels_to_use,
+            _compute_mesh_from_fused_point_cloud=compute_mesh,
+            _compute_camera_ground_mesh_init_state=Mock(),
+        )
+        initializer.preparation_key = functools.partial(CameraGroundMeshRoadInitialization.preparation_key, initializer)
+        return initializer
+
+    monkeypatch.setattr(initializations_module.BaseInitialization, "factory", staticmethod(factory))
+    return layer, config, compute_mesh
+
+
+def test_prepared_road_initializer_is_handed_over_and_computed_once(monkeypatch):
+    layer, config, compute_mesh = _configure_prepared_road(monkeypatch)
+    datasource = object()
+    with InitializationResources() as resources:
+        configure_initialization(resources, config)
+        for callback in resources.on_datasource_loading:
+            callback(datasource)
+        prepared = acquire_initializer("road", layer, config.trainer, [], ["road"])
+        assert prepared is resources.prepared_initializers["road"].initializer
+        with pytest.raises(RuntimeError, match="already took"):
+            acquire_initializer("road", layer, config.trainer, [], ["road"])
+        assert resources.get(prepared.preparation_key("mesh", datasource)) is not None
+        mesh = CameraGroundMeshRoadInitialization._build_mesh_from_fused_point_cloud(prepared, datasource)
+    assert mesh == ("mesh",)
+    assert compute_mesh.call_count == 1
+
+
+def _mutate_road_initialization(layer):
+    layer.initialization.point_cloud_path = "other.ply"
+    return [], ["road"]
+
+
+def _mutate_road_layer(layer):
+    layer.class_labels.append("lane")
+    return [], ["road"]
+
+
+@pytest.mark.parametrize(
+    "mutate, changed",
+    [
+        (_mutate_road_initialization, "initialization config"),
+        (_mutate_road_layer, "layer config"),
+        (lambda layer: (["car"], ["road"]), "ignored labels"),
+        (lambda layer: ([], ["road", "lane"]), "used labels"),
+    ],
+)
+def test_mismatched_prepared_road_initializer_raises(monkeypatch, mutate, changed):
+    layer, config, _ = _configure_prepared_road(monkeypatch)
+    with InitializationResources() as resources:
+        configure_initialization(resources, config)
+        # Mutations land on the same objects the prepared initializer holds.
+        labels_to_ignore, labels_to_use = mutate(layer)
+        with pytest.raises(RuntimeError, match=f"changed since planning: .*{changed}"):
+            acquire_initializer("road", layer, config.trainer, labels_to_ignore, labels_to_use)
+
+
+def test_unplanned_layer_is_built_by_the_caller(monkeypatch):
+    layer, config, _ = _configure_prepared_road(monkeypatch)
+    assert acquire_initializer("road", layer, config.trainer, [], ["road"]).labels_to_use == ["road"]
+    with InitializationResources() as resources:
+        configure_initialization(resources, config)
+        built = acquire_initializer("other", layer, config.trainer, [], ["road"])
+        assert built is not resources.prepared_initializers["road"].initializer
 
 
 if __name__ == "__main__":

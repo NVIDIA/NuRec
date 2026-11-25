@@ -1,0 +1,92 @@
+--- a/mmseg/apis/inference.py
++++ b/mmseg/apis/inference.py
+@@ -14,17 +14,14 @@
+ from mmengine import Config
+ from mmengine.dataset import Compose
+ from mmengine.registry import init_default_scope
+-from mmengine.runner import load_checkpoint
+ from mmengine.structures import PixelData
+ from mmengine.utils import mkdir_or_exist
+ from PIL import Image
+ 
+-from mmseg.models import BaseSegmentor
+ from mmseg.registry import MODELS
+ from mmseg.structures import SegDataSample
+ from mmseg.trt import Mask2formerInferencer
+ from mmseg.utils import SampleList, dataset_aliases, get_classes, get_palette
+-from mmseg.visualization import SegLocalVisualizer
+ 
+ 
+ def init_model(
+@@ -109,6 +106,8 @@
+ 
+     model = MODELS.build(config.model)
+     if checkpoint is not None:
++        from mmengine.runner import load_checkpoint
++
+         checkpoint = load_checkpoint(model, checkpoint, map_location='cpu')
+         model.dataset_meta = _get_dataset_meta(
+             checkpoint.get('meta', {}), lambda: model.decode_head.num_classes)
+@@ -189,7 +188,7 @@
+ 
+     return resolutions
+ 
+-def _prepare_data(imgs: ImageType, model: BaseSegmentor):
++def _prepare_data(imgs: ImageType, model: torch.nn.Module):
+     cfg = model.cfg
+     for t in cfg.test_pipeline:
+         if t.get('type') == 'LoadAnnotations':
+@@ -220,7 +219,7 @@
+     return data, is_batch
+ 
+ 
+-def inference_model(model: Union[BaseSegmentor, Mask2formerInferencer],
++def inference_model(model: Union[torch.nn.Module, Mask2formerInferencer],
+                     img: ImageType) -> Union[SegDataSample, SampleList]:
+     """Inference image(s) with the segmentor.
+ 
+@@ -274,7 +273,7 @@
+ 
+ 
+ def get_model_device_input_spec(
+-        model: Union[BaseSegmentor, Mask2formerInferencer],
++        model: Union[torch.nn.Module, Mask2formerInferencer],
+         resolution: tuple) -> tuple:
+     """Return the CUDA input shape, dtype, and device for a model.
+ 
+@@ -293,6 +292,8 @@
+         input_tensor = model.inputs[0].device
+         shape = (model.max_batch_size, *model._input_shape)
+         return tuple(int(value) for value in shape), input_tensor.dtype, input_tensor.device
++    from mmseg.models import BaseSegmentor
++
+     if isinstance(model, BaseSegmentor):
+         try:
+             device = next(model.parameters()).device
+@@ -306,7 +307,7 @@
+ 
+ 
+ def inference_model_device(
+-        model: Union[BaseSegmentor, Mask2formerInferencer],
++        model: Union[torch.nn.Module, Mask2formerInferencer],
+         img: torch.Tensor,
+         stream: torch.cuda.Stream) -> SegDataSample:
+     """Run segmentation from a CUDA-resident BGR image.
+@@ -443,7 +444,7 @@
+ 
+ 
+ def show_result_pyplot(
+-    model: Union[BaseSegmentor, Mask2formerInferencer],
++    model: Union[torch.nn.Module, Mask2formerInferencer],
+     img: Union[str, np.ndarray],
+     result: SegDataSample,
+     opacity: float = 0.5,
+@@ -479,6 +480,8 @@
+     Returns:
+         np.ndarray: the drawn image which channel is RGB.
+     """
++    from mmseg.visualization import SegLocalVisualizer
++
+     if hasattr(model, 'module'):
+         model = model.module
+     if isinstance(img, str):

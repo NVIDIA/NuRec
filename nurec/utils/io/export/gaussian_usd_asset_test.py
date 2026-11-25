@@ -5,7 +5,6 @@
 Lightweight tests for USD Gaussian Asset export utilities.
 """
 
-import io
 import tempfile
 import unittest
 import zipfile
@@ -15,13 +14,14 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, cast
 from unittest.mock import Mock, patch
 
-import imageio.v3 as iio
+import cv2
 import numpy as np
 import torch
 
 from pxr import Sdf, Usd, UsdGeom
 
 from nurec.config.model import SkyEnvMapBackgroundConfig
+from nurec.utils.io.export import gaussian_partition
 from nurec.utils.io.export import gaussian_usd_asset as gaussian_usd_asset_module
 from nurec.utils.io.export.gaussian_usd_asset import (
     USD_GAUSSIAN_ROOT_PATH,
@@ -77,6 +77,48 @@ class TestUtilityFunctions(unittest.TestCase):
         self.assertFalse(config["saturate_radiance"])
         self.assertFalse(config["background"]["saturate_radiance"])
         self.assertFalse(config["nested"][0]["saturate_radiance"])
+
+    def test_track_export_timestamps_clip_resampled_range(self):
+        accessor = Mock()
+        accessor.get_track_timestamps.return_value = [10, 30]
+        accessor.get_track_time_range_safe.return_value = (10, 30)
+        self.assertEqual(
+            gaussian_usd_asset_module._get_track_export_timestamps(accessor, 0, "track", [0, 15, 25, 40]),
+            [15, 25],
+        )
+        self.assertEqual(
+            gaussian_usd_asset_module._get_track_export_timestamps(accessor, 0, "track", None),
+            [10, 30],
+        )
+
+    def test_non_track_export_timestamps_match_authored_timeline(self):
+        accessor = Mock()
+        capabilities = SimpleNamespace(has_rigid_tracks=False, has_temporal_appearance=True)
+        self.assertEqual(
+            gaussian_usd_asset_module._get_export_timestamps(accessor, capabilities, [10, 20], 5), [10, 20]
+        )
+        self.assertEqual(gaussian_usd_asset_module._get_export_timestamps(accessor, capabilities, None, 5), [5])
+        capabilities.has_temporal_appearance = False
+        self.assertEqual(gaussian_usd_asset_module._get_export_timestamps(accessor, capabilities, [10, 20], 5), [5])
+        accessor.get_track_timestamps.assert_not_called()
+
+    def test_automatic_partition_cap_respects_row_and_size_limits(self):
+        row_limit = gaussian_partition.OVRTX_MAX_GAUSSIANS_PER_LAYER
+        self.assertIsNone(gaussian_partition.automatic_partition_cap(row_limit, 1.0))
+        self.assertEqual(gaussian_partition.automatic_partition_cap(row_limit + 1, 1.0), row_limit)
+        bytes_per_row = 1024.0
+        size_cap = int(gaussian_partition.USDZ_SAFE_MEMBER_BYTES * 0.8 / bytes_per_row)
+        self.assertIsNone(gaussian_partition.automatic_partition_cap(size_cap, bytes_per_row))
+        self.assertEqual(gaussian_partition.automatic_partition_cap(size_cap + 1, bytes_per_row), size_cap)
+
+    def test_spatial_partitions_cover_each_row_once(self):
+        positions = np.arange(303, dtype=np.float32).reshape(101, 3)
+        partitions = gaussian_partition.partition_gaussian_indices(positions, 8)
+        self.assertTrue(all(0 < len(partition) <= 8 for partition in partitions))
+        torch.testing.assert_close(torch.cat(partitions).sort().values, torch.arange(101))
+        for invalid_cap in (0, gaussian_partition.OVRTX_MAX_GAUSSIANS_PER_LAYER + 1):
+            with self.assertRaises(ValueError):
+                gaussian_partition.partition_gaussian_indices(positions, invalid_cap)
 
     def test_resample_timestamps_basic(self):
         timestamps_us = [100, 200, 300, 400, 500]
@@ -144,15 +186,23 @@ class TestUSDStageUtilities(unittest.TestCase):
             background.textures.copy_(expected_color.expand_as(background.textures))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = create_background_domelight(background, Path(tmpdir))
+            result = create_background_domelight(background, Path(tmpdir), radiance_scale=2.0)
 
         self.assertIsNotNone(result)
         assert result is not None
-        _, named_hdr = result
-        decoded_hdr = iio.imread(io.BytesIO(named_hdr.serialized), extension=".hdr")
-        expected_hdr = np.broadcast_to(expected_color.cpu().numpy(), decoded_hdr.shape)
+        named_stage, named_hdr = result
+        dome = named_stage.stage.GetPrimAtPath(gaussian_usd_asset_module.SKY_DOME_LIGHT_PATH)
+        self.assertEqual(dome.GetAttribute("inputs:intensity").Get(), 1.0)
+        self.assertEqual(dome.GetAttribute("inputs:exposure").Get(), 0.0)
+        # Decode with OpenCV directly: imageio's generic reader may dispatch to a backend that
+        # tone-maps to 8-bit (observed in CI), whereas IMREAD_UNCHANGED keeps linear float32.
+        decoded_bgr = cv2.imdecode(np.frombuffer(named_hdr.serialized, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        decoded_hdr = decoded_bgr[..., ::-1]
+        expected_hdr = np.broadcast_to(2.0 * expected_color.cpu().numpy(), decoded_hdr.shape)
         self.assertEqual(decoded_hdr.shape, (cubemap_size * 2, cubemap_size * 3, 3))
-        np.testing.assert_allclose(decoded_hdr.astype(np.float32) / 255.0, expected_hdr, atol=1.0 / 255.0, rtol=0)
+        # HDR decoding returns linear floating-point radiance, not 8-bit pixel values.
+        # RGBE uses an 8-bit mantissa; the scaled maximum (1.25) has exponent 2.
+        np.testing.assert_allclose(decoded_hdr.astype(np.float32), expected_hdr, atol=2.0 / 256.0, rtol=0)
 
     def test_create_gaussian_model_root_basic(self):
         stage = Usd.Stage.CreateInMemory()
@@ -347,6 +397,7 @@ class TestExportCachePpispDispatch(unittest.TestCase):
         render_settings = stage.GetRootLayer().customLayerData["renderSettings"]
         self.assertEqual(render_settings, {"rtx:post:tonemap:op": 2})
         self.assertNotIn("rtx:rtpt:gaussian:skipTonemapping:enabled", render_settings)
+        self.assertFalse(render_product.GetAttribute("omni:rtx:gaussian:skipTonemapping:enabled").IsValid())
 
     def test_compose_requests_hdr_color_and_sets_skip_tonemapping_for_runtime_ppisp(self) -> None:
         cache = USDGaussianExportCache()
@@ -370,6 +421,7 @@ class TestExportCachePpispDispatch(unittest.TestCase):
         render_settings = stage.GetRootLayer().customLayerData["renderSettings"]
         self.assertEqual(render_settings["rtx:post:tonemap:op"], 2)
         self.assertFalse(render_settings["rtx:rtpt:gaussian:skipTonemapping:enabled"])
+        self.assertFalse(render_product.GetAttribute("omni:rtx:gaussian:skipTonemapping:enabled").Get())
 
     def test_compose_skips_writer_when_no_ppisp_module(self) -> None:
         cache = USDGaussianExportCache()
@@ -465,7 +517,7 @@ class _FakeModel:
         self.post_processings = [object()]
         self.background = None
         self.gaussian_process_group = None
-        self.config = SimpleNamespace(renderer=SimpleNamespace(global_z_order=False))
+        self.config = SimpleNamespace(renderer=SimpleNamespace(name="3dgut-gsplat"))
 
 
 class _FakeGaussiansSystem:
@@ -539,13 +591,16 @@ class _RecordingExportCache:
     def write_to_usdz(self, output_path: Path) -> None:
         self.write_to_usdz_path = output_path
 
+    def compose_default_usd_stage(self) -> Usd.Stage:
+        return Usd.Stage.CreateInMemory()
+
 
 class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
     """Mocked orchestration coverage for PPISP export mode decisions."""
 
     def _config(self, tmpdir: str) -> SimpleNamespace:
         ckpt_dir = Path(tmpdir) / "ckpt"
-        ckpt_dir.mkdir()
+        ckpt_dir.mkdir(exist_ok=True)
         (ckpt_dir / "last.ckpt").write_bytes(b"mock checkpoint")
         return SimpleNamespace(
             ckpt_dir=str(ckpt_dir),
@@ -560,6 +615,8 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
         tmpdir: str,
         datasource: object,
         ppisp_module: object | None = _DEFAULT_PPISP_MODULE,
+        checkpoint: object | None = None,
+        system: object | None = None,
         **overrides: object,
     ) -> Mock:
         config = self._config(tmpdir)
@@ -570,10 +627,11 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
 
         kwargs: Dict[str, object] = dict(
             config_name="fake_config",
+            artifact_path=None,
             output_dir=str(Path(tmpdir) / "usd_out"),
             percentage_gaussians=100.0,
             usd_format="usdz",
-            usd_schema="geompoints",
+            usd_schema="lightfield",
             force_sh_0=False,
             apply_activation=True,
             export_parsed_extra_signals=False,
@@ -598,8 +656,12 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
 
         with (
             patch.object(gaussian_usd_asset_module, "parse_typed_config", return_value=config) as parse_config,
-            patch.object(gaussian_usd_asset_module, "make_system", return_value=_FakeGaussiansSystem()),
-            patch.object(gaussian_usd_asset_module.torch, "load", return_value={"state_dict": {}}),
+            patch.object(gaussian_usd_asset_module, "make_system", return_value=system or _FakeGaussiansSystem()),
+            patch.object(
+                gaussian_usd_asset_module.torch,
+                "load",
+                return_value=checkpoint if checkpoint is not None else {"state_dict": {}},
+            ),
             patch.object(gaussian_usd_asset_module, "GaussiansSystem", _FakeGaussiansSystem),
             patch.object(gaussian_usd_asset_module, "make_dataset", return_value=_FakeDataset(datasource)),
             patch.object(gaussian_usd_asset_module, "get_ppisp_from_model", return_value=ppisp_module),
@@ -607,6 +669,255 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
         ):
             callback(**kwargs)
         return parse_config
+
+    def test_artifact_upgrades_weights_with_original_config(self) -> None:
+        original_config = {"version": {"major": 26, "minor": 5, "patch": 18}}
+        fake_artifact = SimpleNamespace(
+            parsed_config=original_config,
+            checkpoint=object(),
+            datasource_summary={},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            with (
+                patch.object(gaussian_usd_asset_module, "Artifact", return_value=fake_artifact),
+                patch.object(gaussian_usd_asset_module, "upgrade_config", return_value={}),
+                patch.object(gaussian_usd_asset_module.NuRecConfig, "model_validate", return_value=config),
+                patch.object(gaussian_usd_asset_module.DataSourceSummary, "from_dict", return_value="summary"),
+                patch.object(
+                    gaussian_usd_asset_module, "upgrade_model", return_value={"migrated": "trained"}
+                ) as upgrade,
+                patch.object(gaussian_usd_asset_module, "iter_gaussian_nodes", return_value=[]),
+                patch.object(gaussian_usd_asset_module, "run_sh_match_optimization"),
+            ):
+                system = _FakeGaussiansSystem()
+                checkpoint = {"state_dict": {"model.obsolete": "trained", "system_state": "preserved"}}
+                self._invoke_export(
+                    tmpdir=tmpdir,
+                    datasource=_FakeDatasource(),
+                    config_name=None,
+                    artifact_path=Path(tmpdir) / "old.artifact",
+                    scene_radiance_scale=1.0,
+                    hydra_args=["version.patch=99"],
+                    checkpoint=checkpoint,
+                    system=system,
+                )
+                upgrade.assert_called_once()
+                self.assertEqual(upgrade.call_args.args[0], {"obsolete": "trained"})
+                self.assertEqual(upgrade.call_args.args[1].version.patch, 18)
+                self.assertEqual(upgrade.call_args.kwargs["datasource_summary"], "summary")
+                self.assertEqual(system.loaded_state_dict, {"model.migrated": "trained", "system_state": "preserved"})
+
+    def test_rigid_nodes_support_default_explicit_and_automatic_partitioning(self) -> None:
+        attributes = SimpleNamespace(positions=np.arange(18, dtype=np.float32).reshape(6, 3))
+        for explicit_cap, automatic_cap, expected_layers in ((None, None, 1), (2, None, 4), (None, 2, 4)):
+            with self.subTest(explicit_cap=explicit_cap, automatic_cap=automatic_cap):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with (
+                        patch.object(
+                            gaussian_usd_asset_module, "iter_gaussian_nodes", return_value=[("rigid", object())]
+                        ),
+                        patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
+                        patch.object(gaussian_usd_asset_module, "automatic_partition_cap", return_value=automatic_cap),
+                        patch.object(
+                            gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]
+                        ) as export,
+                        patch.object(gaussian_usd_asset_module, "run_sh_match_optimization"),
+                    ):
+                        accessor_cls.return_value.get_capabilities.return_value = SimpleNamespace(
+                            has_rigid_tracks=True,
+                            has_deformation=False,
+                            has_temporal_appearance=False,
+                        )
+                        accessor_cls.return_value.get_attributes_at_timestamp.return_value = (attributes, None, None)
+                        accessor_cls.return_value.get_valid_gaussian_mask.return_value = np.ones(6, dtype=bool)
+                        accessor_cls.return_value.get_cuboid_tracks.return_value = SimpleNamespace(tracks_id=["a"])
+                        accessor_cls.return_value.get_track_gaussian_mapping.return_value = {"a": torch.arange(6)}
+                        self._invoke_export(
+                            tmpdir=tmpdir,
+                            datasource=_FakeDatasource(),
+                            scene_radiance_scale=1.0,
+                            max_gaussians_per_partition=explicit_cap,
+                        )
+                        self.assertEqual(export.call_count, expected_layers)
+                        if expected_layers > 1:
+                            indices = [call.kwargs["gaussian_indices_override"] for call in export.call_args_list]
+                            self.assertTrue(all(len(index) <= 2 for index in indices))
+                            torch.testing.assert_close(torch.cat(indices).sort().values, torch.arange(6))
+
+    def test_usdz_size_estimate_includes_synthesized_arrays(self) -> None:
+        n = 4
+        attributes = SimpleNamespace(
+            positions=np.zeros((n, 3), dtype=np.float32),
+            rotations=np.zeros((n, 4), dtype=np.float32),
+            scales=np.zeros((n, 3), dtype=np.float32),
+            densities=np.zeros((n, 1), dtype=np.float32),
+            albedo_coefficients=np.zeros((n, 3), dtype=np.float32),
+            specular_coefficients=None,
+            lidar_intensity=None,
+            lidar_raydrop_logits=None,
+        )
+        base = (3 + 4 + 3 + 1 + 3) * 4
+        estimate = gaussian_usd_asset_module._estimate_usdz_bytes_per_gaussian
+        self.assertEqual(estimate(attributes), base)
+        # lidarExtraSignals adds a float3 per row whenever any LiDAR signal exists.
+        attributes.lidar_intensity = np.zeros(n, dtype=np.float32)
+        self.assertEqual(estimate(attributes), base + 12)
+
+    def test_partitioning_subsamples_once_before_splitting(self) -> None:
+        attributes = SimpleNamespace(positions=np.arange(30, dtype=np.float32).reshape(10, 3))
+        for rigid in (False, True):
+            for automatic in (False, True):
+                with self.subTest(rigid=rigid, automatic=automatic), tempfile.TemporaryDirectory() as tmpdir:
+                    with (
+                        patch.object(
+                            gaussian_usd_asset_module, "iter_gaussian_nodes", return_value=[("node", object())]
+                        ),
+                        patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
+                        patch.object(gaussian_usd_asset_module, "automatic_partition_cap", return_value=1),
+                        patch.object(
+                            gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]
+                        ) as export,
+                        patch.object(gaussian_usd_asset_module, "run_sh_match_optimization"),
+                    ):
+                        accessor = accessor_cls.return_value
+                        accessor.get_capabilities.return_value = SimpleNamespace(
+                            has_rigid_tracks=rigid, has_deformation=False, has_temporal_appearance=False
+                        )
+                        accessor.get_attributes_at_timestamp.return_value = (attributes, None, None)
+                        # Filtering must precede subsampling: eight valid rows, four selected.
+                        accessor.get_valid_gaussian_mask.return_value = np.array([True] * 8 + [False] * 2)
+                        accessor.get_cuboid_tracks.return_value = SimpleNamespace(tracks_id=["a", "b"])
+                        accessor.get_track_gaussian_mapping.return_value = {
+                            "a": torch.arange(4),
+                            "b": torch.arange(4, 10),
+                        }
+                        self._invoke_export(
+                            tmpdir=tmpdir,
+                            datasource=_FakeDatasource(),
+                            scene_radiance_scale=1.0,
+                            percentage_gaussians=50.0,
+                            max_gaussians_per_partition=None if automatic else 1,
+                        )
+                        self.assertEqual(export.call_count, 4)
+                        indices = torch.cat(
+                            [call.kwargs["gaussian_indices_override"] for call in export.call_args_list]
+                        )
+                        self.assertEqual(len(indices.unique()), 4)
+                        self.assertTrue(torch.all(indices < 8))
+                        self.assertTrue(
+                            all(call.kwargs["percentage_gaussians"] == 100.0 for call in export.call_args_list)
+                        )
+                        if rigid:
+                            self.assertEqual(int((indices < 4).sum()), 2)
+
+    def test_sorting_mode_hint_follows_renderer(self) -> None:
+        resolve = gaussian_usd_asset_module.resolve_sorting_mode_hint
+
+        def renderer(name: str, mode: str = "kbuffer", k_buffer_size: int = 0) -> SimpleNamespace:
+            return SimpleNamespace(name=name, render=SimpleNamespace(mode=mode, k_buffer_size=k_buffer_size))
+
+        self.assertEqual(resolve(renderer("3dgs-gsplat", k_buffer_size=4)), "zDepth")
+        self.assertEqual(resolve(renderer("3dgut-gsplat", k_buffer_size=0)), "cameraDistance")
+        self.assertEqual(resolve(renderer("3dgut-gsplat", k_buffer_size=1)), "rayDistance")
+        self.assertEqual(resolve(renderer("3dgut-gsplat", k_buffer_size=16)), "rayDistance")
+        self.assertEqual(resolve(renderer("3dgut-gsplat", mode="splat", k_buffer_size=16)), "cameraDistance")
+
+    def test_automatic_partition_applies_row_limit_to_loose_formats(self) -> None:
+        attributes = SimpleNamespace(positions=np.arange(18, dtype=np.float32).reshape(6, 3))
+        for usd_format in ("usda", "usdc", "usd", "usdz"):
+            with self.subTest(usd_format=usd_format):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with (
+                        patch.object(
+                            gaussian_usd_asset_module, "iter_gaussian_nodes", return_value=[("rigid", object())]
+                        ),
+                        patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
+                        patch.object(gaussian_usd_asset_module, "automatic_partition_cap", return_value=2) as cap,
+                        patch.object(
+                            gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]
+                        ) as export,
+                        patch.object(gaussian_usd_asset_module, "run_sh_match_optimization"),
+                    ):
+                        accessor_cls.return_value.get_capabilities.return_value = SimpleNamespace(
+                            has_rigid_tracks=True,
+                            has_deformation=False,
+                            has_temporal_appearance=False,
+                        )
+                        accessor_cls.return_value.get_attributes_at_timestamp.return_value = (attributes, None, None)
+                        accessor_cls.return_value.get_valid_gaussian_mask.return_value = np.ones(6, dtype=bool)
+                        accessor_cls.return_value.get_cuboid_tracks.return_value = SimpleNamespace(tracks_id=["a"])
+                        accessor_cls.return_value.get_track_gaussian_mapping.return_value = {"a": torch.arange(6)}
+                        self._invoke_export(
+                            tmpdir=tmpdir,
+                            datasource=_FakeDatasource(),
+                            scene_radiance_scale=1.0,
+                            usd_format=usd_format,
+                        )
+                        self.assertEqual(export.call_count, 4)
+                        bytes_per_gaussian = cap.call_args.args[1]
+                        if usd_format == "usdz":
+                            self.assertGreater(bytes_per_gaussian, 0)
+                        else:
+                            self.assertEqual(bytes_per_gaussian, 0)
+
+    def test_automatic_partition_uses_exported_track_timeline(self) -> None:
+        # Two overlapping native timelines; the rig timeline is deliberately shorter.
+        native_timestamps = [[0, 10, 20, 30], [20, 30, 40, 50]]
+        attributes = SimpleNamespace(positions=np.zeros((6, 3), dtype=np.float32))
+        for deformation in (False, True):
+            for export_rig, resample, expected_frames in ((False, True, 6), (True, False, 6), (True, True, 2)):
+                with self.subTest(deformation=deformation, export_rig=export_rig, resample=resample):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        with (
+                            patch.object(
+                                gaussian_usd_asset_module, "iter_gaussian_nodes", return_value=[("rigid", object())]
+                            ),
+                            patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
+                            patch.object(
+                                gaussian_usd_asset_module, "automatic_partition_cap", return_value=None
+                            ) as cap,
+                            patch.object(
+                                gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]
+                            ) as export,
+                            patch.object(gaussian_usd_asset_module, "run_sh_match_optimization"),
+                            patch.object(
+                                gaussian_usd_asset_module,
+                                "create_rig_trajectories_stage",
+                                return_value=(None, 0, None, [0, 50]),
+                            ),
+                        ):
+                            accessor = accessor_cls.return_value
+                            accessor.get_capabilities.return_value = SimpleNamespace(
+                                has_rigid_tracks=True,
+                                has_deformation=deformation,
+                                has_temporal_appearance=not deformation,
+                            )
+                            accessor.get_attributes_at_timestamp.return_value = (attributes, None, None)
+                            accessor.get_cuboid_tracks.return_value = SimpleNamespace(tracks_id=["a", "b", "empty"])
+                            accessor.get_track_gaussian_mapping.return_value = {
+                                "a": torch.arange(3),
+                                "b": torch.arange(3, 6),
+                                "empty": torch.tensor([]),
+                            }
+                            accessor.get_track_timestamps.side_effect = lambda index: native_timestamps[index]
+                            accessor.get_track_time_range_safe.side_effect = lambda index: (
+                                native_timestamps[index][0],
+                                native_timestamps[index][-1],
+                            )
+                            self._invoke_export(
+                                tmpdir=tmpdir,
+                                datasource=_FakeDatasource(),
+                                scene_radiance_scale=1.0,
+                                export_rig_trajectories=export_rig,
+                                resample_animation=resample,
+                            )
+                            # 12 B positions per row.
+                            cap.assert_called_once_with(6, 12.0 * expected_frames)
+                            self.assertEqual(
+                                export.call_args.kwargs["reference_timestamps_us"],
+                                ([0, 50] if export_rig else []) if resample else None,
+                            )
 
     def test_forwards_config_parser_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -662,7 +973,12 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
                 ),
                 patch.object(gaussian_usd_asset_module, "select_spg_files_for_export") as select_spg,
             ):
-                accessor_cls.return_value.get_capabilities.return_value = Mock()
+                accessor_cls.return_value.get_capabilities.return_value = Mock(has_rigid_tracks=False)
+                accessor_cls.return_value.get_attributes_at_timestamp.return_value = (
+                    SimpleNamespace(positions=np.zeros((1, 3), dtype=np.float32)),
+                    None,
+                    None,
+                )
                 self._invoke_export(tmpdir=tmpdir, datasource=_FakeDatasource())
 
         self.assertEqual(call_order, ["sh_match", "radiance_scale", "export_gaussians"])
@@ -704,7 +1020,12 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
                 patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
                 patch.object(gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]),
             ):
-                accessor_cls.return_value.get_capabilities.return_value = Mock()
+                accessor_cls.return_value.get_capabilities.return_value = Mock(has_rigid_tracks=False)
+                accessor_cls.return_value.get_attributes_at_timestamp.return_value = (
+                    SimpleNamespace(positions=np.zeros((1, 3), dtype=np.float32)),
+                    None,
+                    None,
+                )
                 self._invoke_export(
                     tmpdir=tmpdir,
                     datasource=_FakeNCOREDataSource(),
@@ -762,7 +1083,12 @@ class ExportGaussianUsdAssetPPISPOrchestrationTest(unittest.TestCase):
                 patch.object(gaussian_usd_asset_module, "GaussianExportAccessor") as accessor_cls,
                 patch.object(gaussian_usd_asset_module, "export_gaussians_as_usd_asset", return_value=[]),
             ):
-                accessor_cls.return_value.get_capabilities.return_value = Mock()
+                accessor_cls.return_value.get_capabilities.return_value = Mock(has_rigid_tracks=False)
+                accessor_cls.return_value.get_attributes_at_timestamp.return_value = (
+                    SimpleNamespace(positions=np.zeros((1, 3), dtype=np.float32)),
+                    None,
+                    None,
+                )
                 self._invoke_export(
                     tmpdir=tmpdir,
                     datasource=_FakeNCOREDataSource(),

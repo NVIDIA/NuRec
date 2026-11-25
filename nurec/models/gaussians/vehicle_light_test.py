@@ -472,10 +472,14 @@ def test_complete_sam3_inputs_enable_vehicle_light_initialization() -> None:
     ) == ("/masks", "/masks/manifest.json")
 
 
-def test_resolved_aux_artifact_supplies_both_sam3_inputs() -> None:
-    config = cast(Any, {"mask_dir": None, "mask_manifest_path": None, "sam3_aux_dir": "/aux/sam3"})
-
-    assert _resolve_vehicle_light_mask_inputs(config) == ("/aux/sam3/masks", "/aux/sam3/manifest.json")
+def test_resolved_aux_artifact_supplies_both_sam3_inputs(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.touch()
+    config = cast(Any, {"mask_dir": None, "mask_manifest_path": None, "sam3_aux_dir": str(tmp_path)})
+    assert _resolve_vehicle_light_mask_inputs(config) == (
+        str(tmp_path / "masks"),
+        str(manifest),
+    )
 
 
 def test_explicit_sam3_inputs_take_precedence_over_aux() -> None:

@@ -13,6 +13,7 @@ import ncore.impl.data.types as ncore_datatypes
 from nurec.instant_nurec.config.predict import SensorOverrideConfig
 from nurec.instant_nurec.utils.sensor import to_simple_pinhole_model_parameters
 from nurec.utils.geometry import pose_offsets_to_se3, se3_matrix_inverse
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.types import RigTrajectories
 
 
@@ -305,13 +306,13 @@ class SensorOverride:
         self, camera_model_parameters: ncore_datatypes.ConcreteCameraModelParametersUnion
     ) -> ncore_datatypes.ConcreteCameraModelParametersUnion:
         if self.height is not None:
-            original_width, original_height = camera_model_parameters.resolution.tolist()
-            image_scale = self.height / original_height
-            image_width = int(original_width * image_scale)
-            camera_model_parameters = camera_model_parameters.transform(
-                image_domain_scale=image_scale,
-                new_resolution=(image_width, self.height),
+            source_width, source_height = camera_model_parameters.resolution.tolist()
+            source_resolution = (int(source_width), int(source_height))
+            image_transform = ImageResolutionTransform.fit_height(
+                source_resolution,
+                self.height,
             )
+            camera_model_parameters = image_transform.apply_to_camera_parameters(camera_model_parameters)
         if self.force_pinhole:
             camera_model_parameters = to_simple_pinhole_model_parameters(
                 camera_model_parameters,

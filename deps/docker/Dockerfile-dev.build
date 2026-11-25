@@ -1,8 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG BASE_IMAGE=pass-dev-deps-image-through-the-base-image-build-arg.invalid/nurec-dev-deps
+# NVIDIA Ubuntu base, sources: https://catalog.ngc.nvidia.com/orgs/nvidia/base/resources/ubuntu-sources/noble-20260911
+ARG BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:noble-20260911
+# Image containing NuRec's pre-installed development dependencies
+ARG NUREC_DEV_DEPS_IMAGE=pass-dev-deps-image-through-the-nurec-dev-deps-image-build-arg.invalid/nurec-dev-deps
+
+FROM ${NUREC_DEV_DEPS_IMAGE} AS dev-deps
+
 FROM ${BASE_IMAGE}
+COPY --from=dev-deps /opt/nvidia/nurec-build-deps /opt/nvidia/nurec-build-deps
 
 # TARGETARCH is auto-populated by BuildKit (amd64 on x86_64 hosts, arm64 on aarch64).
 ARG TARGETARCH

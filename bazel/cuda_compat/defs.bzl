@@ -60,15 +60,16 @@ cuda_compat_deb = repository_rule(
 _EXTRACT_SCRIPT = """#!/bin/bash
 set -euo pipefail
 
-deb="$(readlink -f "$1")"
-output_dir="$2"
-mtree="$(readlink -f "$3")"
-prefix="$4"
+extract_deb_data="$1"
+deb="$(readlink -f "$2")"
+output_dir="$3"
+mtree="$(readlink -f "$4")"
+prefix="$5"
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-(cd "$workdir" && ar x "$deb" data.tar.xz && tar xf data.tar.xz)
+"$extract_deb_data" "$deb" "$workdir"
 mkdir -p "$output_dir"
 cp -a "$workdir"/usr/local/cuda-*/compat/. "$output_dir"/
 
@@ -100,8 +101,9 @@ def _cuda_compat_libs_impl(ctx):
     ctx.actions.run(
         inputs = [ctx.file.deb],
         outputs = [output_dir, mtree],
+        tools = [ctx.executable._extract_deb_data],
         executable = script,
-        arguments = [ctx.file.deb.path, output_dir.path, mtree.path, ctx.attr.prefix],
+        arguments = [ctx.executable._extract_deb_data.path, ctx.file.deb.path, output_dir.path, mtree.path, ctx.attr.prefix],
         mnemonic = "ExtractCudaCompatLibs",
         progress_message = "Extracting CUDA compat libraries",
     )
@@ -115,6 +117,11 @@ cuda_compat_libs = rule(
     implementation = _cuda_compat_libs_impl,
     attrs = {
         "deb": attr.label(mandatory = True, allow_single_file = True),
+        "_extract_deb_data": attr.label(
+            default = "//bazel/cuda_compat:extract_deb_data",
+            executable = True,
+            cfg = "exec",
+        ),
         "prefix": attr.string(
             mandatory = True,
             doc = "Path the libraries are archived under, e.g. usr/local/cuda/compat",

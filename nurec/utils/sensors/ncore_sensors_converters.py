@@ -12,7 +12,11 @@ from typing import Optional
 
 import torch
 
-from ncore.data import FThetaCameraModelParameters
+from ncore.data import (
+    ConcreteCameraModelParametersUnion,
+    FThetaCameraModelParameters,
+    OpenCVFisheyeCameraModelParameters,
+)
 from ncore.data import ReferencePolynomial as NcoreReferencePolynomial
 from ncore.sensors import (
     BivariateWindshieldModel,
@@ -61,13 +65,16 @@ class CameraModelConverter:
     def convert(
         camera_model: CameraModel,
         device: Optional[torch.device] = None,
+        *,
+        host_parameters: ConcreteCameraModelParametersUnion | None = None,
     ) -> CameraModelConverterResult:
         """Convert ncore CameraModel to kernel-compatible parameter types.
 
         Args:
             camera_model: ncore camera model to convert
             device: Target device for tensor parameters (defaults to CPU)
-            dtype: Target dtype for tensor parameters
+            host_parameters: Optional current host snapshot from camera_model.get_parameters().
+                Reuses already available calibration without a second device-to-host copy.
 
         Returns:
             CameraModelConverterResult containing projection, external distortion, resolution, and shutter type
@@ -83,7 +90,9 @@ class CameraModelConverter:
         if isinstance(camera_model, OpenCVPinholeCameraModel):
             projection = CameraModelConverter._convert_opencv_pinhole(camera_model, device)
         elif isinstance(camera_model, OpenCVFisheyeCameraModel):
-            projection = CameraModelConverter._convert_opencv_fisheye(camera_model, device)
+            if host_parameters is not None and not isinstance(host_parameters, OpenCVFisheyeCameraModelParameters):
+                raise TypeError("OpenCV fisheye conversion requires matching host parameters")
+            projection = CameraModelConverter._convert_opencv_fisheye(camera_model, device, host_parameters)
         elif isinstance(camera_model, FThetaCameraModel):
             projection = CameraModelConverter._convert_ftheta(camera_model, device)
         else:
@@ -95,7 +104,9 @@ class CameraModelConverter:
         return CameraModelConverterResult(
             projection=projection,
             external_distortion=external_distortion,
-            resolution=tuple(camera_model.resolution.tolist()),
+            resolution=tuple(host_parameters.resolution.tolist())
+            if host_parameters is not None
+            else tuple(camera_model.resolution.tolist()),
             shutter_type=ShutterType(camera_model.shutter_type.value),
         )
 
@@ -119,8 +130,28 @@ class CameraModelConverter:
     def _convert_opencv_fisheye(
         camera_model: OpenCVFisheyeCameraModel,
         device: torch.device,
+        host_parameters: OpenCVFisheyeCameraModelParameters | None = None,
     ) -> OpenCVFisheyeProjection:
         """Convert OpenCVFisheyeCameraModel to OpenCVFisheyeProjection."""
+
+        if (
+            host_parameters is not None
+            and camera_model.dtype == torch.float32
+            and not any(
+                value.requires_grad
+                for value in (camera_model.principal_point, camera_model.focal_length, camera_model.forward_poly)
+            )
+        ):
+            return OpenCVFisheyeProjection.from_host_components(
+                principal_point=host_parameters.principal_point,
+                focal_length=host_parameters.focal_length,
+                forward_poly=host_parameters.radial_coeffs,
+                resolution=host_parameters.resolution,
+                max_angle=host_parameters.max_angle,
+                newton_iterations=camera_model.newton_iterations,
+                min_2d_norm=1e-6,
+                device=device,
+            )
 
         return OpenCVFisheyeProjection.from_components(
             focal_length=camera_model.focal_length.to(device),
@@ -129,7 +160,7 @@ class CameraModelConverter:
             resolution=camera_model.resolution.to(device),
             max_angle=camera_model.max_angle,
             newton_iterations=camera_model.newton_iterations,
-            min_2d_norm=torch.tensor(1e-6, device=device),
+            min_2d_norm=1e-6,
         )
 
     @staticmethod

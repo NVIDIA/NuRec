@@ -8,6 +8,7 @@ load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
 load("@rules_pkg//:mappings.bzl", "pkg_files", "strip_prefix")
 load("@rules_pkg//:pkg.bzl", "pkg_tar")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
 load("//bazel/rules_oci:default_layer_groups.bzl", "default_layer_groups")
 
 # Formatting target aliases for convenience
@@ -129,10 +130,22 @@ py_binary(
     name = "run",
     srcs = RUN_SRCS,
     main = "run.py",
+    # Collect the bytecode that rules_python compiles at build time for every
+    # Python source in the transitive closure (first- and third-party) into the
+    # runfiles. The runfiles tree is rebuilt for every `bazel run` and packaged
+    # as is into the container images, so without this each start compiled
+    # every imported module from source.
+    pyc_collection = "include_pyc",
     visibility = [
         # Add visibility for the AV Benchmark workflow
         "//workflows/av_benchmark:__pkg__",
     ],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "run_test",
+    srcs = ["run_test.py"],
     deps = [":pylib"],
 )
 
@@ -269,6 +282,10 @@ oci_image(
     ],
     tars = [
         "//bazel/cuda_compat:compat_tar",  # put first: rarely changes
+    ] + select({
+        "//bazel/conditions:rdma": ["//bazel/rdma:runtime_libs_tar"],
+        "//conditions:default": [],
+    }) + [
         ":image_licenses_tar",
         ":run_image_layer",
         ":home_dir_tar",

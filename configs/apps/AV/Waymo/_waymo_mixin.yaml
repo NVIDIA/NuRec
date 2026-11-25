@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Owner: Haithem Turki
+defaults:
+  - override /image_resolution/camera@_global_.dataset.n_val_image_resolution: relative_2
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_2
 
 dataset:
   camera_ids:
@@ -11,11 +14,6 @@ dataset:
     - camera_front_left_50fov
   lidar_ids:
     - lidar_top
-  n_val_image_subsample: 2
-  samplers:
-    batch_sampler:
-      camera_pixel_sampler:
-        subsample: 2
 
 system:
   test:

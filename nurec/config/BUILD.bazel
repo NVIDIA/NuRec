@@ -42,6 +42,37 @@ py_library(
     name = "pylib_base_schema",
     srcs = ["base_schema.py"],
     deps = [
+        pip_requirement("omegaconf"),
+        pip_requirement("pydantic"),
+    ],
+)
+
+py_library(
+    name = "pylib_image_resolution",
+    srcs = ["image_resolution.py"],
+    deps = [
+        ":pylib_base_schema",
+        "//nurec/utils:pylib_image_resolution",
+        pip_requirement("pydantic"),
+    ],
+)
+
+pytest_test(
+    name = "image_resolution_test",
+    srcs = ["image_resolution_test.py"],
+    deps = [
+        ":pylib_fixed_camera_render",
+        ":pylib_image_resolution",
+        pip_requirement("pydantic"),
+    ],
+)
+
+py_library(
+    name = "pylib_fixed_camera_render",
+    srcs = ["fixed_camera_render.py"],
+    deps = [
+        ":pylib_base_schema",
+        ":pylib_image_resolution",
         pip_requirement("pydantic"),
     ],
 )
@@ -94,7 +125,6 @@ py_library(
         "component_only.py",
         "datamodule.py",
         "dataset.py",
-        "fixed_camera_render.py",
         "nurec.py",
         "prober.py",
         "profiling.py",
@@ -105,6 +135,8 @@ py_library(
         "//:asset_harvester_package_group",
     ],
     deps = [
+        ":pylib_fixed_camera_render",
+        ":pylib_image_resolution",
         "//nurec/libs/losses/orchestration:pylib_config",
         pip_requirement("pydantic"),
         pip_requirement("omegaconf"),
@@ -131,6 +163,7 @@ py_library(
     deps = [
         ":pylib",
         ":pylib_base_schema",
+        ":pylib_image_resolution",
         ":pylib_resolvers",
         "//nurec:pylib_reporoot",
         "//nurec/instant_nurec/config:pylib_parse",

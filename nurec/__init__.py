@@ -10,15 +10,6 @@
 import logging
 import os
 
-
-# pytorch-lightning 2.6.5's checkpoint loader (Trainer fit/validate resume ->
-# lightning_fabric cloud_io._load) defaults torch.load(weights_only=True),
-# unlike 2.4.0. NuRec checkpoints carry OmegaConf containers and internal pickled
-# types from trusted training runs, which weights_only=True rejects. Force the
-# legacy full-unpickle load process-wide rather than threading weights_only=False
-# through every PL resume call site.
-os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-
 from nurec.config.version import get_version
 from nurec.repo_root import __reporoot__  # noqa: F401  # re-exported as nurec.__reporoot__ for downstream consumers
 from nurec.utils.colored_exceptions import enable_colored_exceptions

@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import os
 import unittest
 
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest import mock
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +15,17 @@ import torch
 
 from omegaconf import OmegaConf
 
-from nurec.render.render import CameraRenderOptions, LidarRayBundle, RenderableModel
+import nurec.render.render as render_module
+
+from nurec.render.actors import ActorsSnapshot
+from nurec.render.render import (
+    CameraRenderOptions,
+    CpuPreparationUnsupportedError,
+    LidarRayBundle,
+    RayBundle,
+    RenderableModel,
+)
+from nurec.utils.batch import FrameMeta, RenderingData
 from nurec.utils.types import GaussiansCompositeReturn, GaussiansRenderReturn
 
 
@@ -32,13 +44,61 @@ class TestSensorRenderExecutionMode(unittest.TestCase):
                 return GaussiansCompositeReturn(rendered_cam=rendered_cam)
 
         renderable = RenderableModel(cast(Any, ObservingGaussian()))
-        ray_bundle = SimpleNamespace(rendering_data=object(), frame_meta=object())
+        timestamps = torch.tensor([[10, 20]], dtype=torch.int64)
+        ray_bundle = RayBundle(
+            rendering_data=RenderingData(
+                rays=torch.zeros(1, 1, 1, 6),
+                sensor_model_parameters=[None],
+                poses_tquat_startend=torch.zeros(1, 2, 7),
+                timestamps_startend_us=timestamps,
+                timestamps_startend_us_cpu=timestamps,
+            ),
+            frame_meta=FrameMeta(unique_sensor_idx=0, unique_frame_idx=-1, training_frame_idx=-1),
+        )
 
-        with patch("nurec.render.render.GaussiansComposite", ObservingGaussian):
+        with mock.patch("nurec.render.render.GaussiansComposite", ObservingGaussian):
             renderable._render_volume_from_ray_bundle(cast(Any, ray_bundle))
             renderable._lidar_rays_inference(cast(Any, ray_bundle))
 
         self.assertEqual(observed_modes["camera"], observed_modes["lidar"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_camera_render_keeps_cpu_timestamps_and_tensor_dtypes() -> None:
+    timestamps = torch.tensor([[10, 20]], dtype=torch.int64)
+    rendering = RenderingData(
+        rays=torch.zeros(1, 1, 1, 6, dtype=torch.float64),
+        sensor_model_parameters=[None],
+        poses_tquat_startend=torch.zeros(1, 2, 7, dtype=torch.float64),
+        timestamps_startend_us=timestamps,
+        timestamps_startend_us_cpu=timestamps,
+    )
+
+    class ObservingGaussian:
+        def parameters(self):
+            yield torch.empty(0, device="cuda")
+
+        def __call__(self, *, batch, **_kwargs):
+            camera = batch.rendering.camera
+            assert camera.timestamps_startend_us_cpu is timestamps
+            assert camera.timestamps_startend_us_cpu.device.type == "cpu"
+            assert camera.timestamps_startend_us.device.type == "cuda"
+            assert camera.timestamps_startend_us.dtype == torch.int64
+            assert camera.rays.device.type == camera.poses_tquat_startend.device.type == "cuda"
+            assert camera.rays.dtype == camera.poses_tquat_startend.dtype == torch.float32
+            torch.testing.assert_close(camera.timestamps_startend_us.cpu(), timestamps)
+            return GaussiansCompositeReturn(
+                rendered_cam=GaussiansRenderReturn(
+                    rgb=torch.zeros(1, 3, device="cuda"), opacity=torch.ones(1, 1, device="cuda")
+                )
+            )
+
+    renderable = RenderableModel(cast(Any, ObservingGaussian()))
+    bundle = RayBundle(rendering, FrameMeta(unique_sensor_idx=0, unique_frame_idx=-1, training_frame_idx=-1))
+    with mock.patch("nurec.render.render.GaussiansComposite", ObservingGaussian):
+        frame = renderable.render_camera_frame_from_ray_bundle(bundle, CameraRenderOptions(color_image=True))
+    assert frame.color_image is not None and frame.color_image.shape == (1, 1, 3)
+    assert rendering.timestamps_startend_us is timestamps
 
 
 class TestCompactLidarRendering(unittest.TestCase):
@@ -136,6 +196,79 @@ class TestCompactLidarRendering(unittest.TestCase):
         )
 
 
+def test_camera_batch_uses_rendering_interval_for_actor_edits() -> None:
+    timestamps = torch.tensor([[10, 20], [10, 20]], dtype=torch.int64)
+    rendering = RenderingData(
+        rays=torch.zeros(2, 2, 3, 6),
+        sensor_model_parameters=[None, None],
+        poses_tquat_startend=torch.zeros(2, 2, 7),
+        timestamps_startend_us=timestamps.clone(),
+        timestamps_startend_us_cpu=timestamps,
+    )
+    frame_meta = [FrameMeta(unique_sensor_idx=index, unique_frame_idx=-1, training_frame_idx=-1) for index in range(2)]
+    rendered = GaussiansRenderReturn(rgb=torch.zeros(12, 3), opacity=torch.zeros(12, 1))
+    model = mock.MagicMock(return_value=GaussiansCompositeReturn(rendered_cam=rendered))
+    renderable = RenderableModel(cast(Any, model))
+    actors = ActorsSnapshot.empty()
+
+    with (
+        mock.patch.object(renderable, "supports_shared_camera_batch", return_value=True),
+        mock.patch.object(renderable, "_edit_actors", return_value=None) as edit_actors,
+    ):
+        frames = renderable.render_camera_color_batch(rendering, frame_meta, actors)
+        edit_actors.assert_called_once_with(actors, 10, 20)
+        assert len(frames) == 2
+
+        rendering.timestamps_startend_us_cpu[1, 1] = 21
+        with pytest.raises(ValueError, match="same frame interval"):
+            renderable.render_camera_color_batch(rendering, frame_meta, actors)
+        edit_actors.assert_called_once()
+
+
+def test_checkpoint_loaders_honor_cpu_device() -> None:
+    checkpoint: dict[str, Any] = {"state_dict": {}}
+    normal = cast(Any, SimpleNamespace(is_compact=False, open_checkpoint=io.BytesIO))
+    with mock.patch("nurec.render.render.torch.load", return_value=checkpoint) as load:
+        RenderableModel._load_gaussian_checkpoint(normal, torch.device("cpu"))
+    assert load.call_args.kwargs["map_location"] == "cpu"
+
+    compact = cast(Any, SimpleNamespace(is_compact=True, source="scene.usdz"))
+    with mock.patch("nurec.render.render.compact_usdz.load_compact_checkpoint", return_value=checkpoint) as load:
+        RenderableModel._load_gaussian_checkpoint(compact, torch.device("cpu"))
+    assert load.call_args.kwargs["device"] == torch.device("cpu")
+
+
+def test_instant_nurec_rejects_cpu_preparation() -> None:
+    config = OmegaConf.create({"model": {"name": "celsius"}})
+    with pytest.raises(CpuPreparationUnsupportedError, match="Instant NuRec artifacts"):
+        RenderableModel._load_model_and_upgrade(config, cast(Any, object()), config, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("parameter_devices", "track_devices"),
+    [(["cuda"], []), (["cpu"], ["cuda"])],
+)
+def test_cpu_preparation_rejects_non_cpu_model_state(parameter_devices: list[str], track_devices: list[str]) -> None:
+    config = OmegaConf.create({"model": {}, "trainer": {}})
+    artifact = mock.MagicMock(datasource_summary={})
+    model = mock.MagicMock()
+    model.parameters.return_value = [mock.MagicMock(device=torch.device(device)) for device in parameter_devices]
+    model.buffers.return_value = []
+    model.cuboid_track_devices.return_value = {torch.device(device) for device in track_devices}
+
+    with (
+        mock.patch("nurec.render.render.ModelConfig.model_validate") as model_config,
+        mock.patch("nurec.render.render.TrainerConfig.model_validate"),
+        mock.patch("nurec.render.render.DataSourceSummary.from_dict"),
+        mock.patch("nurec.render.render.GaussiansComposite", return_value=model),
+        mock.patch.object(RenderableModel, "_load_gaussian_checkpoint", return_value={"state_dict": {}}),
+        mock.patch("nurec.render.render.upgrade_model", return_value={}),
+        pytest.raises(CpuPreparationUnsupportedError, match="retained non-CPU model tensors"),
+    ):
+        model_config.return_value.renderer.name = "gsplat"
+        RenderableModel._load_model_gaussians_composite_and_upgrade(config, artifact, config, torch.device("cpu"))
+
+
 # --- Inference-time per-track timestamp-estimation ray-stride knob ---
 # Covers the guarantees the feature must keep:
 #   1. it is a no-op unless explicitly opted in (default behavior unchanged),
@@ -204,11 +337,14 @@ def test_explicit_hydra_override_outranks_the_cli_stride():
     assert _merged_stride(16, (f"{STRIDE_KEY}=64",)) == 64
 
 
-def test_inference_defaults_stay_overridable_by_the_caller():
-    """The stride must not have displaced the pre-existing caller-wins property."""
-    key = "model.renderer.outputs.camera.enable_distance"
+INFERENCE_DEFAULT_KEYS = tuple(entry.split("=", 1)[0] for entry in RenderableModel._INFERENCE_DEFAULT_OVERRIDES)
+
+
+@pytest.mark.parametrize("key", INFERENCE_DEFAULT_KEYS)
+def test_inference_defaults_stay_overridable_by_the_caller(key):
+    """An explicit caller override outranks every inference default (the stride must not displace that)."""
     ordered = RenderableModel._ordered_config_overrides((), (f"{key}=True",))
-    assert OmegaConf.from_dotlist(list(ordered)).model.renderer.outputs.camera.enable_distance is True
+    assert OmegaConf.select(OmegaConf.from_dotlist(list(ordered)), key) is True
 
 
 def _grid_stride_factors(stride: int) -> tuple[int, int]:
@@ -289,14 +425,101 @@ def test_ray_traced_nrend_artifact_needs_an_explicit_gsplat_renderer():
     assert upgraded.model.renderer.name == "3dgut-gsplat"
 
 
+@pytest.mark.parametrize(
+    ("is_compact", "preserved", "camera_features"),
+    [(False, frozenset(), True), (True, frozenset(), False), (True, frozenset({"camera_extra_signal"}), True)],
+)
+def test_camera_outputs_follow_compact_signal_availability(
+    monkeypatch: pytest.MonkeyPatch, is_compact: bool, preserved: frozenset[str], camera_features: bool
+) -> None:
+    outputs = {
+        "enable_extended_features": True,
+        "enable_sensor_features": True,
+        "enable_distance": True,
+        "enable_normals": True,
+    }
+    artifact = cast(
+        Any,
+        SimpleNamespace(
+            parsed_config={
+                "model": {
+                    "renderer": {
+                        "name": "3dgut-gsplat",
+                        "outputs": {"camera": outputs, "lidar": outputs.copy()},
+                    }
+                }
+            },
+            is_compact=is_compact,
+            source="scene.usdz",
+        ),
+    )
+
+    def load_model(config, loaded_artifact, original_config, device):
+        assert loaded_artifact is artifact
+        assert device == torch.device("cpu")
+        assert config.model.renderer.name == original_config.model.renderer.name == "3dgut-gsplat"
+        assert OmegaConf.to_container(config.model.renderer.outputs.camera) == {
+            **outputs,
+            "enable_sensor_features": camera_features,
+        }
+        assert OmegaConf.to_container(config.model.renderer.outputs.lidar) == outputs
+        assert OmegaConf.to_container(original_config.model.renderer.outputs.camera) == outputs
+        raise RuntimeError("Reached model loading")
+
+    monkeypatch.setattr(render_module.compact_usdz, "compact_preserved_extra_signal_tensors", lambda _: preserved)
+    monkeypatch.setattr(RenderableModel, "_load_model_and_upgrade", staticmethod(load_model))
+    overrides = (
+        "model.renderer.name=3dgrt-optix-nrend",
+        "model.renderer.name=3dgut-gsplat",
+        "model.renderer.outputs.camera.enable_extended_features=True",
+        "model.renderer.outputs.camera.enable_sensor_features=True",
+        "model.renderer.outputs.camera.enable_distance=True",
+        "model.renderer.outputs.camera.enable_normals=True",
+        "model.renderer.outputs.lidar.enable_normals=True",
+    )
+    with pytest.raises(RuntimeError, match="Reached model loading"):
+        RenderableModel.load_from_artifact(artifact, config_overrides=overrides, device="cpu")
+    assert artifact.parsed_config["model"]["renderer"]["outputs"]["camera"] == outputs
+
+
+def test_renderer_override_pins_matching_interpolation_before_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact = cast(
+        Any,
+        SimpleNamespace(
+            parsed_config={
+                "chosen_renderer": "3dgut-gsplat",
+                "model": {"renderer": {"name": "${chosen_renderer}"}},
+            },
+            is_compact=False,
+        ),
+    )
+
+    def upgrade(config):
+        config = config.copy()
+        config.chosen_renderer = "3dgrt-optix-nrend"
+        assert config.model.renderer.name == "3dgut-gsplat"
+        return config
+
+    def load_model(config, loaded_artifact, original_config, device):
+        assert config.model.renderer.name == original_config.model.renderer.name == "3dgut-gsplat"
+        assert original_config.chosen_renderer == "3dgut-gsplat"
+        raise RuntimeError("Reached model loading")
+
+    monkeypatch.setattr(render_module, "upgrade_config", upgrade)
+    monkeypatch.setattr(RenderableModel, "_load_model_and_upgrade", staticmethod(load_model))
+    with pytest.raises(RuntimeError, match="Reached model loading"):
+        RenderableModel.load_from_artifact(
+            artifact, config_overrides=("model.renderer.name=3dgut-gsplat",), device="cpu"
+        )
+    assert artifact.parsed_config["model"]["renderer"]["name"] == "${chosen_renderer}"
+
+
 @pytest.mark.parametrize("with_callback", [False, True])
 @pytest.mark.parametrize("override_split_size", [None, 512])
 def test_model_load_callback_runs_after_effective_cuda_configuration(
     monkeypatch: pytest.MonkeyPatch, with_callback: bool, override_split_size: int | None
 ) -> None:
     """The default loader and capture hook share upgraded, caller-overridden CUDA settings."""
-    import nurec.render.render as render_module
-
     calls: list[str] = []
     artifact = cast(
         Any,
@@ -322,8 +545,9 @@ def test_model_load_callback_runs_after_effective_cuda_configuration(
         check_environment()
         calls.append("callback")
 
-    def load_model(config, loaded_artifact, original_config):
+    def load_model(config, loaded_artifact, original_config, device):
         check_environment()
+        assert device == torch.device("cuda")
         assert config.system.max_split_size_mb == expected_split_size
         assert original_config.system.max_split_size_mb == 128
         assert loaded_artifact is artifact
@@ -344,3 +568,79 @@ def test_model_load_callback_runs_after_effective_cuda_configuration(
 
     assert calls == (["callback", "load"] if with_callback else ["load"])
     assert artifact.parsed_config["system"]["max_split_size_mb"] == 128
+
+
+@pytest.mark.parametrize("neighbor_source", ["rangeview", "angle"])
+@pytest.mark.parametrize("point_cloud", [False, True])
+def test_template_filter_uses_sensor_angles_during_platform_rotation(neighbor_source, point_cloud):
+    # The middle ray is a flying return. Platform rotation spreads the world rays
+    # beyond the maximum neighbour gap, so using end-pose-compensated angles would
+    # incorrectly keep it. Filtering must follow the original firing geometry.
+    sensor_angles = torch.tensor([-0.2, 0.0, 0.2])
+    firing_yaws = torch.tensor([0.0, 0.5, 1.0])
+
+    def directions(angles):
+        return torch.stack((angles.cos(), angles.sin(), torch.zeros_like(angles)), dim=1)
+
+    end_yaw = firing_yaws[-1]
+    end_inverse = torch.eye(4)
+    end_inverse[:2, :2] = torch.stack(
+        (torch.stack((end_yaw.cos(), end_yaw.sin())), torch.stack((-end_yaw.sin(), end_yaw.cos())))
+    )
+    bundle = SimpleNamespace(
+        rendering_data=SimpleNamespace(
+            rays=torch.cat((torch.zeros(3, 3), directions(sensor_angles + firing_yaws)), dim=1).reshape(1, 3, 1, 6),
+            sensor_model_parameters=[None],
+            unstructured_lidar_tiling=SimpleNamespace(directions=directions(sensor_angles)),
+        ),
+        T_nurec_sensor_end=end_inverse,
+        model_elements=torch.zeros(3, 2),
+    )
+    model = RenderableModel(cast(Any, torch.nn.Linear(1, 1)))
+    model._lidar_rendering_settings.enable_lidar_post_filter = True
+    predicted = GaussiansCompositeReturn(
+        rendered_lidar=GaussiansRenderReturn(distance=torch.tensor([10.0, 1.0, 10.0]), opacity=torch.ones(3))
+    )
+    method = model.render_lidar_frame_from_ray_bundle if point_cloud else model.render_lidar_ray_frame_from_ray_bundle
+    with patch.object(model, "_lidar_rays_inference", return_value=predicted):
+        frame = method(
+            cast(LidarRayBundle, bundle),
+            neighbor_source=neighbor_source,
+            distance_filter_threshold=0.5,
+            elevation_resolution_deg=1.0,
+            azimuth_max_gap_deg=20.0,
+        )
+
+    if point_cloud:
+        assert frame.point_positions.shape == (2, 3)
+    else:
+        torch.testing.assert_close(frame.ray_valid, torch.tensor([True, False, True]))
+        torch.testing.assert_close(frame.ray_distances, predicted.rendered_lidar.distance)
+
+
+def test_structured_bundle_keeps_rangeview_filter():
+    bundle = SimpleNamespace(
+        rendering_data=SimpleNamespace(
+            rays=torch.zeros(1, 1, 3, 6),
+            sensor_model_parameters=[object()],
+            unstructured_lidar_tiling=None,
+        ),
+        T_nurec_sensor_end=torch.eye(4),
+        model_elements=torch.zeros(3, 2),
+    )
+    model = RenderableModel(cast(Any, torch.nn.Linear(1, 1)))
+    predicted = GaussiansCompositeReturn(
+        rendered_lidar=GaussiansRenderReturn(distance=torch.ones(3), opacity=torch.ones(3))
+    )
+    with (
+        patch.object(model, "_lidar_rays_inference", return_value=predicted),
+        patch("nurec.render.render.angle_gradient_filter") as angle_filter,
+        patch(
+            "nurec.render.render.distance_based_filter", return_value=torch.tensor([False, True, False])
+        ) as grid_filter,
+    ):
+        frame = model.render_lidar_ray_frame_from_ray_bundle(cast(LidarRayBundle, bundle), enable_distance_filter=True)
+
+    grid_filter.assert_called_once()
+    angle_filter.assert_not_called()
+    torch.testing.assert_close(frame.ray_valid, torch.tensor([True, False, True]))

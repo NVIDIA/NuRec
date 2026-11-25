@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 from nurec.config.model import ExtraSignalSkyMlpBackgroundConfig, SkyEnvMapBackgroundConfig
 from nurec.config.trainer import TrainerConfig
 from nurec.models.background import ExtraSignalSkyMlpBackground, SkyEnvMapBackground
-from nurec.models.background_sampling import sample_cubemap_seamless
+from nurec.models.background_sampling import pad_cubemap_for_seamless_sampling, sample_cubemap_seamless
 from nurec.utils.geometry import cartesian_to_spherical
 from nurec.utils.misc import unpack_optional
 from nurec.utils.types import ExtraSignal, GaussiansCompositeReturn, GaussiansRenderReturn
@@ -176,12 +176,12 @@ def test_skyenvmapbackground_tracks_gradients_only_after_warmup() -> None:
 @pytest.mark.parametrize("ray_dtype", [torch.float32, torch.float16])
 def test_skyenvmapbackground_direct_coverage_matches_autograd_tracking(ray_dtype: torch.dtype) -> None:
     bg = SkyEnvMapBackground(_make_sky_env_map_config("cubemap", size=16), MockTrainerConfig()).to("cuda")
-    rays_d = torch.nn.functional.normalize(torch.randn(512, 3, device="cuda"), dim=-1)
+    rays_d = torch.nn.functional.normalize(torch.randn(512, 3, device="cuda"), dim=-1).to(ray_dtype)
     opacity = torch.linspace(0.0, 0.9, rays_d.shape[0], device="cuda")
     mask = torch.arange(rays_d.shape[0], device="cuda") % 3 != 0
-    # Under autocast the rays reach forward in fp16 while the texture is sampled in fp32.
-    sampling_rays = (rays_d @ bg.to_opengl.T).to(ray_dtype)
-    raw_rgb = bg._sample_raw(sampling_rays)
+    # World rays may arrive in fp16 under autocast; both the sampler and the coverage
+    # tracking rotate them into OpenGL in exact float32.
+    raw_rgb = bg._sample_raw(bg._rotate_rays_to_opengl(rays_d))
     masked_rgb = torch.where(mask[:, None], raw_rgb, raw_rgb.detach())
     reference = (
         torch.autograd.grad(
@@ -192,7 +192,7 @@ def test_skyenvmapbackground_direct_coverage_matches_autograd_tracking(ray_dtype
         .squeeze(0)
         .mean(dim=-1)
     )
-    bg._track_texture_grads(masked_rgb, sampling_rays, opacity, mask, is_training=True)
+    bg._track_texture_grads(masked_rgb, rays_d, opacity, mask, is_training=True)
 
     torch.testing.assert_close(bg.texture_grads, reference, atol=2e-5, rtol=2e-5)
 
@@ -348,6 +348,172 @@ def test_skyenvmapbackground_cubemap_uses_shared_seamless_sampler() -> None:
     expected = bg.activation(sample_cubemap_seamless(bg.textures.squeeze(0), open_gl_rays))
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="rotation helper runs on CUDA rays")
+@pytest.mark.parametrize("ray_dtype", [torch.float32, torch.float16])
+def test_skyenvmapbackground_rotation_matches_matmul_exactly(ray_dtype: torch.dtype) -> None:
+    bg = SkyEnvMapBackground(_make_sky_env_map_config("cubemap"), MockTrainerConfig()).to("cuda")
+    rays = torch.nn.functional.normalize(torch.randn(100_000, 3, device="cuda"), dim=-1)
+    axes = torch.cat([torch.eye(3, device="cuda"), -torch.eye(3, device="cuda")])
+    rays = torch.cat([rays, axes]).to(ray_dtype)
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        expected = rays.float() @ bg.to_opengl.T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    # The rotation is a signed permutation, so the gather + sign flip is bit-exact in float32,
+    # and autocast must not downcast the rays on the way.
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        rotated = bg._rotate_rays_to_opengl(rays)
+    assert rotated.dtype == torch.float32
+    assert torch.equal(rotated, expected)
+
+
+def _ray_bundle(n_rays: int, *, seed: int = 0) -> torch.Tensor:
+    """``[N, 6]`` origin+direction rays; the direction half is a strided view like the renderer's."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    rays = torch.randn(n_rays, 6, device="cuda", generator=generator)
+    rays[:, 3:] = torch.nn.functional.normalize(rays[:, 3:], dim=-1)
+    return rays
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat cubemap sampler is CUDA-only")
+@pytest.mark.parametrize("saturate_radiance", [False, True])
+def test_skyenvmapbackground_fused_forward_matches_separate_ops(saturate_radiance: bool) -> None:
+    bg = SkyEnvMapBackground(
+        _make_sky_env_map_config("cubemap", saturate_radiance=saturate_radiance), MockTrainerConfig()
+    ).to("cuda")
+    with torch.no_grad():
+        # Radiance outside [0, 1] so relu and saturate both have active and clipped texels.
+        bg.textures.copy_(torch.rand_like(bg.textures) * 2.0 - 0.5)
+    rays_d = _ray_bundle(1024)[:, 3:]
+    assert not rays_d.is_contiguous()
+
+    results = _forward_results(1024, 0.0, device="cuda")
+    rendered = unpack_optional(results.rendered_cam)
+    rendered.rgb = torch.rand_like(unpack_optional(rendered.rgb))
+    rendered.opacity = torch.rand_like(rendered.opacity)
+    foreground = rendered.rgb.clone()
+    # The separate ops the fused launch replaces: rotate, sample + activate, blend.
+    expected_bg = bg.sample(bg._rotate_rays_to_opengl(rays_d))
+    expected_rgb = foreground + expected_bg * (1.0 - rendered.opacity[:, None])
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        bg.forward(rays_d, results, is_training=False)
+
+    background = unpack_optional(unpack_optional(rendered.extra_ray_signals).rgb_background)
+    # The sky does not depend on the autocast state: rays stay float32 into the kernel and
+    # the background keeps the float32 contract of ``rgb_background``.
+    assert background.dtype == torch.float32
+    assert torch.equal(unpack_optional(rendered.rgb), expected_rgb)
+    assert torch.equal(background, expected_bg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat cubemap sampler is CUDA-only")
+def test_skyenvmapbackground_generic_cubemap_path_matches_fused_path_bitwise() -> None:
+    bg = SkyEnvMapBackground(_make_sky_env_map_config("cubemap"), MockTrainerConfig()).to("cuda")
+    with torch.no_grad():
+        bg.textures.copy_(torch.rand_like(bg.textures) * 2.0 - 0.5)
+    rays_d = _ray_bundle(1024, seed=7)[:, 3:]
+    foreground = torch.rand(1024, 3, device="cuda")
+    opacity = torch.rand(1024, device="cuda")
+
+    def forward(force_generic: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        results = _forward_results(1024, 0.0, device="cuda")
+        rendered = unpack_optional(results.rendered_cam)
+        rendered.rgb = foreground.clone()
+        rendered.opacity = opacity.clone()
+        if force_generic:
+            with patch.object(bg, "_fused_composite_applicable", return_value=False):
+                bg.forward(rays_d, results, is_training=False)
+        else:
+            bg.forward(rays_d, results, is_training=False)
+        return unpack_optional(rendered.rgb), unpack_optional(
+            unpack_optional(rendered.extra_ray_signals).rgb_background
+        )
+
+    # The generic path (rotate, sample, activate, blend as separate torch ops) is what the
+    # fused launch replaces; the two must agree bit for bit.
+    fused_rgb, fused_bg = forward(force_generic=False)
+    generic_rgb, generic_bg = forward(force_generic=True)
+    assert torch.equal(fused_rgb, generic_rgb)
+    assert torch.equal(fused_bg, generic_bg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat cubemap sampler is CUDA-only")
+def test_skyenvmapbackground_fused_training_gradients_match_separate_ops() -> None:
+    bg = SkyEnvMapBackground(_make_sky_env_map_config("cubemap", size=16), MockTrainerConfig()).to("cuda")
+    with torch.no_grad():
+        bg.textures.copy_(torch.rand_like(bg.textures) * 2.0 - 0.5)
+    rays_d = _ray_bundle(2048, seed=3)[:, 3:]
+    mask = torch.arange(rays_d.shape[0], device="cuda") % 3 != 0
+    foreground = torch.rand(rays_d.shape[0], 3, device="cuda")
+    opacity = torch.rand(rays_d.shape[0], device="cuda")
+
+    def loss(rgb: torch.Tensor, background: torch.Tensor) -> torch.Tensor:
+        return rgb.square().sum() + background.sum()
+
+    results = _forward_results(rays_d.shape[0], 0.0, device="cuda")
+    rendered = unpack_optional(results.rendered_cam)
+    rendered.rgb = foreground.clone()
+    rendered.opacity = opacity.clone()
+    bg.forward(rays_d, results, is_training=True, texture_update_mask=mask)
+    loss(
+        unpack_optional(rendered.rgb),
+        unpack_optional(unpack_optional(rendered.extra_ray_signals).rgb_background),
+    ).backward()
+    fused_grad = unpack_optional(bg.textures.grad).clone()
+    bg.textures.grad = None
+
+    # Reference: the generic path's ops with the same detach-for-non-sky-rays mask.
+    raw = bg._sample_raw(bg._rotate_rays_to_opengl(rays_d))
+    raw = torch.where(mask[:, None], raw, raw.detach())
+    reference_bg = bg.activation(raw)
+    reference_rgb = foreground + reference_bg * (1.0 - opacity[:, None])
+    loss(reference_rgb, reference_bg).backward()
+
+    torch.testing.assert_close(fused_grad, unpack_optional(bg.textures.grad), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat cubemap sampler is CUDA-only")
+def test_skyenvmapbackground_padded_textures_cache_hits_and_invalidates() -> None:
+    bg = SkyEnvMapBackground(_make_sky_env_map_config("cubemap"), MockTrainerConfig()).to("cuda")
+
+    # Training mode never caches: apex FusedAdam updates the texture without bumping its
+    # version counter, so there is no in-tensor signal to key a cache on.
+    with torch.no_grad():
+        assert bg._padded_textures() is not bg._padded_textures()
+
+    # Eval mode without grad (validation, serving): padded once and reused; explicit in-place
+    # writes (load_state_dict, copy_) bump the version counter and invalidate it.
+    bg.eval()
+    with torch.no_grad():
+        first = bg._padded_textures()
+        assert bg._padded_textures() is first
+        bg.textures.add_(0.25)
+        second = bg._padded_textures()
+        assert second is not first
+        assert bg._padded_textures() is second
+
+    # A write that leaves the version counter alone (``.data``, like FusedAdam) is still picked
+    # up, because switching modes drops the cache.
+    bg.train()
+    version = bg.textures._version
+    bg.textures.data.add_(0.25)
+    assert bg.textures._version == version
+    bg.eval()
+    with torch.no_grad():
+        third = bg._padded_textures()
+    assert third is not second
+    torch.testing.assert_close(third, pad_cubemap_for_seamless_sampling(bg.textures.squeeze(0)))
+
+    # Grad-enabled forwards never use the cache: the padding has to stay in the graph.
+    assert bg._padded_textures() is not bg._padded_textures()
+    assert bg._padded_textures().requires_grad
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="equirectangular parity test requires CUDA")

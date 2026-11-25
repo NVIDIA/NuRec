@@ -46,8 +46,9 @@ class LauncherTestBase(unittest.TestCase):
         (self.nre_root / "run.py").touch()
         (self.nre_root / ".bazelversion").write_text("8.3.1")
         (self.nre_root / "configs").mkdir()
-        (self.nre_root / "docs/basics").mkdir(parents=True)
-        (self.nre_root / "docs/basics/software.rst").write_text("ghcr.io/nvidia/nurec/nurec_dev_deps:test-release")
+        self.software_guide = self.nre_root / "docs/fern/versions/26.10/pages/basics/software.mdx"
+        self.software_guide.parent.mkdir(parents=True)
+        self.software_guide.write_text("ghcr.io/nvidia/nurec/nurec_dev_deps:test-release")
 
         for name in (
             "run.sh",

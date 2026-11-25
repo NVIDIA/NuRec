@@ -18,6 +18,10 @@ The commands above should be run anytime the protobufs change as it will update 
 should also be committed to the repository to reflect the protobuf changes. Several tests depend on these
 generated files.
 
+See [LiDAR gRPC 0.1.0 consumer changes](release/LIDAR_MIGRATION.md) for the
+source-versioned contract and migration guidance. This guide is independent of
+the published 26.10 documentation.
+
 ## Serving modes
 
 `serve-grpc` runs in one of two modes, both exposing the same gRPC API:
@@ -25,8 +29,9 @@ generated files.
 - **Single-process (default).** One process serves renders directly (`serve.py`).
 - **Multi-process drop-in (`serve-grpc --multiproc-workers N`, `N > 0`).** An owner process holds one
   read-only copy of the weights and shares it over CUDA IPC to `N` worker processes behind a front proxy
-  (`multiproc_serve.py`, `model_owner.py`), for MPS-backed throughput scaling. It is a drop-in for the
-  single-process API; asset editing and temporal-harmonizer sessions are the two refused capabilities.
+  (`multiproc_serve.py`, `model_owner.py`) for MPS-backed throughput scaling. It exposes the same gRPC
+  API but does not support temporal-harmonizer sessions, CUDA IPC sessions, or scene prefetch.
+  `--camera-only` is restricted to single-process serving.
 
 See [the gRPC API guide](https://docs.nvidia.com/nurec/api/grpc_api_guide.html) for the full flag set, admission/deployment
 semantics, and drop-in migration notes.

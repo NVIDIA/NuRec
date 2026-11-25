@@ -47,6 +47,18 @@ slangtorch_library(
 )
 
 pytest_test(
+    name = "collector_prebuilt_configs_test",
+    srcs = ["collector_prebuilt_configs_test.py"],
+    data = ["//configs"],
+    deps = [
+        ":pylib",
+        "//nurec/config:pylib",
+        "//nurec/config:pylib_parse",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+pytest_test(
     name = "collect_test",
     srcs = ["collect_test.py"],
     data = [

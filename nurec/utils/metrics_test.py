@@ -468,10 +468,13 @@ def test_schema_v5_yaml_still_validates_for_kratos(
     assert aggregated_metric_rows_from_content(reparsed, reporting_date=REPORTING_DATE)
 
 
+@pytest.mark.parametrize("metric_name", ["cuda_ms", "frame_wall_ms"])
 @pytest.mark.parametrize("sensor_types", [(), (False,), (True,), (False, True)])
 def test_profile_yaml_is_additive_and_keeps_kratos_input_compatible(
-    collector: MetricsCollector, tmp_path: Path, sensor_types: tuple[bool, ...]
+    collector: MetricsCollector, tmp_path: Path, sensor_types: tuple[bool, ...], metric_name: str
 ) -> None:
+    """Round-trip render timing samples through the shared YAML, typed schema and telemetry reader."""
+
     # General and ordinary sensor metrics must survive even when profiling summaries are enabled.
     collector.save_metric(MetricSample(name="setup_ms", value=7.0))
     expected: list[tuple[str | None, str | None, str, float]] = [(None, None, "setup_ms", 7.0)]
@@ -493,17 +496,19 @@ def test_profile_yaml_is_additive_and_keeps_kratos_input_compatible(
                 frame=4,
                 iteration=iteration,
                 is_lidar=is_lidar,
-                cuda_ms=value,
+                # Bind validity separately from the float-valued timing metrics.
+                metric_validity=None,
+                **{metric_name: value},
             )
-            expected.append((camera_id, lidar_id, "cuda_ms", value))
-    collector.set_metric_metadata("cuda_ms", warmup_frames=3, iterations=2, trajectory_id=0)
+            expected.append((camera_id, lidar_id, metric_name, value))
+    collector.set_metric_metadata(metric_name, warmup_frames=3, iterations=2, trajectory_id=0)
     report = write_report(collector, tmp_path)
 
     # This is the same YAML -> model validation boundary used by both Kratos readers.
     reparsed = MetricsFileContent.model_validate(report)
     assert reparsed.schema_version == 5
     assert "schema" not in report
-    assert reparsed.metric_metadata["cuda_ms"]["warmup_frames"] == 3
+    assert reparsed.metric_metadata[metric_name]["warmup_frames"] == 3
     rows = metric_rows_from_content(reparsed, reporting_date=REPORTING_DATE)
     assert sorted(((row.camera_id, row.lidar_id, row.metric_name, row.value) for row in rows), key=str) == sorted(
         expected, key=str
@@ -520,11 +525,11 @@ def test_profile_yaml_is_additive_and_keeps_kratos_input_compatible(
         if is_lidar not in sensor_types:
             assert legacy_sensors == {}
             continue
-        current_samples = getattr(reparsed.metrics.per_sequence["sequence"], group)["shared-name"]["cuda_ms"]
+        current_samples = getattr(reparsed.metrics.per_sequence["sequence"], group)["shared-name"][metric_name]
         assert [
             (sample.frame, sample.iteration) for sample in current_samples if isinstance(sample, FrameMetricSample)
         ] == [(4, 1), (4, 2)]
-        legacy_samples = legacy_sensors["shared-name"]["cuda_ms"]
+        legacy_samples = legacy_sensors["shared-name"][metric_name]
         assert [sample.value for sample in legacy_samples] == [sample.value for sample in current_samples]
         assert all(type(sample) is MetricSample for sample in legacy_samples)
 
@@ -636,6 +641,7 @@ def test_collector_reuses_loaded_version_without_querying_source_control(
     assert report["hardware"]["gpu_name"] == "Test GPU"
 
 
+@pytest.mark.parametrize("timing_metric", ["cuda_ms", "frame_wall_ms"])
 @pytest.mark.parametrize(
     ("is_lidar", "sensor_id", "group", "opposite_group", "modality"),
     [
@@ -651,7 +657,10 @@ def test_frame_samples_keep_distinct_clock_extrema(
     group: str,
     opposite_group: str,
     modality: str,
+    timing_metric: str,
 ) -> None:
+    """Keep each clock's samples and extrema independent through shared timing aggregation."""
+
     for frame, iteration, wall, cuda in ((8, 1, 30.0, 1.0), (8, 2, 10.0, 3.0), (12, 1, 20.0, 2.0)):
         collector.record_frame(
             sequence_id="sequence",
@@ -660,9 +669,11 @@ def test_frame_samples_keep_distinct_clock_extrema(
             frame=frame,
             iteration=iteration,
             render_time_ms=wall,
-            cuda_ms=cuda,
+            # Bind validity separately from the float-valued timing metrics.
+            metric_validity=None,
+            **{timing_metric: cuda},
         )
-    for metric in ("render_time_ms", "cuda_ms"):
+    for metric in ("render_time_ms", timing_metric):
         collector.set_metric_metadata(metric, warmup_frames=3, iterations=2, renderer="test")
 
     report = write_report(collector, tmp_path)
@@ -681,15 +692,15 @@ def test_frame_samples_keep_distinct_clock_extrema(
             {"name": "render_time_ms", "value": 10.0, "frame": 8, "iteration": 2, "valid": True},
             {"name": "render_time_ms", "value": 20.0, "frame": 12, "iteration": 1, "valid": True},
         ],
-        "cuda_ms": [
-            {"name": "cuda_ms", "value": 1.0, "frame": 8, "iteration": 1, "valid": True},
-            {"name": "cuda_ms", "value": 3.0, "frame": 8, "iteration": 2, "valid": True},
-            {"name": "cuda_ms", "value": 2.0, "frame": 12, "iteration": 1, "valid": True},
+        timing_metric: [
+            {"name": timing_metric, "value": 1.0, "frame": 8, "iteration": 1, "valid": True},
+            {"name": timing_metric, "value": 3.0, "frame": 8, "iteration": 2, "valid": True},
+            {"name": timing_metric, "value": 2.0, "frame": 12, "iteration": 1, "valid": True},
         ],
     }
     for metric, mean, std, minimum, maximum in (
         ("render_time_ms", 20.0, (200.0 / 3) ** 0.5, (10.0, 2), (30.0, 1)),
-        ("cuda_ms", 2.0, (2.0 / 3) ** 0.5, (1.0, 1), (3.0, 2)),
+        (timing_metric, 2.0, (2.0 / 3) ** 0.5, (1.0, 1), (3.0, 2)),
     ):
         metadata = report["metric_metadata"][metric]
         assert metadata["warmup_frames"] == 3

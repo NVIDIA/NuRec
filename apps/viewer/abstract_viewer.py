@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Any, Literal, Optional, cast, get_args
+from typing import Any, Literal, Optional, TypeVar, cast, get_args
 
 import numpy as np
 import torch
@@ -42,6 +42,17 @@ from nurec.utils.visualize import scalar2img
 
 logger = logging.getLogger(__name__)
 RUNFILES = runfiles.Create()
+
+T = TypeVar("T")
+
+
+def set_gui_value(handle: viser.GuiInputHandle[T], value: T) -> None:
+    """
+    Assigns the value of a viser GUI handle. viser defines another method between the `value`
+    getter and its setter, so mypy does not see the setter and rejects `handle.value = x` with
+    'Property "value" is read-only'.
+    """
+    cast(Any, handle).value = value
 
 
 def pad_to_aspect_ratio(input_image: np.ndarray, aspect_ratio: float) -> np.ndarray:
@@ -162,7 +173,7 @@ class RasterArtifacts:
 
 @dataclass
 class BBoxHandle:
-    box: viser.MeshHandle
+    box: viser.BoxHandle
     label: viser.LabelHandle
     color: np.ndarray
     node_name: str
@@ -384,7 +395,7 @@ class RenderStateMachine(Thread):
         if self.time_slider.value == timestamp_relative_us:
             return  # no change, don't trigger adjustments
 
-        self.time_slider.value = timestamp_relative_us
+        set_gui_value(self.time_slider, timestamp_relative_us)
         self._on_time_updated()
 
     def _get_time_us(self) -> int:
@@ -438,7 +449,7 @@ class RenderStateMachine(Thread):
             assert self.current_trajectory is not None
             assert self.time_absolute_label is not None
             absolute_time = self.current_trajectory.time_range_us.to_global(time_slider.value)
-            self.time_absolute_label.value = str(absolute_time)
+            set_gui_value(self.time_absolute_label, str(absolute_time))
             self._on_time_updated()
 
         self.time_slider = time_slider
@@ -570,8 +581,8 @@ class RenderStateMachine(Thread):
 
             # recreate the time slider to respect the new time range
             self._recreate_time_slider()
-            self.camera_rotation_offset.value = (0.0, 0.0, 0.0)
-            self.camera_translation_offset.value = (0.0, 0.0, 0.0)
+            set_gui_value(self.camera_rotation_offset, (0.0, 0.0, 0.0))
+            set_gui_value(self.camera_translation_offset, (0.0, 0.0, 0.0))
 
         ## dropdown for picking display modality (rgb/distance/etc)
         self.modality_dropdown = self.client.gui.add_dropdown(
@@ -629,8 +640,9 @@ class RenderStateMachine(Thread):
                 num_poses += len(trajectory_positions)
                 spline = self.client.scene.add_spline_catmull_rom(
                     trajectory_id.camera_sequence_str(),
-                    trajectory_positions,
-                    line_width=3.0,
+                    points=trajectory_positions,
+                    thickness=3.0,
+                    thickness_units="screen",
                     tension=0.0,
                     color=(0.0, 1.0, 0.0),  # green
                 )
@@ -962,7 +974,7 @@ class RenderStateMachine(Thread):
         for frame_idx, relative_timestamp_us in enumerate(
             np.arange(self.time_slider.min, self.time_slider.max, 1000000 // render_fps)
         ):
-            self.time_slider.value = relative_timestamp_us
+            set_gui_value(self.time_slider, int(relative_timestamp_us))
             # Wait for the other thread to update camera
             # There's currently no way of knowing whether the update has been applied.
             # so we sleep here

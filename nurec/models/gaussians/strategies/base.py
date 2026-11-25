@@ -57,12 +57,23 @@ class BaseGaussianStrategy(nn.Module, ABC):
     def refresh_runtime_scenes(self, gaussians_nodes: TypedModuleDict[BaseGaussianModel]) -> None:
         """Refresh strategy-specific runtime scene bindings after row replacement."""
 
+    def update_prepared_visibility(
+        self,
+        *,
+        visibility: torch.Tensor,
+        gaussians_nodes: TypedModuleDict[BaseGaussianModel],
+    ) -> None:
+        """Consume a coordinated owner-local visibility union."""
+
     @torch.no_grad()
     def serialization_state_dict_overrides(
         self, gaussians_nodes: TypedModuleDict[BaseGaussianModel]
     ) -> dict[str, torch.Tensor]:
         """Return bounded Gaussian state tensors without mutating the live model."""
         return {}
+
+    def on_train_step_start(self) -> None:
+        """Called before the training batch forward for strategy-specific checks."""
 
     @abstractmethod
     def _update_step_train_batch_end_impl(

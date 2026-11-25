@@ -13,16 +13,28 @@ DEFAULT_VISIBILITY = [
 package(default_visibility = DEFAULT_VISIBILITY)
 
 py_library(
+    name = "pylib_utils",
+    srcs = ["utils.py"],
+    deps = [
+        "//nurec/libs/geometry/kernels:pylib",
+        "//nurec/utils:pylib_image_resolution",
+        "//nurec/utils:pylib_profiling",
+        "//nurec/utils:pylib_types",
+        pip_requirement("nvidia-ncore"),
+        pip_requirement("torch"),
+    ],
+)
+
+py_library(
     name = "pylib",
     srcs = [
         "__init__.py",
         "actors.py",
         "bbox_overlay.py",
-        "lidar_firing_pattern.py",
+        "lidar_tiling.py",
         "render.py",
         "scene.py",
         "track_labels.py",
-        "utils.py",
     ],
     visibility = DEFAULT_VISIBILITY + [
         # Add visibility for //:run
@@ -30,6 +42,7 @@ py_library(
         "//nurec/instant_nurec:__pkg__",
     ],
     deps = [
+        ":pylib_utils",
         "//nurec:pylib",
         "//nurec/artifact:pylib",
         "//nurec/compression:pylib_usdz",
@@ -39,6 +52,7 @@ py_library(
         "//nurec/libs/sensors:camera_kernels",
         "//nurec/libs/vren:pylib",
         "//nurec/libs/vren:pylib_cc",
+        "//nurec/lidar/firing_patterns:templates",
         "//nurec/models:pylib",
         "//nurec/models/gaussians:pylib",
         "//nurec/models/gaussians:pylib_gaussians_composite",
@@ -51,6 +65,16 @@ py_library(
         pip_requirement("omegaconf"),
         pip_requirement("pillow"),
         pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "utils_test",
+    size = "small",
+    srcs = ["utils_test.py"],
+    deps = [
+        ":pylib_utils",
+        pip_requirement("numpy"),
     ],
 )
 
@@ -82,13 +106,14 @@ pytest_test(
 )
 
 pytest_test(
-    name = "lidar_firing_pattern_test",
+    name = "lidar_tiling_test",
     size = "small",
     srcs = [
-        "lidar_firing_pattern_test.py",
+        "lidar_tiling_test.py",
     ],
     deps = [
         ":pylib",
+        "//nurec/lidar/firing_patterns:templates",
         pip_requirement("numpy"),
         pip_requirement("torch"),
     ],

@@ -138,6 +138,50 @@ class TestConfiguredDistanceBounds(unittest.TestCase):
 
 
 class TestRescaleCameraMeanLossesToOriginalValidPixels(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_accumulator_rescaling_preserves_ppisp_and_appended_calibration_gradients(self) -> None:
+        from nurec.libs.losses.orchestration.config import AccumulatorLoss, LossAccumulatorReturn
+
+        vector = torch.tensor([8.0, 3.0], device="cuda", requires_grad=True)
+        ppisp = torch.tensor(5.0, device="cuda", requires_grad=True)
+        calibration = torch.tensor(2.0, device="cuda", requires_grad=True)
+        result = LossAccumulatorReturn(
+            vector,
+            {"rgb_l1_mean": 0, "road_gaussians_abs_mean": 1},
+            {"rgb_l1_mean": 2.0, "road_gaussians_abs_mean": 4.0},
+        )
+        result.append_producer_loss(
+            AccumulatorLoss(
+                name="ppisp_ppisp_loss_mean", lambda_=0.7, value=ppisp, reduce_fn=lambda value, **_: value.reshape(())
+            )
+        )
+        labels = CameraFrameLabels(flags=self.masked_flags.cuda())
+        context = ComponentOnlyLossNormalizationContext.capture(self.original_flags.cuda())
+        rescale_camera_mean_losses_to_original_valid_pixels(
+            result,
+            labels,
+            context,
+            camera_loss_kinds_by_name={"rgb_l1_mean": CameraLossKind.RGB},
+            distance_bounds_by_name={},
+        )
+        result.append_producer_loss(
+            AccumulatorLoss(
+                name="rig_spline_curvature",
+                lambda_=0.3,
+                value=calibration,
+                reduce_fn=lambda value, **_: value.reshape(()),
+            )
+        )
+        logged: dict[str, torch.Tensor | float] = {}
+        result.log(lambda name, value: logged.__setitem__(name, value))
+        torch.testing.assert_close(result.weighted_values, vector.new_tensor([2.0, 3.0, 3.5, 0.6]))
+        torch.testing.assert_close(result.compute_total(), vector.new_tensor(9.1))
+        self.assertEqual(logged["train_params/rgb_l1_mean_lambda"], 2.0)
+        result.compute_total().backward()
+        torch.testing.assert_close(vector.grad, vector.new_tensor([0.25, 1.0]))
+        torch.testing.assert_close(ppisp.grad, ppisp.new_tensor(0.7))
+        torch.testing.assert_close(calibration.grad, calibration.new_tensor(0.3))
+
     def setUp(self) -> None:
         base = RayFlags.RGB_LABEL.value | RayFlags.VALID_NORMAL.value
         self.original_flags = torch.full((1, 1, 4, 1), base, dtype=torch.int32)

@@ -295,6 +295,7 @@ Optional flags:
 | `--enable-timing`                                        | `False`                                                                        | Print per-stage rendering timings.                                                                                |
 | `--ray-chunk-size`                                       | `2^62`                                                                         | Max rays per forward pass; lower it to fit smaller GPUs.                                                          |
 | `--egocar-hood-dir`                                      | unset                                                                          | Override directory of egocar hood images.                                                                         |
+| `--egocar-hood-cache-size`                               | `32`                                                                           | Max hood images cached on the render GPU per process (LRU); the bank is only listed at startup.                   |
 | `--enable-editing-actors`                                | `False`                                                                        | Required for `render-grpc --edit-assets`.                                                                         |
 | `--download-cache-dir`                                   | `~/.cache/nurec/downloaded_scenes`                                             | Cache for scenes downloaded on demand by the server.                                                              |
 | `--download-cache-size`                                  | `5`                                                                            | Max number of cached downloaded scenes (LRU).                                                                     |
@@ -355,15 +356,15 @@ Optional flags (RGB):
 
 LiDAR-mode flags (require `--lidar`):
 
-| Flag                                                     | Default          | Purpose                                                                   |
-| -------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------- |
-| `--lidar`                                                | off              | Switch to `render_lidar` and write point clouds.                          |
-| `--lidar-id`                                             | first available  | LiDAR sensor ID to use for frame timestamps.                              |
-| `--lidar-format [bin\|ply]`                              | `bin`            | Binary blob (`xyz` then `intensity`) or PLY with intensity-mapped colors. |
-| `--lidar-raydrop-threshold`                              | `0.5`            | Drop rays with `raydrop > T`.                                             |
-| `--lidar-opacity-threshold`                              | `0.0`            | Drop rays with `opacity <= T`. `0.0` disables the filter.                 |
-| `--lidar-distance-filter` / `--no-lidar-distance-filter` | artifact default | Toggle distance-based edge filtering (removes floating points).           |
-| `--lidar-distance-filter-threshold`                      | artifact default | `[0, 1]`; higher = fewer points filtered.                                 |
+| Flag                                                     | Default          | Purpose                                                                                                                                             |
+| -------------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--lidar`                                                | off              | Switch to `render_lidar` and write point clouds.                                                                                                    |
+| `--lidar-id`                                             | first available  | LiDAR sensor ID to use for frame timestamps.                                                                                                        |
+| `--lidar-format [bin\|ply\|per-ray]`                     | `bin`            | `bin`/`ply`: compensated point clouds. `per-ray`: uncompensated NPZ frames, request poses/times, and a pattern catalog in a fresh output directory. |
+| `--lidar-raydrop-threshold`                              | `0.5`            | Drop rays with `raydrop > T`.                                                                                                                       |
+| `--lidar-opacity-threshold`                              | `0.0`            | Drop rays with `opacity <= T`. `0.0` disables the filter.                                                                                           |
+| `--lidar-distance-filter` / `--no-lidar-distance-filter` | artifact default | Toggle distance-based edge filtering (removes floating points).                                                                                     |
+| `--lidar-distance-filter-threshold`                      | artifact default | `[0, 1]`; higher = fewer points filtered.                                                                                                           |
 
 `render-grpc` writes `timestamps.json` next to the rendered frames
 listing the per-frame `frame_start_timestamp_us` /

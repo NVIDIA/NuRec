@@ -15,6 +15,8 @@ static const uint MAX_POLYNOMIAL_TERMS = 6;
 // Numerical constants
 static const float EPSILON = 1e-6;  // General numerical guard for avoiding division by near-zero
 static const float NEWTON_EPSILON = 1e-10;  // Tighter tolerance for Newton iteration convergence
+static const float FISHEYE_INVERSE_DERIVATIVE_EPSILON = 1e-6;
+static const float FISHEYE_INVERSE_RESIDUAL_EPSILON = 4e-7;
 
 // Shared polynomial evaluation utilities to avoid code duplication across camera models.
 struct PolynomialUtils {
@@ -559,12 +561,11 @@ struct OpenCVPinholeCameraModelParameters : ICameraProjection {
 
 // OpenCV Fisheye camera model
 // Matches OpenCV's fisheye model: theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
-// Uses Newton iteration for exact undistortion to match OpenCV behavior
+// Inverts the optical-axis monotonic branch with safeguarded Newton/bisection.
 // IDifferentiable inherited from ICameraProjection - allows gradient flow through struct members
 struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
-    // Maximum Newton iterations for polynomial inversion (compile-time bound for autodiff)
-    // TODO: evaluate if this can be lowered to 10 iterations like Ftheta.
-    static const int MAX_NEWTON_ITERATIONS = 20;
+    // Independent of the legacy Newton budget: keep using safe Newton steps until convergence.
+    static const int MAX_SOLVER_ITERATIONS = 52;
 
     float2 principal_point;     // (cx, cy)
     float2 focal_length;        // (fx, fy)
@@ -572,7 +573,7 @@ struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
     float approx_backward_factor; // Factor for approximate backward polynomial for initial guess
     float2 resolution;            // [width, height] resolution in pixels
     no_diff float max_angle;            // Maximum ray angle in radians - configuration threshold
-    no_diff int newton_iterations;      // Number of Newton iterations - discrete value
+    no_diff int newton_iterations;      // Deprecated compatibility field; ignored by this solver
     no_diff float min_2d_norm;          // Minimum 2D norm threshold - configuration threshold
 
     // Evaluate forward polynomial
@@ -584,7 +585,7 @@ struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
         return theta * (1.0 + theta2 * (k1 + theta2 * (k2 + theta2 * (k3 + theta2 * k4))));
     }
 
-    // eighth-degree differential of forward polynomial 1 + 3*k1*theta^2 + 5*k2*theta^4 + 7*k3*theta^8 + 9*k4*theta^8
+    // eighth-degree differential: 1 + 3*k1*theta^2 + 5*k2*theta^4 + 7*k3*theta^6 + 9*k4*theta^8
     [Differentiable]
     float eval_dforward_poly(float theta) {
         float k1 = forward_poly[0], k2 = forward_poly[1], k3 = forward_poly[2], k4 = forward_poly[3];
@@ -597,17 +598,64 @@ struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
         return approx_backward_factor * x;
     }
 
-    // Invert forward polynomial using Newton iteration
+    // max_angle is restricted to the first monotonic branch when parameters are built.
+    // A negative result denotes an unsupported radius or a failed/ill-conditioned solve.
+    // Do not differentiate through iteration decisions or an unsafe Newton division.
+    float solve_forward_poly(float y) {
+        float lower = 0.0;
+        float upper = max_angle;
+        if (!isfinite(upper) || upper <= 0.0) return -1.0;
+        float max_radius = eval_forward_poly(upper);
+        if (!isfinite(y) || y < 0.0 || !isfinite(max_radius) || max_radius <= 0.0 || y >= max_radius) return -1.0;
+
+        float x = eval_approx_backward_poly(y);
+        if (!isfinite(x) || x <= lower || x >= upper) x = 0.5 * (lower + upper);
+        float previous_step = upper - lower;
+        float last_step = previous_step;
+        for (int i = 0; i < MAX_SOLVER_ITERATIONS; i++) {
+            float residual = eval_forward_poly(x) - y;
+            float derivative = eval_dforward_poly(x);
+            if (!isfinite(residual) || !isfinite(derivative)) return -1.0;
+
+            if (derivative > FISHEYE_INVERSE_DERIVATIVE_EPSILON
+                && abs(residual) <= FISHEYE_INVERSE_RESIDUAL_EPSILON * max(1.0, y)
+                && abs(residual) <= 1e-6 * derivative) return x;
+
+            if (residual < 0.0) lower = x;
+            else upper = x;
+
+            float next_x = 0.5 * (lower + upper);
+            if (derivative > FISHEYE_INVERSE_DERIVATIVE_EPSILON) {
+                float newton_step = residual / derivative;
+                float candidate = x - newton_step;
+                // rtsafe-style progress check against the step before last, not bracket width.
+                if (isfinite(candidate) && candidate > lower && candidate < upper
+                    && abs(newton_step) <= 0.5 * abs(previous_step)) next_x = candidate;
+            }
+            if (next_x == x) break;
+            previous_step = last_step;
+            last_step = x - next_x;
+            x = next_x;
+        }
+
+        float residual = eval_forward_poly(x) - y;
+        float derivative = eval_dforward_poly(x);
+        if (isfinite(residual) && isfinite(derivative) && derivative > FISHEYE_INVERSE_DERIVATIVE_EPSILON
+            && abs(residual) <= FISHEYE_INVERSE_RESIDUAL_EPSILON * max(1.0, y)) return x;
+        return -1.0;
+    }
+
     [Differentiable]
     float invert_forward_poly_newton(float y) {
-        float x = eval_approx_backward_poly(y);
-        [MaxIters(MAX_NEWTON_ITERATIONS)]
-        for (int i = 0; i < newton_iterations; i++) {
-            float df_x = eval_dforward_poly(x);
-            float residual = eval_forward_poly(x) - y;
-            x = x - residual / df_x;
-        }
-        return x;
+        float root = no_diff solve_forward_poly(y);
+        if (root < 0.0) return -1.0;
+
+        // Implicit derivative of g(theta)=y, independent of the seed and fallback path.
+        // Preserve the bounded primal root; only the zero-valued correction carries gradients.
+        float derivative = detach(eval_dforward_poly(root));
+        float residual = y - eval_forward_poly(root);
+        float detached_residual = detach(residual);
+        return root + (residual - detached_residual) / derivative;
     }
 
     [Differentiable]
@@ -625,7 +673,12 @@ struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
         float eps = 1e-6;
         float ray_xy_norm = max(numerically_stable_xy_norm(camera_ray), eps);
 
-        float theta = min(atan2(ray_xy_norm, camera_ray.z), max_angle);
+        float theta = atan2(ray_xy_norm, camera_ray.z);
+        if (theta >= max_angle) {
+            result.valid = false;
+            result.image_point = float2(0.0, 0.0);
+            return result;
+        }
 
         float3 ray_norm = normalize(camera_ray);
         float delta = eval_forward_poly(theta);
@@ -650,12 +703,14 @@ struct OpenCVFisheyeCameraModelParameters : ICameraProjection {
         float y = (image_point.y - principal_point.y) / focal_length.y;
 
         float delta = length(float2(x, y));
-        if (delta < min_2d_norm) {
+        if (!isfinite(delta) || delta < min_2d_norm) {
             return float3(0.0, 0.0, 1.0);
         }
 
-        // Use Newton iteration to invert forward polynomial
         float theta = invert_forward_poly_newton(delta);
+        // The ray-only API has no validity output. Unsupported pixels use a finite,
+        // constant sentinel and must still be excluded by the caller's camera/image mask.
+        if (theta < 0.0) return float3(0.0, 0.0, 1.0);
 
         // Compute ray direction
         float sin_theta = sin(theta);

@@ -7,20 +7,126 @@ import contextlib
 import copy
 import glob
 import hashlib
+import io
 import json
 import logging
+import os
+import struct
+import time
 import zipfile
+import zlib
 
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, FrozenSet, Generator, List, Optional
+from typing import Any, BinaryIO, Dict, FrozenSet, Generator, List, Optional, Tuple
 
 import numpy as np
 import yaml
 
 
 log = logging.getLogger(__name__)
+
+# libyaml's loader parses the ~200 KB parsed_config.yaml several times faster than the pure-Python
+# one and builds the same objects; PyYAML only exposes it when it was built against libyaml.
+_YAML_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+# A file whose mtime or ctime is this close to the moment its digest was computed is never trusted on
+# its stat alone (git's "racily clean" rule): timestamp granularity could hide a rewrite in between.
+_FOOTPRINT_RACY_WINDOW_S = 2.0
+
+
+def _footprint_of(stat: os.stat_result) -> Tuple[int, int, int, int]:
+    """(size, mtime_ns, ctime_ns, inode): what a rewrite or a replacement of the file changes."""
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+
+
+# Local file header of a zip member: signature, version, flags, method, time, date, crc, compressed
+# size, uncompressed size, name length, extra length (zipfile's equivalents are undocumented internals).
+_ZIP_LOCAL_FILE_HEADER = struct.Struct("<4sHHHHHIIIHH")
+_ZIP_LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+_ZIP_FLAG_ENCRYPTED = 0x1
+_CRC_CHUNK_SIZE = 16 << 20
+
+
+def _yaml_safe_load(stream: Any) -> Any:
+    return yaml.load(stream, Loader=_YAML_SAFE_LOADER)  # noqa: S506 - the loader is a SafeLoader variant
+
+
+class _StoredZipMemberFile(io.RawIOBase):
+    """Read-only, seekable view of one uncompressed (stored) zip member, read with ``os.preadv``.
+
+    Readers that support ``readinto`` (``torch.load`` does) pull bytes straight from the page cache
+    into their destination buffer, with no intermediate copy of the member. The CRC-32 check that
+    ``zipfile`` performs while reading is available separately as :meth:`verify_crc`.
+    """
+
+    def __init__(self, path: Path, info: zipfile.ZipInfo):
+        super().__init__()
+        self._name = info.filename
+        self._fd = os.open(path, os.O_RDONLY)
+        header = os.pread(self._fd, _ZIP_LOCAL_FILE_HEADER.size, info.header_offset)
+        if len(header) != _ZIP_LOCAL_FILE_HEADER.size:
+            os.close(self._fd)
+            raise zipfile.BadZipFile(f"Truncated local file header for {info.filename!r}")
+        signature, *_, name_length, extra_length = _ZIP_LOCAL_FILE_HEADER.unpack(header)
+        if signature != _ZIP_LOCAL_FILE_HEADER_SIGNATURE:
+            os.close(self._fd)
+            raise zipfile.BadZipFile(f"Bad local file header for {info.filename!r}")
+        self._data_offset = info.header_offset + _ZIP_LOCAL_FILE_HEADER.size + name_length + extra_length
+        self._size = info.file_size
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        view = memoryview(buffer).cast("B")
+        wanted = min(len(view), self._size - self._pos)
+        done = 0
+        while done < wanted:
+            got = os.preadv(self._fd, [view[done:wanted]], self._data_offset + self._pos + done)
+            if got == 0:
+                break
+            done += got
+        self._pos += done
+        return done
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._pos + offset
+        elif whence == io.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError(f"invalid whence ({whence})")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._pos = position
+        return position
+
+    def tell(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        if not self.closed:
+            os.close(self._fd)
+        super().close()
+
+    def verify_crc(self, expected: int) -> None:
+        """Stream the whole member once through ``zlib.crc32`` and rewind; ``BadZipFile`` on mismatch."""
+        chunk = memoryview(bytearray(_CRC_CHUNK_SIZE))
+        crc = 0
+        self.seek(0)
+        while n := self.readinto(chunk):
+            crc = zlib.crc32(chunk[:n], crc)
+        self.seek(0)
+        if crc != expected:
+            raise zipfile.BadZipFile(f"Bad CRC-32 for file {self._name!r}")
 
 
 # Filenames of the per-class semantic metadata side files inside the USDZ artifact.
@@ -32,7 +138,7 @@ TRACK_SPLIT_METADATA_FILENAME = "track_split_metadata.json"
 _CHECKPOINT_NAME = "checkpoint.ckpt"
 # Keep this local so the artifact reader does not depend on compression.
 _COMPACT_PAYLOAD_NAME = "compact.safetensors"
-# The directory of measured firing patterns, written by nurec.utils.io.firing_patterns.
+# The directory of measured firing patterns, written by nurec.lidar.firing_patterns.io.
 FIRING_PATTERNS_DIR = "firing_patterns"
 
 
@@ -68,6 +174,8 @@ class Artifact:
     _semantic_class_colors_loaded: bool = field(default=False, init=False, repr=False)
     _zip_namelist: FrozenSet[str] | None = field(default=None, init=False, repr=False)
     _sha256_footprint: str | None = field(default=None, init=False, repr=False)
+    # `_footprint_of` the source when `_sha256_footprint` was computed, if trustworthy.
+    _footprint_stat: Tuple[int, int, int, int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         assert self.source.suffix == ".usdz"
@@ -107,6 +215,7 @@ class Artifact:
         self._semantic_class_colors_loaded = False
         self._zip_namelist = None
         self._sha256_footprint = None
+        self._footprint_stat = None
 
     @contextlib.contextmanager
     def temporary_cache(self) -> Generator[Artifact, None, None]:
@@ -129,6 +238,30 @@ class Artifact:
 
         self._checkpoint.seek(0)  # reset the stream to the beginning if reusing the cache
         return self._checkpoint
+
+    def open_checkpoint(self, verify_crc: bool = True) -> BinaryIO:
+        """Open checkpoint.ckpt for reading without materializing it.
+
+        The member is read in place (see ``_StoredZipMemberFile``) and nothing is cached on the
+        artifact; close the returned file (or use it as a context manager) when done. With
+        ``verify_crc`` the member's CRC-32 is checked first, as ``zipfile`` would while reading it, and
+        a mismatch raises ``zipfile.BadZipFile``. A compressed or encrypted member, which a conformant
+        USDZ never has, falls back to a buffered copy that ``zipfile`` checks itself.
+        """
+        if self.is_compact:
+            raise ValueError("compact USDZ artifacts do not contain checkpoint.ckpt; use the compact loader")
+        with zipfile.ZipFile(self.source, "r") as zip_file:
+            info = zip_file.getinfo(_CHECKPOINT_NAME)
+            if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & _ZIP_FLAG_ENCRYPTED:
+                return BytesIO(zip_file.read(_CHECKPOINT_NAME))
+        member = _StoredZipMemberFile(self.source, info)
+        try:
+            if verify_crc:
+                member.verify_crc(info.CRC)
+        except BaseException:
+            member.close()
+            raise
+        return io.BufferedReader(member)
 
     @property
     def is_compact(self) -> bool:
@@ -171,7 +304,7 @@ class Artifact:
     def metadata(self) -> Dict[str, Any]:
         if self._metadata is None:
             with zipfile.ZipFile(self.source, "r") as zip_file:
-                self._metadata = yaml.safe_load(zip_file.open("metadata.yaml"))
+                self._metadata = _yaml_safe_load(zip_file.open("metadata.yaml"))
 
         return self._metadata
 
@@ -191,7 +324,7 @@ class Artifact:
         # want to apply upgrade_model() which requires the pre-upgrade config returned here.
         if self._parsed_config is None:
             with zipfile.ZipFile(self.source, "r") as zip_file:
-                self._parsed_config = yaml.safe_load(zip_file.open("parsed_config.yaml"))
+                self._parsed_config = _yaml_safe_load(zip_file.open("parsed_config.yaml"))
 
         return self._parsed_config
 
@@ -259,7 +392,7 @@ class Artifact:
             with zipfile.ZipFile(self.source, "r") as zip_file:
                 metadata_dict = {}
                 if "external_assets/metadata.yaml" in zip_file.namelist():
-                    metadata_content = yaml.safe_load(zip_file.open("external_assets/metadata.yaml"))
+                    metadata_content = _yaml_safe_load(zip_file.open("external_assets/metadata.yaml"))
                     if "assets" in metadata_content:
                         for asset_info in metadata_content["assets"]:
                             track_id = asset_info["track_id"]
@@ -300,6 +433,14 @@ class Artifact:
 
         Expected structure in artifact: firing_patterns/{logical_lidar_id}.npz. A lidar with a
         parametric sensor model does not need one, so the mapping is normally empty or partial.
+
+        Returns:
+            Logical lidar IDs mapped to NPZ member bytes. The mapping is loaded on
+            first access and cached; it is empty when the artifact has no pattern members.
+
+        Raises:
+            OSError: If the artifact cannot be opened or read.
+            zipfile.BadZipFile: If the artifact archive or a pattern member is corrupt.
         """
         if self._firing_patterns is None:
             self._firing_patterns = {}
@@ -434,11 +575,31 @@ class Artifact:
         (read in chunks) and cached thereafter.
         """
         if self._sha256_footprint is None:
-            digest = hashlib.sha256()
-            chunk_size = 1 << 20
             with open(self.source, "rb") as f:
-                for chunk in iter(lambda: f.read(chunk_size), b""):
-                    digest.update(chunk)
-            self._sha256_footprint = digest.hexdigest()
+                # Stat through the open descriptor, before reading: a rewrite during the read then
+                # shows up as a changed timestamp on the next footprint_is_current() check.
+                stat = os.fstat(f.fileno())
+                hashed_at = time.time()
+                self._sha256_footprint = hashlib.file_digest(f, "sha256").hexdigest()
+            # Recorded only when the digest can be trusted on the stat (_FOOTPRINT_RACY_WINDOW_S).
+            if max(stat.st_mtime_ns, stat.st_ctime_ns) < int((hashed_at - _FOOTPRINT_RACY_WINDOW_S) * 1e9):
+                self._footprint_stat = _footprint_of(stat)
 
         return self._sha256_footprint
+
+    def footprint_is_current(self) -> bool:
+        """
+        Whether the cached :attr:`sha256_footprint` still describes the file on disk, judged by the
+        file's size, mtime, ctime and inode against those recorded when the digest was computed. Lets
+        callers skip re-reading a file nobody touched; ctime and inode also catch a replacement that
+        preserves size and mtime (``cp -p``, ``rsync -t``, a rename into place), since ctime cannot
+        be set from user space. False when no trusted digest is cached or the file cannot be stat'ed,
+        so callers fall back to re-hashing.
+        """
+        if self._footprint_stat is None:
+            return False
+        try:
+            stat = os.stat(self.source)
+        except OSError:
+            return False
+        return _footprint_of(stat) == self._footprint_stat

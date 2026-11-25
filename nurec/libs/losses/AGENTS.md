@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 ## Consuming a gsplat loss
 
 The fused dispatches are `torch.nn.Module`s. Own them as submodules of
-`ModuleLosses` and call them directly. They cannot be called from inside a
+`AccumulatorModuleLosses` and call them directly. They cannot be called from inside a
 `torch.autograd.Function.forward`, which runs under `no_grad` — the graph it
 builds is discarded and gradients vanish with no error.
 

@@ -383,13 +383,18 @@ def _pad_cubemap_for_seamless_sampling(cubemap: torch.Tensor) -> torch.Tensor:
     return _PadCubemapForSeamlessSampling.apply(cubemap, topology)
 
 
+def seamless_face_coordinate_scale(cubemap_size: int) -> float:
+    """Face-coordinate contraction that maps samples into the interior of the padded faces."""
+    return cubemap_size / (cubemap_size + _SEAMLESS_PADDING_PER_AXIS)
+
+
 def _prepare_sampling_rays(rays: torch.Tensor, cubemap_size: int) -> tuple[torch.Tensor, float]:
     """Return ``(rays, face_coordinate_scale)`` to pass to the fused cubemap sampler.
 
     The scale maps face coordinates into the interior of the seamlessly padded faces.
     It is applied here for non-float32 rays and left to the kernel for float32 rays.
     """
-    face_coordinate_scale = cubemap_size / (cubemap_size + _SEAMLESS_PADDING_PER_AXIS)
+    face_coordinate_scale = seamless_face_coordinate_scale(cubemap_size)
     if rays.dtype == torch.float32:
         return rays.contiguous(), face_coordinate_scale
 
@@ -445,6 +450,21 @@ def cubemap_coverage_seamless(cubemap_size: int, rays: torch.Tensor, weights: to
     return coverage.squeeze(-1)
 
 
+def pad_cubemap_for_seamless_sampling(cubemap: torch.Tensor) -> torch.Tensor:
+    """Prepare ``[6, S, S, C]`` cubemap faces for the fused seamless samplers.
+
+    The fused samplers clamp bilinear taps to the selected face, so a one-texel border
+    of neighboring-face texels is added (and the channel count padded to the sampler's
+    RGB group size). The result depends only on ``cubemap`` and is differentiable with
+    respect to it; callers whose texture does not change between samples can reuse it.
+    """
+    channel_padded_cubemap = cubemap.float()
+    channel_padding = -cubemap.shape[-1] % _FUSED_SAMPLER_CHANNEL_COUNT
+    if channel_padding:
+        channel_padded_cubemap = torch.nn.functional.pad(channel_padded_cubemap, (0, channel_padding))
+    return _pad_cubemap_for_seamless_sampling(channel_padded_cubemap)
+
+
 def sample_cubemap_seamless(cubemap: torch.Tensor, rays: torch.Tensor) -> torch.Tensor:
     """Sample an OpenGL cubemap with seamless cross-face bilinear filtering.
 
@@ -484,11 +504,7 @@ def sample_cubemap_seamless(cubemap: torch.Tensor, rays: torch.Tensor) -> torch.
     # The fused sampler clamps bilinear taps to the selected face. Add a
     # one-texel border from neighboring faces and contract the face coordinates
     # to preserve seamless cube filtering.
-    channel_padded_cubemap = cubemap.float()
-    channel_padding = -n_channels % _FUSED_SAMPLER_CHANNEL_COUNT
-    if channel_padding:
-        channel_padded_cubemap = torch.nn.functional.pad(channel_padded_cubemap, (0, channel_padding))
-    seamless_cubemap = _pad_cubemap_for_seamless_sampling(channel_padded_cubemap)
+    seamless_cubemap = pad_cubemap_for_seamless_sampling(cubemap)
     sampling_rays, sampler_face_coordinate_scale = _prepare_sampling_rays(rays, cubemap_size)
 
     # The fused sampler processes RGB textures. Sample channels in groups of

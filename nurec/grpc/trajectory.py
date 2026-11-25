@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -318,8 +318,7 @@ class Trajectory:
         assert self.poses.batch_size == self.timestamps_us.shape
 
         # check strict monotonicity
-        delta = self.timestamps_us[1:] - self.timestamps_us[:-1]
-        assert (delta > 0).all()
+        assert (self.timestamps_us[1:] > self.timestamps_us[:-1]).all()
 
     def __len__(self) -> int:
         return self.timestamps_us.shape[0]

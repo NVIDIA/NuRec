@@ -12,7 +12,5 @@ defaults:
   - /apps/prod/options/subsampling/3dgut: batch_sampler_2
   - options/sensors: waymo_1cam_1lidar
   - options/validation: default
+  - override /image_resolution/camera@_global_.dataset.n_train_sequential_image_resolution: relative_2
   - override /logger: dummy
-
-dataset:
-  n_train_sequential_image_subsample: 2 # needs to equal to n_val_image_subsample and camera_pixel_sampler.subsample

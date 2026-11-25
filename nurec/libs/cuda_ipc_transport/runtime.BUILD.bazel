@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "runtime",
+    srcs = ["lib/libcudart_static.a"],
+    # Keep this runtime private even when torch has loaded another libcudart.
+    linkopts = [
+        "-Wl,--exclude-libs,libcudart_static.a",
+        "-ldl",
+        "-lpthread",
+        "-lrt",
+    ],
+)
+
+# The IPC tests import memory in a separate process using this same runtime.
+exports_files(["lib/libcudart.so.12"])

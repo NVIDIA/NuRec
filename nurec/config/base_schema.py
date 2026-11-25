@@ -1,14 +1,16 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any, Iterable, Mapping, TypeVar, Union, cast
 
 from omegaconf import DictConfig, OmegaConf
+from omegaconf.errors import OmegaConfBaseException
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
 from pydantic import (
     Field,  # reexport
+    model_validator,
 )
 
 
@@ -159,6 +161,22 @@ class BaseConfigSchema(PydanticBaseModel):
     We extend it with an extra method which converts a typed config into an untyped one
     for use with modules which have not yet been reworked.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _plain_field_mapping(cls, value: Any) -> Any:
+        # Pydantic probes absent optional fields with __getitem__. OmegaConf
+        # constructs rich errors for each miss, copying the configuration tree.
+        # A shallow mapping avoids that work while keeping untyped child configs
+        # as DictConfig/ListConfig objects for consumers that still require them.
+        if not isinstance(value, DictConfig):
+            return value
+        try:
+            return dict(value.items())
+        except OmegaConfBaseException:
+            # Some configs keep unresolved values in fields this schema ignores.
+            # Preserve Pydantic's lazy field access and validation on that path.
+            return value
 
     def to_dictconfig(self) -> DictConfig:
         # TODO: remove once the entire repo has transitioned to strongly typed config.

@@ -1,0 +1,22 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# H10 perspective-camera subset with the roof ET30X as its only lidar.
+
+dataset:
+  camera_ids:
+  - camera_front_wide_120fov
+  - camera_front_tele_30fov
+  - camera_cross_left_120fov
+  - camera_cross_right_120fov
+  - camera_rear_left_70fov
+  - camera_rear_right_70fov
+
+  val_camera_ids:
+  - camera_front_wide_120fov
+
+  # NCore component instance derived from the H10 rig key; the rig sensor name
+  # itself is lidar:hesai:roof:et30x.
+  lidar_ids:
+  - "lidar_hesai_roof_et30x"

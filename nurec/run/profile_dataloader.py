@@ -15,6 +15,7 @@ import nurec.systems
 from nurec.config.parse import parse_typed_config
 from nurec.run.main import setup_environment_and_logger
 from nurec.systems.gaussians import InProcessInstantNuRecInitializer
+from nurec.utils.glibc_malloc import tune_glibc_malloc
 
 
 @click.command("profile-dataloader")
@@ -39,6 +40,8 @@ def profile_dataloader(
 ) -> None:
     """Entry point to profile dataloader - pulls training batches in isolation and reports associated timings"""
 
+    # Match the training entrypoint's allocator settings so host timings are comparable.
+    tune_glibc_malloc()
     config = parse_typed_config(config_name=config_name, hydra_args=hydra_args)
 
     in_process_instant_nurec_initializer: InProcessInstantNuRecInitializer | None = None

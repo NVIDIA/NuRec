@@ -37,6 +37,8 @@ py_library(
         "//nurec/systems:pylib",
         "//nurec/utils:pylib",
         "//nurec/utils:pylib_callbacks",
+        "//nurec/utils:pylib_glibc_malloc",
+        "//nurec/utils:pylib_initialization",
         "//nurec/utils:pylib_prober",
         "//nurec/utils/debug:pylib",
         pip_requirement("click"),
@@ -44,6 +46,43 @@ py_library(
         pip_requirement("hydra-core"),
         pip_requirement("omegaconf"),
         pip_requirement("numpy"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "main_teardown_test",
+    srcs = ["main_teardown_test.py"],
+    deps = [
+        ":pylib",
+        "//nurec/models/gaussians:pylib",
+        "//nurec/systems:pylib",
+        pip_requirement("pytorch_lightning"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "main_precision_plugin_test",
+    srcs = ["main_precision_plugin_test.py"],
+    deps = [
+        ":pylib",
+        pip_requirement("pytorch_lightning"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "main_malloc_test",
+    srcs = ["main_malloc_test.py"],
+    deps = [":pylib"],
+)
+
+pytest_test(
+    name = "main_threads_test",
+    srcs = ["main_threads_test.py"],
+    deps = [
+        ":pylib",
         pip_requirement("torch"),
     ],
 )

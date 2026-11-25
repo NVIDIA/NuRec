@@ -37,14 +37,15 @@ from nurec.datasets.summary import DataSourceSummary
 from nurec.datasets.tracks import CuboidTracks
 from nurec.harmonizer.training_controller import TrainingHarmonizerController
 from nurec.instant_nurec.config.instant_nurec import InstantNuRecConfig
-from nurec.libs.losses.models.reduce_functions.reduce_functions import MeanReduceFn
 from nurec.libs.losses.orchestration.component_only_normalization import (
     ComponentOnlyLossNormalizationContext,
     configured_camera_loss_kinds_by_name,
     configured_distance_bounds_by_name,
     rescale_camera_mean_losses_to_original_valid_pixels,
 )
-from nurec.libs.losses.orchestration.config import LossAggregatorReturn, LossReturn, ReduceConfig
+from nurec.libs.losses.orchestration.config import LossResult
+from nurec.libs.losses.orchestration.loss_accumulator import LossAccumulator
+from nurec.libs.losses.orchestration.loss_orchestrator import LossOrchestrator
 from nurec.metrics import AggregationMethod, MetricFactory, MetricManager, MetricType, PSNRMetric
 from nurec.models.background import SkyEnvMapBackground
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
@@ -102,7 +103,7 @@ if TYPE_CHECKING:
     from nurec.datasets.samplers.holdout import CoveragePlan
 
 
-# Per-system producer contract: consume the fully materialized nested InstantNuRec
+# Per-system producer contract: consume the fully materialized nested instant_nurec
 # config and outer datasource summary, then return a device-local,
 # NuRec-coordinate payload for the Gaussian layer initializers to borrow.
 InProcessInstantNuRecInitializer = Callable[[InstantNuRecConfig, DataSourceSummary], PLYGaussianLoader]
@@ -138,14 +139,16 @@ def _validate_in_process_instant_nurec_consumers(config: NuRecConfig) -> None:
         )
 
 
-_mean_loss_value = MeanReduceFn(ReduceConfig(name="mean"))
-
-
 @register_system("gaussians-system")
 class GaussiansSystem(BaseSystemSO):
     config: GaussiansSystemConfig
     model: GaussiansComposite
     test_out_types: list[str]
+    loss: LossOrchestrator
+
+    def _create_losses(self, config: NuRecConfig) -> LossOrchestrator:
+        assert config.loss is not None
+        return LossAccumulator(config.loss, config.trainer)
 
     def __init__(
         self,
@@ -153,7 +156,7 @@ class GaussiansSystem(BaseSystemSO):
         in_process_instant_nurec_initializer: InProcessInstantNuRecInitializer | None = None,
     ) -> None:
         super().__init__(config)
-        # Run entrypoints inject this dependency only when in-process InstantNuRec is configured.
+        # Run entrypoints inject this dependency only when in-process instant_nurec is configured.
         # Store it per system and defer execution until ``setup()``, after
         # Lightning assigns the runtime device; ``None`` preserves the ordinary
         # NuRec path.
@@ -178,11 +181,11 @@ class GaussiansSystem(BaseSystemSO):
             f"GaussiansSystem/record_quality_metrics: psnr_interval={self.config.record_quality_metrics.psnr_interval}"
         )
 
-        # The composite and setup-time in-process InstantNuRec handoff must share this exact
+        # The composite and setup-time in-process instant_nurec handoff must share this exact
         # object: setup publishes the transient payload into it, and the layer
         # initializers consume that payload during Gaussian materialization.
         self.datasource_summary: DataSourceSummary = DataSourceSummary.from_datasource(self.datamodule.get_datasource())
-        # In-process InstantNuRec lifecycle is tracked per GaussiansSystem instance:
+        # In-process instant_nurec lifecycle is tracked per GaussiansSystem instance:
         #   (False, False): no payload has been published. This includes the
         #   normal bypass path and a producer failure before it returns, so a
         #   later setup call is not blocked by these flags.
@@ -229,6 +232,7 @@ class GaussiansSystem(BaseSystemSO):
         self._pending_selective_adam_visibility: AsyncVisibilityUnion | None = None
         self._pending_selective_adam_node_ids: tuple[str, ...] = ()
         self._pending_selective_adam_layer_ids: frozenset[str] = frozenset()
+        self._pending_mcmc_visibility: AsyncVisibilityUnion | None = None
         self._serialization_state_dict_hook_handle: Any | None = None
         self._active_tile_mapping_prewarmer = ActiveTileMappingPrewarmer()
 
@@ -250,7 +254,7 @@ class GaussiansSystem(BaseSystemSO):
             and not self._in_process_instant_nurec_initialized
         ):
             raise RuntimeError(
-                "A previous in-process InstantNuRec initialization attempt failed or did not complete; "
+                "A previous in-process instant_nurec initialization attempt failed or did not complete; "
                 "setup cannot be retried safely on the same GaussiansSystem instance"
             )
 
@@ -294,7 +298,7 @@ class GaussiansSystem(BaseSystemSO):
                 if attempting_in_process_instant_nurec:
                     if not self.datasource_summary.runtime_instant_nurec_ply_consumed:
                         raise RuntimeError(
-                            "In-process InstantNuRec Gaussian materialization completed without consuming its in-memory payload"
+                            "In-process instant_nurec Gaussian materialization completed without consuming its in-memory payload"
                         )
                     # Initializers have materialized their trainable, rank-local tensors.
                     self._in_process_instant_nurec_initialized = True
@@ -507,7 +511,7 @@ class GaussiansSystem(BaseSystemSO):
             or component_only.camera_supervision.loss_normalization != CameraLossNormalization.all_valid_pixels
         ):
             return
-        configured_losses = self.loss.losses + self.loss.in_cuda.losses
+        configured_losses = self.loss.configured_losses
         if any(loss.name.startswith("lpips_") for loss in configured_losses):
             raise ValueError(
                 "component_only camera loss_normalization='all_valid_pixels' is incompatible with LPIPS. "
@@ -553,7 +557,7 @@ class GaussiansSystem(BaseSystemSO):
     ) -> None:
         super().on_train_batch_end(outputs, batch, batch_local_idx)
         with self._mcmc_exception_context():
-            self.model.raise_if_mcmc_publication_failed()
+            self.model.raise_if_publication_failed()
             with ScopedTimer("GaussiansSystem/model/update_step_train_batch_end"):
                 self.model.update_step_train_batch_end(self.current_epoch, self.global_step, batch, self)
         # Memory-based garbage collection
@@ -598,12 +602,12 @@ class GaussiansSystem(BaseSystemSO):
         """Coordinate rank-local MCMC failures before another rank can enter a collective."""
         return distributed_context(cast(Trainer, self._trainer))
 
-    def _raise_if_mcmc_publication_failed(self) -> None:
+    def _raise_if_publication_failed(self) -> None:
         with self._mcmc_exception_context():
-            self.model.raise_if_mcmc_publication_failed()
+            self.model.raise_if_publication_failed()
 
     def preflight_distributed_checkpoint_state_dict(self) -> None:
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
 
     def forward(
         self,
@@ -617,7 +621,7 @@ class GaussiansSystem(BaseSystemSO):
         clamp_output: bool = True,
         prepare_selective_adam_visibility: bool = False,
     ) -> GaussiansCompositeReturn:
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
         return self.model(
             batch,
             is_training_batch=is_training_batch,
@@ -649,7 +653,7 @@ class GaussiansSystem(BaseSystemSO):
         return super().training_step(batch, batch_local_idx)
 
     @ScopedTimer("GaussiansSystem/training_losses")
-    def training_losses(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> LossAggregatorReturn:
+    def training_losses(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> LossResult:
         """Stage one rank-symmetric visibility union for the base optimizer hooks.
 
         :class:`BaseSystem` launches the staged WORLD collective exactly once
@@ -658,10 +662,16 @@ class GaussiansSystem(BaseSystemSO):
         caller bypassed that required lifecycle; fail closed rather than
         discarding work that may already be in flight.
         """
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
+        # Runs inside BaseSystem's coordinated forward-error gate, before rendering.
+        self.model.gaussians_strategy.on_train_step_start()
 
         assert self._pending_selective_adam_visibility is None, (
             "A previous SelectiveAdam visibility union was not consumed by "
+            "BaseSystem.training_step before the next training forward"
+        )
+        assert self._pending_mcmc_visibility is None, (
+            "A previous MCMC visibility union was not consumed by "
             "BaseSystem.training_step before the next training forward"
         )
         node_ids, selective_layer_ids = self._get_selective_adam_step_layers()
@@ -694,6 +704,11 @@ class GaussiansSystem(BaseSystemSO):
 
         loss_return = self._training_losses(batch, out, batch_local_idx)
 
+        # Component-only coverage and other loss-side collectives must run on
+        # every rank before a rank-local missing-source error enters the gate.
+        if out.mcmc_visibility_union is not None:
+            out.mcmc_visibility_union.require_complete_sources()
+
         # Publish the unlaunched work only after all forward/loss construction
         # that can raise locally has succeeded. BaseSystem's next coordinated
         # block owns launch, backward, resolve, and clearing.
@@ -706,6 +721,8 @@ class GaussiansSystem(BaseSystemSO):
                 node_ids=node_ids,
                 selective_layer_ids=selective_layer_ids,
             )
+        if not self.model.controller_distillation_active and out.mcmc_visibility_union is not None:
+            self._stage_pending_mcmc_visibility(out.mcmc_visibility_union)
 
         return loss_return
 
@@ -820,6 +837,11 @@ class GaussiansSystem(BaseSystemSO):
         if pending.local_source_missing:
             self._warn_selective_adam_dense_fallback(sorted(selective_layer_ids))
 
+    def _stage_pending_mcmc_visibility(self, pending: AsyncVisibilityUnion) -> None:
+        """Publish strict MCMC visibility for launch after the forward gate."""
+        assert self._pending_mcmc_visibility is None, "A previous MCMC visibility union is still pending"
+        self._pending_mcmc_visibility = pending
+
     def _stage_selective_adam_visibility(
         self,
         visibility: torch.Tensor,
@@ -881,6 +903,18 @@ class GaussiansSystem(BaseSystemSO):
         )
 
     def _prepare_optimizers_after_backward(self) -> None:
+        mcmc_pending = self._pending_mcmc_visibility
+        if mcmc_pending is not None:
+            try:
+                with ScopedTimer("GaussiansSystem/mcmc_visibility/resolve_after_backward"):
+                    visibility = mcmc_pending.resolve()
+                    self.model.gaussians_strategy.update_prepared_visibility(
+                        visibility=visibility,
+                        gaussians_nodes=self.model.gaussians_nodes,
+                    )
+            finally:
+                self._pending_mcmc_visibility = None
+
         pending = self._pending_selective_adam_visibility
         if pending is None:
             return
@@ -899,7 +933,11 @@ class GaussiansSystem(BaseSystemSO):
             self._pending_selective_adam_layer_ids = frozenset()
 
     def _launch_optimizers_async_preparation(self) -> None:
-        """Launch the staged visibility WORLD collective exactly once per step."""
+        """Launch staged visibility WORLD collectives exactly once per step."""
+        mcmc_pending = self._pending_mcmc_visibility
+        if mcmc_pending is not None:
+            with ScopedTimer("GaussiansSystem/mcmc_visibility/launch_async_all_reduce"):
+                mcmc_pending.launch()
         pending = self._pending_selective_adam_visibility
         if pending is not None:
             with ScopedTimer("GaussiansSystem/selective_adam_visibility/launch_async_all_reduce"):
@@ -908,7 +946,7 @@ class GaussiansSystem(BaseSystemSO):
     @ScopedTimer("GaussiansSystem/training_losses/_training_losses")
     def _training_losses(
         self, batch: DataAndRenderingBatch, out: GaussiansCompositeReturn, batch_local_idx: int
-    ) -> LossAggregatorReturn:
+    ) -> LossResult:
         self.apply_alpha(batch, out)
 
         # Component-only optimization: zero pred/gt outside the enabled
@@ -917,12 +955,35 @@ class GaussiansSystem(BaseSystemSO):
         # path that records the empty-mask probe.
         normalization_context = self._maybe_apply_component_only_mask(batch, out, record_coverage=True)
 
+        # Keep independent metric work before the loss-to-backward sequence.
+        with ScopedTimer("_training_losses/psnr"):
+            data_camera = batch.data.camera
+            if data_camera is not None:
+                if self.global_step % self.config.record_quality_metrics.psnr_interval == 0:
+                    with torch.no_grad():
+                        rgb_ray_mask = torch.logical_and(
+                            data_camera.labels.get_mask_flags_all(RayFlags.RGB_LABEL),
+                            data_camera.labels.get_mask_flags_none(RayFlags.INVALID),
+                        ).reshape(-1)
+                        rendered_rgb = unpack_optional(unpack_optional(out.rendered_cam).rgb)
+                        psnr = self.train_psnr_metric.compute_item_masked(
+                            rendered_rgb,
+                            unpack_optional(data_camera.labels.rgb).reshape(rendered_rgb.shape),
+                            rgb_ray_mask,
+                        )
+                        self.log("train/psnr", psnr, prog_bar=True)
+
         # Compute the loss
         with ScopedTimer("_training_losses/loss_call"):
-            loss_return = self.loss(results=out, target=batch, model=self.model, step=self.global_step)
+            loss_return = self.loss(
+                results=out,
+                target=batch,
+                model=self.model,
+                step=self.global_step,
+            )
             if normalization_context is not None:
                 assert batch.data.camera is not None
-                configured_losses = list(self.loss.losses) + list(self.loss.in_cuda.losses)
+                configured_losses = self.loss.configured_losses
                 rescale_camera_mean_losses_to_original_valid_pixels(
                     loss_return,
                     batch.data.camera.labels,
@@ -930,37 +991,16 @@ class GaussiansSystem(BaseSystemSO):
                     camera_loss_kinds_by_name=configured_camera_loss_kinds_by_name(configured_losses),
                     distance_bounds_by_name=configured_distance_bounds_by_name(configured_losses),
                 )
-            if (regularization := self.model.calib.regularization_loss()) is not None:
+            if regularization := self.model.calib.regularization_loss():
                 name, value, weight = regularization
-                loss_return.loss_returns[name] = LossReturn(
-                    name=name,
-                    lambda_=weight,
-                    value=value,
-                    reduce_fn=_mean_loss_value,
-                )
-                loss_return.total_value = loss_return.reduce()
+                loss_return.append_loss(name=name, value=value, weight=weight)
 
-        with ScopedTimer("_training_losses/loss_logging"):
-            loss_return.log(logging_fn=self.log)
+        if self.logger_enabled:
+            with ScopedTimer("_training_losses/loss_logging"):
+                loss_return.log(logging_fn=self.log)
 
         timer = ScopedTimer("_training_losses/misc_logging")
         timer.start()
-
-        data_camera = batch.data.camera
-        if data_camera is not None:
-            if self.global_step % self.config.record_quality_metrics.psnr_interval == 0:
-                with torch.no_grad():
-                    rgb_ray_mask = torch.logical_and(
-                        data_camera.labels.get_mask_flags_all(RayFlags.RGB_LABEL),
-                        data_camera.labels.get_mask_flags_none(RayFlags.INVALID),
-                    ).reshape(-1)
-                    rendered_rgb = unpack_optional(unpack_optional(out.rendered_cam).rgb)
-                    psnr = self.train_psnr_metric.compute_item_masked(
-                        rendered_rgb,
-                        unpack_optional(data_camera.labels.rgb).reshape(rendered_rgb.shape),
-                        rgb_ray_mask,
-                    )
-                    self.log("train/psnr", psnr, prog_bar=True)
 
         assert batch.rendering is not None, "Rendering should not be None at this stage"
         rendering_camera = batch.rendering.camera
@@ -1340,7 +1380,7 @@ class GaussiansSystem(BaseSystemSO):
                     )
 
     def validation_step(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> None:
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
         track_transform_ids: Optional[list[str]] = None
         track_transforms: Optional[torch.Tensor] = None
 
@@ -2097,7 +2137,7 @@ class GaussiansSystem(BaseSystemSO):
             self.log_and_inpaint_env_map(self.model.background)
 
     def test_step(self, batch: DataAndRenderingBatch, batch_local_idx: int) -> None:
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
         if len(self.test_out_types):
             batch_idx = unpack_optional(batch.data.idx)
 
@@ -2127,7 +2167,7 @@ class GaussiansSystem(BaseSystemSO):
             - set the load_in_place flag to false to enable enable dealing with dynamic number of Gaussians.
         """
 
-        self.model.raise_if_mcmc_publication_failed()
+        self.model.raise_if_publication_failed()
 
         # Most checkpoints can be loaded in place, but if the dimensions of the buffers are not know in advance, they need to be assigned to the uninitialized tesnors instead.
         checkpoint["load_in_place"] = False
@@ -2403,5 +2443,5 @@ class GaussiansSystem(BaseSystemSO):
         return super().load_state_dict(updated_state_dict, *args, **kwargs)
 
     def on_save_checkpoint(self, checkpoint: Checkpoint) -> None:
-        self._raise_if_mcmc_publication_failed()
+        self._raise_if_publication_failed()
         super().on_save_checkpoint(checkpoint)

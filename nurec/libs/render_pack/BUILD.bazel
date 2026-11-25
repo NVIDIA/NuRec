@@ -22,6 +22,19 @@ cuda_library(
     hdrs = ["render_pack.h"],
 )
 
+# IPC may link a private runtime instead of this library's default runtime.
+filegroup(
+    name = "ipc_pack_objects",
+    srcs = [":render_pack_cuda"],
+    output_group = "pic_objects",
+    visibility = ["//nurec/libs/cuda_ipc_transport:__pkg__"],
+)
+
+exports_files(
+    ["render_pack.h"],
+    visibility = ["//nurec/libs/cuda_ipc_transport:__pkg__"],
+)
+
 # Standalone binding for the render-pack kernel — no transport-specific host
 # libraries, so its correctness is testable in the default GPU CI.
 cc_binary(

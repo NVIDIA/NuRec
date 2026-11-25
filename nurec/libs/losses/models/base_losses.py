@@ -21,7 +21,7 @@ from nurec.libs.losses.models.lambda_schedulers.registry import make as make_lam
 from nurec.libs.losses.models.reduce_functions.registry import make as make_reduce_fn
 from nurec.libs.losses.models.registry import make_loss_fn
 from nurec.libs.losses.models.utils import get_mask_semantic
-from nurec.libs.losses.orchestration.config import LossItemConfig, LossReturn, RayReduceFn
+from nurec.libs.losses.orchestration.config import AccumulatorLoss, LossItemConfig, LossReturn, RayReduceFn
 from nurec.models.base import BaseModel
 from nurec.utils.batch import CameraFrameLabels, DataAndRenderingBatch, LidarFrameLabels
 from nurec.utils.misc import unpack_optional
@@ -82,6 +82,18 @@ class BaseLoss(nn.Module, ABC):
 
     def should_run_fn(self, step: int) -> bool:
         return self.lambda_ > 0.0 and step >= self.start_step
+
+    def accumulate(self, **kwargs: Any) -> AccumulatorLoss | None:
+        """Compatibility entry; producers may override to publish unreduced data directly."""
+        legacy = self(**kwargs)
+        if legacy is None:
+            return None
+        return AccumulatorLoss(
+            name=legacy.name,
+            lambda_=1.0,
+            value=legacy.reduced_value,
+            reporting_weight=float(legacy.lambda_),
+        )
 
     def apply_loss_fn(
         self,
@@ -165,7 +177,7 @@ class BaseLossWithConfidence(BaseLoss):
         if confidence is None or self.confidence_alpha_ is None:
             return loss_return
 
-        loss_value = loss_return.value
+        loss_value = unpack_optional(loss_return.value)
 
         ndim_a = confidence.ndim
         assert confidence.shape[:ndim_a] == loss_value.shape[:ndim_a], (
@@ -214,7 +226,7 @@ class BaseLossWithSemanticWeights(BaseLossWithConfidence):
         Apply loss-specific function to arguments and create return
         """
         loss_return = super().apply_loss_fn(*args, confidence=confidence, reduce_mask=reduce_mask, **kwargs)
-        loss_value = loss_return.value
+        loss_value = unpack_optional(loss_return.value)
 
         if len(self.mask_semantic_classes) > 0:
             assert frame_labels is not None, "frame_labels should be provided when mask_semantic_classes is not empty"

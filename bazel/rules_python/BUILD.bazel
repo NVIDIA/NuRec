@@ -1,2 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+load(":venv_pyc_links_test.bzl", "venv_pyc_links_test")
+
+venv_pyc_links_test(
+    name = "venv_pyc_links_test",
+    size = "small",
+)

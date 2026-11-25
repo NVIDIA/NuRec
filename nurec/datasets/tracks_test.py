@@ -61,6 +61,35 @@ def test_empty_track_min_distance_mask_does_not_poison_cuda() -> None:
     torch.testing.assert_close(probe, torch.zeros(1, dtype=torch.int64, device="cuda"))
 
 
+def test_datasource_summary_decodes_tracks_on_requested_device() -> None:
+    tracks = _make_cadence_test_tracks(torch.device("cpu"))
+    state = DataSourceSummary.State(
+        n_frames_per_camera=np.zeros(0, dtype=np.int32),
+        n_training_frames_per_camera=np.zeros(0, dtype=np.int32),
+        n_frames_per_lidar=np.zeros(0, dtype=np.int32),
+        sequence_tracks_all={"sequence": tracks},
+        sequence_tracks_dynamic=None,
+        rig_trajectories=None,
+        xform_matrices=np.zeros((0, 4), dtype=np.float32),
+        aabb_blb=np.zeros((1, 3), dtype=np.float32),
+        aabb_trf=np.ones((1, 3), dtype=np.float32),
+    )
+
+    summary = DataSourceSummary.from_dict(state.to_dict(), device=torch.device("cpu"))
+
+    decoded = summary.state.sequence_tracks_all
+    assert decoded is not None
+    decoded_tracks = decoded["sequence"]
+    assert decoded_tracks.device.type == "cpu"
+    assert decoded_tracks.tracks_id == tracks.tracks_id
+    assert decoded_tracks.tracks_label_class == tracks.tracks_label_class
+    torch.testing.assert_close(decoded_tracks.tracks_packinfo, tracks.tracks_packinfo)
+    torch.testing.assert_close(decoded_tracks.tracks_poses.data, tracks.tracks_poses.data)
+    torch.testing.assert_close(decoded_tracks.tracks_timestamps_us, tracks.tracks_timestamps_us)
+    torch.testing.assert_close(decoded_tracks.tracks_flags, tracks.tracks_flags)
+    torch.testing.assert_close(decoded_tracks.cuboids_dims, tracks.cuboids_dims)
+
+
 def test_track_cadence_freeze_recomputes_from_replacement_endpoints() -> None:
     tracks = _make_cadence_test_tracks(torch.device("cpu"))
     frozen = CuboidTracks.Ops.freeze(
@@ -78,8 +107,8 @@ def test_track_cadence_freeze_recomputes_from_replacement_endpoints() -> None:
     )
 
 
-def test_subset_carries_cadence_and_pose_order() -> None:
-    device = torch.device("cuda")
+@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
+def test_subset_carries_cadence_and_pose_order(device: torch.device) -> None:
     tracks = _make_cadence_test_tracks(device)
     tracks.tracks_poses.data[:, 0] = torch.arange(tracks.tracks_poses.shape[0], dtype=torch.float32, device=device)
     expected_poses = torch.cat((tracks.tracks_poses.data[6:10], tracks.tracks_poses.data[:6])).clone()

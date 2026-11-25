@@ -30,14 +30,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest import mock
 
 import grpc
 import pytest
 import torch
 import yaml
 
+from click.testing import CliRunner
+
 from nurec.grpc import multiproc_serve as _mp  # for monkeypatching module-level mps_active
 from nurec.grpc.cache_keys import BackendCacheKey, SceneCacheKey
+from nurec.grpc.grpc_server_config import GrpcServerConfig
 from nurec.grpc.model_owner import (
     AttachSceneRequest,
     ModelOwnerRegistry,
@@ -61,6 +65,7 @@ from nurec.grpc.multiproc_serve import (
     SceneCoordinator,
     SceneDetachBusyError,
     SceneDownloadInterceptor,
+    SceneEditBusyError,
     SceneLoadError,
     SceneNotKnownError,
     ScenePoolDegradedError,
@@ -86,7 +91,7 @@ from nurec.grpc.multiproc_serve import (
     mps_preflight,
     serve_proxy,
 )
-from nurec.grpc.protos import ipc_pb2, sensorsim_pb2
+from nurec.grpc.protos import ipc_pb2, rdma_pb2, sensorsim_pb2
 from nurec.grpc.protos.common_pb2 import Empty
 from nurec.grpc.protos.sensorsim_pb2_grpc import (
     SensorsimServiceServicer,
@@ -94,6 +99,11 @@ from nurec.grpc.protos.sensorsim_pb2_grpc import (
     add_SensorsimServiceServicer_to_server,
 )
 from nurec.grpc.scene_cache import SceneCache, SceneCacheEviction, SceneCacheEvictionError
+from nurec.grpc.serve import serve_grpc
+from nurec.models.gaussians.gaussians_composite import GaussiansComposite
+from nurec.models.gaussians.gaussians_model import BaseGaussianModel
+from nurec.models.gaussians.strategies.mcmc import MCMCStrategy
+from nurec.models.nn_extensions import TypedModuleDict
 
 
 @dataclass
@@ -156,6 +166,9 @@ class _RecordingStub:
 
     def get_available_cameras(self, request: object, timeout: float | None = None) -> tuple:
         return self._record("get_available_cameras", request, timeout)
+
+    def get_lidar_firing_pattern(self, request: object, timeout: float | None = None) -> tuple:
+        return self._record("get_lidar_firing_pattern", request, timeout)
 
     def get_available_trajectories(self, request: object, timeout: float | None = None) -> tuple:
         return self._record("get_available_trajectories", request, timeout)
@@ -617,8 +630,14 @@ class _FakeContext:
     deadline forwarding. ``add_callback`` records the proxy's cancellation hook so a test can fire it to
     simulate the client cancelling/abandoning the RPC."""
 
-    def __init__(self, time_remaining: float | None = None) -> None:
+    def __init__(
+        self,
+        time_remaining: float | None = None,
+        invocation_metadata: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         self._time_remaining = time_remaining
+        self._active = True
+        self._invocation_metadata = invocation_metadata
         self._callbacks: list = []
 
     def abort(self, code: object, details: str) -> None:
@@ -626,6 +645,21 @@ class _FakeContext:
 
     def time_remaining(self) -> float | None:
         return self._time_remaining
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def cancel(self) -> None:
+        self._active = False
+        self._fire_callbacks()
+
+    def expire(self) -> None:
+        self._time_remaining = 0.0
+        self._active = False
+        self._fire_callbacks()
+
+    def invocation_metadata(self) -> tuple[tuple[str, str], ...]:
+        return self._invocation_metadata
 
     def add_callback(self, callback) -> bool:  # type: ignore[no-untyped-def]
         self._callbacks.append(callback)
@@ -862,6 +896,41 @@ def test_client_without_deadline_forwards_no_timeout_even_when_time_remaining_is
     proxy.render_rgb("r", _FakeContext(time_remaining=inf_future_remaining))
     assert len(calls) == 1
     assert calls[0].timeout is None  # NOT forwarded verbatim (which would overflow into DEADLINE_EXCEEDED)
+
+
+def test_proxy_forwards_only_request_correlation_metadata_to_worker() -> None:
+    class _CompletedCall:
+        def cancel(self) -> bool:
+            return False
+
+        def result(self) -> str:
+            return "ok"
+
+    recorded: dict[str, object] = {}
+
+    class _Method:
+        def future(self, request, **kwargs):  # noqa: ANN001, ANN201
+            recorded["request"] = request
+            recorded.update(kwargs)
+            return _CompletedCall()
+
+    proxy, _calls = _make_proxy(num_workers=1)
+    context = _FakeContext(
+        time_remaining=4.5,
+        invocation_metadata=(
+            ("X-Request-ID", "request-17"),
+            ("x-correlation-id", "correlation-3"),
+            ("authorization", "must-not-forward"),
+            ("x-nre-scene-url", "file:///must-not-forward.usdz"),
+        ),
+    )
+
+    assert proxy._invoke(_Method(), "request", context) == "ok"
+    assert recorded == {
+        "request": "request",
+        "timeout": 4.5,
+        "metadata": (("x-request-id", "request-17"), ("x-correlation-id", "correlation-3")),
+    }
 
 
 class _DeadlineExceededCall:
@@ -1138,10 +1207,10 @@ def test_admission_wait_bails_on_client_cancellation() -> None:
 # Every RPC of the SensorsimService proto the proxy must handle to be a drop-in for serve. Derived by
 # introspecting the generated `SensorsimServiceServicer` (its public methods ARE the proto RPCs) rather than
 # hand-listing, so a future proto RPC cannot be silently omitted from the parity guard. The exclusion set is
-# empty: every RPC must be overridden — including create_harmonizer_session/end_harmonizer_session, which are
-# overridden as FAILED_PRECONDITION refusals (temporal-harmonizer sessions are per-process state the proxy
-# cannot route, and --enable-harmonizer-temporal is refused at multiproc launch) rather than left to fall
-# through to the base servicer's generic UNIMPLEMENTED.
+# empty: every RPC must be overridden — including legacy edit/restore (coordinator-owned rebuilds) and
+# create_harmonizer_session/end_harmonizer_session, which are overridden as FAILED_PRECONDITION refusals
+# (temporal-harmonizer sessions are per-process state the proxy cannot route, and --enable-harmonizer-temporal
+# is refused at multiproc launch) rather than left to fall through to the base servicer's generic UNIMPLEMENTED.
 _SENSORSIM_RPC_EXCLUSIONS: set[str] = set()
 _ALL_SENSORSIM_RPCS = sorted(
     name
@@ -1159,32 +1228,37 @@ def test_all_sensorsim_rpcs_introspection_covers_the_proto_surface() -> None:
 
 def test_proxy_overrides_every_sensorsim_rpc() -> None:
     # If any RPC fell through to the base servicer it would return UNIMPLEMENTED (not drop-in). edit_assets and
-    # restore_model_parameters stay overridden too — as refusal stubs (editing is unsupported under multiproc,
-    # see the two tests below) — so the base servicer's typed UNIMPLEMENTED never leaks for them either.
+    # restore_model_parameters stay explicitly overridden too, through coordinator-owned rebuilds, so the base
+    # servicer's typed UNIMPLEMENTED never leaks for either legacy interface.
     for name in _ALL_SENSORSIM_RPCS:
         assert getattr(RenderProxy, name) is not getattr(SensorsimServiceServicer, name), (
             f"RenderProxy does not override {name} -> would return UNIMPLEMENTED"
         )
 
 
-def test_multiproc_edit_assets_refuses_in_band_with_success_false() -> None:
-    # Editing is not supported with multi-process serving: edit_assets returns transport-OK with
-    # success=False and an explanatory message (never a typed abort), preserving the `response.success`
-    # client contract. Use single-process serve-grpc for in-place edits.
+def test_multiproc_prefetch_is_refused() -> None:
+    proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())])
+    with pytest.raises(_AbortError) as error:
+        proxy.prefetch_scene(object(), _FakeContext())
+    assert error.value.code is grpc.StatusCode.FAILED_PRECONDITION
+    assert "single-process" in error.value.details
+
+
+def test_multiproc_edit_assets_requires_a_scene_coordinator() -> None:
+    # A manually constructed proxy cannot safely mutate its independent workers. A real worker pool always
+    # installs the coordinator, which owns the all-worker rebuild transaction below.
     proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())])
     response = proxy.edit_assets(sensorsim_pb2.EditAssetsRequest(scene_id="s"), _FakeContext())
     assert response.success is False
-    assert "not supported with multi-process serving" in response.message
+    assert "scene coordinator is not configured" in response.message
 
 
-def test_multiproc_restore_model_parameters_aborts_unimplemented() -> None:
-    # There are no in-place edits to restore under multi-process serving, so restore_model_parameters aborts
-    # UNIMPLEMENTED (a typed status) rather than silently succeeding.
+def test_multiproc_restore_model_parameters_requires_a_scene_coordinator() -> None:
     proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())])
     with pytest.raises(_AbortError) as exc:
         proxy.restore_model_parameters(sensorsim_pb2.RestoreModelParametersRequest(scene_id="s"), _FakeContext())
-    assert exc.value.code == grpc.StatusCode.UNIMPLEMENTED
-    assert "not supported with multi-process serving" in exc.value.details
+    assert exc.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "scene coordinator is not configured" in exc.value.details
 
 
 def test_multiproc_create_harmonizer_session_aborts_failed_precondition() -> None:
@@ -1246,6 +1320,27 @@ def test_multiproc_render_camera_use_cuda_ipc_aborts_unimplemented() -> None:
         proxy.render_camera(request, _FakeContext())
     assert exc.value.code == grpc.StatusCode.UNIMPLEMENTED
     assert "not supported with multi-process serving" in exc.value.details
+
+
+@pytest.mark.parametrize(
+    ("rpc", "request_message"),
+    [
+        ("open_rdma_session", rdma_pb2.OpenRdmaSessionRequest()),
+        ("register_receive_buffer", rdma_pb2.RegisterReceiveBufferRequest(session_id="x")),
+        ("close_rdma_session", rdma_pb2.CloseRdmaSessionRequest(session_id="x")),
+        ("render_rgb", sensorsim_pb2.RGBRenderRequest(use_rdma=True, rdma_session_id="sess-1")),
+        ("render_camera", sensorsim_pb2.CameraRenderRequest(use_rdma=True, rdma_session_id="sess-1")),
+    ],
+)
+def test_multiproc_rdma_aborts_unimplemented(rpc: str, request_message) -> None:
+    # An RDMA session's queue pair and registered buffers live on one worker process; the proxy
+    # cannot guarantee a use_rdma render reaches that worker. The session RPCs and use_rdma renders
+    # get a typed UNIMPLEMENTED, never a forward to an arbitrary worker that fails opaquely.
+    proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())])
+    with pytest.raises(_AbortError) as exc:
+        getattr(proxy, rpc)(request_message, _FakeContext())
+    assert exc.value.code == grpc.StatusCode.UNIMPLEMENTED
+    assert "RDMA transport is not supported with multi-process serving" in exc.value.details
 
 
 def test_get_server_config_and_ego_masks_forward_to_worker_zero() -> None:
@@ -1398,6 +1493,7 @@ def test_get_server_config_fallback_overlays_true_multiprocess_topology() -> Non
     response = proxy.get_server_config("cfg", _FakeContext())
     config = dict(response.server_config)
     assert config["serving.mode"] == "multiprocess"  # overlaid over the worker's single_process
+    assert config["scene_prefetch.enabled"] == "False"
     assert config["multiproc.workers"] == "3"  # reflects the real worker count
 
 
@@ -1491,6 +1587,40 @@ def test_batch_render_camera_rejects_use_cuda_ipc() -> None:
         proxy.batch_render_camera(request, _FakeContext())
     assert exc.value.code == grpc.StatusCode.UNIMPLEMENTED
     assert "not supported with multi-process serving" in exc.value.details
+    assert "cam0" in exc.value.details
+
+
+@pytest.mark.parametrize(
+    ("rpc", "request_message"),
+    [
+        (
+            "batch_render_rgb",
+            sensorsim_pb2.BatchRGBRenderRequest(
+                items=[
+                    sensorsim_pb2.BatchRGBRenderRequestItem(
+                        camera_name="cam0", request=sensorsim_pb2.RGBRenderRequest(scene_id="s", use_rdma=True)
+                    )
+                ]
+            ),
+        ),
+        (
+            "batch_render_camera",
+            sensorsim_pb2.BatchCameraRenderRequest(
+                items=[
+                    sensorsim_pb2.BatchCameraRenderRequestItem(
+                        camera_name="cam0", request=sensorsim_pb2.CameraRenderRequest(scene_id="s", use_rdma=True)
+                    )
+                ]
+            ),
+        ),
+    ],
+)
+def test_batch_render_rejects_use_rdma(rpc: str, request_message) -> None:
+    proxy = RenderProxy([_BatchRenderStub(0, [], threading.Lock())])
+    with pytest.raises(_AbortError) as exc:
+        getattr(proxy, rpc)(request_message, _FakeContext())
+    assert exc.value.code == grpc.StatusCode.UNIMPLEMENTED
+    assert "RDMA transport is not supported with multi-process serving" in exc.value.details
     assert "cam0" in exc.value.details
 
 
@@ -2046,6 +2176,115 @@ def _named_tensor_ptr(module: torch.nn.Module, name: str) -> int:
     return named[name].data_ptr()
 
 
+def test_alias_and_release_rebinds_mcmc_scenes_before_empty_cache(monkeypatch) -> None:
+    # Exercise real MCMC scenes: their ParameterDict is not visited by named_parameters().
+    model = GaussiansComposite.__new__(GaussiansComposite)
+    torch.nn.Module.__init__(model)
+    node = BaseGaussianModel.__new__(BaseGaussianModel)
+    torch.nn.Module.__init__(node)
+    for name, width in {
+        "positions": 3,
+        "rotations": 4,
+        "scales": 3,
+        "densities": 1,
+        "extra_signal": 0,
+        "camera_extra_signal": 0,
+        "lidar_extra_signal": 0,
+    }.items():
+        setattr(node, name, torch.nn.Parameter(torch.zeros(2, width)))
+    model.gaussians_nodes = TypedModuleDict({"background": node})
+    model.gaussians_strategy = MCMCStrategy.__new__(MCMCStrategy)
+    torch.nn.Module.__init__(model.gaussians_strategy)
+    model.refresh_mcmc_scenes()
+    backend = _aliasable_backend(model)
+    monkeypatch.setattr(_mp.torch.cuda, "is_available", lambda: True)
+
+    # A second alias also covers rebinding a previously attached model to a new owner.
+    for _ in range(2):
+        original_refs = [weakref.ref(param) for param in model.parameters()]
+        ipc = _matching_ipc_tensors(model)
+        cache_calls = []
+
+        def _empty_cache() -> None:
+            assert all(ref() is None for ref in original_refs)
+            scene = node.get_mcmc_scene()
+            assert scene is not None
+            assert scene.splats["means"] is node.positions
+            assert scene.splats["quats"] is node.rotations
+            assert scene.splats["scales"] is node.scales
+            assert scene.splats["opacities"] is node.densities
+            assert node._mcmc_scene_id == "background"
+            cache_calls.append(True)
+
+        monkeypatch.setattr(_mp.torch.cuda, "empty_cache", _empty_cache)
+        _mp._alias_and_release_worker_weights(cast(_mp.Backend, backend), ipc)
+        assert cache_calls == [True]
+        for name, tensor in ipc.items():
+            assert _named_tensor_ptr(model, name) == tensor.data_ptr()
+            assert torch.count_nonzero(tensor) == 0
+
+
+def test_edited_worker_discards_restore_snapshot_before_empty_cache(monkeypatch) -> None:
+    model = GaussiansComposite.__new__(GaussiansComposite)
+    torch.nn.Module.__init__(model)
+    model.overriden_state = {}
+    model.cuboid_tracks = cast(Any, object())
+    model.obj_track_ids = cast(Any, object())
+    node = BaseGaussianModel.__new__(BaseGaussianModel)
+    torch.nn.Module.__init__(node)
+    node.overriden_parameters = {}
+    node.overriden_buffers = {}
+    node.overriden_state = {}
+    for name, width in {
+        "positions": 3,
+        "rotations": 4,
+        "scales": 3,
+        "densities": 1,
+        "extra_signal": 0,
+        "camera_extra_signal": 0,
+        "lidar_extra_signal": 0,
+    }.items():
+        setattr(node, name, torch.nn.Parameter(torch.zeros(2, width)))
+    model.gaussians_nodes = TypedModuleDict({"background": node})
+    model.gaussians_strategy = MCMCStrategy.__new__(MCMCStrategy)
+    torch.nn.Module.__init__(model.gaussians_strategy)
+    model.refresh_mcmc_scenes()
+    backend = _aliasable_backend(model)
+    original_refs = [weakref.ref(param) for param in model.parameters()]
+    ipc = _matching_ipc_tensors(model)
+
+    def edit_assets(*, replace_assets, insert_assets) -> None:
+        del replace_assets, insert_assets
+        model.save_training_parameters()
+        for name, parameter in list(node.named_parameters(recurse=False)):
+            setattr(node, name, torch.nn.Parameter(torch.ones_like(parameter)))
+
+    setattr(backend, "edit_assets", edit_assets)
+    monkeypatch.setattr(_mp.Backend, "from_artifact", staticmethod(lambda *_a, **_k: backend))
+    monkeypatch.setattr(_mp.torch.cuda, "is_available", lambda: True)
+    dead_at_empty_cache: list[bool] = []
+    monkeypatch.setattr(
+        _mp.torch.cuda,
+        "empty_cache",
+        lambda: dead_at_empty_cache.append(all(reference() is None for reference in original_refs)),
+    )
+
+    journal = (_mp._serialize_edit_request(_edit_request("scene-a", "replacement")),)
+    built = _mp._build_and_release_worker_backend(
+        cast(Any, _StubArtifact(scene_id="scene-a")),
+        "gsplat",
+        ipc,
+        scene_id="scene-a",
+        edit_journal=journal,
+    )
+
+    assert built is backend
+    assert dead_at_empty_cache == [True]
+    assert not model.has_saved_training_parameters()
+    for name, tensor in ipc.items():
+        assert _named_tensor_ptr(model, name) == tensor.data_ptr()
+
+
 def test_alias_and_release_frees_replaced_tensors_before_empty_cache(monkeypatch) -> None:
     # Central invariant: the discarded local parameter AND buffer objects must be UNREFERENCED (released),
     # not merely rebound to other storage, by the time empty_cache() runs — otherwise empty_cache frees nothing
@@ -2108,6 +2347,26 @@ def test_scene_backend_builder_aliases_and_releases(monkeypatch) -> None:
     module = _mp.canonical_model(built.renderable_model)
     assert _named_tensor_ptr(module, "weight") == ipc["weight"].data_ptr()  # aliased
     assert empties == [1]  # cache returned to the driver as part of the build
+
+
+def test_scene_backend_builder_replays_edits_before_aliasing_owner_weights(monkeypatch) -> None:
+    """An edited worker must create matching structure locally before it receives owner IPC tensors."""
+    backend = _aliasable_backend()
+    events: list[str] = []
+
+    def edit_assets(*, replace_assets, insert_assets) -> None:
+        events.append(f"edit:{replace_assets[0].replacement_id}")
+
+    setattr(backend, "edit_assets", edit_assets)
+    monkeypatch.setattr(_mp.Backend, "from_artifact", staticmethod(lambda *_a, **_k: backend))
+    monkeypatch.setattr(_mp, "Artifact", _StubArtifact)
+    monkeypatch.setattr(_mp, "_alias_and_release_worker_weights", lambda *_a: events.append("alias"))
+
+    journal = (_mp._serialize_edit_request(_edit_request("scene-a", "replacement")),)
+    built = _mp._scene_backend_builder("gsplat")("scene-a", "/art", {}, journal)
+
+    assert built is backend
+    assert events == ["edit:replacement", "alias"]
 
 
 def _fake_backend_cache():
@@ -2189,6 +2448,7 @@ def test_worker_bootstrap_aliases_and_releases_before_service_and_ready(monkeypa
     # A monkeypatched SensorSimService records its own turn and raises, stopping the worker right after the
     # seam so no port is ever published; the attach handshake is stubbed so no real owner/GPU is needed.
     order: list[str] = []
+    service_options: dict[str, Any] = {}
     ipc = _matching_ipc_tensors(torch.nn.Linear(2, 2))
 
     monkeypatch.setattr(_mp, "_owner_parent_signals", lambda: (object(), lambda: True))  # OS supervision present
@@ -2204,6 +2464,7 @@ def test_worker_bootstrap_aliases_and_releases_before_service_and_ready(monkeypa
         pass
 
     def _service(*_a, **_k):  # noqa: ANN002, ANN003
+        service_options.update(_k)
         order.append("service")  # reached only after the seam; stop before cache/server/ready
         raise _StopAfterSeam
 
@@ -2228,6 +2489,7 @@ def test_worker_bootstrap_aliases_and_releases_before_service_and_ready(monkeypa
     assert caught.value.code == 1  # our sentinel routed through the fault path (nonzero)
     # The bootstrap alias/release ran BEFORE the service was constructed...
     assert order == ["release", "service"]
+    assert service_options["allow_automatic_backend_eviction"] is False
     # ...and because we stopped at service construction, the worker never published a "ready" port.
     kind, wid, _payload = port_q.get_nowait()
     assert (kind, wid) == ("error", 2)
@@ -2240,6 +2502,7 @@ def test_worker_failed_port_bind_fails_startup_loudly(monkeypatch) -> None:
     # zero-scene startup (scene_id=None → no attach/backend build) with a fake gRPC server whose
     # `add_insecure_port` returns 0; the guard must raise before `server.start()`/ready.
     started: list[int] = []
+    server_kwargs: dict[str, Any] = {}
 
     class _UnbindableServer:
         def add_insecure_port(self, _target: str) -> int:
@@ -2249,7 +2512,13 @@ def test_worker_failed_port_bind_fails_startup_loudly(monkeypatch) -> None:
             started.append(1)  # must NEVER be reached: the guard raises before start()
 
     monkeypatch.setattr(_mp, "_owner_parent_signals", lambda: (object(), lambda: True))  # OS supervision present
-    monkeypatch.setattr(_mp.grpc, "server", lambda *_a, **_k: _UnbindableServer())
+    monkeypatch.setattr(_mp, "collect_cuda_worker_diagnostics", lambda: {"gpu_uuid": "GPU-test"})
+
+    def _server(*_args, **kwargs):  # noqa: ANN002, ANN003
+        server_kwargs.update(kwargs)
+        return _UnbindableServer()
+
+    monkeypatch.setattr(_mp.grpc, "server", _server)
     monkeypatch.setattr(_mp, "SensorSimService", lambda *_a, **_k: SimpleNamespace())
     monkeypatch.setattr(_mp, "add_SensorsimServiceServicer_to_server", lambda *_a, **_k: None)
 
@@ -2269,6 +2538,8 @@ def test_worker_failed_port_bind_fails_startup_loudly(monkeypatch) -> None:
 
     assert caught.value.code == 1  # bind failure routed through the fault path (nonzero)
     assert started == []  # the server was never started
+    assert len(server_kwargs["interceptors"]) == 1
+    assert isinstance(server_kwargs["interceptors"][0], _mp.FatalWorkerExceptionInterceptor)
     kind, wid, payload = port_q.get_nowait()
     assert (kind, wid) == ("error", 7)  # an error, not a phantom "ready" port
     assert "failed to bind worker gRPC server" in payload
@@ -2290,7 +2561,7 @@ def test_scene_attach_channel_attaches_and_refcounts() -> None:
     osr.ensure_loaded("a", _tiny_model)
     built: list[str] = []
     push_q, ack_q, attached, thread = _start_scene_listener(
-        lambda scene_id, artifact_path, ipc_tensors: built.append(scene_id) or f"backend::{scene_id}"  # type: ignore[func-returns-value]
+        lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): built.append(scene_id) or f"backend::{scene_id}"  # type: ignore[func-returns-value]
     )
     channel = SceneAttachChannel(push_q, ack_q, osr.registry)
 
@@ -2311,7 +2582,7 @@ def test_scene_attach_channel_idempotent_attach() -> None:
     osr.ensure_loaded("a", _tiny_model)
     built: list[str] = []
     push_q, ack_q, _attached, thread = _start_scene_listener(
-        lambda scene_id, artifact_path, ipc_tensors: built.append(scene_id) or f"backend::{scene_id}"  # type: ignore[func-returns-value]
+        lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): built.append(scene_id) or f"backend::{scene_id}"  # type: ignore[func-returns-value]
     )
     channel = SceneAttachChannel(push_q, ack_q, osr.registry)
 
@@ -2328,7 +2599,7 @@ def test_scene_attach_channel_detach_drops_refcount_and_mapping() -> None:
     osr = OwnerSceneRegistry()
     osr.ensure_loaded("a", _tiny_model)
     push_q, ack_q, attached, thread = _start_scene_listener(
-        lambda scene_id, artifact_path, ipc_tensors: f"backend::{scene_id}"
+        lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"backend::{scene_id}"
     )
     channel = SceneAttachChannel(push_q, ack_q, osr.registry)
 
@@ -2349,7 +2620,7 @@ def test_scene_attach_channel_rolls_back_refcount_on_worker_failure() -> None:
     osr = OwnerSceneRegistry()
     osr.ensure_loaded("a", _tiny_model)
 
-    def failing_builder(scene_id, artifact_path, ipc_tensors):
+    def failing_builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
         raise RuntimeError(f"build boom {scene_id}")
 
     push_q, ack_q, attached, thread = _start_scene_listener(failing_builder)
@@ -2370,7 +2641,7 @@ def test_scene_attach_channel_two_scenes_detach_one_keeps_other() -> None:
     osr.ensure_loaded("a", _tiny_model)
     osr.ensure_loaded("b", _tiny_model)
     push_q, ack_q, attached, thread = _start_scene_listener(
-        lambda scene_id, artifact_path, ipc_tensors: f"backend::{scene_id}"
+        lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"backend::{scene_id}"
     )
     channel = SceneAttachChannel(push_q, ack_q, osr.registry)
 
@@ -2433,14 +2704,14 @@ def test_scene_attach_listener_dispatch_attach_detach_unknown_stop() -> None:
     attached: dict = {}
     built: list[tuple] = []
 
-    def builder(scene_id, artifact_path, ipc_tensors):
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
         built.append((scene_id, artifact_path))
         return f"backend::{scene_id}"
 
     thread = threading.Thread(target=_scene_attach_listener, args=(attached, builder, push_q, ack_q), daemon=True)
     thread.start()
 
-    push_q.put((_SCENE_ATTACH, 1, "a", "/art-a", {"w": 0}))
+    push_q.put((_SCENE_ATTACH, 1, "a", "/art-a", {"w": 0}, ()))
     assert ack_q.get(timeout=2.0) == (1, "ok", _SCENE_ATTACH)
     assert attached == {"a": "backend::a"} and built == [("a", "/art-a")]
 
@@ -2455,6 +2726,154 @@ def test_scene_attach_listener_dispatch_attach_detach_unknown_stop() -> None:
     push_q.put((_SCENE_STOP,))
     thread.join(timeout=2.0)
     assert not thread.is_alive()
+
+
+class _FailingQueuePayload:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def __reduce__(self):
+        raise RuntimeError(self.message)
+
+
+@pytest.mark.parametrize("operation", ["owner_scene_send", "owner_bootstrap_send"])
+def test_owner_cuda_queue_feeder_failure_arms_shutdown_and_retains_payload(operation: str) -> None:
+    outgoing: Any = multiprocessing.get_context("spawn").Queue()
+    previous_handler = mock.Mock()
+    outgoing._on_queue_feeder_error = previous_handler
+    exited = threading.Event()
+    terminate = mock.Mock(side_effect=lambda code: exited.set())
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+    interceptor.configure_shutdown(mark_unhealthy=lambda: None, stop_server=lambda _grace: None)
+    payload = _FailingQueuePayload("CUDA error: an illegal memory access was encountered")
+    reference = weakref.ref(payload)
+    try:
+        _mp._install_fatal_queue_error_handler(outgoing, interceptor, operation=operation)
+        with mock.patch("nurec.grpc.fatal_worker.threading.Timer") as timer:
+            outgoing.put({"weight": payload})
+            assert exited.wait(2.0)
+            assert interceptor.wait_for_shutdown(2.0)
+            timer.return_value.start.assert_called_once()
+        assert interceptor.state.is_fatal
+        terminate.assert_called_once_with(1)
+        previous_handler.assert_not_called()
+        incident = interceptor.state.incident
+        assert incident is not None and incident.operation == operation
+        # Let the feeder advance beyond its failed frame, proving retention is in the installed hook.
+        outgoing.put("after-failure")
+        assert outgoing.get(timeout=2.0) == "after-failure"
+        del payload
+        gc.collect()
+        assert reference() is not None
+    finally:
+        outgoing.close()
+        outgoing.join_thread()
+
+
+def test_nonfatal_queue_feeder_failure_preserves_previous_handler() -> None:
+    outgoing: Any = multiprocessing.get_context("spawn").Queue()
+    observed = threading.Event()
+    previous_handler = mock.Mock(side_effect=lambda exc, payload: observed.set())
+    outgoing._on_queue_feeder_error = previous_handler
+    terminate = mock.Mock()
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+    try:
+        _mp._install_fatal_queue_error_handler(outgoing, interceptor, operation="owner_scene_send")
+        outgoing.put(_FailingQueuePayload("ordinary serialization failure"))
+        assert observed.wait(2.0)
+        previous_handler.assert_called_once()
+        assert not interceptor.state.is_fatal
+        terminate.assert_not_called()
+    finally:
+        outgoing.close()
+        outgoing.join_thread()
+
+
+def test_scene_attach_listener_stops_worker_on_fatal_cuda_receive_error() -> None:
+    push_q = mock.Mock()
+    push_q.get.side_effect = RuntimeError("CUDA error: an illegal memory access was encountered")
+    builder = mock.Mock()
+    ack_q = mock.Mock()
+    terminate = mock.Mock()
+    stopped = threading.Event()
+    stopped.set()
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+    interceptor.configure_shutdown(mark_unhealthy=mock.Mock(), stop_server=lambda _grace: stopped)
+
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer") as timer:
+        _scene_attach_listener({}, builder, push_q, ack_q, interceptor)
+        assert interceptor.state.is_fatal
+        timer.return_value.start.assert_called_once()
+        assert interceptor.wait_for_shutdown(timeout=2.0)
+
+    push_q.get.assert_called_once()
+    builder.assert_not_called()
+    ack_q.put.assert_not_called()  # the command's sequence number was never received
+    terminate.assert_called_once_with(1)
+    incident = interceptor.state.incident
+    assert incident is not None
+    assert incident.operation == "worker_scene_receive"
+    assert incident.scene_ids == ()
+
+
+def test_scene_attach_listener_propagates_nonfatal_receive_error() -> None:
+    push_q = mock.Mock()
+    failure = RuntimeError("scene transport closed")
+    push_q.get.side_effect = failure
+    terminate = mock.Mock()
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+
+    with pytest.raises(RuntimeError) as raised:
+        _scene_attach_listener({}, mock.Mock(), push_q, mock.Mock(), interceptor)
+
+    assert raised.value is failure
+    assert not interceptor.state.is_fatal
+    terminate.assert_not_called()
+
+
+def test_scene_attach_listener_stops_worker_on_fatal_cuda_build_error() -> None:
+    push_q: queue.Queue = queue.Queue()
+    ack_q: queue.Queue = queue.Queue()
+    owner_registry = OwnerSceneRegistry()
+    owner_registry.ensure_loaded("poisoned-scene", _tiny_model)
+    channel = SceneAttachChannel(push_q, ack_q, owner_registry.registry, is_worker_alive=lambda: True)
+    stopped = threading.Event()
+    exits: list[int] = []
+    interceptor = _mp.FatalWorkerExceptionInterceptor(
+        terminate_worker=lambda code: exits.append(code),
+        drain_grace_s=0.1,
+    )
+    interceptor.configure_shutdown(
+        mark_unhealthy=lambda: None,
+        stop_server=lambda _grace: stopped,
+    )
+    stopped.set()
+
+    def fatal_builder(_scene_id, _artifact_path, _ipc_tensors, _edit_journal):  # noqa: ANN001
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    thread = threading.Thread(
+        target=_scene_attach_listener,
+        args=({}, fatal_builder, push_q, ack_q, interceptor),
+        daemon=True,
+    )
+    thread.start()
+
+    with pytest.raises(RuntimeError, match="uncertain.*still-live worker"):
+        channel.attach("poisoned-scene", "/art", ack_timeout_s=2.0)
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()  # it must not continue to another attach after the context is poisoned
+    assert interceptor.wait_for_shutdown(timeout=1.0)
+    assert exits == [1]
+    assert channel.is_attached("poisoned-scene")
+    assert owner_registry.registry.attached_count("poisoned-scene") == 1  # retained until worker reap
+    incident = interceptor.state.incident
+    assert incident is not None
+    assert incident.operation == "worker_scene_attach_build"
+    assert incident.scene_ids == ("poisoned-scene",)
+    released, failures = channel.release_after_reap()
+    assert released == ["poisoned-scene"] and failures == []
 
 
 def test_worker_scene_table_partial_attach_reports_uncertain_and_detach_recovers() -> None:
@@ -2505,7 +2924,7 @@ def test_worker_scene_table_partial_attach_reports_uncertain_and_detach_recovers
     ack_q: queue.Queue = queue.Queue()
     thread = threading.Thread(
         target=_scene_attach_listener,
-        args=(table, lambda _sid, _path, _ipc: _Backend(), push_q, ack_q),
+        args=(table, lambda _sid, _path, _ipc, edit_journal=(): _Backend(), push_q, ack_q),
         daemon=True,
     )
     thread.start()
@@ -2583,7 +3002,7 @@ def test_worker_scene_table_partial_detach_remains_retryable() -> None:
     ack_q: queue.Queue = queue.Queue()
     thread = threading.Thread(
         target=_scene_attach_listener,
-        args=(table, lambda _sid, _path, _ipc: _Backend(), push_q, ack_q),
+        args=(table, lambda _sid, _path, _ipc, edit_journal=(): _Backend(), push_q, ack_q),
         daemon=True,
     )
     thread.start()
@@ -2626,6 +3045,7 @@ def test_worker_scene_table_refuses_detach_of_in_use_backend_until_render_comple
             renderable_model=None,  # type: ignore[arg-type]
             camera_bank=None,  # type: ignore[arg-type]
             world_to_nurec=None,  # type: ignore[arg-type]
+            scene_time_range_us=None,  # type: ignore[arg-type]
             lidar_bank=None,  # type: ignore[arg-type]
             asset_bank=None,  # type: ignore[arg-type]
             source_artifact=None,  # type: ignore[arg-type]
@@ -2640,7 +3060,7 @@ def test_worker_scene_table_refuses_detach_of_in_use_backend_until_render_comple
     ack_q: queue.Queue = queue.Queue()
     thread = threading.Thread(
         target=_scene_attach_listener,
-        args=(table, lambda _sid, _path, _ipc: _new_backend(), push_q, ack_q),
+        args=(table, lambda _sid, _path, _ipc, edit_journal=(): _new_backend(), push_q, ack_q),
         daemon=True,
     )
     thread.start()
@@ -2697,9 +3117,9 @@ def test_scene_attach_listener_releases_backend_and_ipc_frame_locals_after_detac
     backend_ref = weakref.ref(held[0])
     ipc_ref = weakref.ref(held[1])
 
-    push_q, ack_q, attached, thread = _start_scene_listener(lambda _sid, _path, _ipc: held[0])
+    push_q, ack_q, attached, thread = _start_scene_listener(lambda _sid, _path, _ipc, edit_journal=(): held[0])
     try:
-        push_q.put((_SCENE_ATTACH, 1, "a", "/art", held[1]))
+        push_q.put((_SCENE_ATTACH, 1, "a", "/art", held[1], ()))
         assert ack_q.get(timeout=2.0) == (1, "ok", _SCENE_ATTACH)
         assert "a" in attached
 
@@ -2752,10 +3172,40 @@ def _stop_workers(stops) -> None:
         thread.join(timeout=2.0)
 
 
+class _EditableOwner:
+    """Small owner double whose model can be registered and whose edit replay is observable."""
+
+    def __init__(self, *, reject_replacement: str | None = None) -> None:
+        self.renderable_model = _tiny_model()
+        self.reject_replacement = reject_replacement
+        self.applied: list[list[str]] = []
+
+    def edit_assets(self, *, replace_assets, insert_assets) -> None:
+        replacement_ids = [replace.replacement_id for replace in replace_assets]
+        if self.reject_replacement is not None and self.reject_replacement in replacement_ids:
+            raise RuntimeError(f"rejected replacement {self.reject_replacement}")
+        self.applied.append(replacement_ids + [insert.asset_id for insert in insert_assets])
+
+
+def _edit_request(scene_id: str, replacement_id: str) -> sensorsim_pb2.EditAssetsRequest:
+    request = sensorsim_pb2.EditAssetsRequest(scene_id=scene_id)
+    request.replace.add(original_id="original", replacement_id=replacement_id)
+    return request
+
+
+def _journal_replacement_ids(journal: tuple[bytes, ...]) -> list[str]:
+    result: list[str] = []
+    for payload in journal:
+        request = sensorsim_pb2.EditAssetsRequest()
+        request.ParseFromString(payload)
+        result.extend(replacement.replacement_id for replacement in request.replace)
+    return result
+
+
 def test_scene_coordinator_attaches_on_all_workers_and_is_idempotent() -> None:
     builders = [
-        (lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"),
-        (lambda scene_id, artifact_path, ipc_tensors: f"w1::{scene_id}"),
+        (lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"),
+        (lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w1::{scene_id}"),
     ]
     loads: list[str] = []
 
@@ -2774,6 +3224,728 @@ def test_scene_coordinator_attaches_on_all_workers_and_is_idempotent() -> None:
         assert all(channel.attached_scenes() == {"b"} for channel in channels)
         assert osr.registry.attached_count("b") == 2  # one refcount per worker
     finally:
+        _stop_workers(stops)
+
+
+def test_legacy_edit_rebuild_replays_full_journal_before_every_worker_is_routable() -> None:
+    """Step 1: edits rebuild from clean source and only publish after the all-worker barrier."""
+    worker_journals: list[tuple[str, list[str]]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        worker_journals.append((scene_id, ids))
+        return f"worker::{scene_id}::{','.join(ids) or 'base'}"
+
+    owners: list[_EditableOwner] = []
+
+    def loader(scene_id, artifact_path):
+        owner = _EditableOwner()
+        owners.append(owner)
+        return owner
+
+    osr, coord, channels, tables, stops = _coordinator_with_workers([builder, builder], {"s": "/art-s"}, loader=loader)
+    try:
+        coord.ensure_attached("s")
+        assert [table["s"] for table in tables] == ["worker::s::base", "worker::s::base"]
+
+        # Each edit request stays wire-compatible, while the coordinator replays the complete prior sequence
+        # into a fresh owner and sends that exact sequence to each worker's pre-alias structure build.
+        coord.append_edit_assets("s", _edit_request("s", "replacement-one"))
+        coord.append_edit_assets("s", _edit_request("s", "replacement-two"))
+
+        assert [owner.applied for owner in owners] == [
+            [],
+            [["replacement-one"]],
+            [["replacement-one"], ["replacement-two"]],
+        ]
+        assert [table["s"] for table in tables] == [
+            "worker::s::replacement-one,replacement-two",
+            "worker::s::replacement-one,replacement-two",
+        ]
+        # First attachments carry no journal; the second and third generation carry the ordered state.
+        assert worker_journals == [
+            ("s", []),
+            ("s", []),
+            ("s", ["replacement-one"]),
+            ("s", ["replacement-one"]),
+            ("s", ["replacement-one", "replacement-two"]),
+            ("s", ["replacement-one", "replacement-two"]),
+        ]
+        assert coord.attached_scenes() == {"s"}
+        assert all(channel.attached_scenes() == {"s"} for channel in channels)
+        assert osr.registry.attached_count("s") == 2
+    finally:
+        _stop_workers(stops)
+
+
+def test_legacy_restore_rebuilds_the_clean_base_generation() -> None:
+    worker_journals: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        worker_journals.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    owners: list[_EditableOwner] = []
+
+    def loader(scene_id, artifact_path):
+        owner = _EditableOwner()
+        owners.append(owner)
+        return owner
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder, builder], {"s": "/art-s"}, loader=loader
+    )
+    try:
+        coord.ensure_attached("s")
+        coord.append_edit_assets("s", _edit_request("s", "replacement"))
+        coord.restore_edited_scene("s")
+
+        assert owners[-1].applied == []
+        assert [table["s"] for table in tables] == ["worker::base", "worker::base"]
+        assert worker_journals[-2:] == [[], []]
+        assert "s" not in coord._edit_journals  # noqa: SLF001 - restore clears the legacy mutable alias state
+    finally:
+        _stop_workers(stops)
+
+
+def test_proxy_legacy_edit_and_restore_keep_the_existing_rpc_contract() -> None:
+    """The public Step-1 bridge returns the same EditAssets response and restore Empty message."""
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        return f"worker::{','.join(_journal_replacement_ids(edit_journal)) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {"s": "/art-s"}, loader=lambda _scene_id, _artifact_path: _EditableOwner()
+    )
+    try:
+        coord.ensure_attached("s")
+        proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())], scene_coordinator=coord)
+
+        edited = proxy.edit_assets(_edit_request("s", "replacement"), _FakeContext())
+        assert edited.success and edited.message == "Success"
+        assert tables[0]["s"] == "worker::replacement"
+
+        restored = proxy.restore_model_parameters(
+            sensorsim_pb2.RestoreModelParametersRequest(scene_id="s"), _FakeContext()
+        )
+        assert restored == Empty()
+        assert tables[0]["s"] == "worker::base"
+    finally:
+        _stop_workers(stops)
+
+
+def test_proxy_legacy_edit_unknown_scene_aborts_not_found() -> None:
+    _osr, coord, _channels, _tables, stops = _coordinator_with_workers(
+        [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"worker::{scene_id}"],
+        {"s": "/art-s"},
+        loader=lambda _scene_id, _artifact_path: _EditableOwner(),
+    )
+    try:
+        proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())], scene_coordinator=coord)
+        with pytest.raises(_AbortError) as exc:
+            proxy.edit_assets(_edit_request("unknown", "replacement"), _FakeContext())
+        assert exc.value.code == grpc.StatusCode.NOT_FOUND
+    finally:
+        _stop_workers(stops)
+
+
+def test_cancelled_legacy_edit_wait_does_not_commit() -> None:
+    """A cancelled RPC queued behind an old-generation lease leaves the ready generation untouched."""
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        return f"worker::{','.join(_journal_replacement_ids(edit_journal)) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {"s": "/art-s"}, loader=lambda _scene_id, _artifact_path: _EditableOwner()
+    )
+    ctx = _FakeContext()
+    outcome: dict[str, BaseException] = {}
+    try:
+        coord.ensure_attached("s")
+        coord.acquire("s")
+        proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())], scene_coordinator=coord)
+
+        def edit() -> None:
+            try:
+                proxy.edit_assets(_edit_request("s", "replacement"), ctx)
+            except BaseException as exc:  # pragma: no cover - assertions below retain the exact failure
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=edit)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while "s" not in coord._transitions and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.01)
+        assert "s" in coord._transitions  # noqa: SLF001 - proves the RPC is waiting on the lease
+
+        ctx.cancel()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert isinstance(outcome.get("error"), _AbortError)
+        assert outcome["error"].code == grpc.StatusCode.CANCELLED  # type: ignore[attr-defined]
+        assert tables[0]["s"] == "worker::base"
+        assert "s" not in coord._edit_journals  # noqa: SLF001 - no cancelled delta was published
+    finally:
+        coord.release_scene("s")
+        _stop_workers(stops)
+
+
+def test_expired_legacy_restore_wait_does_not_clear_edit() -> None:
+    """A deadline that expires while restore drains leases preserves the prior edited generation."""
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        return f"worker::{','.join(_journal_replacement_ids(edit_journal)) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {"s": "/art-s"}, loader=lambda _scene_id, _artifact_path: _EditableOwner()
+    )
+    ctx = _FakeContext(time_remaining=10.0)
+    outcome: dict[str, BaseException] = {}
+    try:
+        coord.ensure_attached("s")
+        coord.append_edit_assets("s", _edit_request("s", "replacement"))
+        coord.acquire("s")
+        proxy = RenderProxy([_RecordingStub(0, [], threading.Lock())], scene_coordinator=coord)
+
+        def restore() -> None:
+            try:
+                proxy.restore_model_parameters(
+                    sensorsim_pb2.RestoreModelParametersRequest(scene_id="s"),
+                    ctx,
+                )
+            except BaseException as exc:  # pragma: no cover - assertions below retain the exact failure
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=restore)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while "s" not in coord._transitions and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.01)
+        assert "s" in coord._transitions  # noqa: SLF001 - proves restore is waiting on the lease
+
+        ctx.expire()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert isinstance(outcome.get("error"), _AbortError)
+        assert outcome["error"].code == grpc.StatusCode.DEADLINE_EXCEEDED  # type: ignore[attr-defined]
+        assert tables[0]["s"] == "worker::replacement"
+        assert _journal_replacement_ids(coord._edit_journals["s"]) == ["replacement"]  # noqa: SLF001
+    finally:
+        coord.release_scene("s")
+        _stop_workers(stops)
+
+
+def test_legacy_edit_waits_for_existing_lease_before_detaching_old_generation() -> None:
+    """No render can start on old state after the transition begins; existing leases drain first."""
+    worker_journals: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        worker_journals.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {"s": "/art-s"}, loader=lambda _scene_id, _artifact_path: _EditableOwner()
+    )
+    thread: threading.Thread | None = None
+    lease_held = False
+    try:
+        coord.ensure_attached("s")
+        coord.acquire("s")  # models a render/discovery forward that began before EditAssets
+        lease_held = True
+
+        finished = threading.Event()
+        errors: list[BaseException] = []
+
+        def edit() -> None:
+            try:
+                coord.append_edit_assets("s", _edit_request("s", "replacement"))
+            except BaseException as exc:  # pragma: no cover - assertion below keeps the failure detail
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=edit)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while "s" not in coord._transitions and time.monotonic() < deadline:  # noqa: SLF001 - transition probe
+            time.sleep(0.01)
+        assert "s" in coord._transitions  # noqa: SLF001
+        assert not finished.is_set()
+        assert tables[0]["s"] == "worker::base"  # detach has not happened before the lease returns
+
+        coord.release_scene("s")
+        lease_held = False
+        thread.join(timeout=2.0)
+        assert finished.is_set() and errors == []
+        assert tables[0]["s"] == "worker::replacement"
+        assert worker_journals == [[], ["replacement"]]
+    finally:
+        if lease_held:
+            coord.release_scene("s")
+        if thread is not None:
+            thread.join(timeout=2.0)
+        _stop_workers(stops)
+
+
+@pytest.mark.parametrize("initially_attached, fail_acquire", [(False, False), (True, False), (False, True)])
+def test_lease_taken_before_edit_can_finish_attach_without_deadlock(
+    monkeypatch, initially_attached, fail_acquire
+) -> None:
+    """Park acquisition after lease admission, then start the transition that drains that lease."""
+    entered_attach = threading.Event()
+    resume_attach = threading.Event()
+    draining = threading.Event()
+    acquired = threading.Event()
+    release_render = threading.Event()
+    errors: list[BaseException] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        return f"worker::{','.join(_journal_replacement_ids(edit_journal)) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {"s": "/art-s"}, loader=lambda _sid, _path: _EditableOwner()
+    )
+    if initially_attached:
+        coord.ensure_attached("s")
+    ensure_attached = coord.ensure_attached
+
+    def paused_attach(scene_id, **kwargs):
+        if not kwargs.get("_allow_transition"):
+            entered_attach.set()
+            assert resume_attach.wait(timeout=3.0)
+            if fail_acquire:
+                raise SceneLoadError("acquisition failed before attachment")
+        return ensure_attached(scene_id, **kwargs)
+
+    monkeypatch.setattr(coord, "ensure_attached", paused_attach)
+    wait_for_condition = coord._wait_for_edit_condition_locked  # noqa: SLF001
+
+    def observe_drain(scene_id, predicate, wait_policy):
+        if scene_id in coord._transitions and coord._inflight.get(scene_id, 0):  # noqa: SLF001
+            draining.set()
+        return wait_for_condition(scene_id, predicate, wait_policy)
+
+    monkeypatch.setattr(coord, "_wait_for_edit_condition_locked", observe_drain)
+
+    def render():
+        try:
+            coord.acquire("s")
+            try:
+                acquired.set()
+                assert release_render.wait(timeout=3.0)
+            finally:
+                coord.release_scene("s")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def edit():
+        try:
+            coord.append_edit_assets("s", _edit_request("s", "replacement"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    renderer = threading.Thread(target=render, daemon=True)
+    editor = threading.Thread(target=edit, daemon=True)
+    try:
+        renderer.start()
+        assert entered_attach.wait(timeout=2.0)
+        editor.start()
+        assert draining.wait(timeout=2.0)
+        resume_attach.set()
+        if not fail_acquire:
+            assert acquired.wait(timeout=2.0)
+            assert tables[0]["s"] == "worker::base"
+            assert editor.is_alive()  # The old generation is still leased, so editing cannot detach it.
+        release_render.set()
+        renderer.join(timeout=2.0)
+        editor.join(timeout=2.0)
+        assert not renderer.is_alive() and not editor.is_alive()
+        if fail_acquire:
+            assert len(errors) == 1 and isinstance(errors[0], SceneLoadError)
+        else:
+            assert errors == []
+        assert tables[0]["s"] == "worker::replacement"
+    finally:
+        resume_attach.set()
+        release_render.set()
+        with coord._lock:  # noqa: SLF001 - unblock both threads even if the deadlock regresses
+            coord._transitions.discard("s")  # noqa: SLF001
+            coord._lock.notify_all()  # noqa: SLF001
+        renderer.join(timeout=3.0)
+        if editor.ident is not None:
+            editor.join(timeout=3.0)
+        _stop_workers(stops)
+
+
+@pytest.mark.parametrize("residency", ["unloaded", "attached", "leased"])
+def test_restore_unedited_scene_does_not_load_detach_or_wait(residency) -> None:
+    ch = _FakeSceneChannel()
+    reg, coord = _coordinator_with_fake_channels([ch], {"s": "/art-s"})
+    if residency != "unloaded":
+        coord.ensure_attached("s")
+    if residency == "leased":
+        coord.acquire("s")
+    try:
+        coord.restore_edited_scene("s")
+        assert ch.detach_calls == 0
+        assert reg.released == []
+        assert coord.attached_scenes() == (set() if residency == "unloaded" else {"s"})
+        assert reg.loaded_scenes() == (() if residency == "unloaded" else ("s",))
+        assert not coord._transitions  # noqa: SLF001
+        with pytest.raises(SceneNotKnownError):
+            coord.restore_edited_scene("unknown")
+    finally:
+        if residency == "leased":
+            coord.release_scene("s")
+
+
+def test_legacy_edit_keeps_its_budget_slot_during_rebuild() -> None:
+    """A concurrent scene cannot steal the edited generation's slot between detach and reattach."""
+    entered_rebuild = threading.Event()
+    resume_rebuild = threading.Event()
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        return f"worker::{scene_id}::{','.join(_journal_replacement_ids(edit_journal)) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder],
+        {"s": "/art-s", "other": "/art-other"},
+        loader=lambda _scene_id, _artifact_path: _EditableOwner(),
+        max_scenes=1,
+    )
+    original_ensure_attached = coord.ensure_attached
+
+    def paused_ensure_attached(scene_id, *, _allow_transition=False, _has_lease=False):
+        if scene_id == "s" and _allow_transition:
+            entered_rebuild.set()
+            assert resume_rebuild.wait(timeout=2.0)
+        return original_ensure_attached(scene_id, _allow_transition=_allow_transition, _has_lease=_has_lease)
+
+    coord.ensure_attached = paused_ensure_attached  # type: ignore[method-assign]
+    errors: list[BaseException] = []
+    try:
+        coord.ensure_attached("s")
+
+        def edit() -> None:
+            try:
+                coord.append_edit_assets("s", _edit_request("s", "replacement"))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=edit)
+        thread.start()
+        assert entered_rebuild.wait(timeout=2.0)  # old generation is detached; candidate has not attached
+
+        with pytest.raises(SceneBudgetError):
+            coord.acquire("other")
+
+        resume_rebuild.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive() and errors == []
+        assert coord.attached_scenes() == {"s"}
+        assert tables[0]["s"] == "worker::s::replacement"
+        assert "other" not in tables[0]
+    finally:
+        resume_rebuild.set()
+        _stop_workers(stops)
+
+
+def test_failed_legacy_edit_restores_the_previous_ready_generation() -> None:
+    """A bad new journal never leaves a successful alias pointing at a partial or unedited worker set."""
+    worker_journals: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        worker_journals.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    owners: list[_EditableOwner] = []
+
+    def loader(scene_id, artifact_path):
+        owner = _EditableOwner(reject_replacement="bad")
+        owners.append(owner)
+        return owner
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder, builder], {"s": "/art-s"}, loader=loader
+    )
+    try:
+        coord.ensure_attached("s")
+        coord.append_edit_assets("s", _edit_request("s", "good"))
+        with pytest.raises(SceneLoadError, match="rejected replacement bad"):
+            coord.append_edit_assets("s", _edit_request("s", "bad"))
+
+        assert [table["s"] for table in tables] == ["worker::good", "worker::good"]
+        assert worker_journals[-2:] == [["good"], ["good"]]  # rollback reattached the former complete journal
+        assert _journal_replacement_ids(coord._edit_journals["s"]) == ["good"]  # noqa: SLF001
+        assert owners[-1].applied == [["good"]]
+    finally:
+        _stop_workers(stops)
+
+
+def test_mixed_success_and_busy_edit_detach_restores_previous_journal(monkeypatch) -> None:
+    built: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        built.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    osr, coord, channels, tables, stops = _coordinator_with_workers(
+        [builder, builder], {"s": "/art-s"}, loader=lambda _sid, _path: _EditableOwner()
+    )
+    fired: list[str] = []
+    coord.set_degraded_callback(fired.append)
+    try:
+        coord.append_edit_assets("s", _edit_request("s", "previous"))
+        detach = channels[1].detach
+
+        def busy_detach(scene_id, **kwargs):
+            raise SceneDetachBusyError("render in flight")
+
+        monkeypatch.setattr(channels[1], "detach", busy_detach)
+        with pytest.raises(SceneEditBusyError, match="still rendering"):
+            coord.append_edit_assets("s", _edit_request("s", "candidate"))
+
+        assert not coord.is_degraded() and fired == []
+        assert coord.attached_scenes() == {"s"}
+        assert all(table == {"s": "worker::previous"} for table in tables)
+        assert osr.registry.attached_count("s") == 2
+        assert built == [["previous"], ["previous"], ["previous"]]
+        assert _journal_replacement_ids(coord._edit_journals["s"]) == ["previous"]  # noqa: SLF001
+
+        monkeypatch.setattr(channels[1], "detach", detach)
+        coord.append_edit_assets("s", _edit_request("s", "candidate"))
+        assert all(table == {"s": "worker::previous,candidate"} for table in tables)
+        assert osr.registry.attached_count("s") == 2
+    finally:
+        _stop_workers(stops)
+
+
+def test_edit_waits_for_busy_eviction_recovery_before_publishing_candidate(monkeypatch) -> None:
+    entered_detach, resume_detach, draining = threading.Event(), threading.Event(), threading.Event()
+    errors: dict[str, BaseException] = {}
+    built: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        ids = _journal_replacement_ids(edit_journal)
+        built.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    osr, coord, channels, tables, stops = _coordinator_with_workers(
+        [builder, builder],
+        {"s": "/art-s", "other": "/art-other"},
+        loader=lambda _sid, _path: _EditableOwner(),
+        max_scenes=1,
+    )
+    coord.append_edit_assets("s", _edit_request("s", "previous"))
+    detach = channels[0].detach
+
+    def paused_detach(scene_id, **kwargs):
+        entered_detach.set()
+        assert resume_detach.wait(timeout=3.0)
+        return detach(scene_id, **kwargs)
+
+    def busy_detach(scene_id, **kwargs):
+        raise SceneDetachBusyError("render in flight")
+
+    wait_for_condition = coord._wait_for_edit_condition_locked  # noqa: SLF001
+
+    def observe_drain(scene_id, predicate, wait_policy):
+        if scene_id in coord._transitions:  # noqa: SLF001
+            draining.set()
+        return wait_for_condition(scene_id, predicate, wait_policy)
+
+    monkeypatch.setattr(channels[0], "detach", paused_detach)
+    monkeypatch.setattr(channels[1], "detach", busy_detach)
+    monkeypatch.setattr(coord, "_wait_for_edit_condition_locked", observe_drain)
+
+    def evict():
+        try:
+            coord.ensure_attached("other")
+        except BaseException as exc:
+            errors["evict"] = exc
+
+    def edit():
+        try:
+            coord.append_edit_assets("s", _edit_request("s", "candidate"))
+        except BaseException as exc:
+            errors["edit"] = exc
+
+    evictor, editor = threading.Thread(target=evict, daemon=True), threading.Thread(target=edit, daemon=True)
+    try:
+        evictor.start()
+        assert entered_detach.wait(timeout=2.0)
+        editor.start()
+        assert draining.wait(timeout=2.0)
+        with coord._lock:  # noqa: SLF001
+            assert _journal_replacement_ids(coord._edit_journals["s"]) == ["previous"]  # noqa: SLF001
+        resume_detach.set()
+        evictor.join(timeout=2.0)
+        editor.join(timeout=2.0)
+        assert not evictor.is_alive() and not editor.is_alive()
+        assert isinstance(errors.get("evict"), SceneBudgetError)
+        assert isinstance(errors.get("edit"), SceneEditBusyError)
+        assert not coord.is_degraded()
+        assert all(table == {"s": "worker::previous"} for table in tables)
+        assert all(ids == ["previous"] for ids in built)
+        assert osr.registry.attached_count("s") == 2
+    finally:
+        resume_detach.set()
+        if evictor.ident is not None:
+            evictor.join(timeout=3.0)
+        if editor.ident is not None:
+            editor.join(timeout=3.0)
+        _stop_workers(stops)
+
+
+def test_mixed_busy_detach_recovery_failure_fails_closed() -> None:
+    detached = _FakeSceneChannel()
+    busy = _FakeSceneChannel()
+    reg, coord = _coordinator_with_fake_channels([detached, busy], {"s": "/art-s"})
+    coord.ensure_attached("s")
+    detached.attach_error = RuntimeError("recovery attach failed")
+    busy.detach_error_sequence = [SceneDetachBusyError("render in flight")] * _SCENE_DETACH_MAX_ATTEMPTS
+
+    with pytest.raises(ScenePoolDegradedError, match="could not be safely detached"):
+        coord.append_edit_assets("s", _edit_request("s", "replacement"))
+
+    assert coord.is_degraded()
+    assert "s" not in coord.attached_scenes()
+    assert not detached.is_attached("s")
+    assert busy.is_attached("s")
+    assert reg.loaded_scenes() == ("s",) and reg.released == []
+    assert "s" in coord._retained  # noqa: SLF001
+
+
+def test_mixed_uncertain_and_busy_detach_still_fails_closed() -> None:
+    uncertain, busy = _FakeSceneChannel(), _FakeSceneChannel()
+    reg, coord = _coordinator_with_fake_channels([uncertain, busy], {"s": "/art-s"})
+    coord.ensure_attached("s")
+    uncertain.detach_error_sequence = [RuntimeError("lost ack")] * _SCENE_DETACH_MAX_ATTEMPTS
+    busy.detach_error_sequence = [SceneDetachBusyError("render in flight")] * _SCENE_DETACH_MAX_ATTEMPTS
+    with pytest.raises(ScenePoolDegradedError):
+        coord.append_edit_assets("s", _edit_request("s", "candidate"))
+    assert coord.is_degraded()
+    assert reg.loaded_scenes() == ("s",) and reg.released == []
+
+
+def test_edit_transition_marker_is_cleared_when_pool_degrades_during_drain() -> None:
+    _osr, coord, _channels, _tables, stops = _coordinator_with_workers(
+        [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"worker::{scene_id}"],
+        {"s": "/art-s"},
+        loader=lambda _scene_id, _artifact_path: _EditableOwner(),
+    )
+    errors: list[BaseException] = []
+    try:
+        coord.ensure_attached("s")
+        coord.acquire("s")
+
+        def edit() -> None:
+            try:
+                coord.append_edit_assets("s", _edit_request("s", "x"))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=edit)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while "s" not in coord._transitions and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.01)
+        with coord._lock:  # noqa: SLF001
+            coord._mark_degraded_locked("test degradation")  # noqa: SLF001
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], ScenePoolDegradedError)
+        assert "s" not in coord._transitions  # noqa: SLF001
+        with pytest.raises(ScenePoolDegradedError):
+            coord.restore_edited_scene("s")
+    finally:
+        coord.release_scene("s")
+        _stop_workers(stops)
+
+
+def test_registration_invalidation_discards_edit_journal_before_scene_id_reuse() -> None:
+    worker_journals: list[list[str]] = []
+
+    def builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
+        del scene_id, artifact_path, ipc_tensors
+        ids = _journal_replacement_ids(edit_journal)
+        worker_journals.append(ids)
+        return f"worker::{','.join(ids) or 'base'}"
+
+    _osr, coord, _channels, tables, stops = _coordinator_with_workers(
+        [builder], {}, loader=lambda _scene_id, _artifact_path: _EditableOwner(), max_scenes=1
+    )
+    try:
+        coord.register_scene("s", "/old", source="https://example/old", generation=1)
+        coord.ensure_attached("s")
+        coord.append_edit_assets("s", _edit_request("s", "old-edit"))
+        coord.register_scene("other", "/other", source="https://example/other", generation=2)
+        coord.ensure_attached("other")
+        coord.invalidate_scene("s", generation=1)
+
+        assert "s" not in coord._edit_journals  # noqa: SLF001
+        coord.register_scene("s", "/new", source="https://example/new", generation=3)
+        coord.ensure_attached("s")
+        assert tables[0]["s"] == "worker::base"
+        assert worker_journals[-1] == []
+    finally:
+        _stop_workers(stops)
+
+
+def test_unloaded_edit_holds_registration_identity_until_transition_finishes() -> None:
+    entered_attach = threading.Event()
+    resume_attach = threading.Event()
+
+    def failing_loader(scene_id, artifact_path):
+        raise RuntimeError(f"cannot load {scene_id} from {artifact_path}")
+
+    _osr, coord, _channels, _tables, stops = _coordinator_with_workers(
+        [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"worker::{scene_id}"], {}, loader=failing_loader
+    )
+    original_ensure_attached = coord.ensure_attached
+
+    def paused_ensure_attached(scene_id, *, _allow_transition=False, _has_lease=False):
+        if _allow_transition:
+            entered_attach.set()
+            assert resume_attach.wait(timeout=2.0)
+        return original_ensure_attached(scene_id, _allow_transition=_allow_transition, _has_lease=_has_lease)
+
+    coord.ensure_attached = paused_ensure_attached  # type: ignore[method-assign]
+    errors: list[BaseException] = []
+    try:
+        coord.register_scene("s", "/old", source="https://example/old", generation=1)
+
+        def edit() -> None:
+            try:
+                coord.append_edit_assets("s", _edit_request("s", "old-edit"))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=edit)
+        thread.start()
+        assert entered_attach.wait(timeout=2.0)
+
+        coord.invalidate_scene("s", generation=1)
+        assert coord.registration("s") == ("/old", "https://example/old", 1)
+        with pytest.raises(ValueError, match="different artifact"):
+            coord.register_scene("s", "/new", source="https://example/new", generation=2)
+
+        resume_attach.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], SceneLoadError)
+        assert coord.registration("s") is None
+        assert "s" not in coord._edit_journals  # noqa: SLF001
+
+        coord.register_scene("s", "/new", source="https://example/new", generation=2)
+        assert coord.registration("s") == ("/new", "https://example/new", 2)
+    finally:
+        resume_attach.set()
         _stop_workers(stops)
 
 
@@ -2800,6 +3972,7 @@ def test_worker_scene_table_headroom_keeps_coordinator_attached_scenes() -> None
             renderable_model=None,  # type: ignore[arg-type]
             camera_bank=None,  # type: ignore[arg-type]
             world_to_nurec=None,  # type: ignore[arg-type]
+            scene_time_range_us=None,  # type: ignore[arg-type]
             lidar_bank=None,  # type: ignore[arg-type]
             asset_bank=None,  # type: ignore[arg-type]
             source_artifact=None,  # type: ignore[arg-type]
@@ -2844,7 +4017,7 @@ def test_owner_bookkeeping_stays_bounded_across_evict_and_reregister() -> None:
     # eviction and recreated on next access. (: the scene *registration* `_scene_artifacts` now SURVIVES
     # GPU eviction — it is bounded instead by the on-disk download cache via `invalidate_scene`, exercised
     # below and in the SceneCache tests.)
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {}, max_scenes=1)
     try:
         for i in range(12):
@@ -2869,7 +4042,7 @@ def test_owner_bookkeeping_keeps_permanent_scene_artifacts() -> None:
     # a scene's artifact registration survives GPU eviction — a permanent (glob/bootstrap) scene stays
     # re-attachable with no header, AND an on-demand scene stays ID-only reloadable while its backing
     # artifact is usable. Only a disk-cache invalidation drops an on-demand registration.
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     # "perm" is registered at startup (permanent); "od" arrives on-demand.
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {"perm": "/art-perm"}, max_scenes=1)
     try:
@@ -2896,7 +4069,7 @@ def test_prune_evicted_bookkeeping_respects_active_attach() -> None:
     # Gating invariant: the per-scene bookkeeping prune must NOT drop a scene's lock while an attach is
     # active for it (a waiting re-attach holds that lock — pruning it would let a stale and a fresh lock both
     # admit the scene). It prunes only once quiescent. This locks in the gate `_prune` relies on.
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {}, max_scenes=2)
     try:
         coord.register_scene("s", "/art-s")  # on-demand registration
@@ -2924,7 +4097,7 @@ def test_eviction_prune_does_not_drop_lock_held_by_concurrent_attach() -> None:
     # * current placement (increment BEFORE acquire): gate == 1 at acquire → prune skips → lock kept.
     # * old buggy placement (increment AFTER acquire): gate == 0 in this window → prune would pop the lock
     # the attach thread holds (the double-attach race). Both asserts below would then fail.
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {}, max_scenes=2)
 
     lock_held = threading.Event()
@@ -3066,7 +4239,7 @@ def test_proxy_health_transition_updates_aggregate_and_concrete_service() -> Non
     _mp._set_proxy_health_status(servicer, _mp.health_pb2.HealthCheckResponse.SERVING)  # noqa: SLF001
     _mp._set_proxy_health_status(servicer, _mp.health_pb2.HealthCheckResponse.NOT_SERVING)  # noqa: SLF001
 
-    names = ["", "nurec.grpc.protos.sensorsim.SensorsimService"]
+    names = ["", "nurec.grpc.protos.sensorsim.SensorsimService", "nre.grpc.protos.sensorsim.SensorsimService"]
     assert calls == [
         *((name, _mp.health_pb2.HealthCheckResponse.SERVING) for name in names),
         *((name, _mp.health_pb2.HealthCheckResponse.NOT_SERVING) for name in names),
@@ -3086,6 +4259,7 @@ class _StubPool:
 
     def __init__(self) -> None:
         self.shutdown_calls = 0
+        self.fatal_worker_interceptor = _mp.FatalWorkerExceptionInterceptor()
 
     def shutdown(self) -> None:
         self.shutdown_calls += 1
@@ -3409,6 +4583,57 @@ def test_worker_pool_shutdown_stops_listeners_before_lifecycle_stop_then_joins()
     assert max(owner_release_idxs) < min(deferred_close_idxs)  # deferred proxy channels are the final phase
     # Graceful exit on the request: reaped without SIGTERM/SIGKILL escalation.
     assert all(not proc.is_alive() and not proc.terminated and not proc.killed for proc in procs)
+
+
+def test_fatal_owner_reaps_workers_without_releasing_cuda_owner_state() -> None:
+    order: list = []
+    proc = _GracefulLifecycleProc(0, order)
+    tx = _StopThenDieLifecycleTx(0, proc, order)
+    channel = _OrderingSceneChannel(0, order)
+    registry = _RecordingOwnerRegistryForPool()
+    deferred_closed: list[bool] = []
+    pool = WorkerPool(
+        scene_id="s",
+        worker_addresses=[],
+        owner_backend=None,
+        scene_channels=[channel],  # type: ignore[list-item]
+        _procs=[proc],
+        _lifecycle_txs=[tx],
+        _owner_scene_registry=registry,
+    )
+    pool.defer_close(lambda: deferred_closed.append(True))
+
+    pool.stop_and_reap_workers_for_fatal_owner(graceful_timeout_s=0.01)
+    pool.shutdown()  # concurrent/outer finally paths must stay on the same no-CUDA-cleanup path
+
+    assert not proc.is_alive()
+    assert tx.sent == [WorkerLifecycleCommand.STOP]
+    assert not tx.closed  # endpoint cleanup belongs to the skipped unsafe owner-cleanup phase
+    assert order[:2] == [("channel_stop", 0), ("stop", 0)]
+    assert not any(item[0] == "channel_release" for item in order)
+    assert not registry.released_all
+    assert deferred_closed == []
+
+
+def test_fatal_owner_escalates_to_kill_but_still_retains_owner_state() -> None:
+    proc = _ReapFakeProc(dies_on_terminate=False)
+    registry = _RecordingOwnerRegistryForPool()
+    pool = WorkerPool(
+        scene_id="s",
+        worker_addresses=[],
+        owner_backend=None,
+        _procs=[proc],
+        _owner_scene_registry=registry,
+    )
+
+    pool.stop_and_reap_workers_for_fatal_owner(
+        graceful_timeout_s=0.0,
+        terminate_timeout_s=0.0,
+        kill_timeout_s=0.0,
+    )
+
+    assert not proc.is_alive() and proc.terminated and proc.killed
+    assert not registry.released_all
 
 
 def test_worker_pool_shutdown_is_idempotent_on_repeat() -> None:
@@ -3738,8 +4963,8 @@ def test_spawn_worker_records_proc_and_lifecycle_tx_together_before_wiring_failu
 def test_spawn_worker_creates_only_scene_and_handshake_queues() -> None:
     # `_spawn_worker` creates exactly the five scene/handshake queues (attach req/resp + port + scene
     # req/ack) and no extra queue pair, and the worker payload it builds carries only those slots (bind
-    # against `_worker` so a signature drift is caught). Editing is unsupported in multiproc serving, so no
-    # edit-set queues are ever wired.
+    # against `_worker` so a signature drift is caught). Legacy edits replay through the existing scene-attach
+    # channel, so no dedicated edit-set queues are wired.
     class _FakePipeEnd:
         def close(self) -> None:
             pass
@@ -3845,7 +5070,7 @@ def test_terminate_and_reap_noop_for_already_dead_worker() -> None:
 
 def test_scene_coordinator_seeded_primary_is_already_attached() -> None:
     built: list[str] = []
-    builders = [lambda scene_id, artifact_path, ipc_tensors: built.append(scene_id) or "x"]  # type: ignore[func-returns-value]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): built.append(scene_id) or "x"]  # type: ignore[func-returns-value]
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {}, attached_scenes=("primary",))
     try:
         coord.ensure_attached("primary")  # seeded -> immediate no-op, no attach pushed
@@ -3857,7 +5082,7 @@ def test_scene_coordinator_seeded_primary_is_already_attached() -> None:
 
 
 def test_scene_coordinator_unknown_scene_raises() -> None:
-    builders = [lambda scene_id, artifact_path, ipc_tensors: "x"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): "x"]
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(builders, {"b": "/art-b"})
     try:
         with pytest.raises(SceneNotKnownError, match="not known"):
@@ -3912,10 +5137,10 @@ def test_scene_coordinator_registry_publication_failure_remains_internal(monkeyp
 def test_scene_coordinator_rolls_back_partial_attach() -> None:
     # Worker 0 attaches fine; worker 1's build fails. The coordinator must detach worker 0, release the
     # owner load, and raise — so the scene is neither routed nor left half-attached.
-    def ok_builder(scene_id, artifact_path, ipc_tensors):
+    def ok_builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
         return f"w0::{scene_id}"
 
-    def failing_builder(scene_id, artifact_path, ipc_tensors):
+    def failing_builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
         raise RuntimeError(f"build boom {scene_id}")
 
     osr, coord, channels, tables, stops = _coordinator_with_workers([ok_builder, failing_builder], {"b": "/art-b"})
@@ -3934,7 +5159,7 @@ def test_scene_coordinator_rolls_back_partial_attach() -> None:
 
 
 def test_scene_coordinator_known_scenes_includes_seed_and_artifacts() -> None:
-    builders = [lambda scene_id, artifact_path, ipc_tensors: "x"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): "x"]
     _osr, coord, _channels, _tables, stops = _coordinator_with_workers(
         builders, {"b": "/art-b", "c": "/art-c"}, attached_scenes=("primary",)
     )
@@ -3952,8 +5177,8 @@ def test_scene_coordinator_known_scenes_includes_seed_and_artifacts() -> None:
 
 def _two_worker_builders():
     return [
-        (lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"),
-        (lambda scene_id, artifact_path, ipc_tensors: f"w1::{scene_id}"),
+        (lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"),
+        (lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w1::{scene_id}"),
     ]
 
 
@@ -4279,6 +5504,21 @@ def test_render_rgb_attach_failure_aborts_unavailable() -> None:
     assert calls == []  # half-attached scene is not routed
 
 
+def test_render_rgb_fatal_owner_load_escapes_to_owner_interceptor() -> None:
+    cuda_error = RuntimeError("CUDA error: an illegal memory access was encountered")
+    load_error = SceneLoadError("owner scene load failed")
+    load_error.__cause__ = cuda_error
+    coord = _FakeSceneCoordinator(raise_for={"b": load_error})
+    proxy, calls = _proxy_with_coordinator(coord)
+
+    with pytest.raises(SceneLoadError) as caught:
+        proxy.render_rgb(sensorsim_pb2.RGBRenderRequest(scene_id="b"), _FakeContext())
+
+    assert caught.value is load_error  # the outer fatal interceptor must see the CUDA exception chain
+    assert calls == []
+    assert coord.release_calls == []
+
+
 def test_render_rgb_degraded_pool_aborts_unavailable() -> None:
     # The degraded (fail-closed) lease outcome is the fifth `_scene_lease` mapping; it must surface at the
     # proxy boundary as UNAVAILABLE (fleet restarting), not collapse to UNKNOWN if the except-branch is lost.
@@ -4395,6 +5635,14 @@ def test_get_available_cameras_ensures_scene_then_forwards_to_worker_zero() -> N
     proxy.get_available_cameras(sensorsim_pb2.AvailableCamerasRequest(scene_id="b"), _FakeContext())
     assert coord.acquire_calls == ["b"] and coord.release_calls == ["b"]  # leased across the forward
     assert [(call.method, call.worker_id) for call in calls] == [("get_available_cameras", 0)]
+
+
+def test_get_lidar_firing_pattern_ensures_scene_then_forwards_to_worker_zero() -> None:
+    coord = _FakeSceneCoordinator(known={"b"})
+    proxy, calls = _proxy_with_coordinator(coord)
+    proxy.get_lidar_firing_pattern(sensorsim_pb2.LidarFiringPatternRequest(scene_id="b"), _FakeContext())
+    assert coord.acquire_calls == ["b"] and coord.release_calls == ["b"]  # leased across the forward
+    assert [(call.method, call.worker_id) for call in calls] == [("get_lidar_firing_pattern", 0)]
 
 
 def test_render_rgb_without_coordinator_is_passthrough() -> None:
@@ -5009,7 +6257,7 @@ def test_scene_attach_channel_worker_error_rollback_failure_retains_attachment_u
     osr = OwnerSceneRegistry()
     osr.ensure_loaded("a", _tiny_model)
 
-    def failing_builder(scene_id, artifact_path, ipc_tensors):
+    def failing_builder(scene_id, artifact_path, ipc_tensors, edit_journal=()):
         raise RuntimeError(f"build boom {scene_id}")
 
     push_q, ack_q, _attached, thread = _start_scene_listener(failing_builder)
@@ -5107,13 +6355,19 @@ class _FakeSceneChannel:
     def __init__(self) -> None:
         self._attached: set[str] = set()
         self.attach_error: "Exception | None" = None
+        self.attach_started: "threading.Event | None" = None
+        self.attach_block: "threading.Event | None" = None
         self.detach_error_sequence: list = []  # per-call Exception|None; a raised error leaves it "retained"
         self.detach_calls = 0
         self.detach_started: "threading.Event | None" = None
         self.detach_block: "threading.Event | None" = None
         self.reaped = False
 
-    def attach(self, scene_id: str, artifact_path: str, *, ack_timeout_s: float | None = None) -> None:
+    def attach(self, scene_id: str, artifact_path: str, *, edit_journal=(), ack_timeout_s: float | None = None) -> None:
+        if self.attach_started is not None:
+            self.attach_started.set()
+        if self.attach_block is not None:
+            self.attach_block.wait(timeout=5.0)
         if self.attach_error is not None:
             raise self.attach_error
         self._attached.add(scene_id)
@@ -5154,6 +6408,7 @@ class _FakeOwnerRegistry:
     def __init__(self, *, release_returns: "dict[str, bool] | None" = None) -> None:
         self._loaded: set[str] = set()
         self.release_returns = dict(release_returns or {})
+        self.release_error: "Exception | None" = None
         self.released: list[str] = []
 
     def ensure_loaded(self, scene_id: str, loader) -> object:  # noqa: ANN001
@@ -5168,6 +6423,8 @@ class _FakeOwnerRegistry:
         return tuple(sorted(self._loaded))
 
     def release(self, scene_id: str) -> bool:
+        if self.release_error is not None:
+            raise self.release_error
         result = self.release_returns.get(scene_id, True)
         if result:
             self._loaded.discard(scene_id)
@@ -5283,6 +6540,25 @@ def test_scene_pool_busy_detach_does_not_degrade_and_requester_gets_retryable() 
     assert not coord.is_degraded() and not fired
 
 
+def test_scene_pool_mixed_busy_eviction_restores_fleet_then_retries() -> None:
+    released, busy = _FakeSceneChannel(), _FakeSceneChannel()
+    reg, coord = _coordinator_with_fake_channels(
+        [released, busy], {"a": "/art-a", "b": "/art-b"}, attached_scenes=("primary",), max_scenes=2
+    )
+    coord.ensure_attached("a")
+    busy.detach_error_sequence = [SceneDetachBusyError("render in flight")]
+    with pytest.raises(SceneBudgetError, match="rendering"):
+        coord.ensure_attached("b")
+    assert not coord.is_degraded()
+    assert coord.attached_scenes() == {"primary", "a"}
+    assert released.is_attached("a") and busy.is_attached("a")
+    assert reg.released == []
+    assert released.detach_calls == busy.detach_calls == 1
+    coord.ensure_attached("b")
+    assert coord.attached_scenes() == {"primary", "b"}
+    assert not released.is_attached("a") and not busy.is_attached("a")
+
+
 def test_scene_pool_partial_attach_rollback_with_uncertain_detach_degrades() -> None:
     # a partial attach (worker 1 fails) rolls back through the ONE centralized cleanup path; if rolling
     # back worker 0's attach is itself uncertain, the pool quarantines + degrades and the client sees the
@@ -5320,6 +6596,116 @@ def test_scene_pool_loader_failure_does_not_degrade() -> None:
     assert isinstance(exc_info.value.__cause__, RuntimeError)
     assert not coord.is_degraded()
     assert "a" not in coord._retained  # noqa: SLF001
+
+
+def test_scene_coordinator_propagates_fatal_owner_attach_without_rollback() -> None:
+    fatal_error = RuntimeError("CUDA error: an illegal memory access was encountered")
+    healthy = _FakeSceneChannel()
+    fatal = _FakeSceneChannel()
+    fatal.attach_error = fatal_error
+    reg, coord = _coordinator_with_fake_channels([healthy, fatal], {"a": "/art-a"}, max_scenes=0)
+
+    with pytest.raises(RuntimeError) as caught:
+        coord.ensure_attached("a")
+
+    assert caught.value is fatal_error  # preserved for the outer fatal interceptor
+    assert not coord.is_degraded()
+    assert healthy.is_attached("a")  # no detach/release CUDA work after the fatal transition
+    assert reg.is_loaded("a")
+    assert reg.released == []
+
+
+def test_scene_coordinator_fatal_attach_does_not_wait_for_blocked_sibling() -> None:
+    fatal_error = RuntimeError("CUDA error: an illegal memory access was encountered")
+    blocked = _FakeSceneChannel()
+    blocked.attach_started = threading.Event()
+    blocked.attach_block = threading.Event()
+    fatal = _FakeSceneChannel()
+    fatal.attach_error = fatal_error
+    fatal.attach_block = threading.Event()
+    _reg, coord = _coordinator_with_fake_channels([blocked, fatal], {"a": "/art-a"}, max_scenes=0)
+    caught: list[BaseException] = []
+    done = threading.Event()
+
+    def _attach() -> None:
+        try:
+            coord.ensure_attached("a")
+        except BaseException as exc:  # noqa: BLE001 - capture the cross-thread result for the assertion
+            caught.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_attach)
+    thread.start()
+    try:
+        assert blocked.attach_started.wait(timeout=1.0)
+        fatal.attach_block.set()  # surface the fatal only after its sibling is known to be blocked
+        assert done.wait(timeout=2.0)  # must not wait for the fake's five-second attach timeout
+        assert caught == [fatal_error]
+        assert not blocked.attach_block.is_set()
+    finally:
+        blocked.attach_block.set()
+        fatal.attach_block.set()
+        thread.join(timeout=2.0)
+
+
+def test_scene_coordinator_fatal_detach_does_not_wait_for_blocked_sibling() -> None:
+    fatal_error = RuntimeError("CUDA error: an illegal memory access was encountered")
+    blocked = _FakeSceneChannel()
+    blocked._attached.add("a")  # noqa: SLF001 - seed the fan-out operation under test
+    blocked.detach_started = threading.Event()
+    blocked.detach_block = threading.Event()
+    fatal = _FakeSceneChannel()
+    fatal._attached.add("a")  # noqa: SLF001 - seed the fan-out operation under test
+    fatal.detach_error_sequence = [fatal_error]
+    fatal.detach_block = threading.Event()
+    _reg, coord = _coordinator_with_fake_channels([blocked, fatal], {"a": "/art-a"}, max_scenes=0)
+    caught: list[BaseException] = []
+    done = threading.Event()
+
+    def _detach() -> None:
+        try:
+            coord._detach_all("a")  # noqa: SLF001 - directly pin fatal fan-out behavior
+        except BaseException as exc:  # noqa: BLE001 - capture the cross-thread result for the assertion
+            caught.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_detach)
+    thread.start()
+    try:
+        assert blocked.detach_started.wait(timeout=1.0)
+        fatal.detach_block.set()  # surface the fatal only after its sibling is known to be blocked
+        assert done.wait(timeout=2.0)  # must not wait for the fake's five-second detach timeout
+        assert caught == [fatal_error]
+        assert blocked.is_attached("a")
+    finally:
+        blocked.detach_block.set()
+        fatal.detach_block.set()
+        thread.join(timeout=2.0)
+
+
+def test_scene_coordinator_propagates_fatal_owner_release_without_degradation() -> None:
+    fatal_error = RuntimeError("CUDA error: an illegal memory access was encountered")
+    channel = _FakeSceneChannel()
+    channel._attached.add("a")  # noqa: SLF001 - seed the already-resident eviction victim
+    reg, coord = _coordinator_with_fake_channels(
+        [channel],
+        {"a": "/art-a", "b": "/art-b"},
+        attached_scenes=("a",),
+        max_scenes=1,
+    )
+    reg._loaded.add("a")  # noqa: SLF001 - owner storage exists and release surfaces the CUDA error
+    reg.release_error = fatal_error
+
+    with pytest.raises(RuntimeError) as caught:
+        coord.ensure_attached("b")
+
+    assert caught.value is fatal_error  # no ScenePoolDegradedError/string wrapper hides the CUDA cause
+    assert not coord.is_degraded()
+    assert reg.is_loaded("a")  # poisoned owner storage remains retained for the fatal-owner exit path
+    assert reg.released == []
+    assert "b" not in coord.attached_scenes()
 
 
 def test_scene_pool_blocked_waiter_wakes_unavailable_on_degrade() -> None:
@@ -5910,6 +7296,7 @@ class _FakeMetricsManager:
 
 class _FakePoolForServeProxy:
     def __init__(self) -> None:
+        self.fatal_worker_interceptor = _mp.FatalWorkerExceptionInterceptor()
         self.worker_addresses = ["127.0.0.1:1"]
         self.owner_backend = None
         self.coordinator = None
@@ -5929,8 +7316,54 @@ def _patch_serve_proxy_plumbing(monkeypatch: pytest.MonkeyPatch, servers, proxy)
     server_iter = iter(servers)
     monkeypatch.setattr(_mp.grpc, "server", lambda *a, **k: next(server_iter))
     monkeypatch.setattr(_mp.RenderProxy, "from_addresses", lambda *a, **k: proxy)
-    monkeypatch.setattr(_mp, "add_SensorsimServiceServicer_to_server", lambda *a, **k: None)
+    monkeypatch.setattr(_mp, "add_sensorsim_servicer_to_server", lambda *a, **k: None)
     monkeypatch.setattr(_mp.health_pb2_grpc, "add_HealthServicer_to_server", lambda *a, **k: None)
+
+
+def test_fatal_owner_stops_proxy_before_reaping_workers() -> None:
+    order: list[object] = []
+
+    class _StopEvent:
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            order.append(("proxy_wait", timeout))
+            return True
+
+    class _Server:
+        def stop(self, grace):  # noqa: ANN001, ANN201
+            order.append(("proxy_stop", grace))
+            return _StopEvent()
+
+    class _Pool:
+        def stop_and_reap_workers_for_fatal_owner(self, **timeouts) -> None:
+            assert sum(timeouts.values()) < 5.0 - 2.0
+            order.append("workers_reaped")
+
+    _mp._stop_proxy_and_reap_workers_after_owner_fatal(_Server(), _Pool(), 0.25)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert order == [("proxy_stop", 0.25), ("proxy_wait", 1.25), "workers_reaped"]
+
+
+def test_serve_proxy_installs_owner_fatal_interceptor_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _FakeBindServer(0)
+    proxy = _RecordingProxy()
+    server_kwargs: dict[str, object] = {}
+
+    def _server(*_args, **kwargs):  # noqa: ANN002, ANN003
+        server_kwargs.update(kwargs)
+        return server
+
+    monkeypatch.setattr(_mp.grpc, "server", _server)
+    monkeypatch.setattr(_mp, "collect_cuda_worker_diagnostics", lambda: {"gpu_uuid": "GPU-owner"})
+    monkeypatch.setattr(_mp.RenderProxy, "from_addresses", lambda *a, **k: proxy)
+    monkeypatch.setattr(_mp, "add_sensorsim_servicer_to_server", lambda *a, **k: None)
+    monkeypatch.setattr(_mp.health_pb2_grpc, "add_HealthServicer_to_server", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="failed to bind proxy"):
+        serve_proxy(_FakePoolForServeProxy(), host="127.0.0.1", port=50054, shutdown_event=PoolShutdown())  # type: ignore[arg-type]
+
+    interceptors = server_kwargs["interceptors"]
+    assert isinstance(interceptors, list)
+    assert isinstance(interceptors[0], _mp.FatalWorkerExceptionInterceptor)
 
 
 def test_serve_proxy_public_bind_failure_cleans_up_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6183,7 +7616,7 @@ def test_scene_attach_channel_real_listener_withheld_ack_retains_then_detach_rec
     wrapped_ack_q = _WithholdFirstAttachAck()
     thread = threading.Thread(
         target=_scene_attach_listener,
-        args=(attached, lambda scene_id, _path, _ipc: f"backend::{scene_id}", push_q, wrapped_ack_q),
+        args=(attached, lambda scene_id, _path, _ipc, edit_journal=(): f"backend::{scene_id}", push_q, wrapped_ack_q),
         daemon=True,
     )
     thread.start()
@@ -6723,24 +8156,28 @@ def test_validate_multiproc_admission_reports_first_violation() -> None:
     )
 
 
-def test_validate_multiproc_harmonizer_accepts_default_config() -> None:
-    from nurec.grpc.grpc_server_config import GrpcServerConfig
-
-    # GrpcServerConfig now has enable_harmonizer_temporal (default False): a default config — and an
-    # explicit False — must pass the launch guard.
-    assert _mp.validate_multiproc_harmonizer(GrpcServerConfig()) is None
-    assert _mp.validate_multiproc_harmonizer(GrpcServerConfig(enable_harmonizer_temporal=False)) is None
-    # A config-like object without the field (programmatic callers) is treated as disabled, not an error.
-    config_without_field = cast(Any, SimpleNamespace())
-    assert _mp.validate_multiproc_harmonizer(config_without_field) is None
+def test_validate_multiproc_features_accepts_default_config() -> None:
+    assert _mp.validate_multiproc_features(GrpcServerConfig()) is None
+    assert (
+        _mp.validate_multiproc_features(GrpcServerConfig(enable_harmonizer_temporal=False, camera_only=False)) is None
+    )
+    assert _mp.validate_multiproc_features(cast(Any, SimpleNamespace())) is None
 
 
-def test_validate_multiproc_harmonizer_rejects_temporal() -> None:
-    config = cast(Any, SimpleNamespace(enable_harmonizer_temporal=True))
-    error = _mp.validate_multiproc_harmonizer(config)
+@pytest.mark.parametrize("feature", ["enable_harmonizer_temporal", "camera_only"])
+def test_validate_multiproc_features_rejects_unsupported_features(feature: str) -> None:
+    config = cast(Any, SimpleNamespace(**{feature: True}))
+    error = _mp.validate_multiproc_features(config)
     assert error is not None
-    assert "--enable-harmonizer-temporal" in error
+    assert f"--{feature.replace('_', '-')}" in error
     assert "--multiproc-workers" in error
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_camera_only_rejects_multiprocess_server(workers: int) -> None:
+    result = CliRunner().invoke(serve_grpc, ["--multiproc-workers", str(workers), "--camera-only"])
+    assert result.exit_code == 2
+    assert "supported only with --multiproc-workers=0" in result.output
 
 
 def test_validate_multiproc_mps_contract(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6769,11 +8206,19 @@ def test_validate_multiproc_download_cache_contract() -> None:
     assert _mp.validate_multiproc_download_cache(adequate, require_scene_cache=True) is None
 
 
-def test_run_drop_in_refuses_temporal_harmonizer_before_spawning() -> None:
-    # The programmatic launch path enforces the same contract as the Click layer: an invalid
-    # config fails fast with ValueError before any worker/pool state is created.
-    config = cast(Any, SimpleNamespace(enable_harmonizer_temporal=True))
-    with pytest.raises(ValueError, match="enable-harmonizer-temporal"):
+@pytest.mark.parametrize("feature", ["enable_harmonizer_temporal", "camera_only"])
+def test_run_drop_in_refuses_unsupported_features_before_spawning(
+    feature: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_start(*args, **kwargs):
+        pytest.fail("Invalid configuration must be rejected before starting workers")
+
+    monkeypatch.setattr(_mp, "start_worker_pool", unexpected_start)
+    config = GrpcServerConfig(
+        enable_harmonizer_temporal=feature == "enable_harmonizer_temporal",
+        camera_only=feature == "camera_only",
+    )
+    with pytest.raises(ValueError, match=feature.replace("_", "-")):
         _mp.run_drop_in(config, num_workers=2)
 
 
@@ -6832,7 +8277,7 @@ def test_admission_releases_permit_after_downstream_rpc_error() -> None:
 def test_validate_startup_scenes_attaches_all_and_counts() -> None:
     # every startup glob scene is driven through the real all-worker attach barrier; the count
     # of validated scenes is returned (surfaced later as multiproc.validated_startup_scenes).
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(builders, {"a": "/art-a", "b": "/art-b"})
     try:
         progress: list[str] = []
@@ -6885,7 +8330,7 @@ def test_validate_startup_scenes_aborts_on_first_failure() -> None:
             raise RuntimeError("cannot load bad scene")
         return _tiny_model()
 
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(
         builders, {"good": "/art-good", "bad": "/art-bad"}, loader=loader
     )
@@ -6906,7 +8351,7 @@ def test_validate_startup_scenes_noop_without_coordinator() -> None:
 def test_on_demand_scene_registration_survives_gpu_eviction_and_id_reattaches() -> None:
     # An on-demand scene stays ID-only reloadable after GPU eviction — it re-attaches by id with
     # no re-registration (no client header), because its artifact registration survives GPU eviction.
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(builders, {}, max_scenes=1)
     try:
         coord.register_scene("od", "/art-od", source="file:///art-od")
@@ -7260,7 +8705,7 @@ def test_disk_cache_eviction_invalidates_remote_registration_and_redownloads_onc
 def test_disk_cache_eviction_defers_invalidation_until_scene_leaves_residency() -> None:
     # a disk-cache eviction that names a currently-resident scene must NOT drop it out from under an
     # in-flight render — the invalidation is deferred and applied once the scene leaves residency (evicted).
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(builders, {}, max_scenes=1)
     try:
         coord.register_scene("od", "/art-od", source="http://ex/od")
@@ -7331,7 +8776,7 @@ def test_same_source_header_renews_pending_generation_while_scene_is_resident(tm
             Path(output_path).write_text(url)
             return len(url)
 
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(builders, {}, max_scenes=1)
     try:
         scene_cache.set_on_evict(coord.handle_cache_eviction)
@@ -7436,7 +8881,7 @@ def test_cache_invalidation_callback_failure_degrades_and_surfaces(tmp_path, mon
 def test_disk_cache_eviction_never_invalidates_permanent_scene() -> None:
     # A glob/bootstrap (permanent) scene keeps its registration regardless of the disk cache — a disk eviction
     # that happens to name it is a no-op, so it stays re-attachable by id with no header.
-    builders = [lambda scene_id, artifact_path, ipc_tensors: f"w0::{scene_id}"]
+    builders = [lambda scene_id, artifact_path, ipc_tensors, edit_journal=(): f"w0::{scene_id}"]
     _osr, coord, _ch, _t, stops = _coordinator_with_workers(builders, {"perm": "/art-perm"}, max_scenes=2)
     try:
         coord.invalidate_scene("perm")  # permanent -> ignored
@@ -7472,6 +8917,7 @@ def test_multiproc_server_config_map_reports_effective_values() -> None:
     assert config_map["tracks_timestamp_ray_stride"] == "16"
     assert config_map["serving.mode"] == "multiprocess"
     assert config_map["allowed_image_formats"] == "JPEG"
+    assert config_map["scene_prefetch.enabled"] == "False"
     assert config_map["multiproc.workers"] == "4"
     assert config_map["multiproc.renderer"] == "gsplat"
     assert config_map["multiproc.mps_active"] == "false"
@@ -7482,7 +8928,7 @@ def test_multiproc_server_config_map_reports_effective_values() -> None:
     assert config_map["multiproc.download_cache_size"] == "10"
     assert config_map["multiproc.max_in_flight"] == "8"
     assert config_map["multiproc.admission_timeout_s"] == "1.5"
-    assert "multiproc.max_edit_overlays" not in config_map  # editing removed from multiproc serving
+    assert "multiproc.max_edit_overlays" not in config_map  # obsolete overlay scheduler remains removed
     assert "multiproc.edit_overlays" not in config_map
     assert not any(key.startswith("editing.") for key in config_map)
 
@@ -7818,3 +9264,346 @@ def test_worker_pool_shutdown_zero_scene_fleet_is_clean() -> None:
     assert osr.loaded_scenes() == ()  # no leaked owner scene
     assert channel.attached_scenes() == set()  # no residual attachment
     assert lifecycle_tx.closed  # lifecycle endpoint released
+
+
+@pytest.mark.parametrize("failure_phase", ["candidate", "detach", "rollback"])
+def test_fatal_legacy_edit_failure_bypasses_degradation_and_unsafe_rollback(monkeypatch, failure_phase):
+    _reg, coord = _coordinator_with_fake_channels([_FakeSceneChannel()], {"s": "/art-s"})
+    coord.ensure_attached("s")
+    fatal = RuntimeError("CUDA error: unknown error")
+    fired = []
+    coord.set_degraded_callback(fired.append)
+    rebuilds = []
+
+    def rebuild(*args, **kwargs):
+        rebuilds.append(1)
+        if failure_phase == "rollback" and len(rebuilds) == 1:
+            raise ValueError("invalid edit")
+        raise fatal
+
+    monkeypatch.setattr(coord, "ensure_attached", rebuild)
+    if failure_phase == "detach":
+
+        def detach(*args, **kwargs):
+            raise fatal
+
+        monkeypatch.setattr(coord, "_detach_release_or_quarantine", detach)
+    with pytest.raises(RuntimeError) as caught:
+        coord.append_edit_assets("s", _edit_request("s", "candidate"))
+    assert caught.value is fatal
+    assert not coord.is_degraded() and not fired
+    assert len(rebuilds) == {"candidate": 1, "detach": 0, "rollback": 2}[failure_phase]
+
+
+def test_fatal_busy_detach_recovery_preserves_original_fault():
+    detached, busy = _FakeSceneChannel(), _FakeSceneChannel()
+    reg, coord = _coordinator_with_fake_channels([detached, busy], {"s": "/art-s"})
+    coord.ensure_attached("s")
+    fatal = RuntimeError("CUDA error: unknown error")
+    detached.attach_error = fatal
+    busy.detach_error_sequence = [SceneDetachBusyError("render in flight")]
+    with pytest.raises(RuntimeError) as caught:
+        coord.append_edit_assets("s", _edit_request("s", "candidate"))
+    assert caught.value is fatal
+    assert not coord.is_degraded()
+    assert reg.released == []
+    assert busy.is_attached("s")
+
+
+@pytest.mark.parametrize("operation", ["edit_assets", "restore_model_parameters"])
+def test_proxy_legacy_edits_do_not_translate_wrapped_fatal_cuda(operation):
+    proxy, _ = _make_proxy(num_workers=1)
+    coordinator = mock.Mock()
+    error = SceneLoadError("scene load failed")
+    error.__cause__ = RuntimeError("CUDA error: unknown error")
+    coordinator.append_edit_assets.side_effect = error
+    coordinator.restore_edited_scene.side_effect = error
+    proxy._scene_coordinator = coordinator
+    with pytest.raises(SceneLoadError) as caught:
+        getattr(proxy, operation)(_edit_request("s", "candidate"), _FakeContext())
+    assert caught.value is error
+
+
+def test_owner_bootstrap_fatal_reaps_unpublished_worker_and_blocks_late_spawns(monkeypatch):
+    order = []
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=lambda code: order.append(("exit", code)))
+    monkeypatch.setattr(_mp, "FatalWorkerExceptionInterceptor", lambda **kwargs: interceptor)
+    monkeypatch.setattr(_mp, "collect_cuda_worker_diagnostics", lambda: {})
+    monkeypatch.setattr(_mp.mp, "get_context", lambda _method: object())
+
+    class _Process:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            order.append(("reap", timeout))
+            self.alive = False
+
+    def spawn(worker_id, **kwargs):
+        order.append(("spawn", worker_id))
+        assert kwargs["owner_fatal_worker_interceptor"] is interceptor
+        proc = _Process()
+        # Reproduce a fault after process start but before its handle is published. The startup lock
+        # must prevent the reaper from taking a snapshot before on_started records this live consumer.
+        interceptor.handle_fatal_exception(RuntimeError("CUDA error: unknown error"), operation="owner_bootstrap_send")
+        kwargs["on_started"](proc, None)
+        channel = SceneAttachChannel(queue.Queue(), queue.Queue(), kwargs["registry"], is_worker_alive=proc.is_alive)
+        return SimpleNamespace(proc=proc, channel=channel)
+
+    def ready(*args):
+        assert interceptor.wait_for_shutdown(2.0)
+        raise _mp._BringupCancelled("fatal bootstrap")
+
+    monkeypatch.setattr(_mp, "_spawn_worker", spawn)
+    monkeypatch.setattr(_mp, "_await_worker_ready", ready)
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer"):
+        with pytest.raises(_mp._BringupCancelled):
+            _mp.start_worker_pool(
+                None,
+                num_workers=2,
+                renderer_name="gsplat",
+                enable_editing_actors=False,
+                max_concurrent_bringup=2,
+            )
+    assert len([entry for entry in order if entry[0] == "spawn"]) == 1
+    # The injected terminator returns, so the foreground lifecycle must also force exit.
+    assert [entry[0] for entry in order] == ["spawn", "reap", "exit", "exit"]
+
+
+def test_owner_startup_validation_reaps_workers_before_exit_without_proxy(monkeypatch):
+    order = []
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=lambda code: order.append(("exit", code)))
+    monkeypatch.setattr(_mp, "FatalWorkerExceptionInterceptor", lambda **kwargs: interceptor)
+    monkeypatch.setattr(_mp, "collect_cuda_worker_diagnostics", lambda: {})
+    monkeypatch.setattr(_mp, "_bring_up_pool", lambda *args: None)
+    pool = _mp.start_worker_pool(
+        None, num_workers=0, renderer_name="gsplat", enable_editing_actors=False, progress=lambda _: None
+    )
+
+    class _Process:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            order.append(("reap", timeout))
+            self.alive = False
+
+    pool._procs = [_Process()]
+    fatal = RuntimeError("CUDA error: unknown error")
+
+    def fail():
+        raise fatal
+
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer"):
+        with pytest.raises(RuntimeError) as caught:
+            pool._owner_scene_registry.ensure_loaded("poisoned", fail)
+        assert caught.value is fatal
+        assert interceptor.wait_for_shutdown(2.0)
+
+    assert pool._fatal_owner_shutdown.is_set()
+    assert order[0][0] == "reap"
+    assert order[-1] == ("exit", 1)
+    assert len(order) == 2
+
+
+@pytest.mark.parametrize("phase", ["build", "publish", "detach"])
+def test_fatal_listener_arms_watchdog_before_failed_ack_logging(monkeypatch, phase):
+    fatal = RuntimeError("CUDA error: unknown error")
+    entered, release = threading.Event(), threading.Event()
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=mock.Mock())
+    interceptor.configure_shutdown(mark_unhealthy=lambda: None, stop_server=lambda grace: None)
+
+    class _Table(dict):
+        def __setitem__(self, key, value):
+            if phase == "publish":
+                raise fatal
+            return super().__setitem__(key, value)
+
+        def pop(self, key, default=None):
+            if phase == "detach":
+                raise fatal
+            return super().pop(key, default)
+
+    class _Ack:
+        def put(self, value):
+            raise OSError("ack transport failed")
+
+    def builder(*args):
+        if phase == "build":
+            raise fatal
+        return object()
+
+    def blocked_warning(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(_mp.log, "warning", blocked_warning)
+    push_q = queue.Queue()
+    if phase == "detach":
+        push_q.put((_SCENE_DETACH, 1, "s"))
+    else:
+        push_q.put((_SCENE_ATTACH, 1, "s", "/art", {}, ()))
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer") as timer:
+        thread = threading.Thread(
+            target=_scene_attach_listener, args=(_Table(), builder, push_q, _Ack(), interceptor), daemon=True
+        )
+        thread.start()
+        try:
+            assert entered.wait(2)
+            assert interceptor.state.is_fatal
+            timer.return_value.start.assert_called_once()
+        finally:
+            release.set()
+            thread.join(2)
+            assert interceptor.wait_for_shutdown(2)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("phase", ["stop", "wait"])
+def test_fatal_owner_attempts_reap_when_proxy_shutdown_raises(phase):
+    order = []
+
+    class _Server:
+        def stop(self, grace):
+            if phase == "stop":
+                raise ValueError("stop failed")
+            return self
+
+        def wait(self, timeout):
+            raise ValueError("wait failed")
+
+    class _Pool:
+        def stop_and_reap_workers_for_fatal_owner(self, **timeouts):
+            order.append("reap")
+
+    with pytest.raises(ValueError, match=f"{phase} failed"):
+        _mp._stop_proxy_and_reap_workers_after_owner_fatal(_Server(), _Pool(), 0.25)
+    assert order == ["reap"]
+
+
+def test_fatal_owner_reaps_before_logging_proxy_timeout(monkeypatch):
+    order = []
+
+    class _Server:
+        def stop(self, grace):
+            return self
+
+        def wait(self, timeout):
+            return False
+
+    class _Pool:
+        def stop_and_reap_workers_for_fatal_owner(self, **timeouts):
+            order.append("reap")
+
+    monkeypatch.setattr(_mp.log, "error", lambda *args: order.append("log"))
+    _mp._stop_proxy_and_reap_workers_after_owner_fatal(_Server(), _Pool(), 0.25)
+    assert order == ["reap", "log"]
+
+
+@pytest.mark.parametrize("failure_phase", ["startup_eviction", "proxy_return"])
+def test_run_drop_in_fatal_owner_exits_before_normal_cleanup(monkeypatch, failure_phase):
+    order = []
+
+    class _HardExit(BaseException):
+        pass
+
+    def terminate(code):
+        order.append(("exit", code))
+        if threading.current_thread() is threading.main_thread():
+            raise _HardExit
+
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+    owner_registry = mock.Mock()
+    pool = WorkerPool(
+        scene_id=None,
+        worker_addresses=[],
+        owner_backend=None,
+        _owner_scene_registry=owner_registry,
+        fatal_worker_interceptor=interceptor,
+    )
+    pool.coordinator = mock.Mock()
+    fatal = RuntimeError("CUDA error: unknown error")
+    pool.coordinator.ensure_attached.side_effect = fatal
+    interceptor.configure_shutdown(
+        mark_unhealthy=pool.mark_fatal_owner_shutdown,
+        stop_server=lambda grace: pool.stop_and_reap_workers_for_fatal_owner(
+            graceful_timeout_s=0, terminate_timeout_s=0, kill_timeout_s=0
+        ),
+    )
+    monkeypatch.setattr(_mp, "_plan_glob_scenes", lambda matches: (None, None, {"evicted": "evicted.usdz"}))
+    monkeypatch.setattr(_mp, "mps_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(_mp, "_resolve_download_cache_size", lambda *a, **k: 1)
+    monkeypatch.setattr(_mp, "SceneCache", lambda *a, **k: mock.Mock())
+    monkeypatch.setattr(_mp, "Downloader", lambda *a, **k: object())
+    monkeypatch.setattr(_mp, "start_worker_pool", lambda *a, **k: pool)
+    monkeypatch.setattr(_mp, "_multiproc_server_config_map", lambda *a, **k: {})
+    monkeypatch.setattr(sys, "stdout", _ReconfigurableStringIO())
+
+    def serve(*a, **k):
+        assert failure_phase == "proxy_return"
+        interceptor.handle_fatal_exception(fatal, operation="owner_scene_load")
+        return PoolTerminalReason.WORKER_EXIT
+
+    monkeypatch.setattr(_mp, "serve_proxy", serve)
+    config = _mp.GrpcServerConfig(test_scenes_are_valid=failure_phase == "startup_eviction")
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer"):
+        with pytest.raises(_HardExit):
+            _mp.run_drop_in(config, num_workers=0)
+    assert interceptor.state.is_fatal
+    assert pool._fatal_owner_reap_complete.is_set()
+    owner_registry.release_all_idle.assert_not_called()
+    owner_registry.release_after_reap.assert_not_called()
+    assert order[-1] == ("exit", 1)
+    if failure_phase == "startup_eviction":
+        assert interceptor.state.incident.operation == "startup_scene_validation"
+
+
+@pytest.mark.parametrize("failure_phase", ["startup", "rpc_then_stop"])
+def test_fatal_worker_exits_before_metrics_cleanup_or_clean_stop(monkeypatch, failure_phase):
+    class _HardExit(BaseException):
+        pass
+
+    def terminate(code):
+        assert code == 1
+        if threading.current_thread() is threading.main_thread():
+            raise _HardExit
+
+    interceptor = _mp.FatalWorkerExceptionInterceptor(terminate_worker=terminate)
+    fatal = RuntimeError("CUDA error: unknown error")
+    server = mock.Mock()
+    server.add_insecure_port.return_value = 1234
+    server.stop.return_value = None
+    if failure_phase == "startup":
+        server.add_insecure_port.side_effect = fatal
+    service = mock.Mock()
+    monkeypatch.setattr(_mp, "FatalWorkerExceptionInterceptor", lambda **kwargs: interceptor)
+    monkeypatch.setattr(_mp, "collect_cuda_worker_diagnostics", lambda: {})
+    monkeypatch.setattr(_mp.faulthandler, "register", lambda *a, **k: None)
+    monkeypatch.setattr(_mp, "_owner_parent_signals", lambda: (object(), lambda: True))
+    monkeypatch.setattr(_mp.grpc, "server", lambda *a, **k: server)
+    monkeypatch.setattr(_mp, "SensorSimService", lambda *a, **k: service)
+    monkeypatch.setattr(_mp, "add_SensorsimServiceServicer_to_server", lambda *a, **k: None)
+
+    def stop(*a, **k):
+        interceptor.handle_fatal_exception(fatal, operation="rpc")
+        return _mp.WorkerStopReason.STOP
+
+    monkeypatch.setattr(_mp, "_serve_until_stop", stop)
+    with mock.patch("nurec.grpc.fatal_worker.threading.Timer"):
+        with pytest.raises(_HardExit):
+            _mp._worker(
+                0,
+                None,
+                None,
+                WorkerSpawnConfig(renderer_name="gsplat", enable_editing_actors=False),
+                queue.Queue(),
+                queue.Queue(),
+                queue.Queue(),
+                mock.Mock(),
+            )
+    assert interceptor.state.is_fatal
+    service._metrics_manager.shutdown.assert_not_called()

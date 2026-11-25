@@ -220,6 +220,7 @@ py_library(
     deps = [
         ":camera_slang_cc",
         ":kernels_common",
+        "//nurec/libs:fisheye_domain",
         "//nurec/libs/slang_utils:pylib_utils",
         pip_requirement("numpy"),
         pip_requirement("scipy"),
@@ -369,6 +370,16 @@ pytest_test(
         "//nurec/libs/geometry/kernels:pylib",
         pip_requirement("numpy"),
         pip_requirement("opencv-python"),
+        pip_requirement("torch"),
+    ],
+)
+
+pytest_test(
+    name = "camera_batch_device_test",
+    srcs = ["kernels/cameras/camera_batch_device_test.py"],
+    tags = ["multi-gpu"],
+    deps = [
+        ":camera_kernels",
         pip_requirement("torch"),
     ],
 )

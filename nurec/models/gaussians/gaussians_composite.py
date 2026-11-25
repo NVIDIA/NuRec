@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, fields
 from itertools import accumulate
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Collection, List, Mapping, Optional, Sequence, cast
+from typing import Any, Callable, ClassVar, Collection, List, Mapping, Optional, Self, Sequence, cast
 
 import lietorch as lt
 import numpy as np
@@ -34,6 +34,7 @@ from nurec.config.model import ActiveTileMaskStrategy, ModelConfig, SkipBackgrou
 from nurec.config.trainer import TrainerConfig
 from nurec.datasets.summary import DataSourceSummary
 from nurec.datasets.tracks import CuboidTracks
+from nurec.datasets.vehicle_light import shared_vehicle_light_frame_cache
 from nurec.models.background import BaseBackground, SkyEnvMapBackground
 from nurec.models.base import BaseModel
 from nurec.models.calib import BaseCalib, FreePoseCalib
@@ -67,7 +68,13 @@ from nurec.models.gaussians.gaussians_model import (
     SHGaussianModel,
     distributed_all_gather_gaussian_parameters,
 )
-from nurec.models.gaussians.initializations import BaseInitialization, NoPointsFoundException
+from nurec.models.gaussians.initialization_pipeline import (
+    InitializationRequest,
+    acquire_initializer,
+    layer_labels,
+    prepare_camera_initializers,
+)
+from nurec.models.gaussians.initializations import NoPointsFoundException
 from nurec.models.gaussians.renderers import BaseGaussianRenderer, GSplatRenderer
 from nurec.models.gaussians.segment_plan import (
     LayerSegmentTable,
@@ -82,6 +89,7 @@ from nurec.models.gaussians.strategies import (
     BaseGaussianStrategy,  # Note: imported from strategies/__init__.py, not base.py, so that all strategies get imported.
     GSplatStrategy,
     MCMCStrategy,
+    TamingGSMCMCStrategy,
 )
 from nurec.models.gaussians.utils import SH2RGB, Asset, RGBPostProcessing
 from nurec.models.nn_extensions import TypedModuleDict, TypedModuleList
@@ -102,6 +110,7 @@ from nurec.utils.component_only_mask import (
     build_mask_spec,
 )
 from nurec.utils.geometry import se3_matrix_to_tquat
+from nurec.utils.initialization import close_current_initialization
 from nurec.utils.misc import all_gather_int32, unpack_optional
 from nurec.utils.morton import VOXEL_SIZE
 from nurec.utils.optim import (
@@ -110,7 +119,7 @@ from nurec.utils.optim import (
     classify_gaussian_optimizer_group,
 )
 from nurec.utils.profiling import ScopedTimer
-from nurec.utils.selective_adam_visibility import prepare_async_visibility_union
+from nurec.utils.selective_adam_visibility import AsyncVisibilityUnion, prepare_async_visibility_union
 from nurec.utils.tile_mask import (
     CameraToLidarTileMapping,
     camera_tile_mask_to_lidar_mask,
@@ -237,8 +246,32 @@ def uses_selective_adam(config: Any) -> bool:
     )
 
 
-def ensure_selective_adam_renderer_outputs(renderer_cfg: Any) -> None:
-    """Force renderer scene outputs required for SelectiveAdam visibility masks.
+def uses_taminggs_visibility(config: Any) -> bool:
+    """Return True when the TamingGS-inspired proxy consumes render visibility."""
+    strategy = getattr(config, "strategy", None)
+    if strategy is None or getattr(strategy, "name", None) != "taminggs_mcmc":
+        return False
+    addition = getattr(strategy, "add", None)
+    taminggs = getattr(addition, "taminggs", None) if addition is not None else None
+    return bool(taminggs is not None and getattr(taminggs, "visibility_weight", 0.0) > 0.0)
+
+
+def uses_mcmc_visibility(config: Any) -> bool:
+    """Return True when TamingGS needs the system-owned visibility union."""
+    strategy = getattr(config, "strategy", None)
+    if strategy is None or getattr(strategy, "name", None) != "taminggs_mcmc":
+        return False
+    relocation = getattr(strategy, "relocate", None)
+    max_invisible_steps = getattr(relocation, "max_invisible_steps", None) if relocation is not None else None
+    return bool((max_invisible_steps is not None and max_invisible_steps > 0) or uses_taminggs_visibility(config))
+
+
+def ensure_selective_adam_renderer_outputs(
+    renderer_cfg: Any,
+    *,
+    enable_cumulated_weights: bool = True,
+) -> None:
+    """Force renderer scene outputs required by visibility consumers.
 
     Handles every shape ``renderer_cfg.outputs`` can take across the config paths:
       * ``None`` — create the scene mapping from scratch.
@@ -249,34 +282,41 @@ def ensure_selective_adam_renderer_outputs(renderer_cfg: Any) -> None:
     """
     if isinstance(renderer_cfg, DictConfig):
         with read_write(renderer_cfg):
-            OmegaConf.update(
-                renderer_cfg,
-                "outputs.scene.enable_cumulated_weights",
-                True,
-                force_add=True,
-            )
+            if enable_cumulated_weights:
+                OmegaConf.update(
+                    renderer_cfg,
+                    "outputs.scene.enable_cumulated_weights",
+                    True,
+                    force_add=True,
+                )
             OmegaConf.update(renderer_cfg, "outputs.scene.enable_visibility", True, force_add=True)
         return
 
     outputs = renderer_cfg.outputs
     if isinstance(outputs, DictConfig):
         with read_write(outputs):
-            OmegaConf.update(outputs, "scene.enable_cumulated_weights", True, force_add=True)
+            if enable_cumulated_weights:
+                OmegaConf.update(outputs, "scene.enable_cumulated_weights", True, force_add=True)
             OmegaConf.update(outputs, "scene.enable_visibility", True, force_add=True)
         return
 
     if outputs is None:
-        renderer_cfg.outputs = {"scene": {"enable_cumulated_weights": True, "enable_visibility": True}}
+        scene_outputs = {"enable_visibility": True}
+        if enable_cumulated_weights:
+            scene_outputs["enable_cumulated_weights"] = True
+        renderer_cfg.outputs = {"scene": scene_outputs}
         return
 
     scene = outputs.get("scene", {}) if isinstance(outputs, dict) else getattr(outputs, "scene", {})
     if isinstance(scene, dict):
-        scene["enable_cumulated_weights"] = True
+        if enable_cumulated_weights:
+            scene["enable_cumulated_weights"] = True
         scene["enable_visibility"] = True
         if isinstance(outputs, dict):
             outputs["scene"] = scene
     else:
-        scene.enable_cumulated_weights = True
+        if enable_cumulated_weights:
+            scene.enable_cumulated_weights = True
         scene.enable_visibility = True
 
 
@@ -296,15 +336,21 @@ def assert_selective_adam_occlusion_supported(renderer_cfg: Any, selective_adam_
 
 
 def configure_selective_adam_renderer(config: Any) -> None:
-    """Apply SelectiveAdam-only renderer validation and output configuration."""
-    if not uses_selective_adam(config):
+    """Configure renderer signals required by SelectiveAdam or MCMC."""
+    selective_adam = uses_selective_adam(config)
+    mcmc_visibility = uses_mcmc_visibility(config)
+    if not selective_adam and not mcmc_visibility:
         return
 
-    assert_selective_adam_occlusion_supported(
+    if selective_adam:
+        assert_selective_adam_occlusion_supported(
+            config.renderer,
+            config.selective_adam_occlusion_aware,
+        )
+    ensure_selective_adam_renderer_outputs(
         config.renderer,
-        config.selective_adam_occlusion_aware,
+        enable_cumulated_weights=selective_adam,
     )
-    ensure_selective_adam_renderer_outputs(config.renderer)
 
 
 @dataclass(frozen=True)
@@ -423,13 +469,14 @@ class GaussiansComposite(BaseModel, CompositeModel):
         init_from_datasource: bool,
         component_only: Optional[ComponentOnlyConfig] = None,
     ):
+        initialization_requests: list[InitializationRequest] = []
         BaseModel.__init__(self, config.to_dictconfig())
         self.register_load_state_dict_pre_hook(self._invalidate_fused_gather_generation_plan_before_load)
         self.register_load_state_dict_pre_hook(self._restore_initialization_skipped_layers)
         self.register_load_state_dict_pre_hook(self._reset_incompatible_mcmc_visibility_state_on_load)
         self.register_load_state_dict_post_hook(self._refresh_mcmc_runtime_state_after_load)
         self.register_load_state_dict_post_hook(self._invalidate_derived_render_caches_after_load)
-        self.register_state_dict_pre_hook(self._raise_if_mcmc_publication_failed_before_state_dict)
+        self.register_state_dict_pre_hook(self._raise_if_publication_failed_before_state_dict)
         self.config = config  # type: ignore[assignment] # Override with typed config
         self.trainer_config = trainer_config
         self.gaussian_process_group: Optional[torch.distributed.ProcessGroup] = None
@@ -618,16 +665,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 cuboid_subset_for_node = CuboidTracks.Ops.subset_from_tracks_id(cuboid_subset, supervised_ids)
 
             # Check if the class specific labels are specified or if there is an intradependency on other layers
-            labels_to_ignore = []
-            labels_to_use = self.config.layers[layer_id].class_labels or []
-            if layers_to_ignore := (self.config.layers[layer_id].ignore_classes_from_layers or []):
-                labels_to_ignore.extend(
-                    [
-                        label
-                        for layer in layers_to_ignore
-                        for label in unpack_optional(self.config.layers[layer].class_labels)
-                    ]
-                )
+            labels_to_ignore, labels_to_use = layer_labels(self.config.layers, layer_id)
 
             # Set start and end timestamp for SHGaussianModel with temporal appearance
             if unpack_optional(layer_config.fourier_features_dim) > 1:
@@ -645,13 +683,8 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 start_end_timestamp_us = None
 
             try:
-                initializer = BaseInitialization.factory(
-                    layer_config.initialization.name,
-                    layer_config.initialization,
-                    layer_config,
-                    trainer_config,
-                    labels_to_ignore=labels_to_ignore,
-                    labels_to_use=labels_to_use,
+                initializer = acquire_initializer(
+                    layer_id, layer_config, trainer_config, labels_to_ignore, labels_to_use
                 )
 
                 gaussians_nodes[layer_id] = BaseGaussianModel.factory(
@@ -665,6 +698,9 @@ class GaussiansComposite(BaseModel, CompositeModel):
                     cuboid_subset_for_node,
                     start_end_timestamp_us,
                 )
+
+                if init_from_datasource and trainer_config.world_size == 1:
+                    initialization_requests.append((initializer, datasource, cuboid_subset_for_node))
 
                 if gaussian_template_node_model is None:
                     gaussian_template_node_model = gaussians_nodes[layer_id]
@@ -932,6 +968,54 @@ class GaussiansComposite(BaseModel, CompositeModel):
 
         self._apply_component_only_freeze()
         self._log_component_inventory()
+
+        if initialization_requests:
+            prepare_camera_initializers(initialization_requests)
+
+    def to_device(self, device: torch.device | str) -> Self:
+        """Move module state and cuboid tracks to ``device``."""
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            target = torch.device("cuda", torch.cuda.current_device())
+        self.to(target)
+
+        moved: dict[int, CuboidTracks] = {}
+
+        def move(tracks: CuboidTracks) -> CuboidTracks:
+            key = id(tracks)
+            if key not in moved:
+                moved[key] = tracks if tracks.device == target else tracks.to_device(target)
+            return moved[key]
+
+        self.cuboid_tracks = move(self.cuboid_tracks)
+        self._component_only_layer_tracks = {
+            layer_id: move(tracks) for layer_id, tracks in self._component_only_layer_tracks.items()
+        }
+        for node in self.gaussians_nodes.values():
+            if (tracks := getattr(node, "cuboid_tracks", None)) is not None:
+                setattr(node, "cuboid_tracks", move(tracks))
+
+        # Collector configs hold these buffers outside the module tree.
+        for node, layer_config in zip(self.gaussians_nodes.values(), self.collector.layers_config.layers, strict=True):
+            embed_config = getattr(layer_config, "embed_config", None)
+            if isinstance(
+                embed_config,
+                (collect.IndividualRemapTimeInputEmbeddingConfig, collect.IndividualStepTimeInputEmbeddingConfig),
+            ):
+                time_embed = cast(SHGaussianModel, node).time_embed
+                assert time_embed is not None
+                embed_config.timestamps_us_ranges = cast(torch.Tensor, time_embed.timestamps_us_ranges)
+        return self
+
+    def cuboid_track_devices(self) -> set[torch.device]:
+        """Return devices used by the model's cuboid tracks."""
+        tracks = [self.cuboid_tracks, *self._component_only_layer_tracks.values()]
+        tracks.extend(
+            node_tracks
+            for node in self.gaussians_nodes.values()
+            if (node_tracks := getattr(node, "cuboid_tracks", None)) is not None
+        )
+        return {track.device for track in tracks}
 
     @staticmethod
     def _resolve_lidar_idx_to_id(datasource: DataSourceSummary) -> dict[int, str]:
@@ -1716,19 +1800,19 @@ class GaussiansComposite(BaseModel, CompositeModel):
     def refresh_mcmc_scenes(self) -> None:
         self.gaussians_strategy.refresh_runtime_scenes(self.gaussians_nodes)
 
-    def raise_if_mcmc_publication_failed(self) -> None:
+    def raise_if_publication_failed(self) -> None:
         for node in self.gaussians_nodes.values():
             if isinstance(node, BaseGaussianModel):
-                node.raise_if_mcmc_publication_failed()
+                node.raise_if_publication_failed()
 
     @staticmethod
-    def _raise_if_mcmc_publication_failed_before_state_dict(
+    def _raise_if_publication_failed_before_state_dict(
         module: GaussiansComposite,
         prefix: str,
         keep_vars: bool,
     ) -> None:
         del prefix, keep_vars
-        module.raise_if_mcmc_publication_failed()
+        module.raise_if_publication_failed()
 
     def configure_sharded_params_and_buffers(self) -> list[str]:
         ret = []
@@ -1753,19 +1837,22 @@ class GaussiansComposite(BaseModel, CompositeModel):
         """
         self._invalidate_fused_gather_generation_plan()
         skipped_nodes: set[str] = set()
-        for name, node in self.gaussians_nodes.items():
-            log.info(f"GaussiansComposite/maybe_initialize_gaussians: node={name}")
-            try:
-                node.maybe_initialize_gaussians()
-            except NoPointsFoundException as error:
-                if self.component_only is not None and self._component_state(name) != ComponentState.disabled:
-                    raise ValueError(
-                        f"component_only: non-disabled layer '{name}' could not be initialized because "
-                        "deferred initialization found no points. It cannot be rendered or supervised; "
-                        "disable it or fix its initialization."
-                    ) from error
-                log.warning("Skipping Gaussian node '%s' after deferred initialization: %s", name, error)
-                skipped_nodes.add(name)
+        # One scope around the loop lets the second vehicle-light layer reuse the first's mask and frame work.
+        # The cache holds its VRAM until every layer in this loop has initialized.
+        with shared_vehicle_light_frame_cache():
+            for name, node in self.gaussians_nodes.items():
+                log.info(f"GaussiansComposite/maybe_initialize_gaussians: node={name}")
+                try:
+                    node.maybe_initialize_gaussians()
+                except NoPointsFoundException as error:
+                    if self.component_only is not None and self._component_state(name) != ComponentState.disabled:
+                        raise ValueError(
+                            f"component_only: non-disabled layer '{name}' could not be initialized because "
+                            "deferred initialization found no points. It cannot be rendered or supervised; "
+                            "disable it or fix its initialization."
+                        ) from error
+                    log.warning("Skipping Gaussian node '%s' after deferred initialization: %s", name, error)
+                    skipped_nodes.add(name)
 
         self._prune_initialization_skipped_layers(skipped_nodes)
 
@@ -1783,6 +1870,8 @@ class GaussiansComposite(BaseModel, CompositeModel):
         self._apply_component_only_frozen_tracks()
         self._apply_component_only_freeze()
         self.refresh_mcmc_scenes()
+        # The outer startup scope also drains jobs if initialization raises.
+        close_current_initialization()
 
     def _prune_initialization_skipped_layers(self, skipped_nodes: set[str]) -> bool:
         """Align model/strategy/collector inventories; return whether the strategy was rebuilt."""
@@ -2294,8 +2383,8 @@ class GaussiansComposite(BaseModel, CompositeModel):
         self.drain_fused_gather_generation_plan_refresh()
 
     def _supports_fused_gather_generation_plan(self) -> bool:
-        """Restrict shape-schedule ownership to the two known exact strategies."""
-        return type(getattr(self, "gaussians_strategy", None)) in (GSplatStrategy, MCMCStrategy)
+        """Restrict shape-schedule ownership to the supported exact strategies."""
+        return type(getattr(self, "gaussians_strategy", None)) in (GSplatStrategy, MCMCStrategy, TamingGSMCMCStrategy)
 
     def _is_fused_gather_generation_refresh_step(self, global_step: int) -> bool:
         """Ask whether batch end may change per-layer row counts or layout."""
@@ -2646,6 +2735,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
         is_training_batch: bool,
         sensor_name: str,
         segment_plan: SegmentPlan | None = None,
+        shared_camera_scene: bool = False,
     ) -> GaussiansRenderReturn:
         """
         Render using pre-collected gaussian parameters.
@@ -2666,9 +2756,10 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 )
             with ScopedTimer(f"GaussiansComposite/edit_overrides_{sensor_name}"):
                 try:
+                    timestamp_data = rendering_data[0] if shared_camera_scene else rendering_data
                     self._edit_overrides.apply(
                         gaussian_parameters,
-                        frame_timestamp_us=BaseGaussianModel.get_frame_timestamp(rendering_data),
+                        frame_timestamp_us=BaseGaussianModel.get_frame_timestamp(timestamp_data),
                         layouts=edit_layouts,
                     )
                 except Exception:
@@ -2688,6 +2779,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 extra_ray_signal_infos=extra_ray_signal_infos,
                 frame_meta=frame_meta,
                 segment_plan=segment_plan,
+                shared_camera_scene=shared_camera_scene,
             )
 
         if not is_training_batch:
@@ -2695,6 +2787,15 @@ class GaussiansComposite(BaseModel, CompositeModel):
             out.normal = torch.nn.functional.normalize(out.normal, dim=-1) if out.normal is not None else None
 
         return out
+
+    def _compact_global_scene_tensor_to_local(self, value: torch.Tensor) -> torch.Tensor:
+        """Compact a global layer-major scene tensor to this rank's owner rows."""
+        if self._visibility_local_ranges is None:
+            return value
+        views = tuple(value.narrow(0, start, length) for start, length in self._visibility_local_ranges)
+        if not views:
+            return value.new_empty((0, *value.shape[1:]))
+        return views[0] if len(views) == 1 else torch.cat(views, dim=0)
 
     def _compact_scene_data_to_local(self, out: Optional[GaussiansRenderReturn]) -> None:
         """Compact every scene-level field to the local rank's contiguous layer ranges.
@@ -2713,16 +2814,51 @@ class GaussiansComposite(BaseModel, CompositeModel):
         if out is None or self._visibility_local_ranges is None:
             return
 
-        visibility_local_ranges = self._visibility_local_ranges
-
-        def compact(value: torch.Tensor) -> torch.Tensor:
-            views = tuple(value.narrow(0, start, length) for start, length in visibility_local_ranges)
-            return views[0] if len(views) == 1 else torch.cat(views, dim=0)
-
         for name in GaussiansRenderReturn._SCENE_LEVEL_FIELDS:
             value = getattr(out, name)
             if value is not None:
-                setattr(out, name, compact(value))
+                setattr(out, name, self._compact_global_scene_tensor_to_local(value))
+
+    def _prepare_mcmc_visibility_union(
+        self,
+        out_cam: Optional[GaussiansRenderReturn],
+        out_lidar: Optional[GaussiansRenderReturn],
+        *,
+        element_count: int,
+        device: torch.device,
+    ) -> AsyncVisibilityUnion:
+        """Prepare global render visibility before owner-local compaction.
+
+        Each rank renders globally gathered Gaussians from a different training
+        sample. Reducing after compaction would compare unrelated owner rows at
+        the same local index, so the packet captures the shared global
+        layer-major layout. The system launches its collective only after the
+        coordinated forward-error gate.
+        """
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+            and self._visibility_local_ranges is None
+        ):
+            raise RuntimeError("MCMC visibility has no DDP owner-row layout")
+        visibility_sources: list[torch.Tensor] = []
+        for rendered in (out_cam, out_lidar):
+            if rendered is None:
+                continue
+            source = rendered.frustum_visibility
+            if source is None:
+                source = rendered.visibility
+            if source is None:
+                continue
+            visibility_sources.append(source)
+
+        return prepare_async_visibility_union(
+            visibility_sources,
+            element_count=element_count,
+            device=device,
+            local_ranges=self._visibility_local_ranges,
+            positive_only=False,
+        )
 
     def _active_camera_tile_size(self, width: int, height: int) -> tuple[int, int] | None:
         """(tile_height, tile_width) the camera active tile mask must be built at so it lands
@@ -3111,6 +3247,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
         lidar_stream: Optional[torch.cuda.Stream] = None,
         prepare_selective_adam_visibility: bool = False,
         prefetched_parameter_gather: Optional[_PendingGaussianParameterGather] = None,
+        shared_camera_scene: bool = False,
     ) -> GaussiansCompositeReturn:
         assert rendering_data_cam is not None or rendering_data_lidar is not None, (
             f"{self.__class__.__name__} Either camera or lidar must be provided"
@@ -3134,12 +3271,25 @@ class GaussiansComposite(BaseModel, CompositeModel):
         has_lidar = rendering_data_lidar is not None
 
         if has_cam:
-            assert frame_meta_cam is not None and len(frame_meta_cam) == 1, "Only single-frame batch is supported"
+            camera_batch = cast(RenderingData, rendering_data_cam).b if shared_camera_scene else 1
+            assert frame_meta_cam is not None and len(frame_meta_cam) == camera_batch, (
+                f"Expected {camera_batch} camera frame metadata entries"
+            )
         if has_lidar:
             assert frame_meta_lidar is not None and len(frame_meta_lidar) == 1, "Only single-frame batch is supported"
+        if shared_camera_scene and has_lidar:
+            raise ValueError("Shared-scene camera batching does not support lidar")
+        if shared_camera_scene:
+            if is_training_batch:
+                raise ValueError("Shared-scene camera batching supports inference only")
+            timestamps = cast(RenderingData, rendering_data_cam).timestamps_startend_us_cpu
+            if not torch.equal(timestamps, timestamps[:1].expand_as(timestamps)):
+                raise ValueError("Shared-scene camera views must use the same frame interval")
 
         camera_frustum_cull = None
-        if rendering_data_cam is not None:
+        # Shared collection cannot use one view's frustum; gsplat projects the
+        # collected scene independently for each camera.
+        if rendering_data_cam is not None and not shared_camera_scene:
             camera_frustum_cull = self._build_frustum_cull(rendering_data_cam)
 
         lidar_frustum_cull = None
@@ -3219,9 +3369,10 @@ class GaussiansComposite(BaseModel, CompositeModel):
 
         if has_cam:
             rd_cam = cast(RenderingData, rendering_data_cam)
+            collection_data = rd_cam[0] if shared_camera_scene else rd_cam
             # Collect cam on default stream
             gaussian_cam_parameters, camera_segment_plan = self._collect_sensor(
-                rd_cam,
+                collection_data,
                 is_training_batch,
                 gaussian_nodes,
                 track_transform_ids,
@@ -3270,6 +3421,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 is_training_batch,
                 "cam",
                 segment_plan=camera_segment_plan,
+                shared_camera_scene=shared_camera_scene,
             )
 
         # Synchronize the lidar stream with the default stream to ensure lidar results are ready
@@ -3311,6 +3463,22 @@ class GaussiansComposite(BaseModel, CompositeModel):
                     positive_only=occlusion_aware,
                 )
 
+        mcmc_visibility_union = None
+        if is_training_batch and gaussian_nodes is None and uses_mcmc_visibility(self.config):
+            collected_parameters = (
+                gaussian_cam_parameters if gaussian_cam_parameters is not None else gaussian_lidar_parameters
+            )
+            rendered_for_device = out_cam if out_cam is not None else out_lidar
+            assert collected_parameters is not None
+            assert rendered_for_device is not None
+            with ScopedTimer("GaussiansComposite/mcmc_visibility/prepare_global_union"):
+                mcmc_visibility_union = self._prepare_mcmc_visibility_union(
+                    out_cam,
+                    out_lidar,
+                    element_count=collected_parameters["positions"].shape[0],
+                    device=rendered_for_device.opacity.device,
+                )
+
         # Multi-GPU: slice scene_data (visibility, cumulated_weights) from global to local rank size.
         # The renderer operates on all-gathered gaussians, so these tensors have length = total gaussians
         # across all ranks. The losses expect them to match the local (sharded) parameter count.
@@ -3348,6 +3516,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
             deform_smoothness=deform_smoothness,
             deform_smoothness_mask=deform_smoothness_mask,
             selective_adam_visibility=selective_adam_visibility,
+            mcmc_visibility_union=mcmc_visibility_union,
         )
 
     def get_n_active_features(self) -> int:
@@ -3358,6 +3527,18 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 if isinstance(n_active_features, int):
                     return n_active_features
         return 0
+
+    def supports_shared_camera_batch(self) -> bool:
+        """Return whether one collected scene can render several cameras."""
+        return self._camera_renderer.supports_shared_camera_batch
+
+    def dynamic_track_ids(self) -> list[str]:
+        """Return track IDs whose Gaussian state can vary with the camera frame."""
+        track_ids: set[str] = set()
+        for node in self.gaussians_nodes.values():
+            if isinstance(node, RigidGaussianModel) and not node.is_static:
+                track_ids.update(unpack_optional(node.cuboid_tracks.tracks_id))
+        return sorted(track_ids)
 
     @property
     def controller_distillation_active(self) -> bool:
@@ -3381,6 +3562,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
         render_background: bool = True,
         lidar_stream: Optional[torch.cuda.Stream] = None,
         prepare_selective_adam_visibility: bool = False,
+        shared_camera_scene: bool = False,
         **extra_rays_data,
     ) -> GaussiansCompositeReturn:
         """Main forward pass logic"""
@@ -3441,6 +3623,7 @@ class GaussiansComposite(BaseModel, CompositeModel):
                 lidar_stream=lidar_stream,
                 prepare_selective_adam_visibility=prepare_selective_adam_visibility,
                 prefetched_parameter_gather=prefetched_parameter_gather,
+                shared_camera_scene=shared_camera_scene,
                 **extra_rays_data,
             )
         except BaseException as forward_error:
@@ -3564,46 +3747,66 @@ class GaussiansComposite(BaseModel, CompositeModel):
                     else:
                         out.rendered_cam.rgb[inactive] = 0.0
 
-        # Apply post-processing. We assume single image for post-processing. And only for camera for now.
+        # Apply camera post-processing independently to each rendered view.
         if (
             enable_pp
             and len(self.post_processings) > 0
             and batch.rendering.camera is not None
             and batch.data.camera is not None
         ):
-            with ScopedTimer("GaussiansComposite/post_processing/subsample"):
-                assert batch.rendering.camera.b == 1, "Post-processing only supports batch size 1."
+            camera_rendering = batch.rendering.camera
+            if camera_rendering.b > 1:
+                if not shared_camera_scene:
+                    raise ValueError("Multiple camera views require shared_camera_scene=True")
+                if any(frame_meta.subsample is not None for frame_meta in batch.data.camera.meta):
+                    raise ValueError("Multi-view post-processing does not support subsampled frames")
+            pixels_per_frame = camera_rendering.h * camera_rendering.w
+            for batch_index, frame_meta in enumerate(batch.data.camera.meta):
+                with ScopedTimer("GaussiansComposite/post_processing/subsample"):
+                    if is_training_batch:
+                        assert frame_meta.training_frame_idx >= 0, (
+                            f"training_frame_idx={frame_meta.training_frame_idx} during training batch "
+                            f"(unique_frame_idx={frame_meta.unique_frame_idx}). "
+                            f"This indicates a validation holdout frame leaked into the training sampler."
+                        )
+                    subsample = frame_meta.subsample
+                    if subsample is None:
+                        subsample = RectSubsampled.from_subsample(
+                            original_width=camera_rendering.w,
+                            original_height=camera_rendering.h,
+                            width=camera_rendering.w,
+                            height=camera_rendering.h,
+                        )
+                    pixel_coords = subsample.pixel_coordinates(device=camera_rendering.rays.device)
+                    resolution = subsample.downsampled_resolution()
 
-                if is_training_batch:
-                    training_frame_idx = batch.data.camera.meta[0].training_frame_idx
-                    assert training_frame_idx >= 0, (
-                        f"training_frame_idx={training_frame_idx} during training batch "
-                        f"(unique_frame_idx={batch.data.camera.meta[0].unique_frame_idx}). "
-                        f"This indicates a validation holdout frame leaked into the training sampler."
-                    )
-                subsample = batch.data.camera.meta[0].subsample
-                if subsample is None:
-                    subsample = RectSubsampled(
-                        original_width=batch.rendering.camera.w,
-                        original_height=batch.rendering.camera.h,
-                        width=batch.rendering.camera.w,
-                        height=batch.rendering.camera.h,
-                    )
-                pixel_coords = subsample.pixel_coordinates(device=batch.rendering.camera.rays.device)
-                resolution = subsample.downsampled_resolution()
-            for post_processing in self.post_processings:
-                with ScopedTimer(
-                    f"GaussiansComposite/post_processing/post_processing/{post_processing.__class__.__name__}"
-                ):
-                    post_processing(
-                        results=out,
-                        rays=batch.rendering.camera.rays.reshape(-1, 6),
-                        pixel_coords=pixel_coords.reshape(-1, 2),
-                        resolution=resolution,
-                        training_frame_idx=batch.data.camera.meta[0].training_frame_idx,
-                        unique_sensor_idx=batch.data.camera.meta[0].unique_sensor_idx,
-                        global_step=global_step,
-                    )
+                start = batch_index * pixels_per_frame
+                stop = start + pixels_per_frame
+                view_out = (
+                    out
+                    if camera_rendering.b == 1
+                    else GaussiansCompositeReturn(rendered_cam=unpack_optional(out.rendered_cam)[start:stop])
+                )
+                for post_processing in self.post_processings:
+                    with ScopedTimer(
+                        f"GaussiansComposite/post_processing/post_processing/{post_processing.__class__.__name__}"
+                    ):
+                        post_processing(
+                            results=view_out,
+                            rays=camera_rendering.rays[batch_index].reshape(-1, 6),
+                            pixel_coords=pixel_coords.reshape(-1, 2),
+                            resolution=resolution,
+                            training_frame_idx=frame_meta.training_frame_idx,
+                            unique_sensor_idx=frame_meta.unique_sensor_idx,
+                            global_step=global_step,
+                        )
+                if camera_rendering.b > 1:
+                    rendered = unpack_optional(out.rendered_cam)
+                    rendered_view = unpack_optional(view_out.rendered_cam)
+                    # The serving batch API consumes RGB only. Other post-processing
+                    # outputs are not part of this fast-path contract.
+                    if rendered.rgb is not None and rendered_view.rgb is not None:
+                        rendered.rgb[start:stop].copy_(rendered_view.rgb)
 
         if clamp_output:
             self._maybe_saturate_rgb(out)
@@ -4913,6 +5116,13 @@ class GaussiansComposite(BaseModel, CompositeModel):
         for gaussian_node in self.gaussians_nodes.values():
             gaussian_node.restore_training_parameters()
 
+        self.overriden_state = {}
+
+    def discard_saved_training_parameters(self) -> None:
+        """Release an edit rollback snapshot while keeping the current model state."""
+        # Live state is unchanged, so the fused-gather plan and collect caches remain valid.
+        for gaussian_node in self.gaussians_nodes.values():
+            gaussian_node.discard_saved_training_parameters()
         self.overriden_state = {}
 
     def export_plys(

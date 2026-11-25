@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -138,3 +138,26 @@ torch::Tensor lidar_seg_ensemble_cu(
     torch::Tensor points,
     torch::Tensor result,
     unsigned char ignore_label);
+
+// Per frame and track, the first and last timestamp (us) at which any ray hits the track's cuboid.
+// - returns F x T x 2 int64 [first, last]
+// - a pair with no hit is [INT64_MAX, -1]
+// - every tensor must be contiguous on the same CUDA device
+// - T and F are each at most 65535
+// - runs asynchronously on that device's current stream
+torch::Tensor camera_track_intervals_cu(
+    torch::Tensor pixels,         // N x 2 int16 (i, j) pixel indices at the source image resolution
+    torch::Tensor rays,           // N x 3 float32 camera-space rays
+    torch::Tensor poses,          // F x 2 x 7 float32 start/end poses [x, y, z, quat_x, quat_y, quat_z, quat_w]
+    torch::Tensor timestamps,     // F x 2 int64 start/end frame timestamps (us)
+    torch::Tensor relative_times, // N float32 reported time of each ray, as a fraction of the frame's start-to-end span
+    torch::Tensor packinfo,       // T x 2 int32 [track_start_idx, N_track_poses] each
+    torch::Tensor track_poses,    // N_total_poses x 7 float32 [translation, normalized quaternion]
+    torch::Tensor track_times,    // N_total_poses int64 per-pose timestamps (us)
+    torch::Tensor dims,           // T x 3 float32 cuboid x/y/z extents (in local track frame)
+    int64_t width,                // intersection shutter time of a pixel: i / (width - 1) or j / (height - 1)
+    int64_t height,               // may be below the source image resolution, e.g. when the caller subsamples
+    int64_t shutter,              // ROLLING_TOP_TO_BOTTOM = 1, ROLLING_LEFT_TO_RIGHT = 2, ROLLING_BOTTOM_TO_TOP = 3,
+                                  // ROLLING_RIGHT_TO_LEFT = 4, GLOBAL = 5
+    int64_t max_poses,            // at least the largest N_track_poses
+    int64_t max_hits);            // at least T, so no intersection is truncated

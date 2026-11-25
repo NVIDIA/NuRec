@@ -1,11 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
-import inspect
 import logging
 import os
-import textwrap
 import types
 
 from pathlib import Path
@@ -16,17 +13,28 @@ import numpy as np
 import pytest
 import torch
 
+from upath import UPath
+
 import nurec.systems.base as base_module
 
 from apps.av.road_mesh.ground_mesh import GroundMeshReconstructionSettings
-from nurec.libs.losses.orchestration.config import LossAggregatorBatchReturn, LossAggregatorReturn, LossReturn
+from nurec.datasets.ncore import NCOREDataSource
+from nurec.libs.losses.orchestration.config import (
+    AccumulatorLoss,
+    LossAccumulatorReturn,
+    LossAggregatorBatchReturn,
+    LossAggregatorReturn,
+    LossReturn,
+)
 from nurec.models.calib import BaseCalib
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
-from nurec.systems.base import BaseSystem, BaseSystemSO, DDPStrategySO, _loss_roots_by_name
+from nurec.ncore_backends import NCORE_V4_BACKEND, DatasetMetadata, DatasetRequest, ResolvedDataset
+from nurec.systems.base import BaseSystem, BaseSystemSO, DDPStrategySO
 from nurec.utils.batch import FrameMeta
 from nurec.utils.io.artifact_cache import ArtifactCache, publish_existing_usdz
 from nurec.utils.io.mesh import Mesh
 from nurec.utils.metrics import MetricsCollector
+from nurec.utils.profiling import _collect_backward_node_owners, backward_nvtx_ranges
 from nurec.utils.types import NamedSerialized
 
 
@@ -81,7 +89,7 @@ def test_loss_roots_group_batch_elements_by_loss_name() -> None:
         ]
     )
 
-    roots = _loss_roots_by_name(batch_return)
+    roots = batch_return.backward_roots()
 
     assert set(roots) == {"rgb", "depth"}
     assert roots["rgb"][0] is first_rgb_return.reduced_value
@@ -89,21 +97,33 @@ def test_loss_roots_group_batch_elements_by_loss_name() -> None:
     assert roots["depth"][0] is first_depth_return.reduced_value
 
 
-def test_training_step_keeps_exactly_one_total_manual_backward_call() -> None:
-    """training_step still calls manual_backward once on the summed total."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(BaseSystem.training_step)))
-    manual_backward_calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "manual_backward"
-    ]
-
-    assert len(manual_backward_calls) == 1
-    argument = manual_backward_calls[0].args[0]
-    assert isinstance(argument, ast.Attribute)
-    assert argument.attr == "total_value"
-    assert isinstance(argument.value, ast.Name)
-    assert argument.value.id == "loss_return"
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_accumulator_backward_attribution_preserves_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = torch.tensor([2.0, 4.0], device="cuda", requires_grad=True)
+    ppisp = torch.tensor(3.0, device="cuda", requires_grad=True)
+    result = LossAccumulatorReturn(vector, {"rgb": 0, "ground": 1}, {"rgb": 1.0, "ground": 1.0})
+    result.append_producer_loss(
+        AccumulatorLoss(name="ppisp", value=ppisp, lambda_=0.5, reduce_fn=lambda value, **_: value)
+    )
+    roots = result.backward_roots()
+    total = result.compute_total()
+    assert set(roots) == {"rgb", "ground", "ppisp"}
+    assert total.grad_fn is not None
+    assert _collect_backward_node_owners(roots)[total.grad_fn] == set(result.names)
+    pushes = Mock()
+    pops = Mock()
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", pushes)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", pops)
+    with backward_nvtx_ranges(roots):
+        total.backward(retain_graph=True)
+    torch.testing.assert_close(vector.grad, torch.ones_like(vector))
+    torch.testing.assert_close(ppisp.grad, ppisp.new_tensor(0.5))
+    assert pushes.call_count == pops.call_count > 0
+    pushes.reset_mock()
+    pops.reset_mock()
+    total.backward()
+    pushes.assert_not_called()
+    pops.assert_not_called()
 
 
 def test_setup_distributed_recreates_gaussian_group_after_world(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,8 +254,11 @@ def test_setup_rejects_missing_gaussian_group(monkeypatch: pytest.MonkeyPatch) -
     parent_setup.assert_not_called()
 
 
+@pytest.mark.parametrize("fail_finalization", [False, True])
 @pytest.mark.parametrize("materialize_grad", [True, False], ids=["with-grad", "without-grad"])
-def test_training_step_launches_and_resolves_optimizer_preparation_around_backward(materialize_grad: bool) -> None:
+def test_training_step_launches_and_resolves_optimizer_preparation_around_backward(
+    materialize_grad: bool, fail_finalization: bool
+) -> None:
     events: list[str] = []
     parameter = torch.nn.Parameter(torch.ones(()))
 
@@ -293,24 +316,35 @@ def test_training_step_launches_and_resolves_optimizer_preparation_around_backwa
         if materialize_grad:
             parameter.grad = torch.ones_like(parameter)
 
+    class LossResult:
+        def compute_total(self):
+            events.append("finalize")
+            if fail_finalization:
+                raise RuntimeError("finalization failed")
+            return torch.ones((), requires_grad=True)
+
     harness = types.SimpleNamespace(
         outer_loop_timer=_Timer(),
         inner_loop_timer=_Timer(),
         global_step=0,
         trainer=trainer,
         optimizers=lambda **_kwargs: pl_optimizer,
-        training_losses=lambda _batch, _batch_idx: types.SimpleNamespace(
-            total_value=torch.ones((), requires_grad=True)
-        ),
+        training_losses=lambda _batch, _batch_idx: LossResult(),
         on_training_losses_return=lambda _loss: None,
         manual_backward=manual_backward,
         _launch_optimizers_async_preparation=lambda: events.append("launch_optimizers"),
         _prepare_optimizers_after_backward=lambda: events.append("prepare_optimizers"),
     )
 
+    if fail_finalization:
+        with pytest.raises(RuntimeError, match="finalization failed"):
+            BaseSystem.training_step(cast(Any, harness), batch=cast(Any, None), batch_local_idx=0)
+        assert events == ["finalize"]
+        return
+
     BaseSystem.training_step(cast(Any, harness), batch=cast(Any, None), batch_local_idx=0)
 
-    expected = ["launch_optimizers", "manual_backward", "prepare_optimizers"]
+    expected = ["finalize", "launch_optimizers", "manual_backward", "prepare_optimizers"]
     if materialize_grad:
         expected.append("optimizer_step")
     assert events == expected
@@ -378,7 +412,7 @@ def _run_training_step_with_scheduler(
         trainer=trainer,
         optimizers=lambda **_kwargs: pl_optimizer,
         training_losses=lambda _batch, _batch_idx: types.SimpleNamespace(
-            total_value=torch.ones((), requires_grad=True)
+            compute_total=lambda: torch.ones((), requires_grad=True)
         ),
         on_training_losses_return=lambda _loss: None,
         manual_backward=lambda _loss: setattr(parameter, "grad", torch.ones_like(parameter)),
@@ -1076,14 +1110,30 @@ class _ArtifactCalib(BaseCalib):
         return copied
 
 
-class _RigDataSource:
+class _RigDataSource(NCOREDataSource):
     def __init__(self) -> None:
         self.source_rig = types.SimpleNamespace(
             rig_trajectories=[types.SimpleNamespace(T_rig_world_timestamps_us=torch.tensor([1_000_000, 2_000_000]))],
             baked_offset=0.0,
         )
 
-        self.lidar_sensors = {"lidar_fu": object()}
+        self.lidar_sensors = {"lidar_fu": Mock()}
+        self.resolved_dataset = ResolvedDataset(
+            backend=NCORE_V4_BACKEND,
+            request=DatasetRequest(metadata_path=UPath("unused.json")),
+            metadata=DatasetMetadata(
+                sequence_id="test",
+                time_range_start_us=1_000_000,
+                time_range_end_us=2_000_000,
+                dataset_paths=(),
+            ),
+        )
+
+    def get_track_split_metadata(self):
+        return None
+
+    def get_semantic_classes_map(self, **kwargs):
+        return {}
 
     def get_rig_trajectories(self):
         return self.source_rig
@@ -1152,7 +1202,7 @@ def test_populate_artifact_cache_serializes_firing_patterns_independently(monkey
         parsed_config=types.SimpleNamespace(enabled=False),
         nrend=types.SimpleNamespace(enabled=False),
         rig_trajectories=types.SimpleNamespace(enabled=False, add_default_cameras=True),
-        firing_patterns=types.SimpleNamespace(enabled=True),
+        firing_patterns=types.SimpleNamespace(enabled=True, include_modeled_lidars=False),
     )
     artifact_cache = ArtifactCache(artifact_config=artifact_config)
     # Pre-set so the summary block, which does not understand this stub, is skipped.
@@ -1161,20 +1211,23 @@ def test_populate_artifact_cache_serializes_firing_patterns_independently(monkey
 
     seen = []
 
-    def fake_serialize_patterns(rig_trajectories, lidar_sensors):
-        seen.append((rig_trajectories, lidar_sensors))
+    def fake_serialize_patterns(rig_trajectories, lidar_sensors, dataset, *, include_modeled_lidars):
+        assert include_modeled_lidars is False
+        seen.append((rig_trajectories, lidar_sensors, dataset))
         return [NamedSerialized(filename="firing_patterns/lidar_fu.npz", serialized=b"npz")]
 
-    monkeypatch.setattr("nurec.utils.io.firing_patterns.serialize_firing_patterns", fake_serialize_patterns)
+    monkeypatch.setattr("nurec.lidar.firing_patterns.io.serialize_firing_patterns", fake_serialize_patterns)
 
     _TestSystem.populate_artifact_cache(system, {})
 
     assert [member.filename for member in artifact_cache.firing_patterns] == ["firing_patterns/lidar_fu.npz"]
-    # Measured off the CALIBRATED trajectories, the same ones the artifact records.
+    # Calibrated sensor inventory.
     assert seen[-1][0] is not datasource.source_rig
     assert seen[-1][1] is datasource.lidar_sensors
+    assert seen[-1][2] is datasource.resolved_dataset
+    assert seen[-1][2].backend is datasource.resolved_dataset.backend
 
-    # Cached after the first export, so a second call does not re-measure.
+    # One export per artifact cache.
     _TestSystem.populate_artifact_cache(system, {})
     assert len(seen) == 1
 
@@ -1206,7 +1259,7 @@ def test_populate_artifact_cache_skips_firing_patterns_when_disabled(monkeypatch
     def fail(*_args, **_kwargs):
         raise AssertionError("firing patterns must not be measured when the export is disabled")
 
-    monkeypatch.setattr("nurec.utils.io.firing_patterns.serialize_firing_patterns", fail)
+    monkeypatch.setattr("nurec.lidar.firing_patterns.io.serialize_firing_patterns", fail)
 
     _TestSystem.populate_artifact_cache(system, {})
     assert artifact_cache.firing_patterns is None

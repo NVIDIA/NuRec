@@ -126,7 +126,15 @@ unzip -p baked.usdz asset_edits_manifest.json | jq '.controls[] | {control, stat
 
 ## The idea: geometry in, addressing out
 
-The bake does two things. It physically appends the asset's gaussians to the scene
+Every edit names its operation with a required `op`. `replace` bakes an asset onto a
+captured actor's track and hides the actor; `add` bakes an asset onto a track without
+hiding anything (an attachment) or, at a `world` pose, introduces a new prop on a
+synthesized track; `clone` duplicates a captured track's trained gaussians (or bakes
+another edit's asset again) onto a new track that inherits the source's motion or parks
+at a world pose; `exclude` hides a captured actor and appends nothing. The schema module
+docstring (`nurec/utils/edit/asset_edits_schema.py`) is the format reference.
+
+For an asset-baking edit the bake does two things. It physically appends the asset's gaussians to the scene
 (every switchable state at once — non-default states hidden, the default state and
 static dressing visible), and it writes down where they landed:
 
@@ -155,10 +163,9 @@ On the wire (`DynamicObject.aspect_state`):
 - An empty list means "every baked cluster of this actor HIDDEN this frame"
   (zero opacity — the clusters simply do not rasterize; nothing renders black).
   That includes the off state's geometry, so selecting `off` requires the off-state
-  aspects, not an empty list. Nor does it restore the captured actor:
-  `replace_original: true` — the bake option that hides the actor an edit
-  replaces (see The pipeline) — is baked into the checkpoint, out of the aspect
-  set's reach. A missing `aspect_state` field
+  aspects, not an empty list. Nor does it restore the captured actor: a `replace`
+  (or `exclude`) hides the captured actor in the checkpoint (see The pipeline), out
+  of the aspect set's reach. A missing `aspect_state` field
   means "no statement — render this actor's scheduled/baked state this frame". The two
   cases are distinguishable because `aspect_state` is a message field, which always has
   explicit presence in proto3 (the `optional` keyword documents the intent; it is not
@@ -206,9 +213,11 @@ the scene must support baked asset edits, live insertion, or PLY replacement.
    `--label-tracks <layer_id>` does render, with an id label drawn on every track of that
    layer, on every product named by `--output-type`. Pick the track, write the edit.
 2. **Bake** (`nurec compile-asset-edits`). The composed asset is placed onto the track
-   with one shared transform: uniformly scaled so its length matches the cuboid
-   (`fit_length`) and rested on the cuboid floor. `replace_original: true` hides the
-   captured actor's gaussians (a rebake from the original artifact undoes this). Each
+   with one shared transform and rested on the cuboid floor. A replace is uniformly
+   scaled so its length matches the cuboid (`fit_length`); an add keeps its real size
+   unless its `scale` says otherwise. `op: replace` hides the captured
+   actor's gaussians, `op: add` leaves them (a rebake from the original artifact undoes
+   either). Each
    `controllable` variantSet state bakes as its own cluster — the default state
    visible, every other state hidden; elements identical in every state are baked
    once. The manifest is embedded in the output USDZ.
@@ -226,7 +235,7 @@ the scene must support baked asset edits, live insertion, or PLY replacement.
    serve. (One narrow degrade: a manifest track that passes validation but cannot be
    resolved against the composite's track LIST is dropped with a warning rather than
    failing the scene — its clusters stay hidden and unaddressable.) Refusal matters
-   because — with `replace_original` — the captured actor is hidden in the bake, so
+   because — after a `replace` — the captured actor is hidden in the bake, so
    serving without the edits would silently render a hole where it was. For the same reason the
    `edit_assets` RPC (asset replacement/insertion) is refused on edit-baked scenes: it
    reorders layer rows and would invalidate the manifest's baked indices. Clients can
@@ -258,9 +267,10 @@ Two flags, two different formats, so they carry different names:
 `nurec render --asset-manifest <manifest.json>` overrides where the GEOMETRY manifest is
 read from; by default it comes from inside the baked USDZ, which is where it belongs.
 It only takes effect together with `--asset-edits-schedule`, and the manifest is checked
-against the loaded checkpoint before anything renders (row counts, a per-layer track-id
-digest, and each cluster's rows actually belonging to the track it claims) — pairing a
-manifest with the wrong artifact is refused rather than rendered.
+against the loaded checkpoint before anything renders (a row count and a track-id digest
+for every layer the bake touched — cluster-free bakes of static replaces, excludes and
+captured clones included — and each cluster's rows actually belonging to the track it
+claims) — pairing a manifest with the wrong artifact is refused rather than rendered.
 
 ## Assets are the USD-native surface
 
@@ -292,10 +302,11 @@ no manifest controls, a normal `assets[]` provenance record. It takes no `contro
 and no `prim_path` (the schema rejects both). Animated or controllable assets remain
 SimReady USD only.
 
-A `.ply` carries no units. On a track bind the default `fit_length` fits its bbox to
-the cuboid, so the unit-normalised PLYs the asset bank ships need nothing extra; on a
-world bind pass the prop's real-world `dims` and `scale: fit_length` (or a numeric
-`scale`), otherwise a normalised file bakes about a metre long. Higher-order SH is
+A `.ply` carries no units. A replace's default `fit_length` fits its bbox to the
+cuboid, so the unit-normalised PLYs the asset bank ships need nothing extra there. An
+add keeps real size by default: on a track bind pass `scale: fit_length` (or a numeric
+`scale`); on a world bind pass the prop's real-world `dims` and `scale: fit_length`.
+Otherwise a normalised file bakes about a metre long. Higher-order SH is
 zero-padded or truncated to the scene's SH width at bake time, like any asset.
 
 ## World-pose binds: introducing new props
@@ -307,10 +318,12 @@ replacement rides a captured track:
 ```yaml
 edits:
   - id: barrier_1
+    op: add
     bind: { type: world, position: [150.0, -3.5, 0.0], yaw_deg: 90.0 }
     asset: props/barrier_waterfilled_01/Body.usd
     # no controls: a bare static prop; add controls later to animate it
   - id: cone_1
+    op: add
     bind: { type: world, position: [152.0, -3.5, 0.0], dims: [0.4, 0.4, 0.7] }
     asset: props/traffic_cone/9000014.ply # a static prop may be a 3DGS .ply
     placement: { scale: fit_length } # bank PLYs are unit-normalised: fit to dims
@@ -326,7 +339,8 @@ edits:
   `label_class` (default `protruding_object`) that must route it to the edit's target
   layer and no other — the bake asserts this — and 2 keyframes spanning the artifact's
   rig playback window.
-- `replace_original` is rejected: there is nothing to replace.
+- Only `op: add` binds a world pose: there is no captured actor there to replace or
+  exclude.
 
 The bake persists the track fully: it is appended to `datasource_summary.json` (NuRec
 frame) and `sequence_tracks.json` (world frame) inside the output USDZ, and every
@@ -346,8 +360,53 @@ Consequences worth knowing:
 - Making the prop controllable later is just re-baking with a `controls:` block —
   everything downstream already addresses it by `(layer_id, nurec_track_id)` and its
   string track id, exactly like a replacement edit.
+- A `clone` rides the same machinery with a different pose source: its synthetic track
+  carries the source track's calibrated keyframes (offset in the source's cuboid-local
+  frame, optionally shifted in time) or a parked constant pose, and — for a captured
+  source — the source's per-track appearance state is copied alongside its rows. An
+  `exclude` synthesizes nothing: it hides the captured rows and lists the track under
+  the manifest's `excluded_tracks`; the track itself stays in the scene metadata so no
+  other track's index moves.
 - Props carry no semantic signal (class 0 in semantic outputs) and zeroed lidar
   intensity, same as every baked cluster.
+
+### Layers that share their tracks
+
+Some scene configs give part of an actor its own Gaussian layer that takes its motion from
+an owner layer (`motion_source_layer: dynamic_rigids` / `static_rigids`). Such a dependent
+layer has the same track filter as its owner, so both hold the same tracks at the same
+indices, and NuRec refuses to load them otherwise. The bake keeps that promise:
+
+- Edits name the owner layer. A `layer_id` naming a dependent layer is refused: it has no
+  tracks of its own.
+- A `replace` or `exclude` on an owner track also hides that track's rows in every
+  dependent layer, so no part of a replaced actor floats around the asset.
+- A captured `clone` also copies the dependents' rows of the source track onto the clone's
+  track, with the dependents' own per-track state.
+- A layer may key its appearance to track frames instead of a time embedding: a
+  `features_albedo` table of shape `[G, N, 3]` with `fourier_features_dim: 1`, read at the
+  keyframe of the layer's own track nearest the frame time. Its frames can be packed
+  differently from the owner's motion keyframes (short-gap coalescing is per layer), so a
+  clone's copied table is re-indexed onto the clone's keyframes rather than copied as is.
+  An inherited clone shows, at each keyframe, the frame its source showed `time_shift_us`
+  earlier; a source frame the owner coalesced away shows its kept neighbour's. In a static
+  owner layer, which calibrates every track to one frozen pose, an inherited clone holds that
+  pose at its source's frames, shifted, so it keeps every frame. A parked
+  clone gets one constant-pose keyframe per source frame, spread evenly over the clip
+  window, so it plays its source's frames once across the clip, the way its time-embedded
+  appearance in the owner layer stretches over its span. When several such layers pack the
+  source's frames differently, the parked keyframes are their union; a table with fewer columns
+  than the clone has keyframes is widened (every row repeats its last column, as the trained
+  table pads short tracks, so existing rows render unchanged).
+- A clone's keyframes are the ones every layer carrying it keeps when the artifact reloads
+  (each layer re-applies its own short-gap coalescing at load), so per-keyframe checkpoint
+  rows and re-indexed tables line up with the reloaded track.
+- Synthetic tracks (world binds, clones) must be captured by the owner and all its
+  dependents, at the same index; anything else fails the bake. A world bind's track gets
+  the flags the target layer's filter needs (no `DYNAMIC` for an `is_dynamic: false` layer).
+- The manifest records the per-layer effect under each edit record's `dependent_layers`
+  (and on `excluded_tracks` entries), and binds every touched layer's row count and track
+  digest, dependents included.
 
 ## Relation to in-place editing (`edit_assets`)
 
@@ -357,21 +416,20 @@ actors or replaces existing ones **in place**, by mutating the loaded model's pa
 `restore_model_parameters` as the whole-scene undo. The two look adjacent — both put new
 assets on tracks — but they solve different problems with opposite mechanics:
 
-|                    | Baked asset edits (this doc)                     | `edit_assets`                                   |
-| ------------------ | ------------------------------------------------ | ----------------------------------------------- |
-| Asset              | SimReady USD (or a static `.ply`), baked offline | one static splat cloud (AssetBank id or `.ply`) |
-| Applied            | at bake time; the artifact ships the result      | live, per RPC, on the loaded model              |
-| Server state       | none — per-request `aspect_state`, nothing kept  | edits persist until `restore_model_parameters`  |
-| Animation          | per-frame aspect switching                       | none                                            |
-| Model weights      | untouched (per-frame collected-buffer overrides) | mutated in place                                |
-| Multi-process pool | works (statelessness — see The design rule)      | refused (in-place weight mutation cannot share) |
+|               | Baked asset edits (this doc)                     | `edit_assets`                                   |
+| ------------- | ------------------------------------------------ | ----------------------------------------------- |
+| Asset         | SimReady USD (or a static `.ply`), baked offline | one static splat cloud (AssetBank id or `.ply`) |
+| Applied       | at bake time; the artifact ships the result      | live, per RPC, on the loaded model              |
+| Server state  | none — per-request `aspect_state`, nothing kept  | edits persist until `restore_model_parameters`  |
+| Animation     | per-frame aspect switching                       | none                                            |
+| Model weights | untouched (per-frame collected-buffer overrides) | mutated in place                                |
 
 They are mutually exclusive **per scene**: `edit_assets` insert/replace reorders and
 regrows layer rows, which would silently invalidate the baked manifest's row indices, so
 it is refused on an edit-baked artifact (bake the desired assets instead, or serve a
 plain artifact for `edit_assets`). Every scene without a baked manifest is untouched by
-this design — `edit_assets` behaves there exactly as before. Composing the two on one
-scene — live inserts on top of a baked artifact — would require the runtime's row
+this design — `edit_assets` behaves there exactly as before. Composing the two mechanisms
+on one scene — live inserts on top of a baked artifact — would require the runtime's row
 addressing to be remapped live as edits mutate the layers; that is a known follow-up,
 not part of this design.
 

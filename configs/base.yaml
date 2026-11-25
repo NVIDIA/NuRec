@@ -3,6 +3,7 @@
 
 defaults:
   - _self_
+  - /image_resolution/fixed_render@fixed_camera_render.resolution: relative_2
   - profiling@profiling.params
   - prober
   - /logger: wandb
@@ -95,6 +96,8 @@ checkpoint:
     rig_trajectories:
       enabled: true
       add_default_cameras: false
+    firing_patterns:
+      enabled: true
     sequence_tracks:
       enabled: true
       controllable_only: false
@@ -122,7 +125,6 @@ fixed_camera_render:
   views: [rgb, residual]
   every_n_steps: 100
   start_step: 0
-  subsample: 2          # 1 = full camera resolution, 2 = half, etc.
   video_fps: 10
   jpeg_quality: 90
 

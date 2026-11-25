@@ -24,6 +24,7 @@ py_library(
         "//nurec/benchmark:__subpackages__",
     ],
     deps = [
+        ":pylib_render_frame_pipeline",
         "//nurec/artifact:pylib",
         "//nurec/asset_edits:pylib",  # asset-edit override runtime hooked into render CLI
         "//nurec/datasets:pylib",
@@ -84,6 +85,7 @@ py_library(
         "depth.py",
         "ego_mask.py",
         "gaussian_export_accessor.py",
+        "gaussian_partition.py",
         "gaussian_plys.py",
         "gaussian_statistics.py",
         "gaussian_usd_asset.py",
@@ -174,6 +176,7 @@ pytest_test(
     ],
     deps = [
         ":pylib_render",
+        ":pylib_render_frame_pipeline",
         "//nurec/render:pylib",
         "//nurec/utils:pylib",
         "//nurec/utils:pylib_geometry",
@@ -271,6 +274,7 @@ pytest_test(
         "//nurec/models:pylib",
         pip_requirement("click"),
         pip_requirement("imageio"),
+        pip_requirement("opencv-python"),
         pip_requirement("nvidia-ncore"),
         pip_requirement("torch"),
         "@rules_python//python/runfiles",
@@ -355,4 +359,17 @@ pytest_test(
         "//nurec/grpc/protos:grpc_pb2",
         pip_requirement("grpcio"),  # test builds grpc.aio.AioRpcError to drive admission-retry
     ],
+)
+
+# The wall-accounting helper is independent of rendering and can be tested without CUDA.
+py_library(
+    name = "pylib_render_frame_pipeline",
+    srcs = ["render_frame_pipeline.py"],
+)
+
+pytest_test(
+    name = "render_frame_pipeline_test",
+    size = "small",
+    srcs = ["render_frame_pipeline_test.py"],
+    deps = [":pylib_render_frame_pipeline"],
 )

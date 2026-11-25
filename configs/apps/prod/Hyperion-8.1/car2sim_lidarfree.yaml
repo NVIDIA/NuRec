@@ -18,7 +18,7 @@ defaults:
   - /apps/prod/Hyperion-8.1/options/sensors: hyperion8.1_6cam_1lidar
   - /apps/prod/Hyperion-8.1/options/validation: default
   - /apps/prod/options/calib: disabled
-  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "30000"
+  - /apps/prod/Hyperion-8.1/options/samples_per_epoch: "27000"
   - /apps/prod/Hyperion-8.1/options/lidar_input: virtual_no_training_rays
   - /apps/prod/Hyperion-8.1/options/cuboid_track_label_sources: autolabel
   - /apps/prod/Hyperion-8.1/options/cuboid_track_filter: camera_visible_min_distance_10m
@@ -50,9 +50,11 @@ defaults:
 
   # Training strategy and optimizers.
   - /apps/AV/module_mixins/_mcmc_mixin.yaml
-  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "2300000"
+  - /apps/prod/Hyperion-8.1/options/mcmc_max_gaussians: "1500000"
   - /apps/prod/Hyperion-8.1/options/mcmc_excluded_layers: road
   - /apps/prod/Hyperion-8.1/options/mcmc_layer_policy: lidarfree_vehicle_lights_interpolated_deformables
+  - /apps/prod/Hyperion-8.1/options/mcmc_schedule: taminggs_450_to_27000
+  - /apps/prod/Hyperion-8.1/options/strategy: taminggs_mcmc
   - /apps/prod/Hyperion-8.1/options/gaussian_optimizer: selective_adam
   - /apps/prod/options/construction_barriers: random_cuboids
 
@@ -73,7 +75,6 @@ defaults:
   - /apps/prod/Hyperion-8.1/options/active_tile_mask: camera_invalid_only
 
   # Config-group overrides inherited from the base recipe.
-  - override /model/gaussians/strategy@model.strategy: mcmc
   - override /model/post_processing@model.post_processing.b: ppisp
   - override /model/post_processing@model.post_processing.c: null
   - override /logger: dummy

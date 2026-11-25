@@ -29,13 +29,16 @@ from typing import TYPE_CHECKING, Any, Callable, Final, Optional, Self, TextIO, 
 import torch
 
 from omegaconf import DictConfig
-from pytorch_lightning.profilers import PassThroughProfiler, PyTorchProfiler
 
 from nurec.config.scopedtimer import ProfilerBackend, ScopedTimerConfig, VerbosityLevel, VerbosityLiteral
 from nurec.utils.trainer import adjust_step_for_world_size
 
 
 if TYPE_CHECKING:
+    # Lightning is only needed for the Trainer profiler built by create_profiler(); ScopedTimer and
+    # the NVTX/Tracy backends must stay importable in inference processes without it.
+    from pytorch_lightning.profilers import PyTorchProfiler
+
     import nurec.libs.tracy_utils as tracy  # type: ignore[import-not-found, import-untyped]
 else:
     tracy = None
@@ -345,7 +348,7 @@ def _convert_color_for_backend(color: Optional[ProfileColor], backend: ProfilerB
     return None
 
 
-def create_profiler(config: DictConfig) -> PyTorchProfiler:
+def create_profiler(config: DictConfig) -> "PyTorchProfiler":
     """Construct a Pytorch Lightning profiling object, which wraps Pytorch's profiler.
 
     This setup will produce three output:
@@ -417,6 +420,8 @@ def create_profiler(config: DictConfig) -> PyTorchProfiler:
     )
 
     del config.profiling.enabled  # remove attribute, not to pass it as an arg below.
+
+    from pytorch_lightning.profilers import PyTorchProfiler
 
     return PyTorchProfiler(
         dirpath=prof_dir,
@@ -565,7 +570,7 @@ class CaptureState:
     in_post_train_window: bool = False
 
 
-class ScopedTimer(PassThroughProfiler):
+class ScopedTimer:
     """
     Scoped timing and profiler capture utilities based on NVIDIA Warp's ScopedTimer.
     """
@@ -913,7 +918,6 @@ class ScopedTimer(PassThroughProfiler):
             config (ScopedTimerConfig): Override global config for this instance. Default: None (use global)
             deep (bool): If True, add nvtx annotations for all subfunctions recursively. Default: False
         """
-        super().__init__()
         self._config = config
         self.name = name
         self.tag = tag

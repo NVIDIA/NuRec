@@ -10,6 +10,9 @@ from multiprocessing.connection import Connection
 from apps.av.aux_gen.ncore_aux_data import LoaderWorkerPayload, _open_worker_sequence
 
 
+SPAWN_TEST_TIMEOUT_SECONDS = 60.0
+
+
 def _open_payload_worker(payload: LoaderWorkerPayload, sender: Connection) -> None:
     backend, loader = _open_worker_sequence(payload)
     sender.send((backend.name, str(loader.sequence_id)))
@@ -24,7 +27,7 @@ def open_payload_in_spawned_process(payload: LoaderWorkerPayload) -> tuple[str, 
     process = context.Process(target=_open_payload_worker, args=(payload, sender))
     process.start()
     sender.close()
-    process.join(timeout=60)
+    process.join(timeout=SPAWN_TEST_TIMEOUT_SECONDS)
     if process.is_alive():
         process.terminate()
         process.join()

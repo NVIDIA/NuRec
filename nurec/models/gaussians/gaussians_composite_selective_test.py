@@ -14,7 +14,9 @@ from nurec.models.gaussians.gaussians_composite import (
     assert_selective_adam_occlusion_supported,
     configure_selective_adam_renderer,
     ensure_selective_adam_renderer_outputs,
+    uses_mcmc_visibility,
     uses_selective_adam,
+    uses_taminggs_visibility,
 )
 
 
@@ -28,6 +30,18 @@ def _optimizer_names(general: str, density: str, scale: str) -> SimpleNamespace:
         gaussian_optimizer_name=general,
         gaussian_density_optimizer_name=density,
         gaussian_scale_optimizer_name=scale,
+    )
+
+
+def _taminggs_strategy(
+    *, enabled: bool, visibility_weight: float, max_invisible_steps: int | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        name="taminggs_mcmc" if enabled else "mcmc",
+        relocate=SimpleNamespace(max_invisible_steps=max_invisible_steps),
+        add=SimpleNamespace(
+            taminggs=SimpleNamespace(visibility_weight=visibility_weight),
+        ),
     )
 
 
@@ -142,6 +156,39 @@ class TestUsesSelectiveAdam:
         assert uses_selective_adam(SimpleNamespace()) is False
 
 
+class TestUsesTamingGSInspiredProxyVisibility:
+    """uses_taminggs_visibility gates the proxy's renderer visibility output."""
+
+    def test_enabled_positive_weight_is_true(self):
+        config = SimpleNamespace(strategy=_taminggs_strategy(enabled=True, visibility_weight=5.0))
+        assert uses_taminggs_visibility(config) is True
+        assert uses_mcmc_visibility(config) is True
+
+    def test_ordinary_mcmc_keeps_loss_owned_visibility(self):
+        config = SimpleNamespace(
+            strategy=_taminggs_strategy(enabled=False, visibility_weight=0.0, max_invisible_steps=500)
+        )
+        assert uses_mcmc_visibility(config) is False
+
+    def test_taminggs_relocation_uses_union_without_visibility_score(self):
+        config = SimpleNamespace(
+            strategy=_taminggs_strategy(enabled=True, visibility_weight=0.0, max_invisible_steps=500)
+        )
+        assert uses_mcmc_visibility(config) is True
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            None,
+            SimpleNamespace(name="gsplat"),
+            _taminggs_strategy(enabled=False, visibility_weight=5.0),
+            _taminggs_strategy(enabled=True, visibility_weight=0.0),
+        ],
+    )
+    def test_non_consumers_are_false(self, strategy):
+        assert uses_taminggs_visibility(SimpleNamespace(strategy=strategy)) is False
+
+
 def test_fused_only_config_leaves_renderer_outputs_untouched():
     """The production renderer setup leaves fused-only outputs disabled."""
     config = _optimizer_names("fused_adam", "fused_adam", "fused_adam")
@@ -150,6 +197,53 @@ def test_fused_only_config_leaves_renderer_outputs_untouched():
     renderer_cfg.outputs.scene.enable_cumulated_weights = False
     config.renderer = renderer_cfg
     config.selective_adam_occlusion_aware = True
+
+    configure_selective_adam_renderer(config)
+
+    assert renderer_cfg.outputs.scene.enable_visibility is False
+    assert renderer_cfg.outputs.scene.enable_cumulated_weights is False
+
+
+def test_fused_taminggs_config_enables_only_visibility_output():
+    """The TamingGS-inspired proxy must not enable unrelated renderer outputs."""
+    config = _optimizer_names("fused_adam", "fused_adam", "fused_adam")
+    renderer_cfg = GSplatRendererConfig(name="3dgut-gsplat")
+    renderer_cfg.outputs.scene.enable_visibility = False
+    renderer_cfg.outputs.scene.enable_cumulated_weights = False
+    config.renderer = renderer_cfg
+    config.strategy = _taminggs_strategy(enabled=True, visibility_weight=5.0)
+    config.selective_adam_occlusion_aware = True
+
+    configure_selective_adam_renderer(config)
+
+    assert renderer_cfg.outputs.scene.enable_visibility is True
+    assert renderer_cfg.outputs.scene.enable_cumulated_weights is False
+
+
+def test_ordinary_mcmc_leaves_renderer_outputs_untouched():
+    config = _optimizer_names("fused_adam", "fused_adam", "fused_adam")
+    renderer_cfg = GSplatRendererConfig(name="3dgut-gsplat")
+    renderer_cfg.outputs.scene.enable_visibility = False
+    renderer_cfg.outputs.scene.enable_cumulated_weights = False
+    config.renderer = renderer_cfg
+    config.strategy = _taminggs_strategy(enabled=False, visibility_weight=0.0, max_invisible_steps=500)
+    config.selective_adam_occlusion_aware = False
+
+    configure_selective_adam_renderer(config)
+
+    assert renderer_cfg.outputs.scene.enable_visibility is False
+    assert renderer_cfg.outputs.scene.enable_cumulated_weights is False
+
+
+def test_zero_weight_taminggs_config_leaves_renderer_outputs_untouched():
+    """A disabled score component must not add renderer work."""
+    config = _optimizer_names("fused_adam", "fused_adam", "fused_adam")
+    renderer_cfg = GSplatRendererConfig(name="3dgut-gsplat")
+    renderer_cfg.outputs.scene.enable_visibility = False
+    renderer_cfg.outputs.scene.enable_cumulated_weights = False
+    config.renderer = renderer_cfg
+    config.strategy = _taminggs_strategy(enabled=True, visibility_weight=0.0)
+    config.selective_adam_occlusion_aware = False
 
     configure_selective_adam_renderer(config)
 

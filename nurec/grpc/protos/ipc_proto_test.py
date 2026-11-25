@@ -85,3 +85,13 @@ def test_ipc_session_messages_present():
         "CloseIpcSessionResponse",
     ):
         assert hasattr(ipc_pb2, name), f"missing ipc proto message {name}"
+
+
+def test_ipc_completion_mode_is_additive_and_defaults_to_blocking():
+    assert ipc_pb2.OpenIpcSessionRequest().completion_mode == ipc_pb2.COMPLETION_ON_RETURN
+    assert ipc_pb2.OpenIpcSessionResponse().completion_mode == ipc_pb2.COMPLETION_ON_RETURN
+    assert _tag(ipc_pb2.OpenIpcSessionRequest, "completion_mode") == 4
+    assert _tag(ipc_pb2.OpenIpcSessionResponse, "completion_mode") == 7
+    assert _tag(ipc_pb2.OpenIpcSessionResponse, "cuda_ipc_ready_event_handles") == 8
+    assert _tag(ipc_pb2.OpenIpcSessionResponse, "linux_boot_id") == 9
+    assert _tag(ipc_pb2.OpenIpcSessionResponse, "cuda_runtime_version") == 10

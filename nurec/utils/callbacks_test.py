@@ -7,7 +7,7 @@ import signal
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -15,9 +15,17 @@ import torch
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.logger import DummyLogger
 
+from nurec.config.fixed_camera_render import FixedCameraRenderConfig
+from nurec.config.image_resolution import (
+    AbsoluteImageResolutionConfig,
+    ImageResolutionConfig,
+    RelativeImageResolutionConfig,
+)
+from nurec.datasets.ncore import NCORESequentialDataset
 from nurec.systems.base import BaseSystem, BaseSystemSO
 from nurec.utils.callbacks import (
     CheckpointAndExitOnSignalCallback,
+    FixedCameraRenderCallback,
     PreemptionInterruptException,
     SmoothedProgressBar,
     TimeBasedCheckpointCallback,
@@ -28,6 +36,7 @@ from nurec.utils.callbacks import (
     make_callbacks,
     notify_before_checkpoint_capture,
 )
+from nurec.utils.image_resolution import ImageResolutionTransform
 
 
 class TestTimingLogger:
@@ -248,6 +257,62 @@ def test_epoch_end_records_successful_explicit_last_save(tmp_path) -> None:
 
     save_last.assert_called_once_with(trainer, {})
     assert callback._last_global_step_saved == trainer.global_step
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True])
+@pytest.mark.parametrize(
+    ("resolution", "expected_output_resolution"),
+    [
+        (AbsoluteImageResolutionConfig(width=4), (4, 3)),
+        (RelativeImageResolutionConfig(subsample=3), (2, 2)),
+    ],
+)
+def test_fixed_camera_setup_uses_temporary_per_camera_transform(
+    tmp_path,
+    fetch_fails: bool,
+    resolution: ImageResolutionConfig,
+    expected_output_resolution: tuple[int, int],
+) -> None:
+    original_transform = ImageResolutionTransform.from_subsample((8, 6), 2)
+    dataset = MagicMock(spec=NCORESequentialDataset)
+    dataset.camera_ids = ["front"]
+    dataset.camera_frames = {"front": [7]}
+    dataset.image_resolution_transforms = {"front": original_transform}
+    cached_batch = object()
+    transforms_during_fetch = []
+
+    def fetch_batch(index):
+        assert index == (0, None)
+        transforms_during_fetch.append(dataset.image_resolution_transforms["front"])
+        if fetch_fails:
+            raise RuntimeError("dataset fetch failed")
+        return cached_batch
+
+    dataset.__getitem__.side_effect = fetch_batch
+    system = MagicMock(spec=BaseSystemSO)
+    system.datamodule = MagicMock()
+    system.datamodule.train_dataloader_sequential.return_value.dataset = dataset
+    callback = FixedCameraRenderCallback(
+        FixedCameraRenderConfig(
+            camera_id="front",
+            frame_idxs=[7],
+            resolution=resolution,
+        ),
+        str(tmp_path),
+        "run",
+    )
+    trainer: Any = SimpleNamespace(is_global_zero=False)
+
+    callback.on_train_start(trainer, system)
+
+    assert transforms_during_fetch[0].output_resolution == expected_output_resolution
+    assert dataset.image_resolution_transforms["front"] is original_transform
+    if fetch_fails:
+        assert callback._disabled
+        assert callback._cached_batches == {}
+    else:
+        assert not callback._disabled
+        assert callback._cached_batches == {7: cached_batch}
 
 
 def test_epoch_end_restores_saved_step_when_explicit_last_save_fails(tmp_path) -> None:

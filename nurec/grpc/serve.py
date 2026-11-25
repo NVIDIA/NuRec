@@ -10,6 +10,7 @@ import io
 import logging
 import math
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -21,7 +22,7 @@ from concurrent import futures
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, List, NoReturn, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, NoReturn, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlparse
 
 import click
@@ -31,13 +32,13 @@ import torch
 
 from einops import rearrange
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc  # type: ignore
-from omegaconf import OmegaConf
 from PIL import Image
 
 import ncore.data
 import ncore.impl.common.transformations as ncore_transformations
 import nurec.grpc.protos.common_pb2 as grpc_types
 import nurec.grpc.protos.ipc_pb2 as ipc_types
+import nurec.grpc.protos.rdma_pb2 as rdma_types
 import nurec.grpc.protos.sensorsim_pb2 as sensorsim_types
 import nurec.utils.cli as cli
 import nurec.utils.profiling as profile
@@ -65,7 +66,14 @@ from nurec.grpc.cache_keys import (
 )
 from nurec.grpc.downloader import Downloader, check_safe_scene_id
 from nurec.grpc.ego_hood import EgocarRigBank
+from nurec.grpc.fatal_worker import (
+    FATAL_WORKER_UNAVAILABLE_DETAILS,
+    FatalWorkerExceptionInterceptor,
+    FatalWorkerState,
+    is_fatal_worker_exception,
+)
 from nurec.grpc.grpc_server_config import (
+    DEFAULT_BACKEND_CACHE_WAIT_TIMEOUT_S,
     HARMONIZER_TEMPORAL_COSMOS_BASE_MODEL_URL,
     HARMONIZER_TEMPORAL_COSMOS_TOKENIZER_URL,
     HARMONIZER_TEMPORAL_MODEL_FILENAME,
@@ -111,9 +119,13 @@ from nurec.grpc.protos.sensorsim_pb2 import (
     ExternalAssetObjectsReturn,
     FthetaCameraParam,
     ImageFormat,
+    LidarFiringPatternRequest,
+    LidarFiringPatternReturn,
+    LidarOutputMode,
     LidarRenderFilter,
     LidarRenderRequest,
     LidarRenderReturn,
+    LidarReturnType,
     OpenCVFisheyeCameraParam,
     OpenCVPinholeCameraParam,
     OverlayBoundingBoxSource,
@@ -124,24 +136,33 @@ from nurec.grpc.protos.sensorsim_pb2 import (
 )
 from nurec.grpc.protos.sensorsim_pb2_grpc import SensorsimServiceServicer, add_SensorsimServiceServicer_to_server
 from nurec.grpc.scene_cache import SceneCache, SceneCacheLease
+from nurec.grpc.scene_prefetch import SinglePrefetch
 from nurec.grpc.trajectory import QVec, Trajectory
 from nurec.harmonizer.model import HarmonizerModelFactory, HarmonizerSessionClosedError, HarmonizerState
+from nurec.libs.sensors.kernels.cameras import camera_rays_to_world_rays_batch, generate_image_points
+from nurec.libs.vren.interface import image_points_to_world_rays_shutter_pose
+from nurec.lidar.firing_patterns.io import load_firing_patterns
+from nurec.lidar.firing_patterns.templates import LidarFiringPatternTemplate, LidarFiringPatternTemplateSet
 from nurec.models.gaussians.utils import Asset
 from nurec.render import (
     ActorsSnapshot,
     CameraFrame,
     CameraRenderOptions,
     LidarRayBundle,
+    LidarRayFrame,
     MissingRenderOutputError,
     PoseRange,
     RayBundle,
     RenderableModel,
+    frame_transform_poses,
     overlay_bounding_boxes,
     transform_intrinsics_to_resolution,
 )
 from nurec.render.actors import ActorTracks
-from nurec.render.lidar_firing_pattern import LidarFiringPattern
+from nurec.render.render import CpuPreparationUnsupportedError
+from nurec.utils.batch import FrameMeta, RenderingData
 from nurec.utils.cli import SettingsCollector
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.lidar_model import LidarModelBundle
 from nurec.utils.metrics import MetricsCollector, create_metric_sample
 from nurec.utils.misc import unpack_optional
@@ -162,6 +183,33 @@ from nurec.utils.visualize import (
 
 log = logging.getLogger("nurec.grpc.serve")
 
+# Service name before the proto package became nurec.grpc.protos in 26.10. The messages are wire-compatible, so clients
+# built from earlier protos (e.g. released AlpaSim) are served by the same handlers under this name.
+LEGACY_SENSORSIM_SERVICE_NAME = "nre.grpc.protos.sensorsim.SensorsimService"
+
+
+class _HandlerRecorder:
+    """Stands in for a server to capture the handlers the generated registration builds."""
+
+    method_handlers: Dict[str, Any]
+
+    def add_generic_rpc_handlers(self, generic_handlers: Any) -> None:
+        pass
+
+    def add_registered_method_handlers(self, service_name: str, method_handlers: Dict[str, Any]) -> None:
+        self.method_handlers = method_handlers
+
+
+def add_sensorsim_servicer_to_server(servicer: SensorsimServiceServicer, server: grpc.Server) -> None:
+    """Register the sensorsim service under its current name and under LEGACY_SENSORSIM_SERVICE_NAME."""
+    add_SensorsimServiceServicer_to_server(servicer, server)
+    recorder = _HandlerRecorder()
+    add_SensorsimServiceServicer_to_server(servicer, recorder)
+    handlers = recorder.method_handlers
+    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(LEGACY_SENSORSIM_SERVICE_NAME, handlers),))
+    server.add_registered_method_handlers(LEGACY_SENSORSIM_SERVICE_NAME, handlers)
+
+
 # CUDA IPC transport is always built in (//nurec/libs/cuda_ipc_transport:pylib is an
 # unconditional dep of :pylib), but kept behind a defensive try/except: if the
 # import ever fails, IpcManager stays None and the use_cuda_ipc path is disabled
@@ -174,6 +222,20 @@ except (ImportError, AttributeError):
     IpcManager = None  # type: ignore
 _CUDA_IPC_AVAILABLE = IpcManager is not None
 
+# RDMA transport is linked in only with --config=rdma (//nurec/libs/rdma_transport:pylib
+# is a select()ed dep of :pylib), and loading it needs libibverbs.so.1. When the import
+# fails, _rdma stays None and the RDMA RPCs report the transport unavailable, with the reason.
+try:
+    _rdma: Any = importlib.import_module("nurec.libs.rdma_transport")
+    _RDMA_IMPORT_ERROR = ""
+except ImportError as exc:
+    _rdma = None
+    _RDMA_IMPORT_ERROR = str(exc)
+
+
+class RdmaTransportUnavailableError(Exception):
+    """Raised by the RDMA RPCs when this server was built or deployed without the transport."""
+
 
 @contextlib.contextmanager
 def _nvtx_range(name: str) -> Generator[None, None, None]:
@@ -185,16 +247,81 @@ def _nvtx_range(name: str) -> Generator[None, None, None]:
         yield
 
 
+_DEFAULT_LIDAR_RETURN_TYPES = (LidarReturnType.LIDAR_RETURN_STRONGEST,)
+_SUPPORTED_LIDAR_RETURN_TYPES = frozenset((LidarReturnType.LIDAR_RETURN_FIRST, LidarReturnType.LIDAR_RETURN_STRONGEST))
+
+
+def _validate_lidar_return_types(return_types: Sequence[LidarReturnType]) -> Tuple[LidarReturnType, ...]:
+    requested = tuple(return_types)
+    requested_names = [
+        LidarReturnType.Name(return_type) if return_type in LidarReturnType.values() else str(return_type)
+        for return_type in requested
+    ]
+    if not requested:
+        raise ValueError("at least one LiDAR return layer must be requested")
+    if any(return_type not in _SUPPORTED_LIDAR_RETURN_TYPES for return_type in requested):
+        raise ValueError(f"unsupported LiDAR return layer list [{', '.join(requested_names)}]")
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"LiDAR return layers must be unique; requested [{', '.join(requested_names)}]")
+    return requested
+
+
+def _lidar_return_types_from_request(request: LidarRenderRequest) -> Tuple[LidarReturnType, ...]:
+    """Resolve the ordered layer list; omission selects the STRONGEST default."""
+    return _validate_lidar_return_types(tuple(request.return_types) or _DEFAULT_LIDAR_RETURN_TYPES)
+
+
 # Cap on how long a render waits for the deferred Harmonizer load before failing loudly, and
 # how often that wait rechecks RPC liveness.
 _HARMONIZER_LOAD_TIMEOUT_S = 1800
 _HARMONIZER_POLL_S = 1.0
 
+SENSORSIM_HEALTH_SERVICE_NAME = "nurec.grpc.protos.sensorsim.SensorsimService"
+
+
+def collect_cuda_worker_diagnostics() -> dict[str, str]:
+    """Collect first-fault metadata before the CUDA context can become poisoned."""
+
+    diagnostics = {
+        "cuda_runtime_version": str(torch.version.cuda or "unavailable"),
+        "nvidia_driver_version": "unavailable",
+        "gpu_uuid": "unavailable",
+        "torch_version": str(torch.__version__),
+    }
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None:
+        diagnostics["cuda_visible_devices"] = visible_devices
+    try:
+        device_index = torch.cuda.current_device()
+        diagnostics["cuda_device_index"] = str(device_index)
+        # CUDA ordinals need not match nvidia-smi's physical-device order. Keep
+        # nvidia-smi's GPU-<uuid> form. A MIG instance gets the same prefix; nvidia-smi lists it as MIG-<uuid>.
+        diagnostics["gpu_uuid"] = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
+    except Exception:
+        diagnostics["cuda_device_index"] = diagnostics.get("cuda_device_index", "unavailable")
+        log.warning("Could not collect the CUDA device UUID", exc_info=True)
+
+    try:
+        # The driver version is host-wide; no ordinal/physical-GPU guess is needed.
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            diagnostics["nvidia_driver_version"] = result.stdout.splitlines()[0].strip()
+    except (OSError, subprocess.SubprocessError):
+        log.warning("Could not collect the driver version with nvidia-smi", exc_info=True)
+
+    return diagnostics
+
 
 def actors_snapshot_from_render_request(
     request: RGBRenderRequest | CameraRenderRequest | LidarRenderRequest,
 ) -> ActorsSnapshot:
-    track_ids = []
+    raw_track_ids: dict[str, str] = {}
     track_poses = []
 
     for dynamic_object in request.dynamic_objects:
@@ -205,7 +332,13 @@ def actors_snapshot_from_render_request(
                 "to carry aspect_state) would silently re-pose the actor to the origin with a "
                 "degenerate rotation. Send pose_pair on every listed actor."
             )
-        track_ids.append(DataSourceSummary._clean_track_id_str(dynamic_object.track_id))
+        track_id = DataSourceSummary._clean_track_id_str(dynamic_object.track_id)
+        if track_id in raw_track_ids:
+            raise ValueError(
+                f"DynamicObject IDs {raw_track_ids[track_id]!r} and {dynamic_object.track_id!r} "
+                f"both normalize to {track_id!r}"
+            )
+        raw_track_ids[track_id] = dynamic_object.track_id
 
         track_poses.append(
             torch.stack(
@@ -216,10 +349,64 @@ def actors_snapshot_from_render_request(
             )
         )
 
-    if len(track_ids) == 0:
+    if not raw_track_ids:
         return ActorsSnapshot.empty()
 
-    return ActorsSnapshot(actor_ids=track_ids, actor_poses=torch.stack(track_poses, dim=0))
+    return ActorsSnapshot(actor_ids=list(raw_track_ids), actor_poses=torch.stack(track_poses, dim=0))
+
+
+def _dynamic_actor_state_map(request: CameraRenderRequest) -> Optional[Dict[str, tuple[bytes, Optional[bytes]]]]:
+    states: Dict[str, tuple[bytes, Optional[bytes]]] = {}
+    for dynamic_object in request.dynamic_objects:
+        track_id = DataSourceSummary._clean_track_id_str(dynamic_object.track_id)
+        if track_id in states or not dynamic_object.HasField("pose_pair"):
+            return None
+        aspect_state = (
+            dynamic_object.aspect_state.SerializeToString(deterministic=True)
+            if dynamic_object.HasField("aspect_state")
+            else None
+        )
+        states[track_id] = (dynamic_object.pose_pair.SerializeToString(deterministic=True), aspect_state)
+    return states
+
+
+class _CameraBatchDispatch(Enum):
+    NATIVE_BATCHED_RAYS = "native/batched_rays"
+    NATIVE_PER_CAMERA_RAYS = "native/per_camera_rays"
+    SEQUENTIAL_HINT_DISABLED = "sequential/hint_disabled"
+    SEQUENTIAL_RENDERER_UNSUPPORTED = "sequential/renderer_unsupported"
+    SEQUENTIAL_SINGLE_ITEM = "sequential/single_item"
+    SEQUENTIAL_SCENE_MISMATCH = "sequential/scene_mismatch"
+    SEQUENTIAL_FRAME_INTERVAL_MISMATCH = "sequential/frame_interval_mismatch"
+    SEQUENTIAL_INTRINSICS_MISMATCH = "sequential/intrinsics_mismatch"
+    SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH = "sequential/actor_overrides_mismatch"
+    SEQUENTIAL_ACTOR_EDITING_DISABLED = "sequential/actor_editing_disabled"
+    SEQUENTIAL_ROLLING_ACTORS = "sequential/rolling_shutter_actor_state"
+    SEQUENTIAL_NATIVE_ERROR = "sequential/native_error"
+    FAILED_OOM = "failed/oom"
+
+
+def _camera_batch_incompatibility(
+    requests: List[CameraRenderRequest], dynamic_actor_ids: set[str]
+) -> Optional[_CameraBatchDispatch]:
+    """Return why requests need sequential rendering, or ``None``."""
+    if len(requests) < 2:
+        return _CameraBatchDispatch.SEQUENTIAL_SINGLE_ITEM
+    first = requests[0]
+    first_actor_state = _dynamic_actor_state_map(first)
+    if first_actor_state is None or not set(first_actor_state).issubset(dynamic_actor_ids):
+        return _CameraBatchDispatch.SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH
+    intrinsics = first.camera_intrinsics.SerializeToString(deterministic=True)
+    for request in requests[1:]:
+        if request.scene_id != first.scene_id:
+            return _CameraBatchDispatch.SEQUENTIAL_SCENE_MISMATCH
+        if request.frame_start_us != first.frame_start_us or request.frame_end_us != first.frame_end_us:
+            return _CameraBatchDispatch.SEQUENTIAL_FRAME_INTERVAL_MISMATCH
+        if request.camera_intrinsics.SerializeToString(deterministic=True) != intrinsics:
+            return _CameraBatchDispatch.SEQUENTIAL_INTRINSICS_MISMATCH
+        if _dynamic_actor_state_map(request) != first_actor_state:
+            return _CameraBatchDispatch.SEQUENTIAL_ACTOR_OVERRIDES_MISMATCH
+    return None
 
 
 def actor_tracks_from_grpc(grpc_tracks: List[sensorsim_types.DynamicObjectTrack]) -> ActorTracks:
@@ -234,6 +421,10 @@ def actor_tracks_from_grpc(grpc_tracks: List[sensorsim_types.DynamicObjectTrack]
         trajectory = Trajectory.from_grpc(grpc_track.trajectory)
         poses_se3 = trajectory.poses.as_se3()  # [N_poses, 4, 4] np.ndarray
         timestamps_int64 = trajectory.timestamps_us.astype(np.int64)
+        if len(timestamps_int64) == 1 and timestamps_int64[0] == 0:
+            # Pad at -1 us for two-keyframe interpolation without extending the nonnegative lifetime.
+            poses_se3 = np.repeat(poses_se3, 2, axis=0)
+            timestamps_int64 = np.array([-1, 0], dtype=np.int64)
         object_dims = np.array(
             [grpc_track.object_size.size_x, grpc_track.object_size.size_y, grpc_track.object_size.size_z],
             dtype=np.float32,
@@ -258,6 +449,28 @@ def actor_tracks_from_grpc(grpc_tracks: List[sensorsim_types.DynamicObjectTrack]
     return ActorTracks(_cuboid_tracks_list=cuboid_tracks_list, _interpolator_list=interpolator_list)
 
 
+def _trajectory_on_nonnegative_timeline(
+    poses_se3: torch.Tensor, timestamps_us: torch.Tensor, *, name: str
+) -> Trajectory:
+    source_timestamps = timestamps_us.cpu()
+    timestamps = source_timestamps.numpy()
+    if not (timestamps[1:] > timestamps[:-1]).all():
+        raise ValueError(f"{name} timestamps must be strictly increasing")
+    first_nonnegative = int(np.searchsorted(timestamps, 0))
+    if first_nonnegative == len(timestamps):
+        return Trajectory.create_empty()
+
+    source_poses = poses_se3.cpu()
+    poses_array = source_poses[first_nonnegative:].numpy()
+    timestamps = timestamps[first_nonnegative:]
+    if first_nonnegative and timestamps[0] > 0:
+        interpolator = ncore_transformations.PoseInterpolator(poses=source_poses, timestamps=source_timestamps)
+        poses_array = np.concatenate([interpolator.interpolate_to_timestamps([0]), poses_array])
+        timestamps = np.concatenate([np.array([0], dtype=np.int64), timestamps])
+
+    return Trajectory(timestamps_us=timestamps.astype(np.uint64), poses=QVec.from_se3(poses_array))
+
+
 def actor_tracks_to_grpc(
     actor_tracks: ActorTracks, track_to_asset: Optional[Dict[str, str]] = None
 ) -> List[sensorsim_types.DynamicObjectTrack]:
@@ -274,13 +487,13 @@ def actor_tracks_to_grpc(
     for cuboid_track in actor_tracks._cuboid_tracks_list:
         (track_id,) = cuboid_track.tracks_id  # Validates exactly one track
         (track_label_class,) = cuboid_track.tracks_label_class  # Validates exactly one class
-        poses_se3 = cuboid_track.tracks_poses
-        timestamps_us = cuboid_track.tracks_timestamps_us
-
-        trajectory = Trajectory(
-            timestamps_us=timestamps_us.cpu().numpy().astype(np.uint64),
-            poses=QVec.from_se3(poses_se3.matrix().cpu().numpy()),
+        trajectory = _trajectory_on_nonnegative_timeline(
+            cuboid_track.tracks_poses.matrix(),
+            cuboid_track.tracks_timestamps_us,
+            name=f"Actor {track_id!r}",
         )
+        if trajectory.is_empty():
+            continue
 
         if len(cuboid_track.cuboids_dims) == 0:
             raise ValueError(f"No cuboid dimensions found for track {track_id}")
@@ -303,12 +516,20 @@ def actor_tracks_to_grpc(
 
 @dataclass
 class TorchCamera:
+    """Camera state whose mutable caches are protected by exclusive backend checkout."""
+
     camera_model_parameters: ncore.data.ConcreteCameraModelParametersUnion
     logical_camera_id: str
     unique_sensor_idx: int
     time_range_us: HalfClosedInterval
     world_to_nurec: FrameConversion
     T_camera_rig: torch.Tensor
+    _render_cache: Optional[Tuple[Tuple[int, int], ncore.data.ConcreteCameraModelParametersUnion]] = field(
+        default=None, init=False, repr=False
+    )
+    _camera_rays: Optional[Tuple[ncore.data.ConcreteCameraModelParametersUnion, torch.device, torch.Tensor]] = field(
+        default=None, init=False, repr=False
+    )
 
     def __repr__(self):
         return (
@@ -317,11 +538,9 @@ class TorchCamera:
             f"time_range_us={self.time_range_us})"
         )
 
-    @ScopedTimer()
-    def build_ray_bundle(self, request: RGBRenderRequest | CameraRenderRequest) -> RayBundle:
+    def _pose_range(self, request: RGBRenderRequest | CameraRenderRequest) -> PoseRange:
         start_timestamp_us = request.frame_start_us
         end_timestamp_us = request.frame_end_us
-        resolution_hw = (request.resolution_h, request.resolution_w)
         start_pose = grpc_pose_to_tquat(request.sensor_pose.start_pose)
         end_pose = grpc_pose_to_tquat(request.sensor_pose.end_pose)
 
@@ -332,52 +551,188 @@ class TorchCamera:
                 f"Requested time range {request_interval} is outside of scene time range {self.time_range_us}."
             )
 
-        original_w, original_h = self.camera_model_parameters.resolution.tolist()
-        aspect_ratio = original_w / original_h
-
-        req_resolution_h, req_resolution_w = resolution_hw
-        if (req_resolution_w / original_w) > (req_resolution_h / original_h):
-            new_w = req_resolution_w
-            new_h = int(new_w / aspect_ratio)
-            image_domain_scale = new_w / original_w
-        else:
-            new_h = req_resolution_h
-            new_w = int(new_h * aspect_ratio)
-            image_domain_scale = new_h / original_h
-
-        with ScopedTimer("camera_model_parameters.transform"):
-            camera_params = self.camera_model_parameters.transform(
-                image_domain_scale=image_domain_scale,
-                new_resolution=(new_w, new_h),
-            )
-
-        # TODO: remove this half-closed-interval convention from gRPC API because it is rather unintuitive to add 1 us
-        # to the exact timestamp of the end of frame.
         if end_timestamp_us <= start_timestamp_us:
             raise TimestampOutOfRangeError(
                 f"Render time range [{start_timestamp_us=}, {end_timestamp_us=}) is empty. "
                 "To render at an instant t, use [t, t+1) as the interval."
             )
+        return PoseRange(start_pose, end_pose, start_timestamp_us, end_timestamp_us)
+
+    def _camera_parameters(
+        self, request: RGBRenderRequest | CameraRenderRequest
+    ) -> ncore.data.ConcreteCameraModelParametersUnion:
+        resolution_hw = (request.resolution_h, request.resolution_w)
+        if self._render_cache is not None and self._render_cache[0] == resolution_hw:
+            return self._render_cache[1]
+        req_resolution_h, req_resolution_w = resolution_hw
+        source_width, source_height = self.camera_model_parameters.resolution.tolist()
+        source_resolution = (int(source_width), int(source_height))
+        image_transform = ImageResolutionTransform.fit_keep_aspect_ratio(
+            source_resolution,
+            (req_resolution_w, req_resolution_h),
+        )
+
+        with ScopedTimer("camera_model_parameters.transform"):
+            camera_params = image_transform.apply_to_camera_parameters(self.camera_model_parameters)
+        self._render_cache = resolution_hw, camera_params
+        return camera_params
+
+    @ScopedTimer()
+    def build_ray_bundle(self, request: RGBRenderRequest | CameraRenderRequest) -> RayBundle:
+        camera_params = self._camera_parameters(request)
+        camera_to_world = self._pose_range(request)
 
         return RayBundle.build(
             camera_model_parameters=camera_params,
-            camera_to_world=PoseRange(start_pose, end_pose, start_timestamp_us, end_timestamp_us),
+            camera_to_world=camera_to_world,
             world_to_nurec=self.world_to_nurec,
             unique_sensor_idx=self.unique_sensor_idx,
         )
 
+    def _get_camera_rays(
+        self,
+        camera_params: ncore.data.ConcreteCameraModelParametersUnion,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self._camera_rays is not None and self._camera_rays[0] is camera_params and self._camera_rays[1] == device:
+            return self._camera_rays[2]
+
+        width, height = camera_params.resolution.tolist()
+        image_points = generate_image_points((width, height), device=device)
+        # Identity poses produce camera-local directions. Every ray starts at the
+        # camera origin; build_ray_batch rotates and translates them per view.
+        poses = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]] * 2,
+            dtype=torch.float32,
+        ).to(device=device, non_blocking=True)
+        timestamps = torch.zeros(2, device=device, dtype=torch.int64)
+        world_rays = image_points_to_world_rays_shutter_pose(
+            camera_params,
+            image_points,
+            T_sensor_worlds=poses,
+            timestamps_us=timestamps,
+        )
+        rays = world_rays.world_rays[:, 3:].contiguous()
+        self._camera_rays = camera_params, device, rays
+        return rays
+
+    @ScopedTimer()
+    def build_ray_batch(
+        self,
+        requests: List[CameraRenderRequest],
+        device: torch.device,
+    ) -> tuple[RenderingData, List[FrameMeta]]:
+        """Build global-shutter camera rays in NRE coordinates.
+
+        Use each view's start pose and timestamp. Retain both endpoint poses and
+        timestamps in the returned rendering data.
+
+        Args:
+            requests: Nonempty requests for this camera's intrinsics, sharing an
+                output resolution and nonempty ``[start, end)`` interval.
+            device: CUDA device for ray, pose, and timestamp tensors.
+
+        Returns:
+            Rendering data and frame metadata in request order, including CPU
+            endpoint timestamps. Every ray uses its view's start timestamp.
+
+        Raises:
+            ValueError: Requests are empty, resolutions or intervals differ, or
+                the camera is rolling-shutter.
+            TimestampOutOfRangeError: An interval is empty, reversed, or outside
+                the scene range.
+        """
+        if not requests:
+            raise ValueError("Camera batch must not be empty")
+        first = requests[0]
+        resolution = (first.resolution_h, first.resolution_w)
+        if any((request.resolution_h, request.resolution_w) != resolution for request in requests[1:]):
+            raise ValueError("Camera batch requests must share one output resolution")
+        interval = (first.frame_start_us, first.frame_end_us)
+        if any((request.frame_start_us, request.frame_end_us) != interval for request in requests[1:]):
+            raise ValueError("Camera batch requests must share one frame interval")
+
+        camera_params = self._camera_parameters(first)
+        if camera_params.shutter_type != ncore.data.ShutterType.GLOBAL:
+            raise ValueError("Direct batched rays require global-shutter camera intrinsics")
+        pose_ranges = [self._pose_range(request) for request in requests]
+        poses = torch.stack(
+            [
+                torch.stack([pose.start_pose_tquat_sensor_world, pose.end_pose_tquat_sensor_world])
+                for pose in pose_ranges
+            ]
+        )
+        poses = poses.to(device=device, non_blocking=True)
+        poses = frame_transform_poses(self.world_to_nurec, poses.reshape(-1, 7), is_tquat=True).reshape(-1, 2, 7)
+
+        width, height = camera_params.resolution.tolist()
+        camera_rays = self._get_camera_rays(camera_params, device)
+        world_rays = camera_rays_to_world_rays_batch(
+            camera_rays,
+            poses[:, 0, :3].contiguous(),
+            poses[:, 0, 3:].contiguous(),
+        ).reshape(len(requests), height, width, 6)
+        timestamps_cpu = torch.tensor(
+            [[pose.start_timestamp_us, pose.end_timestamp_us] for pose in pose_ranges],
+            dtype=torch.int64,
+        )
+        timestamps = timestamps_cpu.to(device=device, non_blocking=True)
+        ray_timestamps = timestamps[:, :1, None, None].expand(-1, height, width, -1)
+        rendering_data = RenderingData(
+            rays=world_rays,
+            sensor_model_parameters=[camera_params] * len(requests),
+            poses_tquat_startend=poses,
+            timestamps_startend_us=timestamps,
+            rays_timestamps_us=ray_timestamps,
+            rays_timestamp_layout="global",
+            timestamps_startend_us_cpu=timestamps_cpu,
+        )
+        frame_meta = [
+            FrameMeta(unique_sensor_idx=self.unique_sensor_idx, unique_frame_idx=-1, training_frame_idx=-1)
+            for _ in requests
+        ]
+        return rendering_data, frame_meta
+
 
 def _rig_trajectory_to_grpc_trajectory(trajectory: RigTrajectories.RigTrajectory) -> grpc_types.Trajectory:
-    poses = QVec.from_se3(trajectory.T_rig_worlds.numpy())
-    timestamps_us = trajectory.T_rig_world_timestamps_us.numpy().astype(np.uint64)
-
-    return Trajectory(
-        timestamps_us=timestamps_us,
-        poses=poses,
+    return _trajectory_on_nonnegative_timeline(
+        trajectory.T_rig_worlds,
+        trajectory.T_rig_world_timestamps_us,
+        name=f"Rig {trajectory.sequence_id!r}",
     ).to_grpc()
 
 
-DEFAULT_BACKEND_CACHE_WAIT_S = 120.0
+class _AutomaticGcPause:
+    """Process-wide pause of Python's automatic garbage collection, nestable across threads.
+
+    Collection resumes when the last concurrent pause ends, and only if it was enabled when the
+    first one began.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._depth = 0
+        self._resume = False
+
+    @contextlib.contextmanager
+    def paused(self) -> Generator[None, None, None]:
+        with self._lock:
+            if self._depth == 0:
+                self._resume = gc.isenabled()
+                gc.disable()
+            self._depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._depth -= 1
+                if self._depth == 0 and self._resume:
+                    gc.enable()
+
+
+_automatic_gc = _AutomaticGcPause()
+
+
 BACKEND_CACHE_WAIT_POLL_S = 1.0
 
 
@@ -391,6 +746,7 @@ class CacheWaitAbortedReason(Enum):
     CANCELLED = auto()
     DEADLINE_EXCEEDED = auto()
     SERVER_TIMEOUT = auto()
+    WORKER_UNAVAILABLE = auto()
 
 
 class CacheWaitAbortedError(CacheFullError):
@@ -402,7 +758,7 @@ class CacheWaitAbortedError(CacheFullError):
 
 
 class NoSpareBackendsError(Exception):
-    """Raised when OOM occurs and no spare backends are available to evict."""
+    """Raised when backend construction runs out of memory and no spare can be evicted."""
 
     pass
 
@@ -441,7 +797,7 @@ class BackendReservation:
     scene_id: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class ArtifactRegistration:
     """Associates an artifact with its stable source and source-lifetime policy.
 
@@ -458,6 +814,8 @@ class ArtifactRegistration:
     # backend, but a cache miss must NOT rebuild it: a rebuild would load a private, non-aliased copy
     # that silently diverges from the owner's shared weights, so `create_backend` fails loud instead.
     resident_only: bool = False
+    # A memo of verified content, not part of the registration's identity.
+    source_fingerprint: tuple[int, int, int, int, int] | None = field(default=None, compare=False)
 
     @property
     def backend_cache_key(self) -> BackendCacheKey:
@@ -474,6 +832,25 @@ class BackendCacheWaitPolicy:
     wait_deadline: float | None = None
 
 
+def _ensure_wait_policy_continues(key: str, policy: BackendCacheWaitPolicy | None) -> None:
+    """Check RPC cancellation and the client deadline, not the server wait cap."""
+    if policy is None:
+        return
+    if policy.should_continue is not None and not policy.should_continue():
+        reason = policy.abort_reason() if policy.abort_reason is not None else CacheWaitAbortedReason.CANCELLED
+        raise CacheWaitAbortedError(f"Backend wait aborted: cache_key={key} reason={reason.name}", reason)
+
+
+def _check_backend_wait(key: str, policy: BackendCacheWaitPolicy | None) -> None:
+    """Raise CacheWaitAbortedError on RPC cancellation or an expired wait deadline."""
+    _ensure_wait_policy_continues(key, policy)
+    if policy is None:
+        return
+    if policy.wait_deadline is not None and time.monotonic() >= policy.wait_deadline:
+        reason = CacheWaitAbortedReason.SERVER_TIMEOUT
+        raise CacheWaitAbortedError(f"Backend wait aborted: cache_key={key} reason={reason.name}", reason)
+
+
 class TimestampOutOfRangeError(ValueError):
     """Raised when a render request's time range is outside the scene range."""
 
@@ -484,6 +861,24 @@ class ModelIncompatibilityError(RuntimeError):
     """Raised when a model/artifact is incompatible with the server."""
 
     pass
+
+
+def _cleanup_failed_backend(error: BaseException) -> None:
+    """Release model references in unwound exception frames before CUDA cleanup."""
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 class HarmonizerNotEnabledError(RuntimeError):
@@ -509,6 +904,8 @@ def _classify_render_exception(exc: Exception) -> tuple[grpc.StatusCode, str]:
         # precondition failure, not a malformed request.
         return grpc.StatusCode.FAILED_PRECONDITION, _render_exception_message(exc)
     if isinstance(exc, CacheWaitAbortedError):
+        if exc.reason == CacheWaitAbortedReason.WORKER_UNAVAILABLE:
+            return grpc.StatusCode.UNAVAILABLE, FATAL_WORKER_UNAVAILABLE_DETAILS
         if exc.reason == CacheWaitAbortedReason.CANCELLED:
             return grpc.StatusCode.CANCELLED, _render_exception_message(exc)
         return grpc.StatusCode.DEADLINE_EXCEEDED, _render_exception_message(exc)
@@ -522,6 +919,11 @@ def _classify_render_exception(exc: Exception) -> tuple[grpc.StatusCode, str]:
         return grpc.StatusCode.NOT_FOUND, _render_exception_message(exc)
     if isinstance(exc, (ValueError, TypeError)):
         return grpc.StatusCode.INVALID_ARGUMENT, _render_exception_message(exc)
+    if isinstance(exc, RdmaTransportUnavailableError):
+        return grpc.StatusCode.UNIMPLEMENTED, _render_exception_message(exc)
+    if _rdma is not None and isinstance(exc, _rdma.PreconditionError):
+        # A RuntimeError subclass, so it must precede the RuntimeError branch below.
+        return grpc.StatusCode.FAILED_PRECONDITION, _render_exception_message(exc)
     if isinstance(exc, RuntimeError):
         ipc_status = _classify_ipc_runtime_error(exc)
         if ipc_status is not None:
@@ -583,79 +985,122 @@ def require_allowed_image_format(
     raise  # unreachable, but needed for mypy
 
 
-def require_cuda_ipc_output_format(
+def _buffer_delivery_transport(
+    request: RGBRenderRequest | CameraRenderRequest, context: grpc.ServicerContext
+) -> Optional[tuple[str, str, str]]:
+    """Return (request flag, transport name, client buffer) for the raw-buffer delivery a
+    request asks for -- CUDA IPC or RDMA -- or None for the normal encoded-bytes path. Aborts
+    INVALID_ARGUMENT when it asks for both, since a frame is delivered through one transport."""
+    if request.use_cuda_ipc and request.use_rdma:
+        context.abort(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            "use_cuda_ipc=true and use_rdma=true are mutually exclusive: a frame is delivered through one transport.",
+        )
+        raise  # unreachable, but needed for mypy
+    if request.use_cuda_ipc:
+        return "use_cuda_ipc", "CUDA IPC", "mapped buffer"
+    if request.use_rdma:
+        return "use_rdma", "RDMA", "registered buffer"
+    return None
+
+
+def require_buffer_delivery_output_format(
     request: RGBRenderRequest | CameraRenderRequest, context: grpc.ServicerContext
 ) -> None:
-    """Abort before rendering when a use_cuda_ipc=true request declares an image_format other
-    than RGB_UINT8_PLANAR. The CUDA IPC path always fills the session's buffers with
-    rgb_uint8_planar data (see _ipc_write_rgb / _ipc_write_camera_color) regardless of what
-    image_format says -- e.g. a declared JPEG would otherwise pass a JPEG-only
+    """Abort before rendering when a use_cuda_ipc=true or use_rdma=true request declares an
+    image_format other than RGB_UINT8_PLANAR (or sets both). Buffer delivery always fills the
+    client's buffer with rgb_uint8_planar data (see _ipc_write_rgb / _rdma_write_rgb) regardless
+    of what image_format says -- e.g. a declared JPEG would otherwise pass a JPEG-only
     --allowed-image-formats admission check (require_allowed_image_format validates the
-    *declared* format, not what IPC actually produces) while silently returning raw planar
-    bytes instead."""
-    if not request.use_cuda_ipc or request.image_format == ImageFormat.RGB_UINT8_PLANAR:
+    *declared* format, not what buffer delivery actually produces) while silently returning raw
+    planar bytes instead."""
+    transport = _buffer_delivery_transport(request, context)
+    if transport is None or request.image_format == ImageFormat.RGB_UINT8_PLANAR:
         return
+    flag, transport_name, _ = transport
     try:
         requested_name = ImageFormat.Name(request.image_format)
     except ValueError:
         requested_name = f"UNKNOWN({request.image_format})"
     context.abort(
         grpc.StatusCode.INVALID_ARGUMENT,
-        f"use_cuda_ipc=true requires image_format=RGB_UINT8_PLANAR; got {requested_name}. The CUDA IPC "
+        f"{flag}=true requires image_format=RGB_UINT8_PLANAR; got {requested_name}. The {transport_name} "
         "path always delivers rgb_uint8_planar data into the session's buffers regardless of the "
         "requested format.",
     )
     raise  # unreachable, but needed for mypy
 
 
-def require_cuda_ipc_camera_request(request: CameraRenderRequest, context: grpc.ServicerContext) -> None:
-    """Abort before rendering when a use_cuda_ipc=true CameraRenderRequest asks for something the
-    CUDA IPC path can't deliver. IPC always produces exactly one RGB_UINT8_PLANAR COLOR output,
-    written by the fused pack kernel directly from the float32 raster -- it can't also produce
-    DISTANCE_COLORIZED/SEMANTICS_COLORIZED outputs (different dtypes/layouts, no pack kernel for
-    them) or run the numpy-based bounding-box overlay (which needs a host-visible uint8 image the
-    IPC path never materializes)."""
-    if not request.use_cuda_ipc:
+def require_buffer_delivery_camera_request(request: CameraRenderRequest, context: grpc.ServicerContext) -> None:
+    """Abort before rendering when a use_cuda_ipc=true or use_rdma=true CameraRenderRequest asks
+    for something buffer delivery can't do. It always produces exactly one RGB_UINT8_PLANAR COLOR
+    output, written by the fused pack kernel directly from the float32 raster -- it can't also
+    produce DISTANCE_COLORIZED/SEMANTICS_COLORIZED outputs (different dtypes/layouts, no pack
+    kernel for them) or run the numpy-based bounding-box overlay (which needs a host-visible uint8
+    image the buffer path never materializes)."""
+    transport = _buffer_delivery_transport(request, context)
+    if transport is None:
         return
+    flag, transport_name, client_buffer = transport
     products = list(request.render_products) or [CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR]
     if products != [CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR]:
         product_names = ", ".join(CameraRenderProduct.Name(p) for p in products)
         context.abort(
             grpc.StatusCode.INVALID_ARGUMENT,
-            "use_cuda_ipc=true only supports a single CAMERA_RENDER_PRODUCT_COLOR render_products "
+            f"{flag}=true only supports a single CAMERA_RENDER_PRODUCT_COLOR render_products "
             f"entry (or an empty render_products list, which defaults to COLOR); got [{product_names}].",
         )
         raise  # unreachable, but needed for mypy
     if request.overlay_bounding_boxes != OverlayBoundingBoxSource.OVERLAY_BOUNDING_BOX_SOURCE_UNSPECIFIED:
         context.abort(
             grpc.StatusCode.INVALID_ARGUMENT,
-            "use_cuda_ipc=true does not support overlay_bounding_boxes: the CUDA IPC path writes "
-            "directly into the client's mapped buffer, with no host-visible image to draw onto.",
+            f"{flag}=true does not support overlay_bounding_boxes: the {transport_name} path writes "
+            f"directly into the client's {client_buffer}, with no host-visible image to draw onto.",
         )
         raise  # unreachable, but needed for mypy
-    require_cuda_ipc_output_format(request, context)
+    require_buffer_delivery_output_format(request, context)
 
 
-def _abort_with_classified_exception(context: grpc.ServicerContext, exc: Exception, rpc_name: str) -> None:
+def _abort_with_classified_exception(
+    context: grpc.ServicerContext,
+    exc: Exception,
+    rpc_name: str,
+    *,
+    unknown_status: Optional[grpc.StatusCode] = None,
+) -> None:
+    """Abort with the status _classify_render_exception gives exc. An unclassified exception is
+    re-raised, unless unknown_status is given: then the client gets that status and the message."""
     status, message = _classify_render_exception(exc)
     if status == grpc.StatusCode.UNKNOWN:
         log.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-        raise exc
-    log.warning(f"{rpc_name} failed with {status.name}: {message}")
+        if unknown_status is None:
+            raise exc
+        status = unknown_status
+    else:
+        log.warning(f"{rpc_name} failed with {status.name}: {message}")
     context.abort(status, message)
 
 
-def _grpc_backend_cache_wait_policy(context: grpc.ServicerContext | None) -> BackendCacheWaitPolicy | None:
-    if context is None:
-        return None
-
+def _grpc_backend_cache_wait_policy(
+    context: grpc.ServicerContext | None,
+    server_timeout_s: float = DEFAULT_BACKEND_CACHE_WAIT_TIMEOUT_S,
+    fatal_worker_state: FatalWorkerState | None = None,
+) -> BackendCacheWaitPolicy:
     def should_continue() -> bool:
+        if fatal_worker_state is not None and fatal_worker_state.is_fatal:
+            return False
+        if context is None:
+            return True
         if not context.is_active():
             return False
         remaining = context.time_remaining()
         return remaining is None or remaining > 0
 
     def abort_reason() -> CacheWaitAbortedReason:
+        if fatal_worker_state is not None and fatal_worker_state.is_fatal:
+            return CacheWaitAbortedReason.WORKER_UNAVAILABLE
+        if context is None:
+            return CacheWaitAbortedReason.DEADLINE_EXCEEDED
         remaining = context.time_remaining()
         if remaining is not None and remaining <= 0:
             return CacheWaitAbortedReason.DEADLINE_EXCEEDED
@@ -663,9 +1108,10 @@ def _grpc_backend_cache_wait_policy(context: grpc.ServicerContext | None) -> Bac
             return CacheWaitAbortedReason.CANCELLED
         return CacheWaitAbortedReason.DEADLINE_EXCEEDED
 
-    server_cap = time.monotonic() + DEFAULT_BACKEND_CACHE_WAIT_S
-    remaining = context.time_remaining()
-    wait_deadline = server_cap if remaining is None else min(server_cap, time.monotonic() + remaining)
+    now = time.monotonic()
+    server_cap = now + server_timeout_s
+    remaining = context.time_remaining() if context is not None else None
+    wait_deadline = server_cap if remaining is None else min(server_cap, now + remaining)
 
     return BackendCacheWaitPolicy(
         should_continue=should_continue,
@@ -687,9 +1133,10 @@ class BackendCache:
     claimed spare stays available for checkout while its replacement is built, so
     a request for its key still reuses the warm backend. A successful commit
     evicts the claimed spare if it is still idle, or defers eviction until its
-    checkout returns; a failed or cancelled construction releases the claim,
-    leaving the original spare cached. Explicit GPU-OOM recovery may evict a
-    claimed spare early to reclaim memory.
+    checkout returns. By default, failed or cancelled construction releases
+    the claim and keeps the original spare. GPU-OOM recovery and opt-in eager
+    replacement may evict a claimed spare before construction; that eviction
+    is not rolled back.
 
     ``put_with_retries`` is the production acquisition path. It reuses a spare when
     possible, waits on configured per-scene saturation, and evicts spare backends
@@ -697,7 +1144,13 @@ class BackendCache:
     never evicted and must be returned with ``checkin``.
     """
 
-    def __init__(self, maxsize: int = 10, max_per_key: int | None = None):
+    def __init__(
+        self,
+        maxsize: int = 10,
+        max_per_key: int | None = None,
+        *,
+        allow_automatic_eviction: bool = True,
+    ):
         """
         Initialize the BackendCache with count-based LRU eviction and OOM retry capability.
 
@@ -707,6 +1160,9 @@ class BackendCache:
             max_per_key: Optional maximum number of backend slots for one scene,
                 counting in-use, spare, and pending backends. Saturated requests
                 wait for capacity or replace a spare backend for that scene.
+            allow_automatic_eviction: Whether capacity replacement and OOM recovery may
+                evict spare backends. Disable for coordinator-owned residency; explicit
+                remove_by_key remains available to the coordinator's detach path.
         """
         if maxsize <= 0:
             raise ValueError(f"BackendCache maxsize must be positive, got {maxsize}")
@@ -717,6 +1173,7 @@ class BackendCache:
                 raise ValueError(f"BackendCache max_per_key must be <= maxsize, got {max_per_key} > {maxsize}")
         self.lock = threading.RLock()
         self.capacity_changed = threading.Condition(self.lock)
+        self._allow_automatic_eviction = allow_automatic_eviction
 
         # List of spare backends (LRU order - oldest first)
         self.spares: List[Backend] = list()
@@ -740,6 +1197,12 @@ class BackendCache:
     @property
     def pending_global(self) -> int:
         return len(self.pending_reservations)
+
+    def wake_waiters(self) -> None:
+        """Wake capacity waiters so an external shutdown predicate is re-evaluated promptly."""
+
+        with self.capacity_changed:
+            self.capacity_changed.notify_all()
 
     def _total_count_locked(self) -> int:
         # A claimed spare (pending replacement) or a superseded backend awaiting checkin
@@ -770,6 +1233,10 @@ class BackendCache:
     ) -> Backend | None:
         """Return the oldest eligible spare, normally hiding provisionally claimed spares."""
 
+        # Count replacement and OOM cleanup share this selection path. Pool workers
+        # must retain every coordinator-owned entry until an explicit detach.
+        if not self._allow_automatic_eviction:
+            return None
         excluded = set(excluded_keys or ())
         claimed_ids = set() if include_claimed_spares else self._claimed_spare_ids()
         for backend in self.spares:
@@ -800,9 +1267,9 @@ class BackendCache:
         if not evicted_backends:
             return
         evicted_backends.clear()
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        gc.collect()
 
     def _raise_cache_full(self, key: str, reason: str) -> NoReturn:
         raise CacheFullError(f"Cannot add backend '{key}': {reason}")
@@ -841,35 +1308,16 @@ class BackendCache:
                 return backend
         return None
 
-    @staticmethod
-    def _raise_wait_aborted(key: str, reason: CacheWaitAbortedReason) -> NoReturn:
-        raise CacheWaitAbortedError(f"Stopped waiting for backend '{key}'", reason)
-
-    def _abort_reason_from_policy(self, wait_policy: BackendCacheWaitPolicy | None) -> CacheWaitAbortedReason:
-        if wait_policy is not None and wait_policy.abort_reason is not None:
-            return wait_policy.abort_reason()
-        return CacheWaitAbortedReason.CANCELLED
-
-    def _ensure_wait_policy_continues(self, key: str, wait_policy: BackendCacheWaitPolicy | None) -> None:
-        if wait_policy is None or wait_policy.should_continue is None or wait_policy.should_continue():
-            return
-        self._raise_wait_aborted(key, self._abort_reason_from_policy(wait_policy))
-
     def _wait_for_capacity(self, key: str, *, wait_policy: BackendCacheWaitPolicy | None = None) -> None:
-        self._ensure_wait_policy_continues(key, wait_policy)
+        _check_backend_wait(key, wait_policy)
         wait_deadline = wait_policy.wait_deadline if wait_policy is not None else None
 
         timeout = BACKEND_CACHE_WAIT_POLL_S
         if wait_deadline is not None:
             timeout = min(timeout, max(0.0, wait_deadline - time.monotonic()))
-            if timeout == 0.0:
-                self._raise_wait_aborted(key, CacheWaitAbortedReason.SERVER_TIMEOUT)
 
         self.capacity_changed.wait(timeout=timeout)
-
-        self._ensure_wait_policy_continues(key, wait_policy)
-        if wait_deadline is not None and time.monotonic() >= wait_deadline:
-            self._raise_wait_aborted(key, CacheWaitAbortedReason.SERVER_TIMEOUT)
+        _check_backend_wait(key, wait_policy)
 
     def _reserve_locked(self, key: str, scene_id: str | None = None) -> BackendReservation:
         """Reserve a logical slot without discarding a working spare before commit.
@@ -944,12 +1392,23 @@ class BackendCache:
         validator cannot stall unrelated cache operations. Competing waiters
         have no admission-order guarantee.
         """
+        wait_started: float | None = None
+
+        def acquired(value: Backend | BackendReservation) -> Backend | BackendReservation:
+            if wait_started is not None:
+                log.info(
+                    "Scene backend cache wait: scene_id=%s cache_key=%s elapsed_s=%.3f",
+                    key if scene_id is None else scene_id,
+                    key,
+                    time.perf_counter() - wait_started,
+                )
+            return value
 
         while True:
             with self.capacity_changed:
                 backend = self._checkout_locked(key)
                 if backend is not None:
-                    return backend
+                    return acquired(backend)
 
             # The validator may block on unrelated locks (e.g. a scene download
             # publishing), so it must run with the cache lock released.
@@ -961,14 +1420,16 @@ class BackendCache:
                 # checkout before attempting a new reservation.
                 backend = self._checkout_locked(key)
                 if backend is not None:
-                    return backend
+                    return acquired(backend)
 
                 try:
-                    return self._reserve_locked(key, scene_id)
+                    return acquired(self._reserve_locked(key, scene_id))
                 except CacheFullError as exc:
                     if self.max_per_key is None:
                         raise
                     log.debug(f"Waiting for backend '{key}': {exc}")
+                    if wait_started is None:
+                        wait_started = time.perf_counter()
                     self._wait_for_capacity(key, wait_policy=wait_policy)
 
     def put_reserved(self, reservation: BackendReservation, backend: Backend) -> None:
@@ -1007,6 +1468,29 @@ class BackendCache:
             self._claimed_spares_by_reservation.pop(reservation.token, None)
             self.capacity_changed.notify_all()
 
+    def evict_reserved_spare(self, reservation: BackendReservation) -> bool:
+        """Evict a claimed replacement only while it remains spare; return whether it was removed."""
+        with self.capacity_changed:
+            if reservation.token not in self.pending_reservations:
+                raise ValueError(f"Unknown or already consumed backend reservation for '{reservation.key}'")
+            backend = self._claimed_spares_by_reservation.get(reservation.token)
+            if backend is None or backend not in self.spares:
+                return False
+            self._claimed_spares_by_reservation.pop(reservation.token)
+            self.spares.remove(backend)
+            self.capacity_changed.notify_all()
+
+        evicted_backends = [backend]
+        del backend
+        # Activation needs this capacity now, including storage held by module hooks.
+        self._cleanup_evicted_backends(evicted_backends)
+        return True
+
+    def has_spare(self, key: str) -> bool:
+        """Return whether ``key`` has a backend ready for checkout."""
+        with self.lock:
+            return any(backend.cache_key == key for backend in self.spares)
+
     def checkout(self, key: str) -> Backend | None:
         """
         Get an available backend for a key and mark as in-use.
@@ -1039,10 +1523,10 @@ class BackendCache:
     def put(self, key: str, backend: Backend):
         """
         Add a new backend for the key, initially marked as in-use.
-        Automatically evicts spare backends if cache size limit is reached.
+        Automatically evicts spare backends at the cache size limit when automatic eviction is enabled.
 
         Raises:
-            CacheFullError: If maxsize would be exceeded because all backends are in-use
+            CacheFullError: If maxsize would be exceeded and no spare is eligible for automatic eviction.
         """
 
         # The backend must be a brand new instance
@@ -1057,7 +1541,8 @@ class BackendCache:
 
     @staticmethod
     def _log_acquisition(key: str, backend: Backend, created: bool) -> None:
-        log.info(
+        log.log(
+            logging.INFO if created else logging.DEBUG,
             "Scene backend cache %s: scene_id=%s cache_key=%s sha256=%s",
             "miss" if created else "hit",
             backend.scene_id,
@@ -1075,6 +1560,7 @@ class BackendCache:
         scene_id: str | None = None,
         wait_policy: BackendCacheWaitPolicy | None = None,
         cache_miss_validator: Callable[[], None] | None = None,
+        evict_replacement_before_factory: bool = False,
     ) -> Backend:
         """
         Reuse or construct a backend, with policy-controlled waiting and OOM recovery.
@@ -1084,9 +1570,13 @@ class BackendCache:
         backend that became spare is reused; otherwise, one eligible spare is
         evicted and construction is retried. When a scene is saturated and
         capacity is temporarily unavailable, the caller waits until capacity
-        changes or ``wait_policy`` aborts the acquisition.
+        changes or ``wait_policy`` aborts the acquisition. If
+        ``evict_replacement_before_factory`` is true, evict the reserved spare
+        before the first factory call. It is not restored if construction fails.
         """
         attempt = 0
+        eager_eviction_pending = evict_replacement_before_factory
+        eagerly_evicted = False
 
         while attempt < max_retries:
             try:
@@ -1104,7 +1594,10 @@ class BackendCache:
                 consumed = False
                 constructed_backend: Backend | None = None
                 try:
-                    self._ensure_wait_policy_continues(key, wait_policy)
+                    _ensure_wait_policy_continues(key, wait_policy)
+                    if eager_eviction_pending:
+                        eagerly_evicted = self.evict_reserved_spare(reservation)
+                        eager_eviction_pending = False
                     constructed_backend = backend_factory()
                     # Once construction succeeds the expensive work is paid for, so
                     # always commit: committing warms the cache for the aborting
@@ -1124,12 +1617,13 @@ class BackendCache:
                             self._cleanup_evicted_backends(backends_to_clean)
 
             except torch.cuda.OutOfMemoryError as e:
-                self._ensure_wait_policy_continues(key, wait_policy)
+                _ensure_wait_policy_continues(key, wait_policy)
                 attempt += 1
                 log.warning(
                     f"OOM error loading '{key}' (attempt {attempt}/{max_retries}). "
                     f"{'Trying to evict a spare backend...' if enable_eviction else 'Eviction disabled, will retry.'}"
                 )
+                _cleanup_failed_backend(e)
 
                 checked_in_backend = self.checkout(key)
                 if checked_in_backend is not None:
@@ -1142,15 +1636,21 @@ class BackendCache:
                     if self.evict_one_spare(excluded_keys={key}):
                         log.info("Evicted a spare backend, retrying...")
                         continue
-                    else:
-                        # No more spares to evict
-                        log.exception(
-                            f"Cannot load '{key}': out of memory and no spare backends to evict. "
-                            f"All {len(self.in_use)} cached backends are currently in use."
-                        )
-                        raise NoSpareBackendsError(
-                            f"Out of GPU memory loading '{key}'. No spare backends available to evict."
-                        ) from e
+                    if eagerly_evicted and attempt < max_retries:
+                        eagerly_evicted = False
+                        log.info("Retrying '%s' after eager-eviction OOM cleanup", key)
+                        continue
+                    # No eligible spare can be evicted under the cache policy.
+                    log.exception(
+                        f"Cannot load '{key}': out of memory. in_use={len(self.in_use)} spares={len(self.spares)} "
+                        f"automatic_eviction={self._allow_automatic_eviction}."
+                    )
+                    reason = (
+                        "automatic eviction is disabled"
+                        if not self._allow_automatic_eviction
+                        else "no spare backends are available to evict"
+                    )
+                    raise NoSpareBackendsError(f"Out of GPU memory loading '{key}'; {reason}.") from e
                 else:
                     # Eviction disabled, just retry
                     if attempt >= max_retries:
@@ -1165,7 +1665,8 @@ class BackendCache:
         Evict the oldest spare backend to free up memory.
 
         Returns:
-            True if a backend was evicted, False if no spares available.
+            True if a backend was evicted, False if no eligible spare is available
+            or automatic eviction is disabled.
         """
         # Extract backend info while holding lock
         evicted_backend = None
@@ -1287,7 +1788,36 @@ class BackendCache:
 
 
 class CameraBank:
-    def __init__(self, artifact: Artifact, world_to_nurec: FrameConversion):
+    """Build calibrated cameras and their trajectory from a scene artifact.
+
+    Args:
+        artifact: Scene artifact containing calibrated camera trajectories.
+        world_to_nurec: World-to-NuRec pose and scale conversion used for camera rays.
+        scene_time_range_us: Half-open scene timestamp interval in microseconds.
+
+    Raises:
+        AssertionError: If the artifact does not contain exactly one rig trajectory.
+    """
+
+    def __init__(
+        self,
+        artifact: Artifact,
+        world_to_nurec: FrameConversion,
+        scene_time_range_us: HalfClosedInterval,
+    ):
+        """Load cameras for the supplied scene interval.
+
+        Args:
+            artifact: Scene artifact containing calibrated camera trajectories.
+            world_to_nurec: World-to-NuRec pose and scale conversion used for camera rays.
+            scene_time_range_us: Half-open scene timestamp interval in microseconds.
+
+        Returns:
+            ``None``; stores cameras, coordinate conversion, and the rig trajectory.
+
+        Raises:
+            AssertionError: If the artifact does not contain exactly one rig trajectory.
+        """
         super().__init__()
 
         rig_trajectories = RigTrajectories.from_dict(artifact.rig_trajectories)
@@ -1296,6 +1826,7 @@ class CameraBank:
         self.world_to_nurec = world_to_nurec
 
         self.cameras: dict[str, TorchCamera] = {}
+        self._custom_camera: Optional[Tuple[bytes, TorchCamera]] = None
         self._logged_missing_reconstruction_cameras: set[str] = set()
         self._logged_missing_reconstruction_cameras_lock = threading.Lock()
 
@@ -1311,18 +1842,12 @@ class CameraBank:
         rig_trajectory = rig_trajectories.rig_trajectories[0]
         self.trajectory = _rig_trajectory_to_grpc_trajectory(rig_trajectory)
 
-        rig_timestamps_us = rig_trajectory.T_rig_world_timestamps_us
-        time_range_us = HalfClosedInterval(
-            int(rig_timestamps_us[0].item()),
-            int(rig_timestamps_us[-1].item()) + 1,  # +1 to make the interval half-closed
-        )
-
         for unique_camera_id in rig_trajectory.cameras_frame_timestamps_us.keys():
             camera_calibration = rig_trajectories.camera_calibrations[unique_camera_id]
             logical_camera_id = unique_camera_id_to_camera_id[unique_camera_id]
 
             camera = TorchCamera(
-                time_range_us=time_range_us,
+                time_range_us=scene_time_range_us,
                 camera_model_parameters=camera_calibration.camera_model_parameters,
                 logical_camera_id=logical_camera_id,
                 unique_sensor_idx=camera_calibration.unique_sensor_idx,
@@ -1446,6 +1971,9 @@ class CameraBank:
             return self.cameras[key]
         # If the request has an assigned camera param, it indicates that user customized the camera parameters
         else:
+            spec = camera_intrinsics.SerializeToString(deterministic=True)
+            if self._custom_camera is not None and self._custom_camera[0] == spec:
+                return self._custom_camera[1]
             with ScopedTimer("get_camera_model_parameters"):
                 camera_model_parameters = self._get_camera_model_parameters(camera_intrinsics)
             with ScopedTimer("TorchCamera"):
@@ -1457,7 +1985,7 @@ class CameraBank:
                     # (same for all cameras), and the render request provides sensor_pose explicitly.
                     ref_camera = next(iter(self.cameras.values()))
                     self._log_missing_reconstruction_camera_once(key, ref_camera)
-                return TorchCamera(
+                camera = TorchCamera(
                     time_range_us=ref_camera.time_range_us,
                     camera_model_parameters=camera_model_parameters,
                     logical_camera_id=key,
@@ -1465,6 +1993,8 @@ class CameraBank:
                     world_to_nurec=ref_camera.world_to_nurec,
                     T_camera_rig=ref_camera.T_camera_rig,
                 )
+                self._custom_camera = spec, camera
+                return camera
 
     def _log_missing_reconstruction_camera_once(self, key: str, ref_camera: TorchCamera) -> None:
         with self._logged_missing_reconstruction_cameras_lock:
@@ -1622,26 +2152,40 @@ class CameraBank:
 # result has no unambiguous truth value. Identity comparison is what callers want anyway.
 @dataclass(eq=False)
 class LidarEntry:
-    """One lidar of the artifact, as recorded in its ``RigTrajectories``.
+    """One artifact lidar addressed by its logical sensor name.
 
-    ``logical_id`` is ``LidarCalibration.logical_sensor_name``, not the
-    ``lidar_id@sequence_id`` key: it is what clients address and what ``PerSensor`` config
-    is indexed by. ``model_parameters`` is optional -- such a lidar is still discoverable,
-    it just cannot generate rays. ``bundle()`` is lazy because it allocates on the GPU.
+    The logical ID comes from ``LidarCalibration.logical_sensor_name``, rather than
+    the ``lidar_id@sequence_id`` key, and also indexes per-sensor configuration.
+    Stored templates can supply rays when parametric intrinsics are absent.
+
+    Args:
+        logical_id: Sensor name used by clients to address this lidar.
+        unique_sensor_idx: Dataset sensor index used by the render model.
+        T_lidar_rig: Calibrated ``(4, 4)`` transform from lidar to rig coordinates.
+        model_parameters: Optional parametric intrinsics used to generate modeled rays.
+        firing_pattern_templates: Optional stored template sequence and frame grid,
+            used in preference to synthesizing rays from model intrinsics.
     """
 
     logical_id: str
     unique_sensor_idx: int
     T_lidar_rig: torch.Tensor
     model_parameters: Optional[ncore.data.ConcreteLidarModelParametersUnion]
-    # Observed firing pattern, for units with no nominal model; carried by the artifact.
-    firing_pattern: Optional[LidarFiringPattern] = None
+    firing_pattern_templates: Optional[LidarFiringPatternTemplateSet] = None
 
     _bundle: Optional[LidarModelBundle] = field(default=None, init=False, repr=False)
     _bundle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def bundle(self) -> Optional[LidarModelBundle]:
-        """The ray-generation bundle for this lidar, built on first use (None without intrinsics)."""
+        """The ray-generation bundle for this lidar, built on first use (None without intrinsics).
+
+        Returns:
+            Lazily constructed and cached GPU model bundle, or ``None`` without
+            parametric intrinsics. Stored firing patterns are selected separately.
+
+        Raises:
+            RuntimeError: If model-bundle tensor allocation or initialization fails.
+        """
         if self.model_parameters is None:
             return None
         with self._bundle_lock:
@@ -1649,21 +2193,106 @@ class LidarEntry:
                 self._bundle = LidarModelBundle.load_from_config(self.model_parameters.to_dict())
             return self._bundle
 
+    def select_firing_pattern(
+        self, frame_start_us: int, firing_pattern_id: str = ""
+    ) -> Optional[LidarFiringPatternTemplate]:
+        """Resolve an explicit ID, or select the phase containing ``frame_start_us``.
+
+        Args:
+            frame_start_us: Requested physical frame start in microseconds, used to
+                select the nearest repeating phase when no ID is supplied.
+            firing_pattern_id: Optional exact pattern ID. A non-empty ID takes
+                precedence over timestamp-based selection.
+
+        Returns:
+            The selected template, or ``None`` when neither stored templates nor
+            an explicit pattern ID are available.
+
+        Raises:
+            KeyError: If an explicit ID cannot be resolved for this lidar.
+            ValueError: If timestamp-based selection receives a non-integer start time.
+        """
+        if self.firing_pattern_templates is None:
+            if firing_pattern_id:
+                raise KeyError(f"No firing patterns are available for lidar '{self.logical_id}'")
+            return None
+        if firing_pattern_id:
+            return self.firing_pattern_templates.get_by_id(firing_pattern_id)
+        return self.firing_pattern_templates.select(frame_start_us)
+
+
+def _fill_firing_pattern(
+    pattern: LidarFiringPatternTemplate,
+    frame_period_us: int,
+    result: LidarFiringPatternReturn,
+) -> None:
+    """Encode a firing pattern into ``result``.
+
+    Shared by get_lidar_firing_pattern and the copy render_lidar embeds on request, so the two
+    can never describe the same sensor differently. It writes into a caller-owned message so
+    the embedded case does not build a temporary and deep-copy its buffers into it.
+    """
+    result.num_rays = pattern.n_rays
+    result.directions_sensor = np.ascontiguousarray(pattern.directions_sensor, dtype="<f4").tobytes()
+    result.firing_pattern_id = pattern.pattern_id(frame_period_us)
+    result.frame_period_us = frame_period_us
+    grid = pattern.grid
+    if grid is not None:
+        result.num_columns, result.num_rows = grid
+    if pattern.packet_ray_offsets is not None:
+        if pattern.n_rays > np.iinfo(np.uint32).max:
+            raise ValueError(f"firing pattern has {pattern.n_rays} rays, beyond uint32 packet-layout capacity")
+        packet_layout = result.packet_layout
+        packet_layout.num_packets = len(pattern.packet_ray_offsets) - 1
+        packet_layout.ray_offsets_u32_le = np.asarray(pattern.packet_ray_offsets, dtype="<u4", order="C").tobytes()
+        packet_timestamps = pattern.timestamp_offsets_us[pattern.packet_ray_offsets[:-1]]
+        expanded_packet_timestamps = np.repeat(packet_timestamps, np.diff(pattern.packet_ray_offsets))
+        if np.array_equal(expanded_packet_timestamps, pattern.timestamp_offsets_us):
+            packet_layout.timestamp_offsets_us = np.asarray(packet_timestamps, dtype="<i8", order="C").tobytes()
+            return
+
+    result.timestamp_offsets_us = np.ascontiguousarray(pattern.timestamp_offsets_us, dtype="<i8").tobytes()
+
 
 class LidarBank:
     """The artifact's lidars, keyed by logical sensor id.
 
     All of them are retained so discovery and per-sensor config work on a multi-lidar
     artifact; rendering still targets one lidar per request (see :meth:`get_entry`).
+
+    Args:
+        artifact: Scene artifact containing lidar calibrations and optional
+            ``firing_patterns/<logical_id>.npz`` members.
+
+    Raises:
+        ValueError: If logical lidar IDs are duplicated or stored patterns fail validation.
+        OSError: If the artifact cannot be opened or read.
     """
 
-    def __init__(self, artifact: Artifact):
+    def __init__(self, artifact: Artifact, *, enabled: bool = True):
+        """Load every calibrated lidar and its optional stored templates.
+
+        Args:
+            artifact: Scene artifact containing lidar calibrations and optional
+                ``firing_patterns/<logical_id>.npz`` members.
+            enabled: If false, leave the bank empty without reading the artifact.
+
+        Returns:
+            ``None``; initializes the ordered mapping of logical IDs to lidar entries.
+
+        Raises:
+            ValueError: If logical lidar IDs are duplicated or stored patterns fail validation.
+            OSError: If the artifact cannot be opened or read.
+        """
         super().__init__()
+
+        self.lidars: OrderedDict[str, LidarEntry] = OrderedDict()
+        if not enabled:
+            return
 
         rig_trajectories = RigTrajectories.from_dict(artifact.rig_trajectories)
         stored_patterns = artifact.firing_patterns
 
-        self.lidars: OrderedDict[str, LidarEntry] = OrderedDict()
         for unique_lidar_id, lidar_calibration in rig_trajectories.lidar_calibrations.items():
             logical_id = lidar_calibration.logical_sensor_name
             if logical_id in self.lidars:
@@ -1672,16 +2301,20 @@ class LidarBank:
                     f"LidarBank: duplicate logical lidar id '{logical_id}' (from unique id "
                     f"'{unique_lidar_id}'); logical lidar ids must be unique within an artifact."
                 )
-            firing_pattern = None
+            firing_pattern_templates = None
             if logical_id in stored_patterns:
-                firing_pattern = LidarFiringPattern.load(io.BytesIO(stored_patterns[logical_id]))
-                log.info(f"LidarBank: lidar '{logical_id}' uses the firing pattern stored in the artifact")
+                firing_pattern_templates = load_firing_patterns(io.BytesIO(stored_patterns[logical_id]))
+                log.info(
+                    "LidarBank: lidar '%s' uses %d firing-pattern templates stored in the artifact",
+                    logical_id,
+                    len(firing_pattern_templates.templates),
+                )
             self.lidars[logical_id] = LidarEntry(
                 logical_id=logical_id,
                 unique_sensor_idx=lidar_calibration.unique_sensor_idx,
                 T_lidar_rig=lidar_calibration.T_sensor_rig,
                 model_parameters=lidar_calibration.lidar_model_parameters,
-                firing_pattern=firing_pattern,
+                firing_pattern_templates=firing_pattern_templates,
             )
 
     def get_entry(self, logical_id: Optional[str] = None) -> Optional[LidarEntry]:
@@ -1689,11 +2322,22 @@ class LidarBank:
 
         Omitting the id is only unambiguous for a single-lidar artifact; on a multi-lidar
         artifact it raises rather than picking one arbitrarily.
+
+        Args:
+            logical_id: Exact logical sensor name, or ``None`` to select the only lidar.
+
+        Returns:
+            The requested or sole lidar entry, or ``None`` when no ID was requested
+            and the artifact contains no lidar sensors.
+
+        Raises:
+            KeyError: If the requested ID is unknown.
+            ValueError: If omission is ambiguous because the artifact contains multiple lidars.
         """
         if logical_id is not None:
             entry = self.lidars.get(logical_id)
             if entry is None:
-                raise ValueError(
+                raise KeyError(
                     f"Unknown lidar '{logical_id}'; this artifact has {sorted(self.lidars)}. "
                     "Call get_available_lidars to discover them."
                 )
@@ -1717,10 +2361,12 @@ class AssetBank:
     def __init__(self, artifact: Artifact):
         super().__init__()
         self.external_assets = artifact.external_assets  # Dict[track_id, ply_bytes]
-        self._dims_offset = OmegaConf.select(
-            OmegaConf.create(artifact.parsed_config),
-            "dataset.valid_pixels_cuboid_track_params.track_padding_m",
-            default=[0.0, 0.0, 0.0],
+        # parsed_config.yaml is dumped from the typed (pydantic) config, so it holds plain values and
+        # no interpolations; the one key needed here is read from the mapping directly. Building a
+        # DictConfig out of the whole ~200 KB tree costs 0.1-0.5 s per scene load.
+        dataset_config = artifact.parsed_config.get("dataset") or {}
+        self._dims_offset = (dataset_config.get("valid_pixels_cuboid_track_params") or {}).get(
+            "track_padding_m", [0.0, 0.0, 0.0]
         )
 
         if self.external_assets:
@@ -1899,9 +2545,34 @@ def _install_edit_overrides(backend: "Backend", artifact: Artifact) -> None:
 
 @dataclass
 class Backend:
+    """Hold the loaded model, sensor banks, and request state for one artifact.
+
+    Prefer ``from_artifact`` to assemble these components consistently.
+
+    Args:
+        renderable_model: Loaded scene model used for camera and lidar rendering.
+        camera_bank: Calibrated cameras and their recorded rig trajectory.
+        world_to_nurec: Coordinate and scale conversion from world to NuRec space.
+        scene_time_range_us: Half-open scene availability interval in microseconds.
+        lidar_bank: Logical lidar entries with optional intrinsics and stored patterns.
+        asset_bank: External assets available for insertion or replacement.
+        source_artifact: Artifact retained for metadata and lazy asset access.
+        backend_cache_key: Exact scene/content identity used for backend pooling.
+        distance_vmax_m: Default camera distance-colormap maximum in metres.
+        aspect_registry: Optional aspect-edit registry for a baked scene.
+        edit_track_index: Optional map from client track IDs to layer and internal track IDs.
+        edit_track_aspects: Baked aspect names by track ID, used to reject invalid edits.
+        file_schedules: Immutable baseline schedules from the artifact's edit manifest.
+        _live_aspects_logged: Internal flag suppressing repeated live-edit logging.
+        _render_lock: Lock serializing operations that mutate render state.
+        _lidar_stream: Optional backend-owned CUDA stream, initialized lazily when absent.
+        cache_key: Optional opaque lookup key assigned by the backend cache.
+    """
+
     renderable_model: RenderableModel
     camera_bank: CameraBank
     world_to_nurec: FrameConversion
+    scene_time_range_us: HalfClosedInterval
     lidar_bank: LidarBank
     asset_bank: AssetBank
     source_artifact: Artifact = field(repr=False)
@@ -1954,70 +2625,116 @@ class Backend:
         return self.backend_cache_key.scene_key.scene_id
 
     @staticmethod
+    def _config_overrides(artifact: Artifact, renderer: Backend.RendererType) -> tuple[str, ...]:
+        config_overrides: tuple[str, ...] = ()
+        if renderer == Backend.RendererType.GSPLAT:
+            config_overrides = ("model.renderer.name=3dgut-gsplat",)
+
+        # Keep distance enabled: a cached backend serves both color and distance requests.
+        config_overrides += ("model.renderer.outputs.camera.enable_distance=True",)
+        if artifact.semantic_class_names is not None:
+            config_overrides += (
+                "model.renderer.outputs.camera.enable_extended_features=True",
+                "model.renderer.outputs.camera.enable_sensor_features=True",
+            )
+        return config_overrides
+
+    @staticmethod
     def from_artifact(
         artifact: Artifact,
         renderer: Backend.RendererType,
         tracks_timestamp_ray_stride: int = 1,
         *,
         backend_cache_key: BackendCacheKey,
+        camera_only: bool = False,
     ) -> Backend:
-        try:
-            config_overrides: tuple[str, ...] = ()
+        """Load a renderable scene and its calibrated sensor banks from an artifact.
 
-            if renderer == Backend.RendererType.GSPLAT:
-                # gRPC serves many artifacts; prefer an explicit flag over arbitrary overrides.
-                config_overrides = ("model.renderer.name=3dgut-gsplat",)
+        Args:
+            artifact: Exported scene supplying model data, trajectories, and sensor metadata.
+            renderer: Renderer implementation to select when loading the model.
+            tracks_timestamp_ray_stride: Ray subsampling stride used when estimating
+                per-track timestamps during inference.
+            backend_cache_key: Exact scene and artifact identity used by the backend cache.
+            camera_only: If true, skip lidar setup.
 
-            # Distance is a first-class CameraRender product any client may request against this
-            # shared, cached backend, and the renderer is fixed at load time. Enable it
-            # unconditionally so DISTANCE_COLORIZED is available: gsplat only produces the depth
-            # channel when this gate is set (renderers.py:1055-1060). Mirrors the render CLI,
-            # which re-enables
-            # enable_distance for --output-type distance-colorized. Trade-off: forgoes the CDIM 4->3
-            # optimization for color-only gsplat camera renders.
-            config_overrides += ("model.renderer.outputs.camera.enable_distance=True",)
+        Returns:
+            A loaded backend with camera, lidar, and asset banks and the scene time interval.
 
-            # Semantic logits require extended features.
-            if artifact.semantic_class_names is not None:
-                config_overrides += (
-                    "model.renderer.outputs.camera.enable_extended_features=True",
-                    "model.renderer.outputs.camera.enable_sensor_features=True",
-                )
-
-            # Inference-only ray-stride; scoped to present track layers inside load_from_artifact.
-
-            renderable_model = RenderableModel.load_from_artifact(
+        Raises:
+            ModelIncompatibilityError: If model loading rejects artifact types or values.
+            AssertionError: If the artifact does not contain exactly one rig trajectory.
+            ValueError: If sensor metadata, stored patterns, or asset-edit metadata is invalid.
+            OSError: If artifact data cannot be read.
+            RuntimeError: If model initialization or GPU allocation fails.
+        """
+        # Loading allocates millions of short-lived Python objects (the config tree, the datasource
+        # JSON); each automatic generation-2 collection they trigger walks the server's whole live
+        # heap. Hold those off for the load and collect what it left behind once, at its end.
+        with _automatic_gc.paused():
+            return Backend._build_from_artifact(
                 artifact,
-                config_overrides=config_overrides,
-                tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
+                renderer,
+                tracks_timestamp_ray_stride,
+                backend_cache_key=backend_cache_key,
+                camera_only=camera_only,
             )
+
+    @staticmethod
+    def _build_from_artifact(
+        artifact: Artifact,
+        renderer: Backend.RendererType,
+        tracks_timestamp_ray_stride: int,
+        *,
+        backend_cache_key: BackendCacheKey,
+        camera_only: bool,
+    ) -> Backend:
+        """Build the backend while automatic garbage collection is paused by the caller."""
+        try:
+            with ScopedTimer("Backend.from_artifact/load_from_artifact"):
+                renderable_model = RenderableModel.load_from_artifact(
+                    artifact,
+                    config_overrides=Backend._config_overrides(artifact, renderer),
+                    tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
+                )
         except (TypeError, ValueError) as exc:
             raise ModelIncompatibilityError(str(exc)) from exc
 
-        world_to_nurec = RigTrajectories.from_dict(artifact.rig_trajectories).world_to_nurec
+        with ScopedTimer("Backend.from_artifact/rig_trajectories"):
+            rig_trajectories = RigTrajectories.from_dict(artifact.rig_trajectories)
+            world_to_nurec = rig_trajectories.world_to_nurec
+            scene_time_range_us = _scene_time_range_us(rig_trajectories)
 
-        lidar_bank = LidarBank(artifact)
+        with ScopedTimer("Backend.from_artifact/LidarBank"):
+            lidar_bank = LidarBank(artifact, enabled=not camera_only)
 
-        backend = Backend(
-            renderable_model=renderable_model,
-            camera_bank=CameraBank(artifact, world_to_nurec),
-            world_to_nurec=world_to_nurec,
-            lidar_bank=lidar_bank,
-            asset_bank=AssetBank(artifact),
-            source_artifact=artifact,
-            backend_cache_key=backend_cache_key,
-        )
+        with ScopedTimer("Backend.from_artifact/CameraBank+AssetBank"):
+            backend = Backend(
+                renderable_model=renderable_model,
+                camera_bank=CameraBank(artifact, world_to_nurec, scene_time_range_us),
+                world_to_nurec=world_to_nurec,
+                scene_time_range_us=scene_time_range_us,
+                lidar_bank=lidar_bank,
+                asset_bank=AssetBank(artifact),
+                source_artifact=artifact,
+                backend_cache_key=backend_cache_key,
+            )
 
         try:
-            _install_edit_overrides(backend, artifact)
+            with ScopedTimer("Backend.from_artifact/install_edit_overrides"):
+                _install_edit_overrides(backend, artifact)
         except Exception as exc:
             # An edit-baked artifact whose runtime cannot install must refuse to serve:
             # with replace_original the captured actor is hidden in the bake, so
             # serving without the edits would silently render a hole where it was.
             raise ModelIncompatibilityError(f"asset-edit install failed: {exc}") from exc
 
-        torch.cuda.empty_cache()
-        gc.collect()
+        with ScopedTimer("Backend.from_artifact/empty_cache+gc"):
+            # The one full collection of the load (automatic ones are paused, see from_artifact). A
+            # cheaper young-generation collection here would only defer the full one onto the first
+            # render request. The caching allocator then returns the blocks of the dropped tensors.
+            gc.collect()
+            torch.cuda.empty_cache()
 
         return backend
 
@@ -2264,6 +2981,62 @@ class Backend:
 
         return frame, (h, w), model_overlay_snapshot
 
+    @with_render_lock()
+    @ScopedTimer()
+    def render_camera_batch_shared_scene(
+        self,
+        requests: List[CameraRenderRequest],
+        enable_editing_actors: bool = False,
+    ) -> tuple[Optional[List[CameraFrame]], _CameraBatchDispatch]:
+        """Render compatible camera requests from one collected Gaussian scene.
+
+        Args:
+            requests: Camera requests already limited to color-only output and a
+                fixed CUDA IPC layout.
+            enable_editing_actors: Whether request actor overrides may be applied.
+
+        Returns:
+            Rendered frames and the batching outcome, or ``None`` and the
+            reason for sequential rendering.
+        """
+        if not self.renderable_model.supports_shared_camera_batch():
+            return None, _CameraBatchDispatch.SEQUENTIAL_RENDERER_UNSUPPORTED
+        dynamic_actor_ids = self.renderable_model.dynamic_actor_ids()
+        incompatibility = _camera_batch_incompatibility(requests, dynamic_actor_ids)
+        if incompatibility is not None:
+            return None, incompatibility
+        first = requests[0]
+        if first.dynamic_objects and not enable_editing_actors:
+            return None, _CameraBatchDispatch.SEQUENTIAL_ACTOR_EDITING_DISABLED
+
+        camera = self.camera_bank._get_camera(first.camera_intrinsics)
+        if camera.camera_model_parameters.shutter_type != ncore.data.ShutterType.GLOBAL and dynamic_actor_ids:
+            return None, _CameraBatchDispatch.SEQUENTIAL_ROLLING_ACTORS
+
+        self._validate_dynamic_object_updates_request(
+            num_dynamic_objects=len(first.dynamic_objects),
+            enable_editing_actors=enable_editing_actors,
+        )
+        self._update_aspect_states(first)
+        actors_snapshot = (
+            actors_snapshot_from_render_request(first) if enable_editing_actors and first.dynamic_objects else None
+        )
+        if camera.camera_model_parameters.shutter_type == ncore.data.ShutterType.GLOBAL:
+            rendering_data, frame_meta = camera.build_ray_batch(requests, self.renderable_model.device)
+            frames = self.renderable_model.render_camera_color_batch(
+                rendering_data,
+                frame_meta,
+                actors_snapshot=actors_snapshot,
+            )
+            return frames, _CameraBatchDispatch.NATIVE_BATCHED_RAYS
+
+        ray_bundles = [camera.build_ray_bundle(request) for request in requests]
+        frames = self.renderable_model.render_camera_color_batch_from_ray_bundles(
+            ray_bundles,
+            actors_snapshot=actors_snapshot,
+        )
+        return frames, _CameraBatchDispatch.NATIVE_PER_CAMERA_RAYS
+
     def get_available_cameras(self) -> AvailableCamerasReturn:
         return AvailableCamerasReturn(available_cameras=list(self.camera_bank.get_available_cameras()))
 
@@ -2286,7 +3059,7 @@ class Backend:
         return ExternalAssetObjectsReturn(track_ids=self.asset_bank.get_track_ids())
 
     def get_dynamic_objects(self) -> List[sensorsim_types.DynamicObjectTrack]:
-        """Return DynamicObjectTrack for all controllable actors in gRPC format."""
+        """Return DynamicObjectTrack for controllable actors in gRPC format."""
         if not self.renderable_model.supports_edit_actors():
             return []  # Return empty list instead of raising error
 
@@ -2422,7 +3195,10 @@ class Backend:
 
             if insert_assets:
                 self.insert_assets(insert_assets)
-        except Exception:
+        except Exception as exc:
+            # A poisoned CUDA context must reach the fatal interceptor before rollback can wait on GPU work.
+            if is_fatal_worker_exception(exc):
+                raise
             self.renderable_model.restore_training_parameters()
             raise
 
@@ -2442,17 +3218,69 @@ class Backend:
     def render_lidar_request(
         self, request: LidarRenderRequest, enable_editing_actors: bool = False
     ) -> LidarRenderReturn:
-        """
-        Go-to gRPC lidar rendering API.
-        Currently missing
-            * proper serialization of Lidar spec
-            * proper trajectories for ego and traffic objects: currently only start and end pose are passed
+        """Render one lidar interval using native templates or parametric intrinsics.
+
+        Stored templates take precedence over model intrinsics. With no explicit output
+        mode, all sensors return a motion-compensated point cloud in metres.
+        Per-ray output is explicit opt-in. Ego and actor motion use start and end poses.
+
+        Args:
+            request: SensorSim request containing the logical lidar ID, frame start/end
+                in microseconds, sensor poses, actor updates, and filter overrides.
+                A supplied pattern ID overrides timestamp-based phase selection.
+                Per-ray mode requires stored templates and honors the requested return
+                layers and optional embedded firing pattern.
+            enable_editing_actors: Whether request-provided actor pose updates are allowed.
+
+        Returns:
+            A protobuf response containing either an end-of-sweep point cloud or
+            layer-major per-ray distances, intensities, and validity masks. Per-ray
+            responses identify the selected pattern and optionally include its geometry.
+
+        Raises:
+            KeyError: If an explicit lidar or firing-pattern ID is unknown.
+            ValueError: If sensor selection, geometry, output mode, return layers,
+                actor updates, pose interval, or filter settings cannot support the render.
+            ModelIncompatibilityError: If the artifact lacks the required lidar geometry
+                or has a non-finite or non-positive world-to-NuRec distance scale.
+            RuntimeError: If model or GPU rendering operations fail, or rendered ray
+                count disagrees with the selected pattern.
         """
 
         self._validate_dynamic_object_updates_request(
             num_dynamic_objects=len(request.dynamic_objects),
             enable_editing_actors=enable_editing_actors,
         )
+        # An empty lidar_id means "the artifact's only lidar"; on a
+        # multi-lidar artifact get_lidar rejects the ambiguity.
+        lidar_entry = self.lidar_bank.get_entry(getattr(request, "lidar_id", "") or None)
+        if lidar_entry is None:
+            raise ModelIncompatibilityError("Lidar rendering is not supported: artifact has no lidar sensor")
+        # Stored geometry is authoritative when present. An explicit ID takes precedence
+        # over timestamp phase selection; model intrinsics are only the fallback when the
+        # artifact has no firing-pattern templates. Modeled lidars receive stored
+        # templates only via checkpoint.artifact.firing_patterns.include_modeled_lidars.
+        firing_pattern_template = lidar_entry.select_firing_pattern(request.frame_start_us, request.firing_pattern_id)
+
+        if request.HasField("output_mode"):
+            output_mode = request.output_mode
+        else:
+            # Older bindings cannot request per-ray output or decode its fields.
+            output_mode = LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD
+        if output_mode == LidarOutputMode.LIDAR_OUTPUT_PER_RAY:
+            if firing_pattern_template is None:
+                raise ModelIncompatibilityError(
+                    "LIDAR_OUTPUT_PER_RAY requires an artifact-resident firing pattern; "
+                    "this modelled lidar only exposes point-cloud output"
+                )
+            return_types = _lidar_return_types_from_request(request)
+        elif output_mode == LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD:
+            if request.include_firing_pattern or request.return_types:
+                raise ValueError("include_firing_pattern and return_types require LIDAR_OUTPUT_PER_RAY")
+        else:
+            raise ValueError(f"unsupported lidar output mode {output_mode}")
+
+        scale = self._validated_lidar_scale()
         self._update_aspect_states(request)
 
         # Update dynamic tracks
@@ -2468,32 +3296,26 @@ class Backend:
             lidar_to_world = PoseRange(
                 tquat_sensor_world_start, tquat_sensor_world_end, request.frame_start_us, request.frame_end_us
             )
-            # An empty lidar_id means "the artifact's only lidar"; on a
-            # multi-lidar artifact get_lidar rejects the ambiguity.
-            lidar_entry = self.lidar_bank.get_entry(getattr(request, "lidar_id", "") or None)
-            if lidar_entry is None:
-                raise ValueError("Lidar rendering is not supported: artifact has no lidar sensor")
-            # A lidar with intrinsics gets its rays synthesised from the sensor model. One
-            # without (a model-free unit) needs an observed firing pattern to say where and
-            # when it fires; prefer the model when both are present, since it is the
-            # artifact's own record of the sensor.
-            lidar_model = lidar_entry.bundle()
-            if lidar_model is not None:
+            lidar_model = None if firing_pattern_template is not None else lidar_entry.bundle()
+
+            if firing_pattern_template is not None:
+                assert lidar_entry.firing_pattern_templates is not None
+                lidar_ray_bundle = LidarRayBundle.build_model_free(
+                    firing_pattern_template=firing_pattern_template,
+                    frame_period_us=lidar_entry.firing_pattern_templates.frame_period_us,
+                    lidar_to_world=lidar_to_world,
+                    world_to_nurec=self.world_to_nurec,
+                    unique_sensor_idx=lidar_entry.unique_sensor_idx,
+                )
+            elif lidar_model is not None:
                 lidar_ray_bundle = LidarRayBundle.build(
                     lidar_model=lidar_model,
                     lidar_to_world=lidar_to_world,
                     world_to_nurec=self.world_to_nurec,
                     unique_sensor_idx=lidar_entry.unique_sensor_idx,
                 )
-            elif lidar_entry.firing_pattern is not None:
-                lidar_ray_bundle = LidarRayBundle.build_model_free(
-                    firing_pattern=lidar_entry.firing_pattern,
-                    lidar_to_world=lidar_to_world,
-                    world_to_nurec=self.world_to_nurec,
-                    unique_sensor_idx=lidar_entry.unique_sensor_idx,
-                )
             else:
-                raise ValueError(
+                raise ModelIncompatibilityError(
                     f"Lidar rendering is not supported for '{lidar_entry.logical_id}': the artifact "
                     "carries neither lidar model parameters nor a firing pattern for it, so there is "
                     "nothing to say where it fires. Re-export the artifact with "
@@ -2532,6 +3354,40 @@ class Backend:
             if render_filter.HasField("azimuth_max_gap_deg"):
                 azimuth_max_gap_deg = render_filter.azimuth_max_gap_deg
 
+        lidar_stream = self._get_lidar_stream()
+
+        if output_mode == LidarOutputMode.LIDAR_OUTPUT_PER_RAY:
+            with ScopedTimer("render_lidar_ray_frame_from_ray_bundle"):
+                ray_frame = self.renderable_model.render_lidar_ray_frame_from_ray_bundle(
+                    lidar_ray_bundle,
+                    raydrop_threshold=raydrop_threshold,
+                    opacity_threshold=opacity_threshold,
+                    enable_distance_filter=enable_distance_filter,
+                    distance_filter_threshold=distance_filter_threshold,
+                    neighbor_source=neighbor_source,
+                    elevation_resolution_deg=elevation_resolution_deg,
+                    azimuth_max_gap_deg=azimuth_max_gap_deg,
+                    actors_snapshot=actors_snapshot,
+                    frame_start_us=request.frame_start_us,
+                    frame_end_us=request.frame_end_us,
+                    lidar_stream=lidar_stream,
+                )
+            pattern_set = lidar_entry.firing_pattern_templates
+            assert pattern_set is not None and firing_pattern_template is not None
+            if ray_frame.n_rays != firing_pattern_template.n_rays:
+                raise RuntimeError(
+                    f"Rendered {ray_frame.n_rays} rays but selected firing pattern has "
+                    f"{firing_pattern_template.n_rays} rays"
+                )
+            embedded = firing_pattern_template if request.include_firing_pattern else None
+            return self._lidar_ray_frame_to_grpc(
+                ray_frame,
+                return_types=return_types,
+                firing_pattern=embedded,
+                firing_pattern_id=firing_pattern_template.pattern_id(pattern_set.frame_period_us),
+                frame_period_us=pattern_set.frame_period_us,
+            )
+
         with ScopedTimer("render_lidar_frame_from_ray_bundle"):
             lidar_frame = self.renderable_model.render_lidar_frame_from_ray_bundle(
                 lidar_ray_bundle,
@@ -2545,13 +3401,15 @@ class Backend:
                 actors_snapshot=actors_snapshot,
                 frame_start_us=request.frame_start_us,
                 frame_end_us=request.frame_end_us,
-                lidar_stream=self._get_lidar_stream(),
+                lidar_stream=lidar_stream,
             )
 
         with ScopedTimer("unpack_results"):
-            pc_tensor = lidar_frame.point_positions.cpu().flatten().numpy().astype(np.float32)
+            # The renderer's rigid end-pose transform retains NuRec length units.
+            # Convert at the wire boundary, leaving internal renderer units unchanged.
+            pc_tensor = (lidar_frame.point_positions.cpu().flatten().numpy() / scale).astype("<f4")
             if lidar_frame.point_intensities is not None:
-                intensity_tensor = lidar_frame.point_intensities.cpu().flatten().numpy().astype(np.float32)
+                intensity_tensor = lidar_frame.point_intensities.cpu().flatten().numpy().astype("<f4")
             else:
                 intensity_tensor = None
 
@@ -2567,9 +3425,243 @@ class Backend:
             if intensity_tensor is not None:
                 final_result.point_intensities_buffer = intensity_tensor.tobytes()
             else:
-                log.info("The model loaded has no intensity prediction")
+                log.debug("The model loaded has no intensity prediction")
 
         return final_result
+
+    def get_lidar_firing_pattern(self, request: LidarFiringPatternRequest) -> LidarFiringPatternReturn:
+        """The firing geometry of one lidar, as the per-ray render output is indexed by it.
+
+        Stored patterns are reported whenever the artifact carries them, including the
+        compatibility case where the same lidar also has model intrinsics.
+
+        Args:
+            request: Lookup request selecting a logical lidar within this backend.
+                A non-empty pattern ID selects exact content; otherwise an optional
+                frame-start timestamp selects a phase. Omitting both is allowed only for
+                a single template. A supplied timestamp also requests scene-range metadata.
+
+        Returns:
+            Protobuf metadata and raw array buffers for the selected template,
+            including its ID, physical frame period, and optional packet layout.
+
+        Raises:
+            KeyError: If an explicit lidar or pattern ID is unknown.
+            ValueError: If lidar or phase selection is ambiguous, or packet offsets
+                exceed the wire format's uint32 capacity.
+            ModelIncompatibilityError: If the artifact has no lidar or stored pattern.
+        """
+        entry = self.lidar_bank.get_entry(request.lidar_id or None)
+        if entry is None:
+            raise ModelIncompatibilityError("This artifact has no lidar sensor")
+        pattern_set = entry.firing_pattern_templates
+        if pattern_set is None:
+            raise ModelIncompatibilityError(
+                f"No stored firing pattern is available for lidar '{entry.logical_id}'. "
+                "Its rays can only be synthesised from model intrinsics."
+            )
+
+        if request.firing_pattern_id:
+            pattern = pattern_set.get_by_id(request.firing_pattern_id)
+        elif request.HasField("frame_start_us"):
+            pattern = pattern_set.select(request.frame_start_us)
+        else:
+            if len(pattern_set.templates) != 1:
+                raise ValueError(
+                    f"Lidar '{entry.logical_id}' has {len(pattern_set.templates)} phases; "
+                    "set frame_start_us or firing_pattern_id"
+                )
+            pattern = pattern_set.templates[0]
+
+        result = LidarFiringPatternReturn()
+        _fill_firing_pattern(pattern, pattern_set.frame_period_us, result)
+        if request.HasField("frame_start_us"):
+            requested_window = HalfClosedInterval(
+                request.frame_start_us,
+                request.frame_start_us + pattern_set.frame_period_us,
+            )
+            result.requested_frame_within_scene_time_range = requested_window in self.scene_time_range_us
+        return result
+
+    def _validated_lidar_scale(self) -> float:
+        """Require a usable artifact length scale before preparing or encoding rays."""
+        scale = float(self.world_to_nurec.target_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ModelIncompatibilityError(f"world->NuRec target scale must be finite and positive, got {scale}")
+        return scale
+
+    def _lidar_ray_frame_to_grpc(
+        self,
+        ray_frame: LidarRayFrame,
+        return_types: Sequence[LidarReturnType] = _DEFAULT_LIDAR_RETURN_TYPES,
+        firing_pattern: Optional[LidarFiringPatternTemplate] = None,
+        firing_pattern_id: str = "",
+        frame_period_us: Optional[int] = None,
+    ) -> LidarRenderReturn:
+        """Encode a per-ray render, leaving the point-cloud fields empty.
+
+        Distances leave the renderer in NuRec units. Convert them back through the scene's
+        world-to-NuRec scale before labelling the wire buffer as metres.
+        """
+        return_types = _validate_lidar_return_types(return_types)
+
+        scale = self._validated_lidar_scale()
+
+        with ScopedTimer("unpack_results"):
+            distances = (ray_frame.ray_distances.cpu().numpy() / scale).astype("<f4", copy=False)
+            valid = ray_frame.ray_valid.cpu().numpy()
+            intensities = (
+                None
+                if ray_frame.ray_intensities is None
+                else np.clip(ray_frame.ray_intensities.cpu().numpy(), 0.0, 1.0).astype("<f4", copy=False)
+            )
+
+        with ScopedTimer("protobuf encoding"):
+            result = LidarRenderReturn()
+            result.num_rays = ray_frame.n_rays
+            result.num_return_layers = len(return_types)
+            result.return_types.extend(return_types)
+            result.firing_pattern_id = firing_pattern_id
+            # NuRec currently renders one strongest surface. FIRST is an explicit compatibility
+            # alias, so every requested layer receives the same strongest-return samples.
+            result.ray_distances_m_buffer = distances.tobytes() * len(return_types)
+            # LSB-first within each byte, which is what np.packbits(bitorder="little") emits
+            # and what the proto documents; the two have to keep agreeing.
+            packed_valid = np.packbits(valid, bitorder="little").tobytes()
+            result.ray_valid_masks_packed = packed_valid * len(return_types)
+            if intensities is not None:
+                result.ray_intensities_buffer = intensities.tobytes() * len(return_types)
+            else:
+                log.debug("The model loaded has no intensity prediction")
+
+            if firing_pattern is not None:
+                if frame_period_us is None:
+                    raise ValueError("frame_period_us is required when embedding a firing pattern")
+                _fill_firing_pattern(firing_pattern, frame_period_us, result.firing_pattern)
+
+        return result
+
+
+def _scene_time_range_us(rig_trajectories: RigTrajectories) -> HalfClosedInterval:
+    """Return the single rig trajectory's half-open timestamp interval in microseconds."""
+    assert len(rig_trajectories.rig_trajectories) == 1, (
+        f"{Backend.__name__}: expected a single rig_trajectory, got {len(rig_trajectories.rig_trajectories)}"
+    )
+    rig_timestamps_us = rig_trajectories.rig_trajectories[0].T_rig_world_timestamps_us
+    return HalfClosedInterval(int(rig_timestamps_us[0].item()), int(rig_timestamps_us[-1].item()) + 1)
+
+
+@dataclass
+class PreparedBackend:
+    """Hold scene state on CPU until CUDA activation.
+
+    Args:
+        renderable_model: Model prepared on CPU for later transfer to CUDA.
+        camera_bank: Camera metadata sharing the scene time interval.
+        world_to_nurec: Conversion from world coordinates to reconstruction coordinates.
+        scene_time_range_us: Half-open scene timestamp interval in microseconds.
+        lidar_bank: LiDAR metadata whose CUDA resources remain lazy.
+        asset_bank: Editable assets belonging to the scene.
+        source_artifact: Artifact retained for activation and asset-edit setup.
+        backend_cache_key: Cache identity of the prepared scene and renderer.
+    """
+
+    renderable_model: RenderableModel
+    camera_bank: CameraBank
+    world_to_nurec: FrameConversion
+    scene_time_range_us: HalfClosedInterval
+    lidar_bank: LidarBank
+    asset_bank: AssetBank
+    source_artifact: Artifact = field(repr=False)
+    backend_cache_key: BackendCacheKey
+
+    @classmethod
+    def from_artifact(
+        cls,
+        artifact: Artifact,
+        renderer: Backend.RendererType,
+        tracks_timestamp_ray_stride: int,
+        *,
+        backend_cache_key: BackendCacheKey,
+        camera_only: bool = False,
+    ) -> PreparedBackend:
+        """Prepare a Gaussian scene on CPU for later CUDA activation.
+
+        Model tensors remain on CPU, and lidar CUDA data stays lazy. Raise
+        ``CpuPreparationUnsupportedError`` when CPU preparation is unavailable;
+        the caller chooses whether to load synchronously. ``camera_only=True``
+        skips lidar setup.
+
+        Args:
+            artifact: Scene artifact to prepare.
+            renderer: Renderer implementation to use when loading the model.
+            tracks_timestamp_ray_stride: Stride for tracked-object ray timestamp sampling.
+            backend_cache_key: Cache identity of the prepared scene and renderer.
+            camera_only: Whether to skip LiDAR metadata and model setup.
+
+        Returns:
+            CPU scene state, including the shared scene time interval.
+        """
+        renderable_model = RenderableModel.load_from_artifact(
+            artifact,
+            config_overrides=Backend._config_overrides(artifact, renderer),
+            tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
+            device="cpu",
+        )
+        rig_trajectories = RigTrajectories.from_dict(artifact.rig_trajectories)
+        world_to_nurec = rig_trajectories.world_to_nurec
+        scene_time_range_us = _scene_time_range_us(rig_trajectories)
+        return cls(
+            renderable_model=renderable_model,
+            camera_bank=CameraBank(artifact, world_to_nurec, scene_time_range_us),
+            world_to_nurec=world_to_nurec,
+            scene_time_range_us=scene_time_range_us,
+            lidar_bank=LidarBank(artifact, enabled=not camera_only),
+            asset_bank=AssetBank(artifact),
+            source_artifact=artifact,
+            backend_cache_key=backend_cache_key,
+        )
+
+    def activate(self) -> Backend:
+        """Move this prepared scene to CUDA and return a backend sharing its state.
+
+        Activation mutates the model in place. Discard this object if activation
+        fails.
+
+        Raises:
+            torch.cuda.OutOfMemoryError: Model transfer exhausts CUDA memory.
+            ModelIncompatibilityError: Asset-edit overrides cannot be installed.
+        """
+        self.renderable_model.to("cuda")
+        backend = Backend(
+            renderable_model=self.renderable_model,
+            camera_bank=self.camera_bank,
+            world_to_nurec=self.world_to_nurec,
+            scene_time_range_us=self.scene_time_range_us,
+            lidar_bank=self.lidar_bank,
+            asset_bank=self.asset_bank,
+            source_artifact=self.source_artifact,
+            backend_cache_key=self.backend_cache_key,
+        )
+        try:
+            _install_edit_overrides(backend, self.source_artifact)
+        except Exception as exc:
+            raise ModelIncompatibilityError(f"asset-edit install failed: {exc}") from exc
+        torch.cuda.empty_cache()
+        gc.collect()
+        return backend
+
+
+@dataclass(frozen=True)
+class PreparedScene:
+    """Pair a prepared backend with the local file used to build it.
+
+    Scene acquisition discards it if registration was replaced or the
+    artifact's content changed.
+    """
+
+    registration: ArtifactRegistration
+    backend: PreparedBackend
 
 
 class ServerMetricsManager:
@@ -2584,6 +3676,9 @@ class ServerMetricsManager:
         self._warmup_skip = 3
         self._save_timer: Optional[threading.Timer] = None
         self._timer_lock = threading.Lock()
+        self._camera_batch_counts: dict[_CameraBatchDispatch, int] = {}
+        self._camera_batch_total = 0
+        self._camera_batch_lock = threading.Lock()
 
         # Initialize metrics collection if output directory is specified
         if self._metrics_output_dir:
@@ -2661,11 +3756,18 @@ class ServerMetricsManager:
         """Record RGB CUDA-IPC-write duration. Skips the same warmup frames as record_camera_render_time,
         but does not itself advance _warmup_rgb_counter — that happens once per render, in
         record_camera_render_time, regardless of delivery path."""
+        self._record_transport_write_time("ipc_write_ms", ipc_write_ms)
+
+    def record_rdma_write_time(self, rdma_write_ms: float) -> None:
+        """Record RGB RDMA-write duration, with the same warmup handling as record_ipc_write_time."""
+        self._record_transport_write_time("rdma_write_ms", rdma_write_ms)
+
+    def _record_transport_write_time(self, metric_name: str, write_ms: float) -> None:
         if self._metrics_collector is None:
             return
 
         if self._warmup_rgb_counter > self._warmup_skip:
-            self._metrics_collector.save_metric(create_metric_sample("ipc_write_ms", ipc_write_ms))
+            self._metrics_collector.save_metric(create_metric_sample(metric_name, write_ms))
             self._save_metrics_deferred()
 
     def record_lidar_render_time(self, render_time_ms: float, scene_id: str | None = None) -> None:
@@ -2704,8 +3806,44 @@ class ServerMetricsManager:
 
         self._warmup_batch_rgb_counter += 1
 
+    def record_cuda_ipc_camera_dispatch(
+        self,
+        outcome: _CameraBatchDispatch,
+        scene_id: str,
+        batch_size: int,
+    ) -> None:
+        """Log the first occurrence of each outcome and every 100th dispatch."""
+        with self._camera_batch_lock:
+            count = self._camera_batch_counts.get(outcome, 0) + 1
+            self._camera_batch_counts[outcome] = count
+            self._camera_batch_total += 1
+            if count != 1 and self._camera_batch_total % 100 != 0:
+                return
+            total = self._camera_batch_total
+            summary = ", ".join(
+                f"{item.value}={self._camera_batch_counts[item]}"
+                for item in sorted(self._camera_batch_counts, key=lambda x: x.value)
+            )
+
+        log.info(
+            "CUDA IPC camera dispatch: scene_id=%s batch_size=%d outcome=%s total=%d (%s)",
+            scene_id,
+            batch_size,
+            outcome.value,
+            total,
+            summary,
+        )
+
     def shutdown(self) -> None:
         """Cancel any pending timer and save final metrics before shutdown."""
+        with self._camera_batch_lock:
+            if self._camera_batch_total:
+                summary = ", ".join(
+                    f"{item.value}={self._camera_batch_counts[item]}"
+                    for item in sorted(self._camera_batch_counts, key=lambda x: x.value)
+                )
+                log.info("CUDA IPC camera dispatch final: total=%d (%s)", self._camera_batch_total, summary)
+
         if self._metrics_collector is None:
             return
 
@@ -2864,6 +4002,50 @@ def resolve_scene_artifact_path(
     return download_scene_to_cache(scene_id, scene_url, scene_cache, downloader)
 
 
+_PREFETCH_SCENE_RPCS = frozenset(
+    f"/{service}/prefetch_scene"
+    for service in ("nurec.grpc.protos.sensorsim.SensorsimService", LEGACY_SENSORSIM_SERVICE_NAME)
+)
+
+
+def _local_file_fingerprint(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _register_local_artifact(artifact: Artifact, scene_key: SceneCacheKey) -> ArtifactRegistration:
+    """Record the hash and file identity of an immutable local artifact."""
+    fingerprint = _local_file_fingerprint(artifact.source)
+    # Finalize exact content identity before publishing the registration while
+    # keeping the full-file read outside the registry lock.
+    _ = artifact.sha256_footprint
+    if _local_file_fingerprint(artifact.source) != fingerprint:
+        raise ValueError(f"Scene changed while it was registered: {artifact.source}")
+    return ArtifactRegistration(
+        artifact=artifact,
+        downloaded=False,
+        scene_key=scene_key,
+        source_fingerprint=fingerprint,
+    )
+
+
+def _validate_local_artifact(registration: ArtifactRegistration) -> None:
+    """Validate local content and cache its fingerprint; rehash only on metadata changes."""
+    source = registration.artifact.source
+    current = _local_file_fingerprint(source)
+    if current == registration.source_fingerprint:
+        return
+    # Use a fresh Artifact: the registration caches the original content hash.
+    digest = Artifact(source).sha256_footprint
+    if _local_file_fingerprint(source) != current:
+        raise ValueError(f"Scene {registration.scene_key.scene_id!r} changed while it was validated")
+    if digest != registration.backend_cache_key.content_sha256:
+        raise ValueError(
+            f"Scene {registration.scene_key.scene_id!r} changed after registration; use a new artifact source"
+        )
+    registration.source_fingerprint = current
+
+
 class SceneDownloadInterceptor(grpc.ServerInterceptor):
     """Interceptor that checks for x-nre-scene-url header and downloads an external scene (http(s)://) or registers from local filesystem (file:// or local path).
 
@@ -2891,6 +4073,10 @@ class SceneDownloadInterceptor(grpc.ServerInterceptor):
     ) -> grpc.RpcMethodHandler:
         handler = continuation(handler_call_details)
         metadata = dict(handler_call_details.invocation_metadata)
+
+        # Prefetch registration and hashing run on its bounded background worker.
+        if handler_call_details.method in _PREFETCH_SCENE_RPCS:
+            return handler
 
         if SCENE_URL_HEADER not in metadata:
             return handler
@@ -3036,6 +4222,7 @@ class SensorSimService(SensorsimServiceServicer):
         artifacts_glob: Optional[str],
         ray_chunk_size: int,
         egocar_hoods_dir: str | None = None,
+        egocar_hood_cache_size: int = 32,
         downloader: Optional[Downloader] = None,  # None during tests
         scene_cache: Optional[SceneCache] = None,  # None during tests
         cache_size: int = 10,
@@ -3044,12 +4231,17 @@ class SensorSimService(SensorsimServiceServicer):
         enable_editing_actors: Optional[bool] = False,
         server_config: Optional[GrpcServerConfig] = None,
         tracks_timestamp_ray_stride: int = 1,
+        *,
+        allow_automatic_backend_eviction: bool = True,
+        fatal_worker_interceptor: FatalWorkerExceptionInterceptor | None = None,
     ) -> None:
         self.server = server
         self.downloader = downloader
         self.scene_cache = scene_cache
         self.ray_chunk_size = ray_chunk_size
         self.enable_editing_actors = enable_editing_actors
+        self._fatal_worker_interceptor = fatal_worker_interceptor
+        self._fatal_worker_state = fatal_worker_interceptor.state if fatal_worker_interceptor is not None else None
         # Inference-only ray-stride for per-track timestamp estimation; threaded to Backend.from_artifact.
         self._tracks_timestamp_ray_stride = tracks_timestamp_ray_stride
         self.version_id = self._create_version_id()
@@ -3061,9 +4253,21 @@ class SensorSimService(SensorsimServiceServicer):
         # single-process server's response; the multiprocess proxy overrides it with
         # `serving.mode=multiprocess` from its own effective config map.
         self.server_config_map["serving.mode"] = "single_process"
+        self.server_config_map["cuda_ipc.camera_batch"] = str(_CUDA_IPC_AVAILABLE)
+        self.server_config_map["cuda_ipc.event_ordered"] = str(_CUDA_IPC_AVAILABLE)
+        self.server_config_map["scene_prefetch.enabled"] = "True"
+        self.server_config_map["scene_prefetch.blocking_admission"] = str(
+            server_config is not None and server_config.max_workers >= 2
+        )
         self.server_config = server_config
         self._allowed_image_formats = allowed_image_format_values(
             server_config.allowed_image_formats if server_config is not None else None
+        )
+        self._camera_only = server_config.camera_only if server_config is not None else False
+        self._backend_cache_wait_timeout_s = (
+            server_config.backend_cache_wait_timeout_s
+            if server_config is not None
+            else DEFAULT_BACKEND_CACHE_WAIT_TIMEOUT_S
         )
         log.info(f"Identifying as {self.version_id=}")
 
@@ -3084,10 +4288,7 @@ class SensorSimService(SensorsimServiceServicer):
         self._artifact_registrations: dict[str, ArtifactRegistration] = {}
         for artifact in artifacts_list:
             scene_key = SceneCacheKey(scene_id=artifact.scene_id)
-            registration = ArtifactRegistration(artifact=artifact, downloaded=False, scene_key=scene_key)
-            # Finalize exact-content identity before the service exposes this
-            # registration. This keeps full-file I/O outside the registry lock.
-            registration.backend_cache_key
+            registration = _register_local_artifact(artifact, scene_key)
             self._artifact_registrations[scene_key.key_hash] = registration
 
         log.info(
@@ -3107,7 +4308,9 @@ class SensorSimService(SensorsimServiceServicer):
         self._harmonizer_error: Optional[BaseException] = None
 
         self.egocar_rig_bank = (
-            EgocarRigBank.load_from_dir(egocar_hoods_dir) if egocar_hoods_dir else EgocarRigBank.empty()
+            EgocarRigBank.from_dir(egocar_hoods_dir, cache_size=egocar_hood_cache_size)
+            if egocar_hoods_dir
+            else EgocarRigBank.empty()
         )
         log.info(f"Available egocar masks: {self.egocar_rig_bank}.")
 
@@ -3118,7 +4321,12 @@ class SensorSimService(SensorsimServiceServicer):
         # SceneCache. The per-scene limit makes excess requests wait for capacity
         # rather than letting one scene construct every globally available
         # backend. The global size remains the aggregate bound.
-        self.backend_cache = BackendCache(maxsize=cache_size, max_per_key=max_backends_per_scene)
+        self.backend_cache = BackendCache(
+            maxsize=cache_size,
+            max_per_key=max_backends_per_scene,
+            allow_automatic_eviction=allow_automatic_backend_eviction,
+        )
+        self._scene_prefetch = SinglePrefetch(self._prepare_scene, ready_timeout_s=self._backend_cache_wait_timeout_s)
 
         # Initialize metrics manager
         self._metrics_manager = ServerMetricsManager(metrics_output_dir, self._artifact_snapshot())
@@ -3138,6 +4346,22 @@ class SensorSimService(SensorsimServiceServicer):
         self._ipc_reserved_bytes = 0
         self._ipc_session_bytes: dict[str, int] = {}
         self._ipc_device_index: Optional[int] = None
+
+        # RDMA transport: lazy-init-on-first-use (so the server starts on hosts without RoCE
+        # hardware), gate-under-lock. _rdma_open_sessions counts live sessions to gate the
+        # proto-skew warning in _warn_once_on_rdma_proto_skew; it is mutated under
+        # _rdma_mgr_lock because gRPC serves the session RPCs from a thread pool.
+        self._rdma_mgr: Optional[Any] = None
+        self._rdma_mgr_lock = threading.Lock()
+        self._rdma_open_sessions = 0
+        self._rdma_skew_warned = False
+
+    @staticmethod
+    def _raise_if_fatal_cuda(exc: BaseException) -> None:
+        # Preserve the actual exception for the outer interceptor and its RPC
+        # diagnostics, rather than converting it to a per-item error response.
+        if is_fatal_worker_exception(exc):
+            raise exc
 
     def _artifact_snapshot(self) -> dict[str, Artifact]:
         with self._artifact_registry_lock:
@@ -3303,6 +4527,7 @@ class SensorSimService(SensorsimServiceServicer):
         try:
             return list(self._encode_jpeg_images(images_u8, requests, batch_encoder))
         except NvjpegImageEncodingError as exc:
+            self._raise_if_fatal_cuda(exc)
             if len(images_u8) <= 1:
                 return [exc]
 
@@ -3346,6 +4571,7 @@ class SensorSimService(SensorsimServiceServicer):
                     )
                 )
             except Exception as exc:
+                self._raise_if_fatal_cuda(exc)
                 results.append(self._batch_rgb_error_item(pending_result.camera_name, exc))
 
         if not pending_jpegs:
@@ -3495,7 +4721,7 @@ class SensorSimService(SensorsimServiceServicer):
         img_size = (int(raster_f32.shape[0]), int(raster_f32.shape[1]))
         raster_f32 = self._maybe_apply_harmonizer(raster_f32, img_size, request, harmonizer_state, context)
         if (egocar_mask := self.egocar_rig_bank.select_from_request(request)) is not None:
-            raster_f32 = egocar_mask.overlay_on_image(raster_f32)
+            raster_f32 = self.egocar_rig_bank.overlay_on_image(egocar_mask, raster_f32)
         return raster_f32
 
     def _apply_bounding_box_overlay_if_requested(
@@ -3648,6 +4874,7 @@ class SensorSimService(SensorsimServiceServicer):
             except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
                 raise
             except Exception as exc:
+                self._raise_if_fatal_cuda(exc)
                 encoded_outcomes[index] = exc
 
         for group_indices in jpeg_quality_groups.values():
@@ -3770,16 +4997,19 @@ class SensorSimService(SensorsimServiceServicer):
         harmonizer_state: Optional[HarmonizerState] = None,
         context: grpc.ServicerContext | None = None,
     ) -> CameraRenderReturn:
-        if request.use_cuda_ipc:
-            # require_cuda_ipc_camera_request (called by render_camera before this) has already
-            # confirmed this request asks for a single CAMERA_RENDER_PRODUCT_COLOR output with no
-            # bounding-box overlay -- the only shape the IPC path can deliver, since the fused
-            # pack kernel writes straight from the float32 raster with no host-visible image for
-            # a second, differently-typed product or an overlay to draw onto.
+        if request.use_cuda_ipc or request.use_rdma:
+            # require_buffer_delivery_camera_request (called by render_camera before this) has
+            # already confirmed this request asks for a single CAMERA_RENDER_PRODUCT_COLOR output
+            # with no bounding-box overlay, through exactly one transport -- the only shape buffer
+            # delivery can produce, since the fused pack kernel writes straight from the float32
+            # raster with no host-visible image for a second, differently-typed product or an
+            # overlay to draw onto.
             frame, _, _ = backend.render_camera_request(request, enable_editing_actors=enable_editing_actors)
             if frame.color_image is None:
                 raise ValueError("Renderer did not return a color image.")
             raster_f32 = self._apply_color_postprocessing_f32(frame.color_image, request, harmonizer_state, context)
+            if request.use_rdma:
+                return CameraRenderReturn(camera_render_outputs=[self._rdma_write_camera_color(raster_f32, request)])
             ipc_start = time.perf_counter()
             with _nvtx_range("serve_grpc.render_camera.ipc_write"):
                 output = self._ipc_write_camera_color(raster_f32, request)
@@ -3844,6 +5074,8 @@ class SensorSimService(SensorsimServiceServicer):
                         cosmos_cache_dir=harmonizer_temporal_cosmos_cache_dir,
                     )
             except BaseException as exc:  # re-raised to the first render that needs the model
+                if self._fatal_worker_interceptor is not None:
+                    self._fatal_worker_interceptor.handle_fatal_exception(exc, operation="harmonizer_load")
                 self._harmonizer_error = exc
                 log.exception("Harmonizer model load failed")
             finally:
@@ -3928,23 +5160,73 @@ class SensorSimService(SensorsimServiceServicer):
         return grpc_types.Empty()
 
     def _resolve_harmonizer_session(
-        self, request: RGBRenderRequest | CameraRenderRequest, context: grpc.ServicerContext
+        self,
+        request: RGBRenderRequest | CameraRenderRequest,
+        context: grpc.ServicerContext,
+        error_prefix: str = "",
     ) -> HarmonizerState:
         """Resolve the supplied session ID for a temporal colour render.
 
-        The ID must be present (INVALID_ARGUMENT) and exist (NOT_FOUND).
+        The ID must be present (INVALID_ARGUMENT) and exist (NOT_FOUND). error_prefix starts each error message.
         """
         if not request.HasField("harmonizer_session_id"):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "harmonizer_session_id is required for a temporal colour render.",
+                f"{error_prefix}harmonizer_session_id is required for a temporal colour render.",
             )
         with self._harmonizer_sessions_lock:
             state = self._harmonizer_sessions.get(request.harmonizer_session_id)
         if state is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"unknown harmonizer session: {request.harmonizer_session_id}")
+            context.abort(
+                grpc.StatusCode.NOT_FOUND, f"{error_prefix}unknown harmonizer session: {request.harmonizer_session_id}"
+            )
         assert state is not None  # context.abort raises; this narrows the type for callers
         return state
+
+    def _resolve_batch_harmonizer_states(
+        self,
+        items: Sequence[BatchRGBRenderRequestItem | BatchCameraRenderRequestItem],
+        context: grpc.ServicerContext,
+        rpc_name: str,
+    ) -> List[Optional[HarmonizerState]]:
+        """Resolve every batch item's temporal session before anything renders.
+
+        Distinct sessions are independent frame sequences, so a batch can carry one per camera. A session
+        may be named by at most one item that needs it, since two would push two frames of one sequence in
+        one call. A missing (INVALID_ARGUMENT), unknown (NOT_FOUND) or repeated (INVALID_ARGUMENT) session
+        aborts the RPC, so a batch rejected here has no side effects.
+
+        An item needs a session, as in render_rgb / render_camera, when it opts in or supplies an ID to
+        reset, and for camera requests only when it renders the colour product. Entries are None otherwise,
+        and for every item when the server is not temporal.
+        """
+        if not self.harmonizer_temporal_enabled:
+            return [None] * len(items)
+
+        states: List[Optional[HarmonizerState]] = []
+        first_item_by_session: Dict[str, int] = {}
+        for i, item in enumerate(items):
+            req = item.request
+            includes_color = not isinstance(req, CameraRenderRequest) or self._camera_request_includes_color_product(
+                req
+            )
+            if not (includes_color and (req.apply_harmonizer or req.HasField("harmonizer_session_id"))):
+                states.append(None)
+                continue
+            states.append(
+                self._resolve_harmonizer_session(req, context, f"{rpc_name}: item[{i}] '{item.camera_name}': ")
+            )
+            previous = first_item_by_session.setdefault(req.harmonizer_session_id, i)
+            if previous != i:
+                error_msg = (
+                    f"{rpc_name}: a temporal harmonizer session may appear at most once per batch: "
+                    f"item[{i}] '{item.camera_name}' and item[{previous}] '{items[previous].camera_name}' "
+                    f"both use session '{req.harmonizer_session_id}'"
+                )
+                log.error(error_msg)
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, error_msg)
+                raise ValueError(error_msg)  # unreachable, but needed for mypy
+        return states
 
     @staticmethod
     def _request_scene_cache_key(
@@ -3954,15 +5236,85 @@ class SensorSimService(SensorsimServiceServicer):
         """Build the scene-cache key selected by a scene-bearing request."""
         metadata = dict(context.invocation_metadata()) if context is not None else {}
         scene_url = metadata.get(SCENE_URL_HEADER)
-        if scene_url is None:
-            return SceneCacheKey(scene_id=scene_id)
-
-        metadata_scene_id = require_scene_id(metadata.get(SCENE_ID_HEADER))
-        if metadata_scene_id != scene_id:
+        metadata_scene_id = metadata.get(SCENE_ID_HEADER)
+        if scene_url is not None:
+            metadata_scene_id = require_scene_id(metadata_scene_id)
+        if metadata_scene_id is not None and metadata_scene_id != scene_id:
             raise SceneNotFoundError(
                 f"Requested scene {scene_id!r} does not match metadata scene {metadata_scene_id!r}."
             )
-        return SceneCacheKey.from_url(metadata_scene_id, scene_url)
+        if scene_url is None:
+            return SceneCacheKey(scene_id=scene_id)
+        return SceneCacheKey.from_url(scene_id, scene_url)
+
+    def prefetch_scene(
+        self,
+        request: sensorsim_types.PrefetchSceneRequest,
+        context: grpc.ServicerContext,
+    ) -> grpc_types.Empty:
+        """Queue one local scene for ordered CPU preparation.
+
+        Duplicate hints are idempotent. A nonblocking distinct hint fails when
+        the pending slot is occupied; ``wait_for_capacity`` lets one caller wait
+        until that slot is available, bounded by the RPC and server deadlines.
+        """
+        try:
+            if not check_safe_scene_id(request.scene_id):
+                raise ValueError(f"scene ID may contain only letters, digits, '.', '_', and '-': {request.scene_id!r}")
+            scene_key = self._request_scene_cache_key(request.scene_id, context)
+            if scene_key.canonical_url is not None and not is_local_scene_uri(scene_key.canonical_url):
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "scene prefetch supports local artifacts only")
+            if request.wait_for_capacity and (self.server_config is None or self.server_config.max_workers < 2):
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "blocking scene prefetch requires --max-workers=2 or greater",
+                )
+            scene_key = self._resolve_prefetch_scene_key(scene_key)
+            if scene_key.canonical_url is not None and not is_local_scene_uri(scene_key.canonical_url):
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "scene prefetch supports local artifacts only")
+            wait_policy = _grpc_backend_cache_wait_policy(context, self._backend_cache_wait_timeout_s)
+
+            def check_wait() -> None:
+                _check_backend_wait(scene_key.key_hash, wait_policy)
+
+            if request.wait_for_capacity:
+                admitted = self._scene_prefetch.submit(
+                    scene_key,
+                    wait_for_capacity=True,
+                    check_wait=check_wait,
+                )
+            else:
+                admitted = self._scene_prefetch.submit(scene_key)
+            if not admitted:
+                context.abort(
+                    grpc.StatusCode.RESOURCE_EXHAUSTED,
+                    "scene prefetch did not admit this hint",
+                )
+            return grpc_types.Empty()
+        except CacheWaitAbortedError as exc:
+            _abort_with_classified_exception(context, exc, "prefetch_scene")
+            raise  # unreachable, but needed for mypy
+        except (SceneNotFoundError, ValueError) as exc:
+            _abort_with_classified_exception(context, exc, "prefetch_scene")
+            raise  # unreachable, but needed for mypy
+
+    def _resolve_prefetch_scene_key(self, scene_key: SceneCacheKey) -> SceneCacheKey:
+        """Resolve a hint without x-nre-scene-url to its registered render key."""
+        if scene_key.canonical_url is not None:
+            return scene_key
+        with self._artifact_registry_lock:
+            candidates = [
+                registration.scene_key
+                for registration in self._artifact_registrations.values()
+                if registration.scene_key.scene_id == scene_key.scene_id
+            ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            raise SceneNotFoundError(
+                f"Scene {scene_key.scene_id!r} has multiple registrations; x-nre-scene-url is required."
+            )
+        raise SceneNotFoundError(f"Scene {scene_key.scene_id!r} not available.")
 
     def test_all_scenes(self) -> None:
         """
@@ -3977,6 +5329,7 @@ class SensorSimService(SensorsimServiceServicer):
         log.info("...done testing gathered scenes.")
 
     def _create_version_id(self) -> grpc_types.VersionId:
+        """Build the get_version reply: the NuRec version, its git hash and the gRPC API version."""
         nurec_version = unpack_optional(
             get_version(
                 # Use an empty default if version is not available in current env (e.g. during sandboxed unit test execution)
@@ -3997,8 +5350,24 @@ class SensorSimService(SensorsimServiceServicer):
             # 0.0.4 -> 0.0.5: extends CUDA IPC delivery to CameraRenderRequest/render_camera --
             # the same three request fields and CameraRenderOutput's format/buffer_id, mirroring
             # RGBRenderRequest/RGBRenderReturn. Additive, wire-compatible.
-            # Patch bump only: no request/response field removal or behavior change.
-            grpc_api_version=grpc_types.VersionId.APIVersion(major=0, minor=0, patch=5),
+            # 0.0.5 -> 0.0.6: batch_render_rgb / batch_render_camera accept temporal Harmonizer items,
+            # one session per item; 0.0.5 servers refuse them with FAILED_PRECONDITION.
+            # 0.0.6 -> 0.0.7: the RDMA (RoCEv2) transport -- open_rdma_session/
+            # register_receive_buffer/close_rdma_session, RGBRenderRequest/CameraRenderRequest's
+            # use_rdma/rdma_session_id/rdma_buffer_id, and bytes_written on RGBRenderReturn and
+            # CameraRenderOutput. Additive, wire-compatible; servers built without --config=rdma
+            # answer open_rdma_session and use_rdma renders with UNIMPLEMENTED.
+            # 0.0.7 -> 0.0.8: camera-batch IPC and opt-in event-ordered sessions.
+            # 0.0.8 -> 0.0.9 adds local scene prefetch.
+            # 0.0.9 -> 0.0.10 adds shared-scene camera batching.
+            # These API additions preserve existing wire fields. Global-shutter inference
+            # now samples dynamic tracks at frame start, including sequential renders.
+            # The preceding additions are retained in 0.1.0.
+            # 0.1.0 adds explicit layer-major per-ray output and pattern lookup while
+            # preserving the point-cloud default. It also corrects scaled-scene units
+            # and tightens request/status validation; see the LiDAR migration guide.
+            # Clients need new bindings to use the added per-ray interface.
+            grpc_api_version=grpc_types.VersionId.APIVersion(major=0, minor=1, patch=0),
         )
 
     def get_version(self, request: grpc_types.Empty, context: grpc.ServicerContext) -> grpc_types.VersionId:
@@ -4036,6 +5405,36 @@ class SensorSimService(SensorsimServiceServicer):
             ],
         )
 
+    def get_lidar_firing_pattern(
+        self, request: LidarFiringPatternRequest, context: grpc.ServicerContext
+    ) -> LidarFiringPatternReturn:
+        """Serve a pattern lookup through the scene's cached backend.
+
+        Args:
+            request: Scene, lidar, and optional phase or exact-ID selection.
+            context: Server RPC context used for deadlines, cancellation, and error status.
+
+        Returns:
+            The selected template's protobuf metadata and array buffers.
+
+        Raises:
+            Exception: ``context.abort`` terminates the RPC for invalid requests
+                (INVALID_ARGUMENT), unknown scene or pattern IDs (NOT_FOUND), unavailable
+                artifact capabilities (FAILED_PRECONDITION), backend capacity
+                (RESOURCE_EXHAUSTED), cancellation, or an expired deadline.
+        """
+        log.info("get_lidar_firing_pattern")
+        if self._camera_only:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "Lidar pattern lookup is disabled by the camera-only serving mode"
+            )
+        try:
+            with self.get_backend(self._request_scene_cache_key(request.scene_id, context), context) as backend:
+                return backend.get_lidar_firing_pattern(request)
+        except Exception as exc:
+            _abort_with_classified_exception(context, exc, "get_lidar_firing_pattern")
+            raise  # unreachable, but needed for mypy
+
     def get_available_cameras(
         self, request: AvailableCamerasRequest, context: grpc.ServicerContext
     ) -> AvailableCamerasReturn:
@@ -4050,7 +5449,8 @@ class SensorSimService(SensorsimServiceServicer):
             log.warning(f"Cannot serve scene {request.scene_id}: {exc}")
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
             raise  # unreachable, but needed for mypy
-        except Exception:
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             raise
         return  # unreachable, but needed for mypy
@@ -4069,7 +5469,8 @@ class SensorSimService(SensorsimServiceServicer):
             log.warning(f"Cannot serve scene {request.scene_id}: {exc}")
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
             raise  # unreachable, but needed for mypy
-        except Exception:
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             raise
 
@@ -4099,7 +5500,8 @@ class SensorSimService(SensorsimServiceServicer):
         except (CacheWaitAbortedError, SceneNotFoundError) as exc:
             _abort_with_classified_exception(context, exc, "get_external_asset_objects")
             raise  # unreachable, but needed for mypy
-        except Exception:
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             raise
 
@@ -4118,7 +5520,8 @@ class SensorSimService(SensorsimServiceServicer):
             log.warning(f"Cannot serve scene {request.scene_id}: {exc}")
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
             raise  # unreachable, but needed for mypy
-        except Exception:
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             raise
 
@@ -4132,6 +5535,7 @@ class SensorSimService(SensorsimServiceServicer):
             _abort_with_classified_exception(context, exc, "edit_assets")
             raise  # unreachable, but needed for mypy
         except Exception as e:
+            self._raise_if_fatal_cuda(e)
             log.error(traceback.format_exc())
             return EditAssetsResponse(success=False, message=f"Failed to edit assets: {str(e)}")
 
@@ -4147,7 +5551,8 @@ class SensorSimService(SensorsimServiceServicer):
         except (CacheWaitAbortedError, SceneNotFoundError) as exc:
             _abort_with_classified_exception(context, exc, "restore_model_parameters")
             raise  # unreachable, but needed for mypy
-        except Exception:
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             raise
 
@@ -4192,6 +5597,9 @@ class SensorSimService(SensorsimServiceServicer):
             f"open_ipc_session {request.requested_width}x{request.requested_height} "
             f"buffers={request.requested_buffer_count}"
         )
+        if request.completion_mode not in (ipc_types.COMPLETION_ON_RETURN, ipc_types.EVENT_ORDERED):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown CUDA IPC completion mode")
+        event_ordered = request.completion_mode == ipc_types.EVENT_ORDERED
         # Bounds the GPU memory a single co-located client (or several) can pin via this
         # transport. NRE_CUDA_IPC_MAX_SESSIONS alone doesn't do this meaningfully: each session
         # can independently request up to --cuda-ipc-max-buffer-count buffers of up to
@@ -4211,9 +5619,9 @@ class SensorSimService(SensorsimServiceServicer):
         # is rolled back if the native allocation subsequently fails.
         max_sessions = int(os.environ.get("NRE_CUDA_IPC_MAX_SESSIONS", "32"))
         max_total_bytes = int(os.environ.get("NRE_CUDA_IPC_MAX_TOTAL_BYTES", str(16 * 1024**3)))
-        requested_bytes = (
-            int(request.requested_width) * int(request.requested_height) * 3 * int(request.requested_buffer_count)
-        )
+        frame_bytes = int(request.requested_width) * int(request.requested_height) * 3
+        alignment = 2 * 1024 * 1024
+        requested_bytes = ((frame_bytes + alignment - 1) // alignment) * alignment * request.requested_buffer_count
         with self._ipc_mgr_lock:
             if self._ipc_open_sessions >= max_sessions:
                 context.abort(
@@ -4232,28 +5640,38 @@ class SensorSimService(SensorsimServiceServicer):
                 raise  # unreachable, but needed for mypy
             self._ipc_open_sessions += 1
             self._ipc_reserved_bytes += requested_bytes
+        session_id = None
         try:
             mgr = self._get_ipc_mgr()
             session_id, handles, buffer_size, device_uuid, actual_width, actual_height = mgr.open_session(
                 request.requested_width,
                 request.requested_height,
                 request.requested_buffer_count,
+                event_ordered=event_ordered,
             )
-            with self._ipc_mgr_lock:
-                self._ipc_session_bytes[session_id] = requested_bytes
-            log.info(f"open_ipc_session ok: session_id={session_id} buffers={len(handles)}")
-            return ipc_types.OpenIpcSessionResponse(
+            response = ipc_types.OpenIpcSessionResponse(
                 session_id=session_id,
                 cuda_ipc_mem_handles=handles,
                 buffer_size=buffer_size,
                 device_uuid=device_uuid,
                 actual_width=actual_width,
                 actual_height=actual_height,
+                completion_mode=request.completion_mode,
+                cuda_ipc_ready_event_handles=mgr.ready_event_handles(session_id),
+                linux_boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                cuda_runtime_version=mgr.runtime_version,
             )
+            with self._ipc_mgr_lock:
+                self._ipc_session_bytes[session_id] = requested_bytes
+            log.info(f"open_ipc_session ok: session_id={session_id} buffers={len(handles)}")
+            return response
         except Exception as exc:
+            if session_id is not None and not is_fatal_worker_exception(exc):
+                mgr.close_session(session_id)
             with self._ipc_mgr_lock:
                 self._ipc_open_sessions -= 1
                 self._ipc_reserved_bytes -= requested_bytes
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             status, message = _classify_render_exception(exc)
             if status == grpc.StatusCode.UNKNOWN:
@@ -4285,24 +5703,29 @@ class SensorSimService(SensorsimServiceServicer):
                     )
             return ipc_types.CloseIpcSessionResponse(success=True)
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             log.error(traceback.format_exc())
             return ipc_types.CloseIpcSessionResponse(success=False, error_message=str(exc))
+
+    def _prepare_raw_frame(self, raster_f32: torch.Tensor, transport: str) -> tuple[torch.Tensor, int, int]:
+        """Checks shared by the buffer-delivery writes (CUDA IPC and RDMA), whose pack kernel
+        reads the (H, W, 3) float32 render output's memory directly. Returns (raster_f32 made
+        contiguous, height, width)."""
+        if raster_f32.dim() != 3 or raster_f32.shape[2] != 3:
+            raise RuntimeError(f"render output expected shape (H, W, 3); got {tuple(raster_f32.shape)}")
+        if not raster_f32.is_cuda:
+            raise RuntimeError(f"render output must be a CUDA tensor for {transport} path")
+        raster_f32 = raster_f32.contiguous()
+        return raster_f32, int(raster_f32.shape[0]), int(raster_f32.shape[1])
 
     def _prepare_ipc_write(
         self, raster_f32: torch.Tensor, request: RGBRenderRequest | CameraRenderRequest
     ) -> tuple[Any, torch.Tensor, int, int]:
-        """Shared validation + sync for every IPC write path (_ipc_write_rgb's own-buffer
-        selection, batch_render_rgb's write into a pre-reserved buffer, and
-        _ipc_write_camera_color): shape/device checks, resolution check against the request,
-        and the render-stream sync the pack kernel depends on. Returns (mgr, raster_f32,
-        height, width)."""
-        if raster_f32.dim() != 3 or raster_f32.shape[2] != 3:
-            raise RuntimeError(f"render output expected shape (H, W, 3); got {tuple(raster_f32.shape)}")
-        if not raster_f32.is_cuda:
-            raise RuntimeError("render output must be a CUDA tensor for CUDA IPC path")
-        raster_f32 = raster_f32.contiguous()
-        height = int(raster_f32.shape[0])
-        width = int(raster_f32.shape[1])
+        """Validate a raster and synchronize its device for legacy IPC writes.
+
+        Return (manager, contiguous raster, height, width).
+        """
+        raster_f32, height, width = self._prepare_raw_frame(raster_f32, "CUDA IPC")
         # Buffers are fixed-size for the session (set at open_ipc_session); a request
         # that renders a different resolution can't be delivered into them.
         if (
@@ -4363,8 +5786,8 @@ class SensorSimService(SensorsimServiceServicer):
     def _ipc_write_camera_color(self, raster_f32: torch.Tensor, request: CameraRenderRequest) -> CameraRenderOutput:
         # render_camera's counterpart to _ipc_write_rgb: same own-buffer-selection write, but
         # returns a CameraRenderOutput (the CAMERA_RENDER_PRODUCT_COLOR entry) instead of an
-        # RGBRenderReturn. require_cuda_ipc_camera_request has already confirmed this request
-        # asks for exactly one COLOR output with no bounding-box overlay.
+        # RGBRenderReturn. require_buffer_delivery_camera_request has already confirmed this
+        # request asks for exactly one COLOR output with no bounding-box overlay.
         mgr, raster_f32, height, width = self._prepare_ipc_write(raster_f32, request)
         released_buffer_id = request.released_buffer_id if request.HasField("released_buffer_id") else None
         filled_buffer_id = mgr.write_render_hwc_f32(
@@ -4382,12 +5805,188 @@ class SensorSimService(SensorsimServiceServicer):
             render_product=CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR,
         )
 
+    def _get_rdma_mgr(self) -> Any:
+        # Import-time constant — fail fast without taking the init lock when the
+        # RDMA transport isn't available.
+        if _rdma is None:
+            raise RdmaTransportUnavailableError(
+                f"RDMA transport not available ({_RDMA_IMPORT_ERROR}); serve-grpc must be built with "
+                "--config=rdma and run where libibverbs.so.1 loads"
+            )
+        if self._rdma_mgr is None:
+            with self._rdma_mgr_lock:
+                if self._rdma_mgr is None:
+                    # NRE_RDMA_DEVICE pins which RoCE NIC the server opens (e.g. "mlx5_1").
+                    # Empty = first PORT_ACTIVE device. Set it so each server picks a NIC with
+                    # PCIe peer-access topology to its GPU; otherwise ibv_reg_mr on cudaMalloc'd
+                    # memory will fail.
+                    device_name = os.environ.get("NRE_RDMA_DEVICE", "")
+                    self._rdma_mgr = _rdma.RdmaManager(device_name)
+                    log.info(
+                        f"RDMA manager initialized: device='{device_name or '(auto)'}' "
+                        f"gid_index={self._rdma_mgr.local_gid_index}"
+                    )
+        return self._rdma_mgr
+
+    def open_rdma_session(
+        self,
+        request: rdma_types.OpenRdmaSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> rdma_types.OpenRdmaSessionResponse:
+        log.info(f"open_rdma_session client_qp={request.qp_num} max_buf={request.max_buf_size}")
+        try:
+            session_id, server_gid, server_gid_index, server_qp_num, server_psn = self._get_rdma_mgr().open_session(
+                request.gid,
+                request.qp_num,
+                request.psn,
+                request.max_buf_size,
+            )
+        except Exception as exc:
+            # An unclassified failure is the server's own (device, CUDA, ibverbs setup); its
+            # message is what the client needs to report it, so abort INTERNAL with it.
+            _abort_with_classified_exception(context, exc, "open_rdma_session", unknown_status=grpc.StatusCode.INTERNAL)
+            raise  # unreachable, but needed for mypy
+        with self._rdma_mgr_lock:
+            self._rdma_open_sessions += 1
+        log.info(f"open_rdma_session ok: session_id={session_id} server_qp={server_qp_num}")
+        return rdma_types.OpenRdmaSessionResponse(
+            session_id=session_id,
+            gid=server_gid,
+            gid_index=server_gid_index,
+            qp_num=server_qp_num,
+            psn=server_psn,
+        )
+
+    def register_receive_buffer(
+        self,
+        request: rdma_types.RegisterReceiveBufferRequest,
+        context: grpc.ServicerContext,
+    ) -> rdma_types.RegisterReceiveBufferResponse:
+        log.info(
+            f"register_receive_buffer session={request.session_id} buf={request.buffer_id} size={request.buffer_size}"
+        )
+        try:
+            self._get_rdma_mgr().register_buffer(
+                request.session_id,
+                request.remote_addr,
+                request.rkey,
+                request.buffer_size,
+                request.buffer_id,
+            )
+        except Exception as exc:
+            message = _render_exception_message(exc)
+            log.warning(f"register_receive_buffer failed: {message}")
+            return rdma_types.RegisterReceiveBufferResponse(success=False, error_message=message)
+        return rdma_types.RegisterReceiveBufferResponse(success=True)
+
+    def close_rdma_session(
+        self,
+        request: rdma_types.CloseRdmaSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> rdma_types.CloseRdmaSessionResponse:
+        log.info(f"close_rdma_session session={request.session_id}")
+        try:
+            # Soft-failing like close_ipc_session: success=False + error_message, never an abort.
+            # close_session reports whether it actually removed a session; repeated or
+            # unknown-id closes are a no-op there, so decrementing unconditionally would drop
+            # the count below the number of live sessions.
+            if self._get_rdma_mgr().close_session(request.session_id):
+                with self._rdma_mgr_lock:
+                    self._rdma_open_sessions = max(0, self._rdma_open_sessions - 1)
+            return rdma_types.CloseRdmaSessionResponse(success=True)
+        except Exception as exc:
+            log.error(traceback.format_exc())
+            return rdma_types.CloseRdmaSessionResponse(success=False, error_message=_render_exception_message(exc))
+
+    def _rdma_write(
+        self, raster_f32: torch.Tensor, request: RGBRenderRequest | CameraRenderRequest, nvtx_name: str
+    ) -> tuple[int, int, int]:
+        """Pack the render output straight into the session's GPUDirect staging buffer and RDMA
+        WRITE it into the client buffer registered as rdma_buffer_id. Unlike the CUDA IPC path,
+        the render keeps its aspect-fit extent rather than having to match the requested
+        resolution: the native write checks it fits the registered buffer and reports the bytes
+        it sent. Returns (bytes_written, height, width)."""
+        raster_f32, height, width = self._prepare_raw_frame(raster_f32, "RDMA")
+        mgr = self._get_rdma_mgr()
+        # The native write packs on the staging buffers' device, through a raw pointer that is
+        # only valid there.
+        if raster_f32.device.index != mgr.cuda_device:
+            raise RuntimeError(
+                f"render output is on CUDA device {raster_f32.device.index}, but the RDMA staging "
+                f"buffers are on device {mgr.cuda_device}"
+            )
+        self._maybe_dump_rdma_frame(raster_f32, request)
+        write_start = time.perf_counter()
+        with _nvtx_range(nvtx_name):
+            # The pack kernel reads the tensor's memory directly, so the render stream
+            # must finish before it does.
+            torch.cuda.synchronize(raster_f32.device)
+            bytes_written = mgr.rdma_write_render_hwc_f32(
+                request.rdma_session_id,
+                request.rdma_buffer_id,
+                raster_f32.data_ptr(),
+                height,
+                width,
+            )
+        self._metrics_manager.record_rdma_write_time((time.perf_counter() - write_start) * 1000.0)
+        return bytes_written, height, width
+
+    def _rdma_write_rgb(self, raster_f32: torch.Tensor, request: RGBRenderRequest) -> RGBRenderReturn:
+        bytes_written, _, _ = self._rdma_write(raster_f32, request, "serve_grpc.rgb_render.rdma_write")
+        return RGBRenderReturn(
+            format="rgb_uint8_planar",
+            buffer_id=request.rdma_buffer_id,
+            bytes_written=bytes_written,
+        )
+
+    def _rdma_write_camera_color(self, raster_f32: torch.Tensor, request: CameraRenderRequest) -> CameraRenderOutput:
+        # render_camera's counterpart to _rdma_write_rgb, returning the CAMERA_RENDER_PRODUCT_COLOR
+        # entry; require_buffer_delivery_camera_request has already confirmed it is the only one.
+        bytes_written, height, width = self._rdma_write(raster_f32, request, "serve_grpc.render_camera.rdma_write")
+        return CameraRenderOutput(
+            format="rgb_uint8_planar",
+            buffer_id=request.rdma_buffer_id,
+            bytes_written=bytes_written,
+            image_height=height,
+            image_width=width,
+            render_product=CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR,
+        )
+
+    def _maybe_dump_rdma_frame(self, raster_f32: torch.Tensor, request: RGBRenderRequest | CameraRenderRequest) -> None:
+        """Debug capture of the frame an RDMA write is about to deliver: the RDMA reply carries no
+        image, so without this there is no on-disk record of what went on the wire. Off unless
+        NRE_RDMA_FRAME_DUMP_DIR names a directory. use_rdma requires image_format=RGB_UINT8_PLANAR,
+        so the file holds exactly the CHW payload the NIC writes. Inline and unthrottled: meant for
+        a one-frame run."""
+        dump_dir = os.environ.get("NRE_RDMA_FRAME_DUMP_DIR")
+        if not dump_dir:
+            return
+        payload = self._encode_image_bytes((raster_f32 * 255).clamp(0, 255).to(torch.uint8), request)
+        camera = request.camera_intrinsics.logical_id or "camera"
+        Path(dump_dir).mkdir(parents=True, exist_ok=True)
+        (Path(dump_dir) / f"{camera}_{request.frame_start_us}.bin").write_bytes(payload)
+
+    def _warn_once_on_rdma_proto_skew(self, request: RGBRenderRequest | CameraRenderRequest, rpc_name: str) -> None:
+        """An open RDMA session but a render that asks for neither buffer transport almost always
+        means the client and server disagree on the request proto (field-tag skew): the client did
+        the RDMA handshake, but its use_rdma lands on a different tag, so the render silently takes
+        the encode path. Warn once rather than degrade unnoticed."""
+        if request.use_rdma or request.use_cuda_ipc or self._rdma_open_sessions == 0 or self._rdma_skew_warned:
+            return
+        self._rdma_skew_warned = True
+        log.warning(
+            f"{rpc_name}: use_rdma=false but an RDMA session is open -- the client set up RDMA but this "
+            "render did not request it. Likely a sensorsim.proto version skew (client/server field tags "
+            "disagree); falling back to the encode path."
+        )
+
     @ScopedTimer()
     def render_rgb(self, request: RGBRenderRequest, context: grpc.ServicerContext) -> RGBRenderReturn:
         log.info("render_rgb")
 
         require_allowed_image_format(request, self._allowed_image_formats, context)
-        require_cuda_ipc_output_format(request, context)
+        require_buffer_delivery_output_format(request, context)
+        self._warn_once_on_rdma_proto_skew(request, "render_rgb")
 
         # Resolve the temporal session before the render try-block so its INVALID_ARGUMENT/NOT_FOUND
         # is not reclassified by the catch-all handler below.
@@ -4413,7 +6012,7 @@ class SensorSimService(SensorsimServiceServicer):
 
             # inpaint the egocar mask
             if (egocar_mask := self.egocar_rig_bank.select_from_request(request)) is not None:
-                raster_f32 = egocar_mask.overlay_on_image(raster_f32)
+                raster_f32 = self.egocar_rig_bank.overlay_on_image(egocar_mask, raster_f32)
 
             # Calculate render time and collect metrics
             render_time_ms = (time.perf_counter() - render_start_time) * 1000.0
@@ -4429,8 +6028,12 @@ class SensorSimService(SensorsimServiceServicer):
                 self._metrics_manager.record_ipc_write_time((time.perf_counter() - ipc_start) * 1000.0)
                 return result
 
+            if request.use_rdma:
+                return self._rdma_write_rgb(raster_f32, request)
+
             return self.encode_image((raster_f32 * 255).clamp(0, 255).to(torch.uint8), request)
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             _abort_with_classified_exception(context, exc, "render_rgb")
             raise  # unreachable, but needed for mypy
 
@@ -4439,7 +6042,8 @@ class SensorSimService(SensorsimServiceServicer):
         log.info("render_camera")
 
         require_allowed_image_format(request, self._allowed_image_formats, context)
-        require_cuda_ipc_camera_request(request, context)
+        require_buffer_delivery_camera_request(request, context)
+        self._warn_once_on_rdma_proto_skew(request, "render_camera")
 
         # Only colour output can use the temporal Harmonizer. Resolve its session before the render
         # try-block so INVALID_ARGUMENT/NOT_FOUND is not reclassified by the catch-all handler below.
@@ -4472,6 +6076,7 @@ class SensorSimService(SensorsimServiceServicer):
                 profile.mark_frame_boundary("camera_render")
                 return result
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             status, message = _classify_render_exception(exc)
             if status == grpc.StatusCode.UNKNOWN:
                 log.error(traceback.format_exc())
@@ -4484,6 +6089,22 @@ class SensorSimService(SensorsimServiceServicer):
     def batch_render_camera(
         self, request: BatchCameraRenderRequest, context: grpc.ServicerContext
     ) -> BatchCameraRenderReturn:
+        """Render camera requests for one scene, preserving item order.
+
+        Return image bytes, or buffer IDs for an IPC batch. IPC requires 1–8 color-only
+        requests sharing a session and its dimensions, RGB_UINT8_PLANAR format, and no
+        bounding-box overlays. Pixels are ready on return unless the session uses
+        EVENT_ORDERED; clients must then wait on each buffer's producer-ready event.
+
+        An item render error becomes a failed item; GPU OOM or batch-level failures
+        abort the call. Invalid requests abort with INVALID_ARGUMENT, unknown sessions
+        with NOT_FOUND, and exhausted resources with RESOURCE_EXHAUSTED.
+
+        For non-IPC items, temporal Harmonizer sessions are resolved before rendering;
+        items using or resetting history must name distinct sessions. IPC batches
+        reject requests that use or reset temporal history with FAILED_PRECONDITION.
+        RDMA delivery is not supported in batches.
+        """
         log.info(f"batch_render_camera: {len(request.items)} cameras")
 
         for index, item in enumerate(request.items):
@@ -4493,27 +6114,18 @@ class SensorSimService(SensorsimServiceServicer):
                 context,
                 request_description=f"Batch item[{index}] {item.camera_name!r}",
             )
-            # CUDA IPC delivery is not implemented for batch_render_camera: each item's buffer
-            # would have to be reserved from its session's pool atomically up front (as
-            # batch_render_rgb does), which this endpoint doesn't do. Reject explicitly rather
-            # than silently falling back to image_bytes for an item that asked for IPC delivery.
-            if item.request.use_cuda_ipc:
+            if item.request.use_rdma:
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
-                    f"batch_render_camera does not support use_cuda_ipc (item[{index}] "
-                    f"{item.camera_name!r}); use render_camera for CUDA IPC delivery of a single "
+                    f"batch_render_camera does not support use_rdma (item[{index}] "
+                    f"{item.camera_name!r}); use render_camera for RDMA delivery of a single "
                     "camera at a time.",
                 )
                 raise  # unreachable, but needed for mypy
+            require_buffer_delivery_camera_request(item.request, context)
 
-        # The temporal harmonizer is autoregressive (each frame conditions on the previous frame's
-        # output), so batch requests cannot safely maintain or reset per-session history.
-        if self.harmonizer_temporal_enabled:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "batch_render_camera does not support the temporal harmonizer; "
-                "use render_camera with a harmonizer session instead.",
-            )
+        if any(item.request.use_cuda_ipc for item in request.items):
+            return self._batch_render_camera_ipc(request, context)
 
         if not request.items:
             return BatchCameraRenderReturn(items=[])
@@ -4535,6 +6147,12 @@ class SensorSimService(SensorsimServiceServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, error_msg)
             raise ValueError(error_msg)  # unreachable, but needed for mypy
 
+        harmonizer_states = self._resolve_batch_harmonizer_states(request.items, context, "batch_render_camera")
+        for item, harmonizer_state in zip(request.items, harmonizer_states):
+            if harmonizer_state is not None and not item.request.apply_harmonizer:
+                # Reset before rendering so a later opt-in cannot use stale history.
+                harmonizer_state.reset()
+
         render_start_time = time.perf_counter()
 
         results = [BatchCameraRenderReturnItem(camera_name=item.camera_name, success=False) for item in request.items]
@@ -4545,11 +6163,13 @@ class SensorSimService(SensorsimServiceServicer):
                 with self.get_backend(self._request_scene_cache_key(scene_id, context), context) as backend:
                     for chunk_index, item in enumerate(chunk_items):
                         result_index = chunk_start + chunk_index
+                        harmonizer_state = harmonizer_states[result_index]
                         if item.request.image_format != ImageFormat.JPEG:
                             results[result_index] = self._render_single_camera_for_batch_camera(
                                 backend,
                                 item,
                                 enable_editing_actors=bool(self.enable_editing_actors),
+                                harmonizer_state=harmonizer_state,
                                 context=context,
                             )
                             continue
@@ -4559,12 +6179,14 @@ class SensorSimService(SensorsimServiceServicer):
                                 backend,
                                 item.request,
                                 enable_editing_actors=bool(self.enable_editing_actors),
+                                harmonizer_state=harmonizer_state,
                                 context=context,
                             )
                             pending_jpeg_items.append((result_index, item, pending_outputs))
                         except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
                             raise
                         except Exception as exc:
+                            self._raise_if_fatal_cuda(exc)
                             results[result_index] = self._batch_camera_error_item(item.camera_name, exc)
 
                 pending_outputs = [
@@ -4605,6 +6227,7 @@ class SensorSimService(SensorsimServiceServicer):
                     except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
                         raise
                     except Exception as exc:
+                        self._raise_if_fatal_cuda(exc)
                         results[result_index] = self._batch_camera_error_item(item.camera_name, exc)
 
             render_time_ms = (time.perf_counter() - render_start_time) * 1000.0
@@ -4614,6 +6237,7 @@ class SensorSimService(SensorsimServiceServicer):
             return BatchCameraRenderReturn(items=results)
 
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             status, message = _classify_render_exception(exc)
             if status == grpc.StatusCode.UNKNOWN:
                 log.error(traceback.format_exc())
@@ -4622,18 +6246,180 @@ class SensorSimService(SensorsimServiceServicer):
             context.abort(status, message)
             raise  # unreachable, but needed for mypy
 
+    def _batch_render_camera_ipc(
+        self, request: BatchCameraRenderRequest, context: grpc.ServicerContext
+    ) -> BatchCameraRenderReturn:
+        """Render a fixed-size color batch into the existing session's buffer pool."""
+        if self.harmonizer_temporal_enabled and any(
+            item.request.apply_harmonizer or item.request.HasField("harmonizer_session_id") for item in request.items
+        ):
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "CUDA IPC camera batches cannot apply temporal Harmonizer or reset its history",
+            )
+        if not 1 <= len(request.items) <= 8:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "CUDA IPC camera batches require 1 to 8 items")
+        first = request.items[0].request
+        session_id = first.ipc_session_id
+        outstanding: set[int] = set()
+        started = time.perf_counter()
+        try:
+            for item in request.items:
+                camera = item.request
+                if not camera.use_cuda_ipc or camera.ipc_session_id != session_id:
+                    raise ValueError("All IPC camera batch items must use one IPC session")
+                if camera.scene_id != first.scene_id:
+                    raise ValueError("All IPC camera batch items must use one scene_id")
+            mgr = self._get_ipc_mgr()
+            width, height, _ = mgr.layout(session_id)
+            for item in request.items:
+                camera = item.request
+                if (camera.resolution_h, camera.resolution_w) != (height, width):
+                    raise ValueError("IPC camera batch dimensions must match the session")
+            released = [
+                item.request.released_buffer_id for item in request.items if item.request.HasField("released_buffer_id")
+            ]
+            reserved = mgr.reserve_buffers(session_id, released, len(request.items))
+            outstanding.update(reserved)
+            results = []
+            rasters = []
+            written = []
+            with torch.cuda.device(self._ipc_device_index):
+                stream = torch.cuda.current_stream()
+                with self.get_backend(self._request_scene_cache_key(first.scene_id, context), context) as backend:
+                    batched_frames = None
+                    dispatch = _CameraBatchDispatch.SEQUENTIAL_HINT_DISABLED
+                    if request.prefer_camera_batching:
+                        try:
+                            batched_frames, dispatch = backend.render_camera_batch_shared_scene(
+                                [item.request for item in request.items],
+                                enable_editing_actors=bool(self.enable_editing_actors),
+                            )
+                            if batched_frames is not None and len(batched_frames) != len(request.items):
+                                raise RuntimeError(
+                                    f"batched camera render returned {len(batched_frames)} frames "
+                                    f"for {len(request.items)} requests"
+                                )
+                        except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
+                            self._metrics_manager.record_cuda_ipc_camera_dispatch(
+                                _CameraBatchDispatch.FAILED_OOM,
+                                first.scene_id,
+                                len(request.items),
+                            )
+                            raise
+                        except Exception as exc:
+                            self._raise_if_fatal_cuda(exc)
+                            batched_frames = None
+                            dispatch = _CameraBatchDispatch.SEQUENTIAL_NATIVE_ERROR
+                            log.exception(
+                                "Shared-scene camera rendering failed; retrying sequentially: "
+                                "scene_id=%s batch_size=%d",
+                                first.scene_id,
+                                len(request.items),
+                            )
+                    self._metrics_manager.record_cuda_ipc_camera_dispatch(
+                        dispatch,
+                        first.scene_id,
+                        len(request.items),
+                    )
+                    for index, (item, buffer_id) in enumerate(zip(request.items, reserved)):
+                        try:
+                            if batched_frames is None:
+                                frame, _, _ = backend.render_camera_request(
+                                    item.request, enable_editing_actors=bool(self.enable_editing_actors)
+                                )
+                            else:
+                                frame = batched_frames[index]
+                            if frame.color_image is None:
+                                raise ValueError("Renderer did not return a color image")
+                            raster = self._apply_color_postprocessing_f32(
+                                frame.color_image, item.request, None, context
+                            )
+                            if tuple(raster.shape) not in (
+                                (height, width, 3),
+                                (height + 1, width, 3),
+                                (height, width + 1, 3),
+                            ):
+                                raise ValueError(
+                                    f"Renderer returned incompatible IPC raster shape {tuple(raster.shape)}"
+                                )
+                            if raster.dtype != torch.float32 or raster.device != stream.device:
+                                raise ValueError("IPC packing requires float32 rasters on the session's CUDA device")
+                            raster = raster[:height, :width]
+                            if raster.stride(2) != 1 or raster.stride(1) != 3:
+                                raster = raster.contiguous()
+                            # Native packing uses the pointer after this function may return.
+                            raster.record_stream(stream)
+                            rasters.append(raster)
+                            written.append(buffer_id)
+                            results.append(
+                                BatchCameraRenderReturnItem(
+                                    camera_name=item.camera_name,
+                                    success=True,
+                                    result=CameraRenderReturn(
+                                        camera_render_outputs=[
+                                            CameraRenderOutput(
+                                                image_height=height,
+                                                image_width=width,
+                                                render_product=CameraRenderProduct.CAMERA_RENDER_PRODUCT_COLOR,
+                                                format="rgb_uint8_planar",
+                                                buffer_id=buffer_id,
+                                            )
+                                        ]
+                                    ),
+                                )
+                            )
+                        except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
+                            raise
+                        except Exception as exc:
+                            results.append(self._batch_camera_error_item(item.camera_name, exc))
+                    response = BatchCameraRenderReturn(items=results)
+                    mgr.write_reserved_buffers(
+                        session_id,
+                        written,
+                        [raster.data_ptr() for raster in rasters],
+                        [raster.stride(0) for raster in rasters],
+                        height,
+                        width,
+                        stream.cuda_stream,
+                    )
+            self._metrics_manager.record_batch_camera_render_time(
+                (time.perf_counter() - started) * 1000, len(results), first.scene_id
+            )
+            outstanding.difference_update(written)
+            return response
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
+            status, message = _classify_render_exception(exc)
+            if status == grpc.StatusCode.UNKNOWN:
+                status = grpc.StatusCode.INTERNAL
+            context.abort(status, message)
+            raise
+        finally:
+            for buffer_id in outstanding:
+                try:
+                    mgr.release_buffer(session_id, buffer_id)
+                except Exception:
+                    log.exception("Failed to reclaim unpublished IPC buffer %s/%d", session_id, buffer_id)
+
     def _render_single_camera_for_batch_camera(
         self,
         backend: Backend,
         item: BatchCameraRenderRequestItem,
         enable_editing_actors: bool = False,
         context: grpc.ServicerContext | None = None,
+        harmonizer_state: Optional[HarmonizerState] = None,
     ) -> BatchCameraRenderReturnItem:
+        """Render one batch_render_camera item; a render error becomes an unsuccessful item.
+
+        Out-of-memory errors propagate.
+        """
         try:
             ret = self._camera_render_return_from_request(
                 backend,
                 item.request,
                 enable_editing_actors=enable_editing_actors,
+                harmonizer_state=harmonizer_state,
                 context=context,
             )
             return BatchCameraRenderReturnItem(
@@ -4644,10 +6430,12 @@ class SensorSimService(SensorsimServiceServicer):
         except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
             raise
         except Exception as exc:
+            if is_fatal_worker_exception(exc):
+                raise
             return self._batch_camera_error_item(item.camera_name, exc)
 
-    @staticmethod
-    def _batch_camera_error_item(camera_name: str, exc: Exception) -> BatchCameraRenderReturnItem:
+    def _batch_camera_error_item(self, camera_name: str, exc: Exception) -> BatchCameraRenderReturnItem:
+        self._raise_if_fatal_cuda(exc)
         status, message = _classify_render_exception(exc)
         error_message = f"{status.name}: {message}" if message else status.name
         if status == grpc.StatusCode.UNKNOWN:
@@ -4696,12 +6484,14 @@ class SensorSimService(SensorsimServiceServicer):
 
         Raises:
             grpc.StatusCode.INVALID_ARGUMENT: If items have different scene_ids, different
-                ipc_session_ids among use_cuda_ipc items, or a use_cuda_ipc item declares an
-                image_format other than RGB_UINT8_PLANAR.
+                ipc_session_ids among use_cuda_ipc items, a use_cuda_ipc item declares an
+                image_format other than RGB_UINT8_PLANAR, or an item asks for use_rdma (not
+                supported in batches); or, under the temporal Harmonizer, if an item that needs a
+                session lacks harmonizer_session_id or two items name the same one.
+            grpc.StatusCode.NOT_FOUND: If an item names an unknown harmonizer_session_id.
             grpc.StatusCode.RESOURCE_EXHAUSTED: If the batch's use_cuda_ipc items need more
                 buffers than the session currently has free.
-            grpc.StatusCode.FAILED_PRECONDITION: If scene cannot be served (cache full, no backends),
-                or if the temporal harmonizer is enabled (unsupported in batch mode).
+            grpc.StatusCode.FAILED_PRECONDITION: If scene cannot be served (cache full, no backends).
         """
         log.info(f"batch_render_rgb: {len(request.items)} cameras")
 
@@ -4712,16 +6502,16 @@ class SensorSimService(SensorsimServiceServicer):
                 context,
                 request_description=f"Batch item[{index}] {item.camera_name!r}",
             )
-            require_cuda_ipc_output_format(item.request, context)
-
-        # The temporal harmonizer is autoregressive (each frame conditions on the previous frame's
-        # output), so batch requests cannot safely maintain or reset per-session history.
-        if self.harmonizer_temporal_enabled:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "batch_render_rgb does not support the temporal harmonizer; "
-                "use render_rgb with a harmonizer session instead.",
-            )
+            # RDMA delivery is not implemented for batch_render_rgb (CUDA IPC is, through buffers
+            # reserved up front). Reject explicitly rather than silently falling back to image_bytes.
+            if item.request.use_rdma:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"batch_render_rgb does not support use_rdma (item[{index}] {item.camera_name!r}); "
+                    "use render_rgb for RDMA delivery of a single camera at a time.",
+                )
+                raise  # unreachable, but needed for mypy
+            require_buffer_delivery_output_format(item.request, context)
 
         if not request.items:
             return BatchRGBRenderReturn(items=[])
@@ -4744,6 +6534,8 @@ class SensorSimService(SensorsimServiceServicer):
             log.error(f"batch_render_rgb: {error_msg}")
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, error_msg)
             raise ValueError(error_msg)  # unreachable, but needed for mypy
+
+        harmonizer_states = self._resolve_batch_harmonizer_states(request.items, context, "batch_render_rgb")
 
         # CUDA IPC items all draw from one session's fixed-size buffer pool, so they must
         # all target the same session (like scene_id above) -- otherwise "does this batch
@@ -4787,6 +6579,7 @@ class SensorSimService(SensorsimServiceServicer):
                 mgr = self._get_ipc_mgr()
                 reserved = mgr.reserve_buffers(ipc_session_id, released_buffer_ids, len(ipc_indices))
             except Exception as exc:
+                self._raise_if_fatal_cuda(exc)
                 log.error(traceback.format_exc())
                 status, message = _classify_render_exception(exc)
                 if status == grpc.StatusCode.UNKNOWN:
@@ -4795,6 +6588,11 @@ class SensorSimService(SensorsimServiceServicer):
                 raise  # unreachable, but needed for mypy
             reserved_buffer_ids = dict(zip(ipc_indices, reserved))
             outstanding_ipc_buffer_ids = set(reserved_buffer_ids.values())
+
+        for item, harmonizer_state in zip(request.items, harmonizer_states):
+            if harmonizer_state is not None and not item.request.apply_harmonizer:
+                # Reset before rendering so a later opt-in cannot use stale history.
+                harmonizer_state.reset()
 
         # Start timing for metrics collection
         render_start_time = time.perf_counter()
@@ -4816,6 +6614,7 @@ class SensorSimService(SensorsimServiceServicer):
                                     item,
                                     self.enable_editing_actors,
                                     context=context,
+                                    harmonizer_state=harmonizer_states[item_index],
                                 )
                                 ipc_start = time.perf_counter()
                                 with _nvtx_range("serve_grpc.batch_render_rgb.ipc_write"):
@@ -4832,6 +6631,7 @@ class SensorSimService(SensorsimServiceServicer):
                                     item,
                                     self.enable_editing_actors,
                                     context=context,
+                                    harmonizer_state=harmonizer_states[item_index],
                                 )
                                 pending_results.append(
                                     PendingBatchRGBEncode(
@@ -4843,6 +6643,7 @@ class SensorSimService(SensorsimServiceServicer):
                         except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
                             raise
                         except Exception as exc:
+                            self._raise_if_fatal_cuda(exc)
                             if buffer_id is not None:
                                 # This item's reserved buffer was never written and will never be
                                 # returned to the client (there's no successful result to carry its
@@ -4854,7 +6655,8 @@ class SensorSimService(SensorsimServiceServicer):
                                 # likely to succeed and would just duplicate the log line.
                                 try:
                                     self._get_ipc_mgr().release_buffer(ipc_session_id, buffer_id)
-                                except Exception:
+                                except Exception as cleanup_exc:
+                                    self._raise_if_fatal_cuda(cleanup_exc)
                                     log.error(
                                         f"batch_render_rgb: failed to release reserved IPC buffer "
                                         f"{buffer_id} for session {ipc_session_id} after item failure:\n"
@@ -4880,6 +6682,7 @@ class SensorSimService(SensorsimServiceServicer):
             return BatchRGBRenderReturn(items=results)
 
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             # Whatever wasn't already accounted for by the per-item handler above -- including
             # buffers for items that already succeeded in an earlier chunk -- is about to be
             # stranded: this method is aborting, so no BatchRGBRenderReturn (and no buffer_id)
@@ -4893,7 +6696,8 @@ class SensorSimService(SensorsimServiceServicer):
                 for buffer_id in outstanding_ipc_buffer_ids:
                     try:
                         mgr.release_buffer(ipc_session_id, buffer_id)
-                    except Exception:
+                    except Exception as cleanup_exc:
+                        self._raise_if_fatal_cuda(cleanup_exc)
                         log.error(
                             f"batch_render_rgb: failed to release reserved IPC buffer {buffer_id} "
                             f"for session {ipc_session_id} while aborting the batch:\n{traceback.format_exc()}"
@@ -4907,6 +6711,7 @@ class SensorSimService(SensorsimServiceServicer):
         item: BatchRGBRenderRequestItem,
         enable_editing_actors: Optional[bool] = None,
         context: grpc.ServicerContext | None = None,
+        harmonizer_state: Optional[HarmonizerState] = None,
     ) -> torch.Tensor:
         """Renders one batch item through to a raw (H, W, 3) float32 raster -- shared by both
         delivery paths. _render_single_camera_image_for_batch takes it the rest of the way
@@ -4915,10 +6720,12 @@ class SensorSimService(SensorsimServiceServicer):
         kernel."""
         raster_f32, img_size = backend.render_rgb_request(item.request, enable_editing_actors=enable_editing_actors)
 
-        raster_f32 = self._maybe_apply_harmonizer(raster_f32, img_size, item.request, context=context)
+        raster_f32 = self._maybe_apply_harmonizer(
+            raster_f32, img_size, item.request, harmonizer_state=harmonizer_state, context=context
+        )
 
         if (egocar_mask := self.egocar_rig_bank.select_from_request(item.request)) is not None:
-            raster_f32 = egocar_mask.overlay_on_image(raster_f32)
+            raster_f32 = self.egocar_rig_bank.overlay_on_image(egocar_mask, raster_f32)
 
         return raster_f32
 
@@ -4928,11 +6735,17 @@ class SensorSimService(SensorsimServiceServicer):
         item: BatchRGBRenderRequestItem,
         enable_editing_actors: Optional[bool] = None,
         context: grpc.ServicerContext | None = None,
+        harmonizer_state: Optional[HarmonizerState] = None,
     ) -> torch.Tensor:
-        raster_f32 = self._render_single_camera_raster_for_batch(backend, item, enable_editing_actors, context)
+        """Render one batch_render_rgb item to an (H, W, 3) uint8 image."""
+        raster_f32 = self._render_single_camera_raster_for_batch(
+            backend, item, enable_editing_actors, context, harmonizer_state=harmonizer_state
+        )
         return (raster_f32 * 255).clamp(0, 255).to(torch.uint8)
 
     def _batch_rgb_error_item(self, camera_name: str, exc: Exception) -> BatchRGBRenderReturnItem:
+        if is_fatal_worker_exception(exc):
+            raise exc
         status, message = _classify_render_exception(exc)
         error_message = f"{status.name}: {message}" if message else status.name
         log.error(f"Failed to render camera {camera_name}: {error_message}")
@@ -4944,6 +6757,11 @@ class SensorSimService(SensorsimServiceServicer):
 
     def render_lidar(self, request: LidarRenderRequest, context: grpc.ServicerContext) -> LidarRenderReturn:
         log.info("render_lidar")
+        if self._camera_only:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Lidar rendering is disabled by the camera-only serving mode",
+            )
 
         # Start timing for metrics collection
         render_start_time = time.perf_counter()
@@ -4960,11 +6778,8 @@ class SensorSimService(SensorsimServiceServicer):
         except (CacheWaitAbortedError, SceneNotFoundError) as exc:
             _abort_with_classified_exception(context, exc, "render_lidar")
             raise  # unreachable, but needed for mypy
-        except (CacheFullError, NoSpareBackendsError) as exc:
-            log.warning(f"Cannot serve scene {request.scene_id}: {exc}")
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
-            raise  # unreachable, but needed for mypy
         except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
             _abort_with_classified_exception(context, exc, "render_lidar")
             raise  # unreachable, but needed for mypy
 
@@ -4978,9 +6793,14 @@ class SensorSimService(SensorsimServiceServicer):
         return grpc_types.Empty()
 
     def _shut_down(self) -> None:
+        self.close()
         if self.server is not None:
             self.server.stop(0)
         # self.server is None during tests as we can't shut down a pytest fixture
+
+    def close(self) -> None:
+        """Release background scene-prefetch state."""
+        self._scene_prefetch.close()
 
     def register_resident_backend(self, backend: Backend) -> None:
         """Register an already-loaded, externally-owned backend so scene-bearing RPCs can resolve it.
@@ -5031,8 +6851,7 @@ class SensorSimService(SensorsimServiceServicer):
                     )
                     return
 
-            artifact = Artifact(resolved)
-            registration = ArtifactRegistration(artifact=artifact, downloaded=False, scene_key=scene_key)
+            registration = _register_local_artifact(Artifact(resolved), scene_key)
             backend_cache_key = registration.backend_cache_key
             with self._artifact_registry_lock:
                 self._artifact_registrations[registration_key] = registration
@@ -5143,18 +6962,59 @@ class SensorSimService(SensorsimServiceServicer):
             case RendererBackend.DEFAULT:
                 return Backend.RendererType.DEFAULT
 
+    def _prepare_scene(self, scene_key: SceneCacheKey) -> PreparedScene | None:
+        """Prepare a local Gaussian scene without moving model tensors to CUDA."""
+        started = time.perf_counter()
+        if scene_key.canonical_url is not None:
+            self._register_local_scene(scene_key, scene_key.canonical_url)
+
+        with self._artifact_registry_lock:
+            registration = self._artifact_registrations.get(scene_key.key_hash)
+            if registration is None or registration.downloaded or registration.resident_only:
+                return None
+            backend_cache_key = registration.backend_cache_key
+            source = registration.artifact.source
+
+        _validate_local_artifact(registration)
+
+        try:
+            with Artifact(source).temporary_cache() as artifact:
+                backend = PreparedBackend.from_artifact(
+                    artifact,
+                    self._get_renderer(),
+                    self._tracks_timestamp_ray_stride,
+                    backend_cache_key=backend_cache_key,
+                    camera_only=self._camera_only,
+                )
+        except CpuPreparationUnsupportedError as exc:
+            log.info("CPU scene preparation unsupported: scene_id=%s reason=%s", scene_key.scene_id, exc)
+            return None
+
+        _validate_local_artifact(registration)
+        log.info(
+            "Scene prefetch ready: scene_id=%s elapsed_s=%.3f",
+            scene_key.scene_id,
+            time.perf_counter() - started,
+        )
+        return PreparedScene(registration, backend)
+
     @contextlib.contextmanager
     def get_backend(
         self,
         requested_scene_key: SceneCacheKey,
         context: grpc.ServicerContext | None = None,
     ) -> Generator[Backend, None, None]:
-        """
-        A context manager that gets an available backend for the requested artifact.
+        """Check out a backend and return it to the cache when the context exits.
 
-        It creates a new backend if one doesn't exist. If creation fails due to OOM,
-        automatically evicts spare backends and retries until successful or no spares remain.
+        On a cache miss, activate matching prefetched state or load synchronously.
+        Recover from loading OOMs by evicting spare backends, with bounded retries.
         """
+
+        if self._fatal_worker_state is not None and self._fatal_worker_state.is_fatal:
+            raise CacheWaitAbortedError(
+                FATAL_WORKER_UNAVAILABLE_DETAILS,
+                CacheWaitAbortedReason.WORKER_UNAVAILABLE,
+            )
 
         artifact_id = requested_scene_key.scene_id
         has_explicit_url = requested_scene_key.canonical_url is not None
@@ -5182,78 +7042,198 @@ class SensorSimService(SensorsimServiceServicer):
             if registration is None:
                 raise SceneNotFoundError(f"Scene {artifact_id=} not available.")
 
+            backend_cache_key = registration.backend_cache_key
+            backend_key = backend_cache_key.key_hash
+
             if registration.downloaded and not has_explicit_url:
                 assert self.scene_cache is not None
                 selection_lease = self.scene_cache.acquire_scene(registration_key)
 
-            backend_cache_key = registration.backend_cache_key
-            backend_key = backend_cache_key.key_hash
-
-        def create_backend() -> Backend:
-            lease: SceneCacheLease | None = None
-            with self._artifact_registry_lock:
-                current_registration = self._artifact_registrations.get(registration_key)
-                if current_registration is not registration:
-                    raise SceneNotFoundError(f"Scene {artifact_id=} not available.")
-                if registration.resident_only:
-                    # The resident, externally-owned backend is gone (evicted or detached). Rebuilding here
-                    # would produce a private, non-aliased copy diverging from the owner's IPC-shared
-                    # weights, so fail loud rather than silently serve a wrong-renderer scene.
-                    raise SceneNotFoundError(
-                        f"Scene {artifact_id=} is no longer resident; it cannot be rebuilt in this process."
-                    )
-                source = registration.artifact.source
-                if registration.downloaded and selection_lease is None:
-                    assert self.scene_cache is not None
-                    lease = self.scene_cache.acquire_scene(registration_key)
-
-            try:
-                with Artifact(source).temporary_cache() as artifact:
-                    if not registration.downloaded:
-                        current_sha256 = artifact.sha256_footprint
-                        if current_sha256 != backend_cache_key.content_sha256:
-                            raise ValueError(
-                                f"Scene {artifact_id!r} changed after registration; use a new artifact source"
-                            )
-                    return Backend.from_artifact(
-                        artifact,
-                        self._get_renderer(),
-                        self._tracks_timestamp_ray_stride,
-                        backend_cache_key=backend_cache_key,
-                    )
-            finally:
-                if lease is not None:
-                    self._release_scene_lease(lease)
-
-        def validate_cache_miss() -> None:
-            with self._artifact_registry_lock:
-                if self._artifact_registrations.get(registration_key) is not registration:
-                    raise SceneNotFoundError(f"Scene {artifact_id=} not available.")
-
+        prepared_backend: PreparedBackend | None = None
         try:
+            prefetch_key = registration.scene_key
+            wait_policy = _grpc_backend_cache_wait_policy(context, self._backend_cache_wait_timeout_s)
+
+            def check_prefetch_wait() -> None:
+                _check_backend_wait(backend_key, wait_policy)
+
+            acquisition_started = time.perf_counter()
+            prefetch_wait_started = time.perf_counter()
+            if self.backend_cache.has_spare(backend_key):
+                log.debug("Discarding scene prefetch for cached backend: scene_id=%s", artifact_id)
+                self._scene_prefetch.discard(prefetch_key)
+                prepared_scene = None
+            else:
+                try:
+                    prepared_scene = self._scene_prefetch.take(
+                        prefetch_key,
+                        check_wait=check_prefetch_wait,
+                    )
+                except CacheWaitAbortedError as error:
+                    if error.reason != CacheWaitAbortedReason.SERVER_TIMEOUT:
+                        raise
+                    self._scene_prefetch.discard(prefetch_key)
+                    prepared_scene = None
+                    log.info("Scene prefetch wait expired; loading synchronously: scene_id=%s", artifact_id)
+                    wait_policy = _grpc_backend_cache_wait_policy(context, self._backend_cache_wait_timeout_s)
+            prefetch_wait_s = time.perf_counter() - prefetch_wait_started
+            if prepared_scene is not None:
+                try:
+                    valid = (
+                        prepared_scene.registration is registration
+                        and prepared_scene.backend.backend_cache_key == backend_cache_key
+                    )
+                    if valid:
+                        _validate_local_artifact(registration)
+                except (OSError, ValueError):
+                    valid = False
+                if valid:
+                    prepared_backend = prepared_scene.backend
+                else:
+                    log.warning("Discarding stale scene prefetch: scene_id=%s", artifact_id)
+            prepared_scene = None
+            acquisition_outcome = "cache_hit"
+            gpu_activation_s = 0.0
+            fallback_s = 0.0
+
+            def create_backend() -> Backend:
+                nonlocal acquisition_outcome, fallback_s, gpu_activation_s, prepared_backend
+                if prepared_backend is not None:
+                    prepared = prepared_backend
+                    prepared_backend = None
+                    activation_started = time.perf_counter()
+                    try:
+                        backend = prepared.activate()
+                    except torch.cuda.OutOfMemoryError:
+                        acquisition_outcome = "oom_retry"
+                        del prepared
+                        raise
+                    except ModelIncompatibilityError as error:
+                        del prepared
+                        _cleanup_failed_backend(error)
+                        raise
+                    except Exception as error:
+                        if is_fatal_worker_exception(error):
+                            del prepared
+                            raise
+                        acquisition_outcome = "fallback"
+                        log.exception(
+                            "Scene prefetch activation failed; loading synchronously: scene_id=%s", artifact_id
+                        )
+                        del prepared
+                        _cleanup_failed_backend(error)
+                    else:
+                        acquisition_outcome = "prepared"
+                        return backend
+                    finally:
+                        gpu_activation_s += time.perf_counter() - activation_started
+
+                if acquisition_outcome == "cache_hit":
+                    acquisition_outcome = "miss"
+
+                fallback_started = time.perf_counter()
+                lease: SceneCacheLease | None = None
+                with self._artifact_registry_lock:
+                    current_registration = self._artifact_registrations.get(registration_key)
+                    if current_registration is not registration:
+                        raise SceneNotFoundError(f"Scene {artifact_id=} not available.")
+                    if registration.resident_only:
+                        # The resident, externally-owned backend is gone (evicted or detached). Rebuilding here
+                        # would produce a private, non-aliased copy diverging from the owner's IPC-shared
+                        # weights, so fail loud rather than silently serve a wrong-renderer scene.
+                        raise SceneNotFoundError(
+                            f"Scene {artifact_id=} is no longer resident; it cannot be rebuilt in this process."
+                        )
+                    source = registration.artifact.source
+                    if registration.downloaded and selection_lease is None:
+                        assert self.scene_cache is not None
+                        lease = self.scene_cache.acquire_scene(registration_key)
+
+                try:
+                    log.info(f"Creating backend for {artifact_id} from {source}")
+                    with ScopedTimer("create_backend"), Artifact(source).temporary_cache() as artifact:
+                        if not registration.downloaded:
+                            _validate_local_artifact(registration)
+                        backend = Backend.from_artifact(
+                            artifact,
+                            self._get_renderer(),
+                            self._tracks_timestamp_ray_stride,
+                            backend_cache_key=backend_cache_key,
+                            camera_only=self._camera_only,
+                        )
+                        if not registration.downloaded:
+                            _validate_local_artifact(registration)
+                        return backend
+                except torch.cuda.OutOfMemoryError:
+                    acquisition_outcome = "oom_retry"
+                    raise
+                finally:
+                    fallback_s += time.perf_counter() - fallback_started
+                    if lease is not None:
+                        self._release_scene_lease(lease)
+
+            def validate_cache_miss() -> None:
+                with self._artifact_registry_lock:
+                    if self._artifact_registrations.get(registration_key) is not registration:
+                        raise SceneNotFoundError(f"Scene {artifact_id=} not available.")
+
             backend = self.backend_cache.put_with_retries(
                 key=backend_key,
                 backend_factory=create_backend,
                 max_retries=5,
                 enable_eviction=True,
                 scene_id=artifact_id,
-                wait_policy=_grpc_backend_cache_wait_policy(context),
+                wait_policy=_grpc_backend_cache_wait_policy(
+                    context,
+                    fatal_worker_state=self._fatal_worker_state,
+                ),
                 cache_miss_validator=validate_cache_miss,
+                evict_replacement_before_factory=prepared_backend is not None,
             )
+        except Exception as exc:
+            self._raise_if_fatal_cuda(exc)
+            raise
         finally:
+            if prepared_backend is not None:
+                log.debug("Discarding unused prepared scene: scene_id=%s", artifact_id)
+            prepared_backend = None
             if selection_lease is not None:
                 self._release_scene_lease(selection_lease)
 
+        level = {
+            "cache_hit": logging.DEBUG,
+            "oom_retry": logging.WARNING,
+        }.get(acquisition_outcome, logging.INFO)
+        log.log(
+            level,
+            "Scene backend acquisition: scene_id=%s outcome=%s elapsed_s=%.3f "
+            "prefetch_wait_s=%.3f gpu_activation_s=%.3f fallback_s=%.3f",
+            artifact_id,
+            acquisition_outcome,
+            time.perf_counter() - acquisition_started,
+            prefetch_wait_s,
+            gpu_activation_s,
+            fallback_s,
+        )
+
+        fatal_failure = False
         try:
-            # Yield the backend to the caller (as a context manager)
             yield backend
         except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
-            self._recover_from_cuda_oom(f"operation on {artifact_id}")
+            try:
+                self._recover_from_cuda_oom(f"operation on {artifact_id}")
+            except Exception as exc:
+                fatal_failure = is_fatal_worker_exception(exc)
+                raise
+            raise
+        except Exception as exc:
+            fatal_failure = is_fatal_worker_exception(exc)
             raise
         finally:
-            # Always return the backend to the cache, even if an exception occurred
-            # This prevents backends from getting stuck in the in_use set forever
-            self.backend_cache.checkin(backend)
+            # Keep a poisoned backend retained until process exit; checkin may
+            # evict it and issue CUDA cleanup before the interceptor sees the fault.
+            if not fatal_failure and (self._fatal_worker_state is None or not self._fatal_worker_state.is_fatal):
+                self.backend_cache.checkin(backend)
 
     def _recover_from_cuda_oom(self, operation: str) -> None:
         log.warning(f"OOM during {operation}, attempting memory cleanup")
@@ -5268,16 +7248,29 @@ class SensorSimService(SensorsimServiceServicer):
             log.info(f"Evicted {evicted_count} spare backend(s) to free GPU memory after OOM")
 
 
+def _publish_serving_unless_fatal(service: SensorSimService, health_servicer: health.HealthServicer) -> bool:
+    def publish() -> None:
+        for name in ("", SENSORSIM_HEALTH_SERVICE_NAME):
+            health_servicer.set(name, health_pb2.HealthCheckResponse.SERVING)
+
+    state = service._fatal_worker_state
+    if state is None:
+        publish()
+        return True
+    return state.publish_readiness(publish)
+
+
 def _serve_once_harmonizer_loaded(service: SensorSimService, health_servicer: health.HealthServicer) -> None:
-    """Flip health to SERVING once the background Harmonizer load has finished, successfully or not."""
+    """Publish model-load readiness without clearing a fatal CUDA transition."""
     service.wait_for_harmonizer_load()
-    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
     load_error = service.harmonizer_load_error
+    if load_error is not None and is_fatal_worker_exception(load_error):
+        return
+    if not _publish_serving_unless_fatal(service, health_servicer):
+        return
     if load_error is None:
         log.info("Harmonizer model loaded; reporting SERVING.")
     else:
-        # Reported SERVING regardless: every RPC that does not need the model is serviceable, and
-        # the load error is re-raised to the first render that does.
         log.error(f"Harmonizer model failed to load ({load_error}); reporting SERVING.")
 
 
@@ -5423,7 +7416,7 @@ def serve_grpc(ctx: click.Context, **grpc_config_options) -> None:
             run_drop_in,
             validate_multiproc_admission,
             validate_multiproc_download_cache,
-            validate_multiproc_harmonizer,
+            validate_multiproc_features,
             validate_multiproc_mps,
         )
 
@@ -5434,13 +7427,12 @@ def serve_grpc(ctx: click.Context, **grpc_config_options) -> None:
         )
         if admission_error is not None:
             raise click.UsageError(admission_error)
-        # Temporal-harmonizer sessions are per-process state the proxy cannot route; refuse at launch.
-        harmonizer_error = validate_multiproc_harmonizer(grpc_config)
-        if harmonizer_error is not None:
-            raise click.UsageError(harmonizer_error)
+        feature_error = validate_multiproc_features(grpc_config)
+        if feature_error is not None:
+            raise click.UsageError(feature_error)
         # Pre-validate the two operator-facing fail-fasts that otherwise raise raw tracebacks from inside
         # run_drop_in (mps_preflight's RuntimeError, _resolve_download_cache_size's ValueError), so the CLI
-        # surfaces one clean `Error:` line — matching the admission/harmonizer pattern above.
+        # surfaces one clean `Error:` line — matching the validation above.
         mps_error = validate_multiproc_mps(num_workers=multiproc_workers, require_mps=require_mps)
         if mps_error is not None:
             raise click.UsageError(mps_error)
@@ -5477,110 +7469,139 @@ def serve_grpc(ctx: click.Context, **grpc_config_options) -> None:
         log.warning(cache_capacity_warning)
 
     with ScopedTimer("serve_grpc"):
-        scene_download_interceptor = SceneDownloadInterceptor()
-        metrics_interceptor = MetricsInterceptor()
-
-        server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=grpc_config.max_workers),
-            interceptors=[metrics_interceptor, scene_download_interceptor],
-            # for lidar output
-            options=[
-                ("grpc.max_send_message_length", 50 * 1024 * 1024),  # 50MB
-                ("grpc.max_receive_message_length", 50 * 1024 * 1024),  # 50MB
-            ],
+        fatal_worker_state = FatalWorkerState()
+        fatal_worker_interceptor = FatalWorkerExceptionInterceptor(
+            state=fatal_worker_state,
+            diagnostics=collect_cuda_worker_diagnostics(),
         )
-
-        scene_cache = SceneCache(
-            cache_dir=Path(grpc_config.download_cache_dir).expanduser(), max_size=grpc_config.download_cache_size
-        )
-
-        downloader = Downloader()
-
-        service = SensorSimService(
-            server,
-            grpc_config.artifact_glob,
-            ray_chunk_size=grpc_config.ray_chunk_size,
-            egocar_hoods_dir=grpc_config.egocar_hood_dir,
-            downloader=downloader,
-            scene_cache=scene_cache,
-            cache_size=grpc_config.cache_size,
-            max_backends_per_scene=grpc_config.max_backends_per_scene,
-            metrics_output_dir=grpc_config.metrics_output_dir,
-            enable_editing_actors=grpc_config.enable_editing_actors,
-            server_config=grpc_config,
-            tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
-        )
-
-        scene_download_interceptor.set_service(service)
-        metrics_interceptor.set_metrics_manager(service._metrics_manager)
-
-        if grpc_config.test_scenes_are_valid:
-            service.test_all_scenes()
-
-        service.set_harmonizer(
-            grpc_config.enable_harmonizer,
-            grpc_config.harmonizer_url,
-            grpc_config.harmonizer_cache,
-            grpc_config.harmonizer_model_filename,
-            grpc_config.harmonizer_resolution,
-            harmonizer_temporal_enabled=grpc_config.enable_harmonizer_temporal,
-            harmonizer_temporal_url=grpc_config.harmonizer_temporal_url,
-            harmonizer_temporal_model_filename=grpc_config.harmonizer_temporal_model_filename,
-            harmonizer_temporal_resolution=grpc_config.harmonizer_temporal_resolution,
-            harmonizer_temporal_cosmos_base_model_url=grpc_config.harmonizer_temporal_cosmos_base_model_url,
-            harmonizer_temporal_cosmos_tokenizer_url=grpc_config.harmonizer_temporal_cosmos_tokenizer_url,
-            harmonizer_temporal_cosmos_cache_dir=grpc_config.harmonizer_temporal_cosmos_cache_dir,
-            max_harmonizer_sessions=grpc_config.max_harmonizer_sessions,
-        )
-
-        address = f"{grpc_config.host}:{grpc_config.port}"
-        server.add_insecure_port(address)
-
-        add_SensorsimServiceServicer_to_server(service, server)
-
-        health_servicer = health.HealthServicer()
-        # HealthServicer starts "" as SERVING, and a dedicated --health-port server starts below,
-        # ahead of the main one. Gate readiness here so neither can answer SERVING while the
-        # Harmonizer is still loading. A failed load also releases the gate -- the error surfaces on
-        # the first render that needs the model, and the rest of the service serves either way.
-        if service.harmonizer_load_pending:
-            health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
-            threading.Thread(
-                target=_serve_once_harmonizer_loaded,
-                args=(service, health_servicer),
-                name="harmonizer-health",
-                daemon=True,
-            ).start()
-
-        health_server: Optional[grpc.Server] = None
-
-        # Health check serving:
-        # - Default/legacy: register health service on the main server.
-        # - If --health-port is set and differs from --port: start a dedicated health-only gRPC server.
-        if grpc_config.health_port is None or grpc_config.health_port == grpc_config.port:
-            health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-            log.info(f"Serving on {address} (health on same port)")
-        else:
-            health_address = f"{grpc_config.host}:{grpc_config.health_port}"
-            health_server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-            health_pb2_grpc.add_HealthServicer_to_server(health_servicer, health_server)
-            health_server.add_insecure_port(health_address)
-            log.info(f"Serving main gRPC on {address} and health on {health_address}")
-            health_server.start()
-
-        # The port binds before the Harmonizer model is loaded, so readiness is reported by the
-        # health service, gated above, rather than inferred from the transport.
-        server.start()
-
         try:
-            server.wait_for_termination()
-        finally:
-            # Cleanup: mark health as down and stop health server if separate
-            if health_server is not None:
+            scene_download_interceptor = SceneDownloadInterceptor()
+            metrics_interceptor = MetricsInterceptor()
+
+            server = grpc.server(
+                futures.ThreadPoolExecutor(max_workers=grpc_config.max_workers),
+                interceptors=[fatal_worker_interceptor, metrics_interceptor, scene_download_interceptor],
+                # for lidar output
+                options=[
+                    ("grpc.max_send_message_length", 50 * 1024 * 1024),  # 50MB
+                    ("grpc.max_receive_message_length", 50 * 1024 * 1024),  # 50MB
+                ],
+            )
+
+            scene_cache = SceneCache(
+                cache_dir=Path(grpc_config.download_cache_dir).expanduser(), max_size=grpc_config.download_cache_size
+            )
+
+            downloader = Downloader()
+
+            service = SensorSimService(
+                server,
+                grpc_config.artifact_glob,
+                ray_chunk_size=grpc_config.ray_chunk_size,
+                egocar_hoods_dir=grpc_config.egocar_hood_dir,
+                egocar_hood_cache_size=grpc_config.egocar_hood_cache_size,
+                downloader=downloader,
+                scene_cache=scene_cache,
+                cache_size=grpc_config.cache_size,
+                max_backends_per_scene=grpc_config.max_backends_per_scene,
+                metrics_output_dir=grpc_config.metrics_output_dir,
+                enable_editing_actors=grpc_config.enable_editing_actors,
+                server_config=grpc_config,
+                tracks_timestamp_ray_stride=tracks_timestamp_ray_stride,
+                fatal_worker_interceptor=fatal_worker_interceptor,
+            )
+
+            scene_download_interceptor.set_service(service)
+            metrics_interceptor.set_metrics_manager(service._metrics_manager)
+
+            health_servicer = health.HealthServicer()
+            for name in ("", SENSORSIM_HEALTH_SERVICE_NAME):
+                health_servicer.set(name, health_pb2.HealthCheckResponse.NOT_SERVING)
+
+            def mark_fatal_worker_unhealthy() -> None:
+                health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
+                health_servicer.set(SENSORSIM_HEALTH_SERVICE_NAME, health_pb2.HealthCheckResponse.NOT_SERVING)
+                service.backend_cache.wake_waiters()
+
+            fatal_worker_interceptor.configure_shutdown(
+                mark_unhealthy=mark_fatal_worker_unhealthy,
+                stop_server=server.stop,
+            )
+
+            if grpc_config.test_scenes_are_valid:
                 try:
-                    health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
-                except Exception:
-                    log.exception("Failed to update health status to NOT_SERVING during shutdown")
-                health_server.stop(0)
+                    service.test_all_scenes()
+                except Exception as exc:
+                    fatal_worker_interceptor.handle_fatal_exception(exc, operation="startup_scene_validation")
+                    fatal_worker_interceptor.exit_if_fatal()
+                    raise
+
+            service.set_harmonizer(
+                grpc_config.enable_harmonizer,
+                grpc_config.harmonizer_url,
+                grpc_config.harmonizer_cache,
+                grpc_config.harmonizer_model_filename,
+                grpc_config.harmonizer_resolution,
+                harmonizer_temporal_enabled=grpc_config.enable_harmonizer_temporal,
+                harmonizer_temporal_url=grpc_config.harmonizer_temporal_url,
+                harmonizer_temporal_model_filename=grpc_config.harmonizer_temporal_model_filename,
+                harmonizer_temporal_resolution=grpc_config.harmonizer_temporal_resolution,
+                harmonizer_temporal_cosmos_base_model_url=grpc_config.harmonizer_temporal_cosmos_base_model_url,
+                harmonizer_temporal_cosmos_tokenizer_url=grpc_config.harmonizer_temporal_cosmos_tokenizer_url,
+                harmonizer_temporal_cosmos_cache_dir=grpc_config.harmonizer_temporal_cosmos_cache_dir,
+                max_harmonizer_sessions=grpc_config.max_harmonizer_sessions,
+            )
+
+            address = f"{grpc_config.host}:{grpc_config.port}"
+            server.add_insecure_port(address)
+
+            add_sensorsim_servicer_to_server(service, server)
+
+            # Readiness cannot clear a fatal transition, even if loading finishes later.
+            if service.harmonizer_load_pending:
+                health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
+                threading.Thread(
+                    target=_serve_once_harmonizer_loaded,
+                    args=(service, health_servicer),
+                    name="harmonizer-health",
+                    daemon=True,
+                ).start()
+            else:
+                _publish_serving_unless_fatal(service, health_servicer)
+
+            health_server: Optional[grpc.Server] = None
+
+            # Health check serving:
+            # - Default/legacy: register health service on the main server.
+            # - If --health-port is set and differs from --port: start a dedicated health-only gRPC server.
+            if grpc_config.health_port is None or grpc_config.health_port == grpc_config.port:
+                health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+                log.info(f"Serving on {address} (health on same port)")
+            else:
+                health_address = f"{grpc_config.host}:{grpc_config.health_port}"
+                health_server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+                health_pb2_grpc.add_HealthServicer_to_server(health_servicer, health_server)
+                health_server.add_insecure_port(health_address)
+                log.info(f"Serving main gRPC on {address} and health on {health_address}")
+                health_server.start()
+
+            # The port binds before the Harmonizer model is loaded, so readiness is reported by the
+            # health service, gated above, rather than inferred from the transport.
+            server.start()
+
+            try:
+                server.wait_for_termination()
+            finally:
+                fatal_worker_interceptor.exit_if_fatal()
+                service.close()
+                # Cleanup: mark health as down and stop health server if separate
+                if health_server is not None:
+                    try:
+                        health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
+                    except Exception:
+                        log.exception("Failed to update health status to NOT_SERVING during shutdown")
+                    health_server.stop(0)
+        finally:
+            fatal_worker_interceptor.exit_if_fatal()
 
     ScopedTimer.print_summary()

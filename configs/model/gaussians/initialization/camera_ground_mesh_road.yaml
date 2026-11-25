@@ -34,14 +34,11 @@ point_cloud_path: null
 # The PLY may optionally contain per-vertex RGB colors.
 mesh_path: null
 
-# Grid meshing parameters
+# Delaunay meshing parameters
 voxel_size: 0.1
 smoothing_passes: 10
 min_points_per_voxel: 1
-# Grid is the default road-init topology because it is fast, local to occupied BEV cells, and
-# avoids Delaunay's long convex-hull bridges. Set `mesh_topology: delaunay` to opt back into the
-# legacy compatibility path for workflows that prefer fully filled convex-hull geometry.
-mesh_topology: grid                  # grid avoids convex-hull bridging and keeps topology local to occupied cells
+mesh_topology: delaunay              # delaunay keeps legacy topology; filters below remove large/steep bad faces
 smoothing_method: neighbor_average   # legacy smoothing; local_plane is available for opt-in experiments
 local_plane_min_neighbors: 3
 local_plane_include_self: false

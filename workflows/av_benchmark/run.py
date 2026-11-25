@@ -86,6 +86,7 @@ def run_workflow(
     variables: dict[str, str],
     work_dir: Path,
     enabled_optional: frozenset[str] = frozenset(),
+    launchers: dict[str, list[str]] | None = None,
 ) -> int:
     results: list[dict[str, Any]] = []
     phase_seconds: dict[str, float] = {}
@@ -118,7 +119,7 @@ def run_workflow(
             write_manifest()
             continue
         args = [resolve(str(a), variables) for a in task["args"]]
-        cmd = [_binary_path(task["binary"]), *args]
+        cmd = [*((launchers or {}).get(task["binary"]) or [_binary_path(task["binary"])]), *args]
         print(f"\n=== [{name}] {shlex.join(cmd)}", flush=True)
 
         started = time.monotonic()
@@ -161,6 +162,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME",
         help="Enable an optional task by name. Repeatable.",
     )
+    parser.add_argument(
+        "--binary",
+        action="append",
+        default=[],
+        metavar="NAME=CMD",
+        help="Run a spec binary with CMD (e.g. a docker run prefix) instead of its runfiles path. Repeatable.",
+    )
     args = parser.parse_args(argv)
 
     spec = load_spec(args.spec)
@@ -194,7 +202,14 @@ def main(argv: list[str] | None = None) -> int:
     if "download" not in args.with_tasks and (not args.clip_root or not variables.get("CLIP_ROOT")):
         parser.error("--clip-root is required unless --with download is enabled")
 
-    return run_workflow(spec, variables, args.work_dir, frozenset(args.with_tasks))
+    launchers: dict[str, list[str]] = {}
+    for launcher in args.binary:
+        name, sep, cmd = launcher.partition("=")
+        if not sep or name not in BINARIES:
+            raise SystemExit(f"--binary expects NAME=CMD with NAME in {sorted(BINARIES)}, got {launcher!r}")
+        launchers[name] = shlex.split(cmd)
+
+    return run_workflow(spec, variables, args.work_dir, frozenset(args.with_tasks), launchers)
 
 
 if __name__ == "__main__":

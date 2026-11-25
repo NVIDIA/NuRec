@@ -6,6 +6,7 @@
 
 import json
 import logging
+import shlex
 
 from typing import Optional
 from unittest import mock
@@ -197,6 +198,15 @@ log = logging.getLogger("nurec.grpc.grpc_server_config_test")
     default=None,
 )
 @click.option(
+    "--egocar-hood-cache-size",
+    type=int,
+    help=(
+        "Maximum number of egocar hood images cached on the render GPU per server process (least recently "
+        "used eviction). The bank directory itself is only listed at startup; a cached 1920x1080 hood is 33 MB."
+    ),
+    default=32,
+)
+@click.option(
     "--download-cache-dir",
     type=str,
     help="Directory for downloaded scene files",
@@ -227,6 +237,12 @@ log = logging.getLogger("nurec.grpc.grpc_server_config_test")
     default=False,
 )
 @click.option(
+    "--camera-only/--no-camera-only",
+    is_flag=True,
+    help="Skip lidar setup and reject lidar rendering. Single-process only.",
+    default=False,
+)
+@click.option(
     "--cache-size",
     type=int,
     help="Maximum number of models to cache (count-based LRU). If OOM occurs during loading, spare backends are automatically evicted and load is retried.",
@@ -251,6 +267,16 @@ log = logging.getLogger("nurec.grpc.grpc_server_config_test")
         "~25MB, so the default allows up to ~1.6GB per session)."
     ),
     default=64,
+)
+@click.option(
+    "--backend-cache-wait-timeout-s",
+    type=float,
+    help=(
+        "Limit backend-capacity, CPU-preparation, and prefetch-admission waits to this many seconds. "
+        "An earlier RPC deadline takes precedence; synchronous loading and rendering are not timed out. "
+        "Unused ready CPU models expire after this many seconds."
+    ),
+    default=120.0,
 )
 @click.option(
     "--use-gsplat/--no-use-gsplat",
@@ -327,14 +353,17 @@ def serve_grpc_old(
     profiling_backend: str,
     ray_chunk_size: int,
     egocar_hood_dir: Optional[str],
+    egocar_hood_cache_size: int,
     download_cache_dir: str,
     download_cache_size: int,
     max_workers: int,
     cache_size: int,
     max_backends_per_scene: Optional[int],
     cuda_ipc_max_buffer_count: int,
+    backend_cache_wait_timeout_s: float,
     metrics_output_dir: Optional[str],
     enable_editing_actors: Optional[bool],
+    camera_only: bool,
     tracks_timestamp_ray_stride: int,
 ) -> click.Context:
     """Neural Rendering gRPC server"""
@@ -633,11 +662,11 @@ def test_sensor_sim_service_wires_max_backends_per_scene_to_backend_cache():
             server_config=server_config,
         )
 
-    backend_cache_cls.assert_called_once_with(maxsize=3, max_per_key=2)
+    backend_cache_cls.assert_called_once_with(maxsize=3, max_per_key=2, allow_automatic_eviction=True)
     assert service.backend_cache == backend_cache_cls.return_value
 
 
-def test_serve_grpc_wires_max_backends_per_scene_to_service():
+def test_serve_grpc_wires_launch_flags_to_service():
     fake_server = mock.MagicMock()
     fake_server.add_insecure_port.return_value = 1
     fake_service = mock.MagicMock()
@@ -648,7 +677,7 @@ def test_serve_grpc_wires_max_backends_per_scene_to_service():
         mock.patch.object(serve_module, "SceneCache"),
         mock.patch.object(serve_module, "Downloader"),
         mock.patch.object(serve_module, "SensorSimService", return_value=fake_service) as service_cls,
-        mock.patch.object(serve_module, "add_SensorsimServiceServicer_to_server"),
+        mock.patch.object(serve_module, "add_sensorsim_servicer_to_server"),
         mock.patch.object(serve_module.health_pb2_grpc, "add_HealthServicer_to_server"),
     ):
         result = CliRunner().invoke(
@@ -705,6 +734,11 @@ def test_download_cache_size_rejects_negative() -> None:
         GrpcServerConfig(download_cache_size=-1)
 
 
+def test_backend_cache_wait_timeout_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        GrpcServerConfig(backend_cache_wait_timeout_s=0)
+
+
 def test_download_cache_size_zero_is_accepted_no_persist() -> None:
     # 0 = the historical "never persist" / evict-immediately disk cache; restored per D-N2 (single-process
     # parity), so it must construct cleanly rather than hard-failing at startup.
@@ -721,3 +755,51 @@ def test_cache_capacity_positive_boundary_is_valid() -> None:
     config = GrpcServerConfig(cache_size=1, download_cache_size=1)
     assert config.cache_size == 1
     assert config.download_cache_size == 1
+
+
+# serve-grpc arguments a closed-loop simulation pipeline starts the server with.
+CLOSED_LOOP_ARGS = (
+    'serve-grpc --host 0.0.0.0 --port 8001 --artifact-glob "*.usdz" --download-cache-size 256 '
+    "--max-workers 5 --cache-size 5 --egocar-hood-dir /config/resources --enable-editing-actors"
+)
+
+
+def test_closed_loop_args_parse():
+    command, *args = shlex.split(CLOSED_LOOP_ARGS)
+    assert command == serve_grpc.name
+    params = _invoke_grpc_test_command(args)
+    expected = {
+        "host": "0.0.0.0",
+        "port": 8001,
+        "artifact_glob": "*.usdz",
+        "download_cache_size": 256,
+        "max_workers": 5,
+        "cache_size": 5,
+        "egocar_hood_dir": "/config/resources",
+        "enable_editing_actors": True,
+    }
+    assert {key: params[key] for key in expected} == expected
+
+
+# Args AlpaSim's renderer service passes after `/app/run serve-grpc` (alpasim src/wizard/configs/base_config.yaml).
+ALPASIM_ARGS = (
+    "--port=6009 --host=0.0.0.0 --artifact-glob=/mnt/nre-data/scenesets/sceneset/**/*.usdz "
+    "--egocar-hood-dir=/mnt/ego-hoods --download-cache-dir /tmp/nre-cache-dir --cache-size=13 --max-workers=4 "
+    "--enable-editing-actors"
+)
+
+
+def test_alpasim_args_parse():
+    params = _invoke_grpc_test_command(shlex.split(ALPASIM_ARGS))
+    expected = {
+        "port": 6009,
+        "host": "0.0.0.0",
+        "artifact_glob": "/mnt/nre-data/scenesets/sceneset/**/*.usdz",
+        "egocar_hood_dir": "/mnt/ego-hoods",
+        "renderer": "default",
+        "download_cache_dir": "/tmp/nre-cache-dir",
+        "cache_size": 13,
+        "max_workers": 4,
+        "enable_editing_actors": True,
+    }
+    assert {key: params[key] for key in expected} == expected

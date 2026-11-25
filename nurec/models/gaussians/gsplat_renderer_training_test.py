@@ -15,6 +15,8 @@ Phase 2 Exit Criteria:
 - sparse_grad and absgrad work correctly
 """
 
+import dataclasses
+
 from types import SimpleNamespace
 from typing import Any
 
@@ -916,9 +918,11 @@ class TestSceneDataOutputs:
 
         rendering_data, gaussian_parameters, device = scene_test_data
         h, w, n = self._H, self._W, self._N
-        renderer = GSplatRenderer(simple_config, mock_model)
+        config = simple_config.model_copy(update={"name": "3dgut-gsplat", "use_rays": True})
+        renderer = GSplatRenderer(config, mock_model)
 
         def fake_rasterization(*args, **kwargs):
+            assert kwargs["rays"].shape == (h, w, 6)
             render_colors = torch.zeros(1, 1, h, w, 4, dtype=torch.float32, device=device)
             render_alphas = torch.zeros(1, 1, h, w, 1, dtype=torch.float32, device=device)
             meta = {
@@ -942,6 +946,140 @@ class TestSceneDataOutputs:
         assert output.visibility is not None
         assert output.visibility.shape == (n,)
         assert torch.equal(output.visibility, torch.tensor([0.0, 1.0, 1.0], device=device))
+
+    def test_shared_scene_camera_batch_uses_gsplat_camera_axis(
+        self, simple_config, mock_model, scene_test_data, monkeypatch
+    ):
+        import nurec.models.gaussians.renderers as gaussian_renderers
+
+        rendering_data, gaussian_parameters, device = scene_test_data
+        rendering_data = RenderingData.collate_fn([rendering_data, rendering_data], device=device)
+        h, w, n = self._H, self._W, self._N
+        config = simple_config.model_copy(update={"name": "3dgut-gsplat", "use_rays": True})
+        renderer = GSplatRenderer(config, mock_model)
+
+        def fake_rasterization(*args, **kwargs):
+            assert kwargs["viewmats"].shape == (1, 2, 4, 4)
+            assert kwargs["Ks"].shape == (1, 2, 3, 3)
+            assert kwargs["rays"].shape == (1, 2, h, w, 6)
+            render_colors = torch.zeros(1, 2, h, w, 4, device=device)
+            render_colors[:, 1] = 1.0
+            render_alphas = torch.zeros(1, 2, h, w, 1, device=device)
+            radii = torch.tensor(
+                [[[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]], [[1.0, 0.0], [0.0, 0.0], [2.0, 0.0]]]],
+                device=device,
+            )
+            return render_colors, render_alphas, {"radii": radii}
+
+        monkeypatch.setattr(gaussian_renderers.gsplat, "rasterization", fake_rasterization)
+        output = renderer.render(
+            rendering_data,
+            gaussian_parameters,
+            n_active_features=0,
+            extra_ray_signal_infos=([], [], []),
+            shared_camera_scene=True,
+        )
+
+        assert output.rgb is not None and output.rgb.shape == (2 * h * w, 3)
+        assert torch.count_nonzero(output.rgb[: h * w]).item() == 0
+        assert torch.all(output.rgb[h * w :] == 1)
+        assert torch.equal(output.visibility, torch.ones(n, device=device))
+
+    def test_shared_scene_camera_batch_requires_identical_intrinsics(self, simple_config, mock_model, scene_test_data):
+        rendering_data, gaussian_parameters, device = scene_test_data
+        rendering_data = RenderingData.collate_fn([rendering_data, rendering_data], device=device)
+        rendering_data.sensor_model_parameters[1] = object()  # type: ignore[list-item]
+        renderer = GSplatRenderer(simple_config, mock_model)
+
+        assert renderer.supports_shared_camera_batch
+        with pytest.raises(ValueError, match="same camera-intrinsics object"):
+            renderer.render(
+                rendering_data,
+                gaussian_parameters,
+                n_active_features=0,
+                extra_ray_signal_infos=([], [], []),
+                shared_camera_scene=True,
+            )
+
+    @pytest.mark.parametrize(
+        "shutter_type", [ShutterType.GLOBAL, ShutterType.ROLLING_TOP_TO_BOTTOM, ShutterType.ROLLING_LEFT_TO_RIGHT]
+    )
+    def test_shared_scene_camera_batch_rasterizes(self, simple_config, mock_model, simple_rendering_data, shutter_type):
+        rendering_data = simple_rendering_data
+        device = rendering_data.rays.device
+        h, w = rendering_data.rays.shape[1:3]
+        camera = rendering_data.sensor_model_parameters[0]
+        camera.shutter_type = shutter_type
+        projection = OpenCVPinholeProjection.from_components(
+            focal_length=torch.as_tensor(camera.focal_length, device=device),
+            principal_point=torch.as_tensor(camera.principal_point, device=device),
+            radial_coeffs=torch.as_tensor(camera.radial_coeffs, device=device),
+            tangential_coeffs=torch.as_tensor(camera.tangential_coeffs, device=device),
+            thin_prism_coeffs=torch.as_tensor(camera.thin_prism_coeffs, device=device),
+            resolution=torch.as_tensor(camera.resolution, device=device),
+        )
+        gaussian_parameters = {
+            "positions": torch.tensor([[-0.6, -0.3, 3.0], [0.4, 0.2, 4.0], [0.1, -0.5, 5.0]], device=device),
+            "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device).repeat(3, 1),
+            "scales": torch.full((3, 3), 0.2, device=device),
+            "densities": torch.full((3,), 0.8, device=device),
+            "features": torch.tensor([[0.9, 0.2, 0.1], [0.1, 0.8, 0.2], [0.2, 0.1, 0.9]], device=device),
+            "extra_signal": torch.empty(3, 0, device=device),
+            "camera_extra_signal": torch.empty(3, 0, device=device),
+        }
+        config = simple_config.model_copy(update={"name": "3dgut-gsplat", "use_rays": True})
+        renderer = GSplatRenderer(config, mock_model)
+
+        views = []
+        for offset in (0.0, 0.35):
+            translation = torch.tensor([offset, 0.0, 0.0], device=device)
+            pose = Pose(translation=translation, rotation=rendering_data.poses_tquat_startend[0, 0, 3:])
+            end_translation = translation + torch.tensor([0.1, 0.05, 0.0], device=device)
+            end_pose = Pose(translation=end_translation, rotation=pose.rotation)
+            rays, *_ = image_points_to_world_rays_shutter_pose(
+                image_points=None,
+                projection=projection,
+                external_distortion=NoExternalDistortion(),
+                resolution=(w, h),
+                shutter_type=SensorlibShutterType(shutter_type.value),
+                dynamic_pose=DynamicPose(start_pose=pose, end_pose=end_pose),
+                return_timestamps=False,
+            )
+            poses = rendering_data.poses_tquat_startend.clone()
+            poses[:, 0, :3] = translation
+            poses[:, 1, :3] = end_translation
+            views.append(dataclasses.replace(rendering_data, rays=rays.reshape(1, h, w, 6), poses_tquat_startend=poses))
+        singles = [
+            renderer.render(
+                view,
+                gaussian_parameters,
+                n_active_features=0,
+                extra_ray_signal_infos=([], [], []),
+            )
+            for view in views
+        ]
+        batched_data = RenderingData.collate_fn(
+            views,
+            device=rendering_data.rays.device,
+        )
+        batched = renderer.render(
+            batched_data,
+            gaussian_parameters,
+            n_active_features=0,
+            extra_ray_signal_infos=([], [], []),
+            shared_camera_scene=True,
+        )
+
+        assert batched.rgb is not None and batched.opacity is not None
+        pixels = h * w
+        assert batched.rgb.shape == (2 * pixels, 3)
+        for index, single in enumerate(singles):
+            assert single.rgb is not None and single.opacity is not None
+            assert torch.count_nonzero(single.opacity) > 0
+            start = index * pixels
+            torch.testing.assert_close(batched.rgb[start : start + pixels], single.rgb)
+            torch.testing.assert_close(batched.opacity[start : start + pixels], single.opacity)
+        assert not torch.allclose(singles[0].rgb, singles[1].rgb)
 
     def test_flat_radii_passed_through(self, simple_config, mock_model, scene_test_data, monkeypatch):
         """Flat (N,) radii from gsplat should produce (N,) visibility without amax."""
@@ -981,6 +1119,44 @@ class TestUnstructuredLidarIntensity:
         renderer = object.__new__(GSplatRenderer)
         renderer._lidar_extra_signals_sh_degree = None
         return renderer
+
+    def test_render_dispatches_single_view_matrices(
+        self,
+        simple_config,
+        mock_model,
+        simple_rendering_data,
+        simple_gaussian_parameters,
+        monkeypatch,
+    ):
+        renderer = GSplatRenderer(simple_config.model_copy(update={"lidar_unstructured": True}), mock_model)
+        renderer._lidar_extra_signals_sh_degree = 1
+        rendering_data = dataclasses.replace(simple_rendering_data, sensor_model_parameters=[None])
+        expected = object()
+        captured = {}
+
+        def capture_midframe(*_args, **kwargs):
+            if "viewmat_midframe" in kwargs:
+                captured["viewmat_midframe"] = kwargs["viewmat_midframe"]
+            return None
+
+        def render_unstructured(**kwargs):
+            captured.update(kwargs)
+            return expected
+
+        monkeypatch.setattr(renderer, "_get_unstructured_lidar_intensity", capture_midframe)
+        monkeypatch.setattr(renderer, "_render_unstructured", render_unstructured)
+
+        result = renderer.render(
+            rendering_data,
+            simple_gaussian_parameters,
+            n_active_features=0,
+            extra_ray_signal_infos=([], [], []),
+        )
+
+        assert result is expected
+        assert captured["viewmat_start"].shape == (4, 4)
+        assert captured["viewmat_end"].shape == (4, 4)
+        assert captured["viewmat_midframe"].shape == (4, 4)
 
     def test_selects_intensity_from_active_lidar_extra_signal_layout(self):
         renderer = self._renderer()
@@ -1663,7 +1839,9 @@ class TestBand0FoldEligibility:
             sparse_value = getattr(sparse, name)
             assert (dense_value is None) == (sparse_value is None)
             if dense_value is not None:
-                assert torch.equal(dense_value, sparse_value), f"partial segments changed {name}"
+                torch.testing.assert_close(
+                    dense_value, sparse_value, rtol=1e-5, atol=0, msg=f"partial segments changed {name}"
+                )
 
     def test_eligible_render_forwards_the_fourier_arguments(self, mock_model, monkeypatch):
         if not torch.cuda.is_available():

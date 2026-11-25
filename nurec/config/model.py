@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Optional, Self
 
 from omegaconf import DictConfig, open_dict
-from pydantic import model_validator
+from pydantic import ConfigDict, model_validator
 
 from nurec.config.base_schema import BaseConfigSchema, Field, PerSensor
 from nurec.config.optim import OptimizerConfig, SchedulerConfig
@@ -907,8 +907,15 @@ class GsplatStrategyConfig(BaseStrategyConfig):
     prune: PruneConfig | None = None
     reset_density: ResetDensityConfig | None = None
 
+    @model_validator(mode="after")
+    def validate_gsplat_reset_cap(self) -> Self:
+        if self.reset_density is not None:
+            if not 0.0 < self.reset_density.new_max_density < 1.0:
+                raise ValueError("GSplatStrategy requires reset_density.new_max_density strictly between 0 and 1")
+        return self
 
-class MCMCStrategyConfig(BaseStrategyConfig):
+
+class BaseMCMCStrategyConfig(BaseStrategyConfig):
     """MCMC sampling strategy configuration."""
 
     class MCMCPerturbationConfig(BaseConfigSchema):
@@ -1008,7 +1015,9 @@ class MCMCStrategyConfig(BaseStrategyConfig):
             return self
 
     class MCMCAdditionConfig(BaseConfigSchema):
-        """Configuration settings of MCMC relocation"""
+        """Configuration settings of MCMC addition."""
+
+        model_config = ConfigDict(extra="forbid")
 
         start_iteration: int = Field(
             ge=0,
@@ -1075,7 +1084,7 @@ class MCMCStrategyConfig(BaseStrategyConfig):
         )
 
         @model_validator(mode="after")
-        def validate_enabled_limits(self) -> "MCMCStrategyConfig.MCMCMaxScaleGuardConfig":
+        def validate_enabled_limits(self) -> "BaseMCMCStrategyConfig.MCMCMaxScaleGuardConfig":
             global_limits = (self.relative_max_scale_to_scene_extent, self.absolute_max_scale_m)
             if self.enabled and all(
                 limit is None for limit in (*global_limits, self.relative_max_scale_to_rigid_cuboid)
@@ -1086,8 +1095,6 @@ class MCMCStrategyConfig(BaseStrategyConfig):
                     "global_limit_layer_ids requires relative_max_scale_to_scene_extent or absolute_max_scale_m"
                 )
             return self
-
-    name: Literal["mcmc"]
 
     binom_n_max: int = Field(
         default=51,
@@ -1137,8 +1144,97 @@ class MCMCStrategyConfig(BaseStrategyConfig):
     )
 
 
+class MCMCStrategyConfig(BaseMCMCStrategyConfig):
+    """Ordinary MCMC sampling strategy."""
+
+    name: Literal["mcmc"]
+
+
+class TamingGSMCMCStrategyConfig(BaseMCMCStrategyConfig):
+    """MCMC sampling with TamingGS allocation and scoring."""
+
+    class TamingGSAdditionConfig(BaseMCMCStrategyConfig.MCMCAdditionConfig):
+        """TamingGS addition schedule and scoring settings."""
+
+        class MCMCTamingGSConfig(BaseConfigSchema):
+            """Opt-in TamingGS-inspired proxy for MCMC addition.
+
+            NRE uses the row-aligned position gradients and Adam second moments as
+            saliency signals instead of the paper's renderer-specific pixel-to-splat
+            attribution. It also uses MCMC donor sampling with replacement. Therefore
+            this is an engineering proxy, not an exact implementation of TamingGS.
+            """
+
+            model_config = ConfigDict(extra="forbid")
+
+            current_gradient_weight: float = Field(
+                default=50.0,
+                ge=0.0,
+                description="Proxy weight for current NRE position gradients.",
+            )
+            gradient_ema_weight: float = Field(
+                default=10.0,
+                ge=0.0,
+                description="Proxy weight for Adam's position-gradient second moment.",
+            )
+            opacity_weight: float = Field(
+                default=100.0,
+                ge=0.0,
+                description="Proxy opacity weight.",
+            )
+            scale_weight: float = Field(
+                default=25.0,
+                ge=0.0,
+                description="Proxy weight for activated scale volume.",
+            )
+            visibility_weight: float = Field(
+                default=5.0,
+                ge=0.0,
+                description="Proxy weight for globally reduced recent render visibility.",
+            )
+            normalization_clip: float = Field(
+                default=10.0,
+                gt=0.0,
+                description=("Maximum value of each score component after normalization by its positive-value median."),
+            )
+            minimum_source_weight: float = Field(
+                default=1.0e-6,
+                gt=0.0,
+                description="Positive sampling floor so every eligible Gaussian remains reachable.",
+            )
+
+            @model_validator(mode="after")
+            def validate_score_weights(self) -> Self:
+                weights = (
+                    self.current_gradient_weight,
+                    self.gradient_ema_weight,
+                    self.opacity_weight,
+                    self.scale_weight,
+                    self.visibility_weight,
+                )
+                if not any(weight > 0.0 for weight in weights):
+                    raise ValueError("TamingGS-inspired MCMC proxy requires at least one positive score weight")
+                return self
+
+        taminggs: MCMCTamingGSConfig = Field(
+            default_factory=MCMCTamingGSConfig,
+            description=(
+                "TamingGS-inspired scoring using position gradients, Adam second moments, opacity, scale volume, "
+                "and recent visibility. Each component is normalized by its positive-value median and clipped "
+                "before weighting. These signals approximate the paper renderer-specific scoring inputs."
+            ),
+        )
+
+    name: Literal["taminggs_mcmc"]
+
+    add: TamingGSAdditionConfig = Field(
+        default_factory=TamingGSAdditionConfig,
+        description="Gaussian addition settings for the TamingGS MCMC strategy.",
+    )
+
+
 # Discriminated union of all strategy types
-StrategyConfigType = GsplatStrategyConfig | MCMCStrategyConfig
+StrategyConfigType = GsplatStrategyConfig | MCMCStrategyConfig | TamingGSMCMCStrategyConfig
 
 
 class BasePostProcessingConfig(BaseConfigSchema):

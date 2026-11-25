@@ -225,6 +225,27 @@ def test_builder_reads_native_instances_and_active_interval(cached_source, activ
     assert len(build_lidar_cone_init_points(source, config.camera_id, config.lidar_id, "cpu").xyz_world) == 0
 
 
+@pytest.mark.parametrize("cone_index", [0, 1])
+def test_builder_selects_cone_rows_from_multiple_classes(cached_source, monkeypatch, cone_index):
+    from nurec.utils.lidar_object_init_points import build_lidar_cone_init_points
+
+    source, config, meta, aux = cached_source
+    meta["thing_classes"] = ["cone", "pole"] if cone_index == 0 else ["pole", "cone"]
+    original = aux.get_object_instance_segmentation
+
+    def instances(camera, timestamp):
+        data = original(camera, timestamp)
+        data["classes"] = np.full(len(data["scores"]), cone_index, dtype=np.int32)
+        return data
+
+    monkeypatch.setattr(aux, "get_object_instance_segmentation", instances)
+    np.testing.assert_array_equal(
+        build_lidar_cone_init_points(source, config.camera_id, config.lidar_id, "cpu").xyz_world, cone()
+    )
+    meta["thing_classes"].reverse()
+    assert not len(build_lidar_cone_init_points(source, config.camera_id, config.lidar_id, "cpu").xyz_world)
+
+
 @pytest.mark.parametrize(
     "invalid",
     ["missing", "incomplete", "image", "timestamps", "classes", "camera", "lidar"],
@@ -242,7 +263,7 @@ def test_builder_rejects_mismatched_inputs(cached_source, invalid):
     if invalid == "timestamps":
         source.camera_sensors["cam"].frames_timestamps_us[1, 1] = 41
     if invalid == "classes":
-        meta["thing_classes"] = ["cone", "pole"]
+        meta["thing_classes"] = ["pole"]
     if invalid == "camera":
         source.train_camera_ids = []
     if invalid == "lidar":

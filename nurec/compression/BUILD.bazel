@@ -113,6 +113,15 @@ py_binary(
     ],
 )
 
+pytest_test(
+    name = "compress_usdz_test",
+    srcs = ["compress_usdz_test.py"],
+    deps = [
+        ":pylib_cli",
+        pip_requirement("click"),
+    ],
+)
+
 py_binary(
     name = "decompress_usdz",
     srcs = [

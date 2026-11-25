@@ -22,14 +22,23 @@ interpreter with no relationship to the parent's __main__.
 """
 
 import ctypes
+import os
 import subprocess
 import sys
+
+from pathlib import Path
 
 import pytest
 import torch
 
+from python.runfiles import runfiles
+
 from nurec.libs.cuda_ipc_transport import IpcManager  # type: ignore[attr-defined]
 
+
+_RUNFILES = runfiles.Create()
+_RUNTIME_CONFIG = Path(_RUNFILES.Rlocation(os.environ["NRE_IPC_RUNTIME_CONFIG"])).read_text().splitlines()
+_EXPECTED_RUNTIME = int(_RUNTIME_CONFIG[0])
 
 _CHILD_OPEN_AND_READ_SCRIPT = """
 import ctypes
@@ -75,6 +84,10 @@ size = int(sys.argv[2])
 cudart_path = sys.argv[3]
 
 lib = ctypes.CDLL(cudart_path)
+version = ctypes.c_int()
+_check(lib.cudaRuntimeGetVersion(ctypes.byref(version)), "cudaRuntimeGetVersion")
+if version.value != int(sys.argv[4]):
+    raise RuntimeError(f"unexpected client CUDA runtime: {version.value}")
 lib.cudaSetDevice.argtypes = [ctypes.c_int]
 lib.cudaSetDevice.restype = ctypes.c_int
 lib.cudaIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), _CudaIpcMemHandle, ctypes.c_uint]
@@ -112,10 +125,26 @@ _check(
 )
 
 host_buf = (ctypes.c_ubyte * size)()
-_check(
-    lib.cudaMemcpy(host_buf, dev_ptr, size, _CUDA_MEMCPY_DEVICE_TO_HOST),
-    "cudaMemcpy",
-)
+if len(sys.argv) > 5:
+    event = ctypes.c_void_p()
+    stream = ctypes.c_void_p()
+    lib.cudaIpcOpenEventHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), _CudaIpcMemHandle]
+    lib.cudaStreamCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+    lib.cudaStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    lib.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+    lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+    lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+    lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
+    _check(lib.cudaIpcOpenEventHandle(ctypes.byref(event),
+        _CudaIpcMemHandle.from_buffer_copy(bytes.fromhex(sys.argv[5]))), "cudaIpcOpenEventHandle")
+    _check(lib.cudaStreamCreateWithFlags(ctypes.byref(stream), 1), "cudaStreamCreateWithFlags")
+    _check(lib.cudaStreamWaitEvent(stream, event, 0), "cudaStreamWaitEvent")
+    _check(lib.cudaMemcpyAsync(host_buf, dev_ptr, size, _CUDA_MEMCPY_DEVICE_TO_HOST, stream), "cudaMemcpyAsync")
+    _check(lib.cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+    _check(lib.cudaStreamDestroy(stream), "cudaStreamDestroy")
+    _check(lib.cudaEventDestroy(event), "cudaEventDestroy")
+else:
+    _check(lib.cudaMemcpy(host_buf, dev_ptr, size, _CUDA_MEMCPY_DEVICE_TO_HOST), "cudaMemcpy")
 lib.cudaIpcCloseMemHandle(dev_ptr)
 sys.stdout.write(bytes(host_buf).hex())
 """
@@ -141,14 +170,23 @@ def _loaded_libcudart_path() -> str:
     raise RuntimeError("libcudart.so not found in /proc/self/maps -- is CUDA initialized in this process?")
 
 
-def _child_open_and_read(handle_bytes: bytes, size: int) -> bytes:
-    """Runs the IPC-handle-open-and-copy in a genuinely separate OS process (not a
-    multiprocessing child — see the module docstring) and returns the bytes it read."""
+def _child_open_and_read(handle_bytes: bytes, size: int, ready_event: bytes | None = None) -> bytes:
+    """Read IPC memory in a fresh process, waiting on ready_event when given."""
+    runtime_path = _RUNFILES.Rlocation(_RUNTIME_CONFIG[1]) if len(_RUNTIME_CONFIG) > 1 else _loaded_libcudart_path()
     result = subprocess.run(
-        [sys.executable, "-c", _CHILD_OPEN_AND_READ_SCRIPT, handle_bytes.hex(), str(size), _loaded_libcudart_path()],
+        [
+            sys.executable,
+            "-c",
+            _CHILD_OPEN_AND_READ_SCRIPT,
+            handle_bytes.hex(),
+            str(size),
+            runtime_path,
+            str(_EXPECTED_RUNTIME),
+        ]
+        + ([ready_event.hex()] if ready_event is not None else []),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
     )
     if result.returncode != 0:
         raise RuntimeError(f"child process failed (exit {result.returncode}): {result.stderr}")
@@ -163,10 +201,40 @@ def _reference_chw_u8_bytes(src_hwc_f32: torch.Tensor) -> bytes:
     return ctypes.string_at(chw_u8.data_ptr(), chw_u8.numel())
 
 
+@pytest.mark.parametrize("native_first", [False, True])
+def test_runtime_is_independent_of_import_order(native_first):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA IPC needs a CUDA device")
+    script = """
+import ctypes
+import importlib
+import sys
+
+native = "nurec.libs.cuda_ipc_transport._nre_cuda_ipc"
+order = [native, "torch"] if sys.argv[1] == "True" else ["torch", native]
+for name in order:
+    importlib.import_module(name)
+module = importlib.import_module(native)
+manager = module.IpcManager(0)
+assert manager.runtime_version == int(sys.argv[2]), manager.runtime_version
+if manager.runtime_version == 12090:
+    library = ctypes.CDLL(module.__file__)
+    assert not hasattr(library, "cudaRuntimeGetVersion"), "private runtime symbols are exported"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(native_first), str(_EXPECTED_RUNTIME)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_open_session_allocates_requested_buffers():
     if not torch.cuda.is_available():
         pytest.skip("CUDA IPC needs a CUDA device")
     mgr = IpcManager(0)
+    assert mgr.runtime_version == _EXPECTED_RUNTIME
     width, height, buffer_count = 8, 6, 2
     session_id, handles, buffer_size, device_uuid, actual_w, actual_h = mgr.open_session(width, height, buffer_count)
     try:
@@ -177,6 +245,67 @@ def test_open_session_allocates_requested_buffers():
         assert len(device_uuid) == 16
     finally:
         assert mgr.close_session(session_id) is True
+
+
+@pytest.mark.parametrize("event_ordered", [False, True])
+@pytest.mark.parametrize("extra_axis", [None, 0, 1])
+def test_batch_packing_and_reuse_on_nondefault_stream(event_ordered, extra_axis):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA IPC needs a CUDA device")
+    mgr = IpcManager(0)
+    width, height = 5, 3
+    session, handles, size, *_ = mgr.open_session(width, height, 2, event_ordered=event_ordered)
+    events = mgr.ready_event_handles(session)
+    assert len(events) == (2 if event_ordered else 0)
+    stream = torch.cuda.Stream()
+    try:
+        assert mgr.layout(session) == (width, height, event_ordered)
+        assert mgr.allocation_size(width, height) == 2 * 1024**2
+        previous = []
+        for count in (2, 1, 2):
+            ids = mgr.reserve_buffers(session, previous, count)
+            shape = [height, width, 3]
+            if extra_axis is not None:
+                shape[extra_axis] += 1
+            with torch.cuda.stream(stream):
+                sources = [torch.rand(shape, device="cuda") * 2 - 0.5 for _ in ids]
+                mgr.write_reserved_buffers(
+                    session,
+                    ids,
+                    [src.data_ptr() for src in sources],
+                    [src.stride(0) for src in sources],
+                    height,
+                    width,
+                    stream.cuda_stream,
+                )
+            for buffer_id, src in zip(ids, sources):
+                actual = _child_open_and_read(handles[buffer_id], size, events[buffer_id] if events else None)
+                assert actual == _reference_chw_u8_bytes(src[:height, :width])
+            previous = ids
+    finally:
+        stream.synchronize()
+        mgr.close_session(session)
+
+
+def test_event_ordered_session_rejects_legacy_writes_and_rolls_back_unpublished_buffers():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA IPC needs a CUDA device")
+    mgr = IpcManager(0)
+    session, *_ = mgr.open_session(3, 2, 1, event_ordered=True)
+    try:
+        source = torch.ones((2, 3, 3), device="cuda")
+        with pytest.raises(ValueError, match="require batch_render_camera"):
+            mgr.write_render_hwc_f32(session, None, source.data_ptr(), 2, 3)
+        ids = mgr.reserve_buffers(session, [], 1)
+        with pytest.raises(ValueError, match="require batch_render_camera"):
+            mgr.write_reserved_buffer(session, ids[0], source.data_ptr(), 2, 3)
+        mgr.write_reserved_buffers(
+            session, ids, [source.data_ptr()], [9], 2, 3, torch.cuda.current_stream().cuda_stream
+        )
+        mgr.release_buffer(session, ids[0])
+        assert mgr.reserve_buffers(session, [], 1) == ids
+    finally:
+        mgr.close_session(session)
 
 
 def test_open_session_respects_configurable_max_buffer_count():

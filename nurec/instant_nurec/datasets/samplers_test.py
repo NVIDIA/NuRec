@@ -236,6 +236,175 @@ def test_adaptive_sequential_frame_batch_sampler() -> None:
     assert context_samples_2.sampled_sensor_frame_idxs == {}
 
 
+def test_adaptive_sequential_frame_batch_sampler_reference_camera_prevents_adjacent_cycle_selection() -> None:
+    # Chunk targets land at 0, 155, 310; at 155 the reference resolves to 200 but the
+    # phase-shifted camera resolves to 110, i.e. the previous capture cycle.
+    camera_frame_timestamps = {
+        "reference": np.array([0, 100, 200, 300, 400], dtype=np.int64),
+        "phase_shifted": np.array([10, 110, 210, 310, 410], dtype=np.int64),
+    }
+    interval = [HalfClosedInterval(0, 465)]
+
+    def sample(reference_camera_id: str | None) -> dict[str, list[int]]:
+        sampler = AdaptiveSequentialFrameBatchSampler(
+            AdaptiveSequentialFrameBatchSamplerConfig(
+                n_frames_per_sample=3,
+                n_samples_per_sequence=1,
+                max_frame_gap_timestamp_us=155,
+                reference_camera_id=reference_camera_id,
+            )
+        )
+        return sampler.sample_frame_batch(
+            np.random.default_rng(seed=0), 0, camera_frame_timestamps, interval, None
+        ).sampled_sensor_frame_idxs
+
+    assert sample(None) == {"reference": [0, 2, 3], "phase_shifted": [0, 1, 3]}
+    assert sample("reference") == {"reference": [0, 2, 3], "phase_shifted": [0, 2, 3]}
+
+
+def test_adaptive_sequential_frame_batch_sampler_snaps_to_fully_synchronized_reference_frames() -> None:
+    # The reference runs at twice the rate of "half_rate", like 30 Hz front-wide vs 15 Hz cross cameras.
+    # Chunk targets land at 0, 310, 620; reference frame 300 has no half-rate capture.
+    camera_frame_timestamps = {
+        "reference": np.arange(0, 700, 100, dtype=np.int64),
+        "half_rate": np.arange(0, 700, 200, dtype=np.int64),
+    }
+    interval = [HalfClosedInterval(0, 930)]
+
+    def sample(max_camera_timestamp_delta_us: int | None) -> dict[str, list[int]]:
+        sampler = AdaptiveSequentialFrameBatchSampler(
+            AdaptiveSequentialFrameBatchSamplerConfig(
+                n_frames_per_sample=3,
+                n_samples_per_sequence=1,
+                max_frame_gap_timestamp_us=310,
+                reference_camera_id="reference",
+                max_camera_timestamp_delta_us=max_camera_timestamp_delta_us,
+            )
+        )
+        return sampler.sample_frame_batch(
+            np.random.default_rng(seed=0), 0, camera_frame_timestamps, interval, None
+        ).sampled_sensor_frame_idxs
+
+    # Snapping alone pairs reference 300 with half-rate 200, a different capture cycle.
+    assert sample(None) == {"reference": [0, 3, 6], "half_rate": [0, 1, 3]}
+    assert sample(0) == {"reference": [0, 4, 6], "half_rate": [0, 2, 3]}
+
+
+def _sample_adaptive_sequential_with_tolerance(
+    camera_frame_timestamps: dict[str, np.ndarray], interval_end_us: int, max_frame_gap_us: int, tolerance_us: int
+) -> dict[str, list[int]]:
+    sampler = AdaptiveSequentialFrameBatchSampler(
+        AdaptiveSequentialFrameBatchSamplerConfig(
+            n_frames_per_sample=3,
+            n_samples_per_sequence=1,
+            max_frame_gap_timestamp_us=max_frame_gap_us,
+            reference_camera_id="reference",
+            max_camera_timestamp_delta_us=tolerance_us,
+        )
+    )
+    return sampler.sample_frame_batch(
+        np.random.default_rng(seed=0), 0, camera_frame_timestamps, [HalfClosedInterval(0, interval_end_us)], None
+    ).sampled_sensor_frame_idxs
+
+
+@pytest.mark.parametrize("phase_offset_us", [-15_100, 10_300])
+def test_adaptive_sequential_frame_batch_sampler_falls_back_on_constant_phase_offset(phase_offset_us: int) -> None:
+    # All-30 Hz cameras with a constant phase offset beyond the 10 ms tolerance (seen on perflab clips):
+    # no reference frame qualifies, so the sampler must not drop the clip and must pair each reference
+    # frame with the nearest frame of the offset camera.
+    reference = np.arange(1, 31, dtype=np.int64) * 33_333
+    camera_frame_timestamps = {"reference": reference, "offset": reference + phase_offset_us}
+    sampled = _sample_adaptive_sequential_with_tolerance(camera_frame_timestamps, 1_000_000, 340_000, 10_000)
+    assert sampled["offset"] == sampled["reference"]
+    assert len(set(sampled["reference"])) == 3
+
+
+def test_adaptive_sequential_frame_batch_sampler_fallback_keeps_best_synchronized_frames() -> None:
+    # 15 Hz camera 20 ms after every other 30 Hz reference frame: odd reference frames have a 13.3 ms sync
+    # delta, even ones 20 ms. With a 10 ms tolerance none qualifies, and the fallback keeps only the
+    # best-synchronized (odd) reference frames.
+    reference = np.arange(0, 30, dtype=np.int64) * 33_333
+    camera_frame_timestamps = {"reference": reference, "half_rate": reference[::2] + 20_000}
+    sampled = _sample_adaptive_sequential_with_tolerance(camera_frame_timestamps, 1_000_000, 340_000, 10_000)
+    assert all(idx % 2 == 1 for idx in sampled["reference"])
+    assert sampled["half_rate"] == [idx // 2 for idx in sampled["reference"]]
+
+
+@pytest.mark.parametrize(
+    ("cross_period_us", "phase_offset_us"), [(33_333, -16_650), (66_667, -16_650), (66_667, 16_650)]
+)
+def test_adaptive_sequential_frame_batch_sampler_fallback_pairs_cameras_at_a_fixed_phase(
+    cross_period_us: int, phase_offset_us: int
+) -> None:
+    # Cross camera (30 or 15 Hz) about half a reference period off, with timestamp jitter: each cross frame
+    # is about equally close to two reference frames. The fallback must pair it on the same side of the
+    # reference frame in every chunk, never mixing capture cycles (seen on prod rigs up to 16.66 ms).
+    rng = np.random.default_rng(seed=0)
+    reference = np.arange(0, 600, dtype=np.int64) * 33_333 + rng.integers(-60, 60, 600)
+    cross = np.arange(0, 600 * 33_333 // cross_period_us, dtype=np.int64) * cross_period_us + phase_offset_us
+    cross = cross + rng.integers(-60, 60, len(cross))
+    camera_frame_timestamps = {"reference": reference, "cross": cross[(cross > 0) & (cross < reference[-1])]}
+    sampler = AdaptiveSequentialFrameBatchSampler(
+        AdaptiveSequentialFrameBatchSamplerConfig(
+            n_frames_per_sample=3,
+            n_samples_per_sequence=100,
+            max_frame_gap_timestamp_us=500_000,
+            reference_camera_id="reference",
+            max_camera_timestamp_delta_us=10_000,
+        )
+    )
+    interval = [HalfClosedInterval(0, int(reference[-1]) + 1)]
+    offsets_us = []
+    for sample_idx in range(100):
+        sampled = sampler.sample_frame_batch(
+            np.random.default_rng(seed=0), sample_idx, camera_frame_timestamps, interval, None
+        ).sampled_sensor_frame_idxs
+        if not sampled:
+            break
+        offsets_us += [
+            int(camera_frame_timestamps["cross"][c]) - int(reference[r])
+            for r, c in zip(sampled["reference"], sampled["cross"], strict=True)
+        ]
+    assert len(offsets_us) > 3
+    assert max(offsets_us) - min(offsets_us) <= 2_000
+
+
+def test_adaptive_sequential_frame_batch_sampler_fallback_rejects_non_overlapping_cameras() -> None:
+    # The fallback only covers constant phase offsets (at most half a reference period). Camera streams
+    # that do not overlap in time must still be rejected instead of pairing frames seconds apart.
+    reference = np.arange(0, 4, dtype=np.int64) * 33_333
+    camera_frame_timestamps = {"reference": reference, "late": reference + 2_000_000}
+    with pytest.raises(InstantNuRecDataError, match="camera captures do not overlap"):
+        _sample_adaptive_sequential_with_tolerance(camera_frame_timestamps, 2_200_000, 800_000, 10_000)
+
+
+def test_adaptive_sequential_frame_batch_sampler_timestamp_tolerance_requires_reference_camera() -> None:
+    with pytest.raises(ValueError, match="max_camera_timestamp_delta_us requires reference_camera_id"):
+        AdaptiveSequentialFrameBatchSampler(
+            AdaptiveSequentialFrameBatchSamplerConfig(
+                n_frames_per_sample=2,
+                n_samples_per_sequence=1,
+                max_frame_gap_timestamp_us=100,
+                max_camera_timestamp_delta_us=0,
+            )
+        )
+
+
+def test_adaptive_sequential_frame_batch_sampler_rejects_missing_reference_camera() -> None:
+    sampler = AdaptiveSequentialFrameBatchSampler(
+        AdaptiveSequentialFrameBatchSamplerConfig(
+            n_frames_per_sample=2,
+            n_samples_per_sequence=1,
+            max_frame_gap_timestamp_us=100,
+            reference_camera_id="missing",
+        )
+    )
+    with pytest.raises(ValueError, match="Reference camera 'missing' is absent"):
+        sampler.sample_frame_batch(
+            np.random.default_rng(seed=0), 0, {"other": np.array([0, 100])}, [HalfClosedInterval(0, 101)], None
+        )
+
+
 @pytest.mark.parametrize("sample_strategy", ["random", "stratified"])
 @pytest.mark.parametrize(
     "target_timestamps,horizon,expected_indices",

@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_python//python:defs.bzl", "py_library")
+
+DEFAULT_VISIBILITY = ["//:core_package_group"]
+
+package(default_visibility = DEFAULT_VISIBILITY)
+
+# Low-level helpers around libibverbs: device open, RoCEv2 GID discovery, RC QP
+# creation and state-machine transition, single-completion CQ poll. @ibverbs is
+# vendored hermetically and x86_64-only, so these targets build in the default
+# wildcard build on x86_64 and are skipped as incompatible elsewhere.
+cc_library(
+    name = "rdma_utils",
+    srcs = ["rdma_utils.cpp"],
+    hdrs = ["rdma_utils.h"],
+    deps = ["@ibverbs"],
+)
+
+# pybind11 module: exposes RdmaManager to Python. Loaded as
+# `nurec.libs.rdma_transport._nre_rdma` by serve.py. Reuses
+# //nurec/libs/render_pack:render_pack_cuda for the fused HWC-f32 -> CHW-u8 pack
+# kernel rather than duplicating it.
+cc_binary(
+    name = "_nre_rdma.so",
+    srcs = ["rdma_module.cpp"],
+    linkshared = True,
+    deps = [
+        ":rdma_utils",
+        "//nurec/libs/render_pack:render_pack_cuda",
+        "@numpyeigen_pybind11//:pybind11",
+        "@rules_cuda//cuda:runtime",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# Linked into serve-grpc only with --config=rdma (see //nurec/grpc:pylib).
+py_library(
+    name = "pylib",
+    srcs = ["__init__.py"],
+    data = [":_nre_rdma.so"],
+)

@@ -129,13 +129,16 @@ class EditManifest:
     ``layer_id``, so one manifest can mix clusters across several Gaussian layers.
 
     ``assets`` is informational provenance only (the per-frame runtime never reads
-    it): one record per baked edit — its asset, parts (prim path -> baked row
-    ranges), native variantSet controls, placement, and how many captured Gaussians
-    were hidden by ``replace_original``.
+    it): one record per baked edit — its operation, asset, parts (prim path -> baked
+    row ranges), native variantSet controls, placement, and how many captured
+    Gaussians a replace / exclude hid. ``excluded_tracks`` lists the captured actors an
+    ``exclude`` edit hid (layer, layer-local index, string id), for scenario-side
+    consumers; the runtime never reads it either.
     """
 
     clusters: list[BakedCluster]
     assets: list[dict[str, Any]] = field(default_factory=list)
+    excluded_tracks: list[dict[str, Any]] = field(default_factory=list)
     # Animation tables consumed by EXTERNAL animator processes driving the renderer
     # over gRPC (see ControlAnimation). Optional; absent when nothing is controllable.
     controls: list["ControlAnimation"] = field(default_factory=list)
@@ -155,6 +158,7 @@ class EditManifest:
         return EditManifest(
             clusters=[BakedCluster.from_dict(c) for c in data.get("clusters", [])],
             assets=[dict(v) for v in data.get("assets", [])],
+            excluded_tracks=[dict(v) for v in data.get("excluded_tracks", [])],
             controls=[ControlAnimation.from_dict(c) for c in data.get("controls", [])],
             layer_row_counts={str(k): int(v) for k, v in (data.get("layer_row_counts") or {}).items()},
             layer_track_digest={str(k): str(v) for k, v in (data.get("layer_track_digest") or {}).items()},
@@ -166,6 +170,8 @@ class EditManifest:
             "clusters": [c.to_dict() for c in self.clusters],
             "assets": [dict(v) for v in self.assets],
         }
+        if self.excluded_tracks:
+            out["excluded_tracks"] = [dict(v) for v in self.excluded_tracks]
         if self.controls:
             out["controls"] = [c.to_dict() for c in self.controls]
         if self.layer_row_counts:
@@ -177,33 +183,30 @@ class EditManifest:
     def validate_against_layers(self, layers: Mapping[str, Any]) -> None:
         """Refuse a manifest that does not address the loaded checkpoint.
 
-        THE install-time gate, shared by every runtime entry point (gRPC serve and the
-        offline render CLI) — a manifest is only meaningful for the exact bake that
-        produced it, and every failure mode here writes baked opacities into unrelated
-        gaussians rather than erroring.
+        This is the install gate of every runtime entry point (gRPC serve and the offline
+        render CLI). A manifest fits only the bake that produced it; a mismatch would write
+        baked opacities into unrelated gaussians instead of failing.
 
-        ``layers``: layer_id -> the loaded Gaussian node (anything exposing
+        ``layers`` maps layer_id to the loaded Gaussian node (anything with
         ``get_num_gaussians()`` and a ``gaussian_cuboid_ids`` tensor).
 
         Checks, cheapest first:
 
-        1. every layer the manifest names is present AND carries per-row cuboid ids
-           (clusters are track-bound by definition, so a layer without them — e.g. a
-           static SH layer — can never be a valid cluster target);
-        2. cluster records are internally coherent (unique ``cluster_id``; parallel
-           ``on_opacities``), since the runtime's per-cluster caches key on them;
-        3. row counts match :attr:`layer_row_counts` (catches a grown/shrunk layer);
-        4. each layer's ``gaussian_cuboid_ids`` digest matches
-           :attr:`layer_track_digest` (catches a REORDERED or retrained layer of
-           unchanged size, which check 3 cannot see);
-        5. every cluster's baked rows are in range AND carry that cluster's own
-           ``nurec_track_id`` — the direct statement of what the indices mean, so it
-           also covers manifests from bakes predating checks 3 and 4.
+        1. every layer the manifest binds is loaded and has per-row cuboid ids. A layer is
+           bound when a cluster lives on it or :attr:`layer_row_counts` /
+           :attr:`layer_track_digest` names it (a bake binds every layer it rewrote);
+        2. cluster records are coherent: unique ``cluster_id`` and parallel ``on_opacities``;
+        3. row counts match :attr:`layer_row_counts`;
+        4. each bound layer's ``gaussian_cuboid_ids`` digest matches
+           :attr:`layer_track_digest`, which catches a reordered or retrained layer of
+           unchanged size;
+        5. every cluster's rows are in range and carry the cluster's own ``nurec_track_id``.
 
         Raises ``ValueError`` naming the offending layer or cluster.
         """
+        bound = dict.fromkeys([*self.layer_ids(), *self.layer_row_counts, *self.layer_track_digest])
         ids_by_layer: dict[str, torch.Tensor] = {}
-        for layer_id in self.layer_ids():
+        for layer_id in bound:
             if layer_id not in layers:
                 raise ValueError(
                     f"asset-edits manifest addresses layer {layer_id!r}, which the loaded "
@@ -213,8 +216,8 @@ class EditManifest:
             if not (isinstance(ids, torch.Tensor) and ids.ndim == 1):
                 raise ValueError(
                     f"asset-edits manifest addresses layer {layer_id!r}, which has no per-row "
-                    "gaussian_cuboid_ids: clusters bind to cuboid tracks, so this layer cannot "
-                    "be a cluster target (wrong layer_id or wrong artifact?)."
+                    "gaussian_cuboid_ids: edits bind to cuboid tracks, so this layer cannot "
+                    "be an edit target (wrong layer_id or wrong artifact?)."
                 )
             ids_by_layer[layer_id] = ids
 
@@ -234,10 +237,7 @@ class EditManifest:
                 )
 
         for layer_id, expected_rows in self.layer_row_counts.items():
-            node = layers.get(layer_id)
-            if node is None or not hasattr(node, "get_num_gaussians"):
-                continue
-            actual_rows = int(node.get_num_gaussians())
+            actual_rows = int(layers[layer_id].get_num_gaussians())
             if actual_rows != int(expected_rows):
                 raise ValueError(
                     f"asset-edits manifest was baked against layer {layer_id!r} with {expected_rows} "
@@ -246,10 +246,7 @@ class EditManifest:
                 )
 
         for layer_id, expected in self.layer_track_digest.items():
-            ids = ids_by_layer.get(layer_id)
-            if ids is None:
-                continue
-            actual = layer_track_digest(ids)
+            actual = layer_track_digest(ids_by_layer[layer_id])
             if actual != expected:
                 raise ValueError(
                     f"asset-edits manifest was baked against a different layer {layer_id!r}: "

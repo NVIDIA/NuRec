@@ -10,7 +10,6 @@ from nurec.libs.losses.models.base_losses import (
     BaseRenderLoss,
     SlangBaseLoss,
 )
-from nurec.libs.losses.models.losses_module import ModuleLosses
 
 
 __all__ = [
@@ -19,5 +18,4 @@ __all__ = [
     "BasePrimitiveLoss",
     "BaseLossWithSemanticWeights",
     "SlangBaseLoss",
-    "ModuleLosses",
 ]

@@ -102,6 +102,11 @@ class BaseGaussianRenderer(ABC):
         # subclasses emit from render(); GaussiansComposite is the sole producer of the mask.
         self._warned_missing_active_tile_mask: bool = False
 
+    @property
+    def supports_shared_camera_batch(self) -> bool:
+        """Return whether one collected scene can render several cameras."""
+        return False
+
     def _warn_missing_active_tile_mask_once(self) -> None:
         """Emit the "active tiling is on but no mask arrived" warning at most once.
 
@@ -132,6 +137,7 @@ class BaseGaussianRenderer(ABC):
         extra_ray_signal_infos: tuple[list[str], list[int], list[Callable]],
         frame_meta: Optional[List[FrameMeta]] = None,
         segment_plan: SegmentPlan | None = None,
+        shared_camera_scene: bool = False,
     ) -> GaussiansRenderReturn: ...
 
     def band0_fold_supported(
@@ -538,6 +544,10 @@ class GSplatRenderer(BaseGaussianRenderer):
     """
 
     config: GSplatRendererConfig  # type: ignore[assignment] # Narrow type
+
+    @property
+    def supports_shared_camera_batch(self) -> bool:
+        return True
 
     def __init__(self, config: GSplatRendererConfig, model: BaseModel) -> None:
         super().__init__(config, model)
@@ -1285,6 +1295,7 @@ class GSplatRenderer(BaseGaussianRenderer):
         extra_ray_signal_infos: tuple[list[str], list[int], list[Callable]],
         frame_meta: Optional[List[FrameMeta]] = None,
         segment_plan: SegmentPlan | None = None,
+        shared_camera_scene: bool = False,
     ) -> GaussiansRenderReturn:
         """Render Gaussians using gsplat (camera or lidar path; dispatched per sensor).
 
@@ -1308,12 +1319,16 @@ class GSplatRenderer(BaseGaussianRenderer):
             segment_plan: Optional draw plan. Its segments use shape ``[2, segment_count]``.
                 Row 0 stores start rows, and row 1 stores row counts. Its offsets use
                 shape ``[segment_count + 1]`` and store packed start rows.
+            shared_camera_scene: Render all views from one collected scene, for
+                inference only. Every view must reference the same camera-intrinsics
+                object.
 
         Returns:
             GaussiansRenderReturn with RGB, ray distance, opacity, normals, and
             `extra_ray_signals` populated for whichever gated tensors had non-zero dim.
         """
-        assert rendering_data.b == 1, "Only single-frame batch supported"
+        if rendering_data.b != 1 and not shared_camera_scene:
+            raise ValueError("Multiple camera views require shared_camera_scene=True")
 
         with ScopedTimer("GSplatRenderer/render"):
             # Extract sensor parameters and set sensor-specific state (camera vs lidar).
@@ -1321,10 +1336,16 @@ class GSplatRenderer(BaseGaussianRenderer):
             # ray list is model-independent), so the per-frame entry is None; that
             # denotes a (non-camera) lidar render, routed to _render_unstructured.
             sensor_params = rendering_data.sensor_model_parameters[0]
+            if shared_camera_scene and any(
+                parameters is not sensor_params for parameters in rendering_data.sensor_model_parameters[1:]
+            ):
+                raise ValueError("Shared-scene camera views must reference the same camera-intrinsics object")
             device = rendering_data.rays[0].device
             is_camera = sensor_params is not None and isinstance(
                 sensor_params, get_union_types(ConcreteCameraModelParametersUnion)
             )
+            if rendering_data.b > 1 and not is_camera:
+                raise ValueError("GSplatRenderer supports multi-view batches only for cameras")
 
             # Single-owner contract: the composite builds the mask and hands it over on
             # rendering_data (see `_warn_missing_active_tile_mask_once` on the base).
@@ -1360,11 +1381,11 @@ class GSplatRenderer(BaseGaussianRenderer):
                 # [frame_start, frame_end] window, so it needs the FRAME-START viewmat
                 # (not the mid-frame viewmat the structured path uses) and the
                 # frame-end pose as viewmat_rs.
-                viewmat_start = self._build_viewmat(rendering_data, device, use_midframe=False)
-                viewmat_end = self._build_rolling_shutter_matrix(rendering_data, device)
+                viewmat_start = self._build_viewmats(rendering_data, device, use_midframe=False)[0]
+                viewmat_end = self._build_rolling_shutter_matrices(rendering_data, device)[0]
                 gaussian_params = self._extract_gaussian_parameters(gaussian_parameters, device)
                 viewmat_midframe = (
-                    self._build_viewmat(rendering_data, device, use_midframe=True)
+                    self._build_viewmats(rendering_data, device, use_midframe=True)[0]
                     if self._lidar_extra_signals_sh_degree is not None
                     else None
                 )
@@ -1445,6 +1466,16 @@ class GSplatRenderer(BaseGaussianRenderer):
                 # Get camera model info from adapter
                 camera_model = sensor_adapter.get_camera_model_name()
                 gsplat_sensor_params = sensor_adapter.get_gsplat_sensor_params()
+                if rendering_data.b > 1:
+                    for name, value in gsplat_sensor_params.items():
+                        if not isinstance(value, torch.Tensor):
+                            continue
+                        if value.shape[:2] != (1, 1):
+                            raise ValueError(
+                                f"Batched camera parameter {name!r} must start with shape (1, 1); "
+                                f"got {tuple(value.shape)}"
+                            )
+                        gsplat_sensor_params[name] = value.expand(1, rendering_data.b, *value.shape[2:])
 
                 external_distortion_params = (
                     external_distortion_adapter.get_distortion_params()
@@ -1453,16 +1484,18 @@ class GSplatRenderer(BaseGaussianRenderer):
                 )
 
                 # Build camera matrices using adapter (start-of-frame pose).
-                viewmat = self._build_viewmat(rendering_data, device)
+                viewmat = self._build_viewmats(rendering_data, device)
 
                 if self.use_rays:
                     # TODO: add ray footprint support to gsplat
                     # TODO: add support for ray timestamp input to gsplat
-                    gsplat_sensor_params["rays"] = rendering_data.rays[0]  # (H, W, 6)
+                    gsplat_sensor_params["rays"] = (
+                        rendering_data.rays.unsqueeze(0) if rendering_data.b > 1 else rendering_data.rays[0]
+                    )
                 use_3dgut = self._use_3dgut
                 rolling_shutter_type = gsplat.RollingShutterType.GLOBAL
                 if self._has_rolling_shutter(camera_params):
-                    viewmat_rs = self._build_rolling_shutter_matrix(rendering_data, device)
+                    viewmat_rs = self._build_rolling_shutter_matrices(rendering_data, device)
                     rolling_shutter_type = self._get_rolling_shutter_type(camera_params)
 
                 far_plane = float(self.config.culling.far_clip_distance_camera)
@@ -1493,9 +1526,9 @@ class GSplatRenderer(BaseGaussianRenderer):
                 }
 
                 # For lidar, use mid-frame
-                viewmat = self._build_viewmat(rendering_data, device, True)
+                viewmat = self._build_viewmats(rendering_data, device, True)
 
-                viewmat_rs = self._build_rolling_shutter_matrix(rendering_data, device)
+                viewmat_rs = self._build_rolling_shutter_matrices(rendering_data, device)
                 # TODO: this is currently ignored with Lidar, but gsplat expects it as a
                 # mandatory parameter. But for giving viewmat_rs (which lidar needs), the
                 # shutter type must be different from GLOBAL.
@@ -1730,19 +1763,13 @@ class GSplatRenderer(BaseGaussianRenderer):
             # and the lidar path (mask over gsplat's [n_bins_elevation, n_bins_azimuth] grid)
             # honor it. The mask tile grid must match gsplat's resolved tile grid (built via
             # active_tile_mask_tile_size / compute_lidar_element_to_tile).
-            # gsplat validates masks against viewmats' batch layout: the mask must be
-            # [*batch_dims, C, tile_height, tile_width] (matching meta["isect_offsets"]).
-            # This renderer always rasterizes a single view, so viewmats is (1, 1, 4, 4)
-            # (batch=1, C=1) and the composite's (B=1, tile_h, tile_w) mask needs the camera
-            # dim inserted -> (B, 1, tile_h, tile_w).
-            # Both layouts already match gsplat's [tile_h, tile_w] grid, so the same
-            # unsqueeze applies: camera masks are (B, tiles_y, tiles_x) and lidar masks are
-            # (B, n_bins_elevation, n_bins_azimuth) (tile id = el * n_bins_azimuth + az,
-            # i.e. elevation-major, as the composite already lays them out).
+            # gsplat masks match viewmats: (scene, view, tile_y, tile_x).
+            # RenderingData batches views of one scene, so add a leading scene axis.
+            # Lidar has one view and uses elevation-major (elevation, azimuth) bins.
             active_tile_mask = (
                 None
                 if rendering_data.active_tile_mask is None
-                else rendering_data.active_tile_mask.unsqueeze(1).contiguous()
+                else rendering_data.active_tile_mask.unsqueeze(0).contiguous()
             )
 
             # Call gsplat rasterization
@@ -1758,7 +1785,7 @@ class GSplatRenderer(BaseGaussianRenderer):
                     colors=(
                         gaussian_params.colors if sh_degree_param is not None else gaussian_params.colors.unsqueeze(0)
                     ),
-                    viewmats=viewmat.unsqueeze(0).unsqueeze(0),  # (1, 1, 4, 4)
+                    viewmats=viewmat.unsqueeze(0),  # (1, C, 4, 4)
                     width=width,
                     height=height,
                     near_plane=near_plane,
@@ -1775,7 +1802,7 @@ class GSplatRenderer(BaseGaussianRenderer):
                     external_distortion_coeffs=external_distortion_params,
                     ut_params=ut_params,
                     rolling_shutter=rolling_shutter_type,
-                    viewmats_rs=viewmat_rs.unsqueeze(0).unsqueeze(0) if viewmat_rs is not None else None,
+                    viewmats_rs=viewmat_rs.unsqueeze(0) if viewmat_rs is not None else None,
                     # 3DGUT mode: with_ut=True (distortion/RS). Pose grads flow when rays are
                     # passed (use_rays=True, the default for 3dgut-gsplat).
                     # Standard mode: with_ut=False (pose grads via viewmat).
@@ -1799,18 +1826,18 @@ class GSplatRenderer(BaseGaussianRenderer):
 
             # Parse outputs
             with ScopedTimer("GSplatRenderer/render/parse_outputs"):
-                opacity = render_alphas[0, 0, :, :, 0]  # (H, W)
+                opacity = render_alphas[0, :, :, :, 0]  # (C, H, W)
 
                 # Extract based on render mode
                 if enable_features:
                     # "RGB+d"/"RGB-d"/"RGB" mode: first 3 channels are RGB
-                    rgb = render_colors[0, 0, :, :, :3]  # (H, W, 3)
+                    rgb = render_colors[0, :, :, :, :3]  # (C, H, W, 3)
                     # Depth is the trailing channel, present only when it was rendered.
-                    distance = render_colors[0, 0, :, :, 3] if enable_distance else None
+                    distance = render_colors[0, :, :, :, 3] if enable_distance else None
                 else:
                     # D/d mode: render_colors only has depth
                     rgb = None
-                    distance = render_colors[0, 0, :, :, 0]  # (H, W) depth or hit distance
+                    distance = render_colors[0, :, :, :, 0]  # (C, H, W) depth or hit distance
 
                 # Conditionally compute/return outputs based on config.outputs.camera.enable_* flags
 
@@ -1821,13 +1848,13 @@ class GSplatRenderer(BaseGaussianRenderer):
                 if enable_normals:
                     render_normals = meta.get("normals")
                     if render_normals is not None:
-                        # Shape: (1, 1, H, W, 3) -> (H, W, 3)
-                        normal = render_normals[0, 0, :, :, :]
+                        # Shape: (1, C, H, W, 3) -> (C, H, W, 3)
+                        normal = render_normals[0]
 
                 if extra_signals is not None:  # we passed extra signals to gsplat
                     render_extra_signals = meta.get("render_extra_signals")
                     assert render_extra_signals is not None, "gsplat should have returned meta.render_extra_signals"
-                    extra_signals = render_extra_signals[0, 0, :, :, :]  # (H, W, E)
+                    extra_signals = render_extra_signals[0]  # (C, H, W, E)
 
                 if extra_signals is not None:
                     E = extra_signals.shape[-1]
@@ -1847,9 +1874,8 @@ class GSplatRenderer(BaseGaussianRenderer):
                     # get one radius per Gaussian.
                     if radii.ndim > 1:
                         radii = radii.amax(dim=-1)
-                    # We always render a single batch / single camera and the losses expect
-                    # (N,) visibility, so flatten the leading dims to (N,).
-                    visibility = radii.reshape(-1) > 0
+                    # Scene-level visibility is the union over this shared scene's cameras.
+                    visibility = (radii.flatten(0, -2).amax(dim=0) if radii.ndim > 1 else radii) > 0
 
                 # Active tiling refinement: AND in "lands in >= 1 active tile". gsplat counts
                 # only ACTIVE tiles in meta["tiles_per_gauss"] (IntersectTile / IntersectTileLidar
@@ -1864,11 +1890,11 @@ class GSplatRenderer(BaseGaussianRenderer):
                 if active_tile_mask is not None and not packed:
                     tiles_per_gauss = meta.get("tiles_per_gauss")
                     if tiles_per_gauss is not None:
-                        # int32 over gsplat's leading batch/camera dims, (B, C, N) for this
-                        # single-image non-packed render -> flatten to (N,) bool. Keep the
-                        # pre-mask (frustum) visibility so MCMC invisible-steps counting can
-                        # ignore the mask narrowing (see GaussiansRenderReturn).
-                        active_vis = tiles_per_gauss.reshape(-1) > 0
+                        # Union active-tile visibility across views. Keep pre-mask visibility
+                        # separate so MCMC invisible-step counts ignore tile masking.
+                        active_vis = (
+                            tiles_per_gauss.flatten(0, -2).amax(dim=0) if tiles_per_gauss.ndim > 1 else tiles_per_gauss
+                        ) > 0
                         # With no radii (gsplat returned no meta["radii"]) there is no base
                         # visibility to preserve, and leaving `frustum_visibility` None would
                         # hand the counters the mask-narrowed signal below -- the exact failure
@@ -2097,31 +2123,24 @@ class GSplatRenderer(BaseGaussianRenderer):
             torch.is_inference_mode_enabled(),
         )
 
-    def _build_viewmat(
+    def _build_viewmats(
         self, rendering_data: RenderingData, device: torch.device, use_midframe: bool = False
     ) -> torch.Tensor:
-        """Build gsplat-compatible viewmat matrix.
+        """Return (B, 4, 4) scene-to-sensor matrices on device.
 
-        Args:
-            rendering_data: Rendering data containing sensor poses
-            device: Target device
-            use_midframe: If True, interpolate start/end poses at t=0.5 to match
-                mid-frame projection pose.
-
-        Returns:
-            viewmat: (4, 4) world-to-camera transformation matrix
+        The scene frame is the rendering data's coordinate frame, normally NRE
+        space. Use frame-start poses by default, or interpolated midpoint poses
+        when ``use_midframe`` is true.
         """
-
         if use_midframe:
-            pose_start = rendering_data.poses_tquat_startend[0, 0]  # (7,)
-            pose_end = rendering_data.poses_tquat_startend[0, 1]  # (7,)
-            t_mid = 0.5 * (pose_start[:3] + pose_end[:3])
-            q_mid = quat_slerp(pose_start[3:].unsqueeze(0), pose_end[3:].unsqueeze(0), 0.5).squeeze(0)
-            pose_tquat = torch.cat([t_mid, q_mid]).unsqueeze(0)  # (1, 7)
+            pose_start = rendering_data.poses_tquat_startend[:, 0]
+            pose_end = rendering_data.poses_tquat_startend[:, 1]
+            t_mid = 0.5 * (pose_start[:, :3] + pose_end[:, :3])
+            q_mid = quat_slerp(pose_start[:, 3:], pose_end[:, 3:], 0.5)
+            pose_tquat = torch.cat([t_mid, q_mid], dim=-1)
         else:
-            pose_tquat = rendering_data.poses_tquat_startend[0, 0].unsqueeze(0)  # (1, 7)
+            pose_tquat = rendering_data.poses_tquat_startend[:, 0]
 
-        # Convert tquat to inverted 4x4 matrix (world-to-camera)
         viewmat = se3pose_to_inverse_matrix(pose_tquat[..., :3], pose_tquat[..., 3:])
 
         # Prober integration - save data for testing the viewmat computation
@@ -2136,7 +2155,7 @@ class GSplatRenderer(BaseGaussianRenderer):
             # Connect the gradient probing to the rest of the computation graph
             (viewmat,) = prober_result
 
-        return viewmat.squeeze(0).to(device)
+        return viewmat.to(device)
 
     def _has_rolling_shutter(self, sensor_params: ConcreteCameraModelParametersUnion) -> bool:
         """Check if sensor has rolling shutter enabled."""
@@ -2163,19 +2182,17 @@ class GSplatRenderer(BaseGaussianRenderer):
         }
         return shutter_map.get(sensor_params.shutter_type, gsplat.RollingShutterType.GLOBAL)
 
-    def _build_rolling_shutter_matrix(self, rendering_data: RenderingData, device: torch.device) -> torch.Tensor:
-        """Build end viewmat for rolling shutter.
+    def _build_rolling_shutter_matrices(self, rendering_data: RenderingData, device: torch.device) -> torch.Tensor:
+        """Return frame-end scene-to-sensor matrices on device.
 
-        Returns:
-            viewmat_rs: (4, 4) world-to-camera matrix at frame end
+        The scene frame is the rendering data's coordinate frame, normally NRE
+        space.
         """
-        # Extract sensor-to-NuRec pose (end)
-        pose_tquat_end = rendering_data.poses_tquat_startend[0, 1].unsqueeze(0)  # (1, 7)
+        pose_tquat_end = rendering_data.poses_tquat_startend[:, 1]
 
-        # Convert tquat to inverted 4x4 matrix (world-to-camera)
         viewmat_rs = se3pose_to_inverse_matrix(pose_tquat_end[..., :3], pose_tquat_end[..., 3:])
 
-        return viewmat_rs.squeeze(0).to(device)
+        return viewmat_rs.to(device)
 
     def collect_profilings(self) -> dict[str, float]:
         """Collect profiling information."""

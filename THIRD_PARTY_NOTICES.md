@@ -39,7 +39,7 @@ the package's own license files.
 - https://github.com/aio-libs/aiohappyeyeballs
 - License text: [aiohappyeyeballs.txt](third_party_licenses/aiohappyeyeballs.txt)
 
-### aiohttp 3.14.3
+### aiohttp 3.14.5
 
 - License: Apache-2.0 AND MIT
 - Copyright © 2018 Fedor Indutny
@@ -144,7 +144,7 @@ the package's own license files.
 - https://github.com/agronholm/cbor2
 - License text: [MIT](third_party_licenses/generic/MIT.txt)
 
-### certifi 2023.11.17
+### certifi 2026.10.23
 
 - License: MPL-2.0
 - https://github.com/certifi/python-certifi
@@ -325,13 +325,6 @@ the package's own license files.
 - https://github.com/rapidsai/ucxx
 - License text: [BSD-3-Clause](third_party_licenses/generic/BSD-3-Clause.txt)
 
-### docstring_parser 0.16
-
-- License: MIT
-- Copyright (c) 2018 Marcin Kurczewski
-- https://github.com/rr-/docstring_parser
-- License text: [MIT](third_party_licenses/generic/MIT.txt)
-
 ### DracoPy 2.0.0
 
 - License: Apache-2.0
@@ -371,13 +364,6 @@ the package's own license files.
 - https://github.com/google/python-fire
 - License text: [fire.txt](third_party_licenses/fire.txt)
 
-### flash_attn 2.7.3+pt2.11.0cu128sm80to120ptx100
-
-- License: BSD-3-Clause
-- Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
-- https://github.com/Dao-AILab/flash-attention
-- License text: [flash-attn.txt](third_party_licenses/flash-attn.txt)
-
 ### flow-vis 0.1
 
 - License: MIT
@@ -401,7 +387,7 @@ the package's own license files.
 - https://github.com/aio-libs/frozenlist
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
-### fsspec 2025.10.0
+### fsspec 2026.9.0
 
 - License: BSD-3-Clause
 - Copyright (c) 2018, Martin Durant
@@ -667,10 +653,12 @@ the package's own license files.
 - https://github.com/richzhang/PerceptualSimilarity
 - License text: [BSD-2-Clause](third_party_licenses/generic/BSD-2-Clause.txt)
 
-### lxml 6.1.0
+### lxml 6.1.3
 
 - License: BSD-3-Clause
 - Copyright (c) 2004 Infrae. All rights reserved.
+- Copyright (C) 1998-2012 Daniel Veillard. All Rights Reserved.
+- Copyright (C) 2001-2002 Daniel Veillard. All Rights Reserved.
 - https://lxml.de/
 - License text: [lxml.txt](third_party_licenses/lxml.txt)
 
@@ -746,6 +734,7 @@ the package's own license files.
 - Copyright 2018-2023 OpenMMLab. All rights reserved.
 - Copyright 2018-2023 OpenMMLab.
 - https://github.com/open-mmlab/mmdetection
+- Modified: patched, see deps/mmdet/mmdet.patch
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
 ### mmengine 0.10.5
@@ -764,7 +753,7 @@ the package's own license files.
 - http://mpmath.org/
 - License text: [mpmath.txt](third_party_licenses/mpmath.txt)
 
-### msgpack 1.2.1
+### msgpack 1.2.4
 
 - License: Apache-2.0
 - Copyright (C) 2008-2011 INADA Naoki <songofacandy@gmail.com>
@@ -811,13 +800,6 @@ the package's own license files.
 - License: Apache-2.0
 - http://ninja-build.org/
 - License text: [ninja.txt](third_party_licenses/ninja.txt)
-
-### nodeenv 1.8.0
-
-- License: BSD-3-Clause
-- Copyright (c) 2011, Eugene Kalinin.
-- https://github.com/ekalinin/nodeenv
-- License text: [nodeenv.txt](third_party_licenses/nodeenv.txt)
 
 ### numba 0.61.2
 
@@ -977,7 +959,7 @@ the package's own license files.
 - https://developer.nvidia.com/cuda-zone
 - License text: [nvidia-nccl-cu12.txt](third_party_licenses/nvidia-nccl-cu12.txt)
 
-### nvidia-ncore 19.8.0
+### nvidia-ncore 19.8.5
 
 - License: Apache-2.0
 - https://github.com/NVIDIA/ncore
@@ -1083,13 +1065,13 @@ the package's own license files.
 - https://github.com/cpburnz/python-pathspec
 - License text: [pathspec.txt](third_party_licenses/pathspec.txt)
 
-### pillow 12.3.0
+### pillow 13.0.0
 
 - License: MIT-CMU
 - Copyright © 1997-2011 by Secret Labs AB
 - Copyright © 1995-2011 by Fredrik Lundh and contributors
 - Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
-- https://python-pillow.github.io
+- https://python-pillow.org
 - License text: [pillow.txt](third_party_licenses/pillow.txt)
 
 ### platformdirs 4.2.2
@@ -1110,13 +1092,6 @@ the package's own license files.
 - License: MIT
 - Copyright 2023 Francis Williams
 - https://github.com/fwilliams/point-cloud-utils
-- License text: [MIT](third_party_licenses/generic/MIT.txt)
-
-### poisson_recon 13.74.1
-
-- License: MIT
-- Copyright (c) 2015 mkazhdan
-- https://github.com/mkazhdan/PoissonRecon
 - License text: [MIT](third_party_licenses/generic/MIT.txt)
 
 ### polyscope 2.6.1
@@ -1275,7 +1250,7 @@ the package's own license files.
 - https://github.com/dateutil/dateutil
 - License text: [python-dateutil.txt](third_party_licenses/python-dateutil.txt)
 
-### pytorch-lightning 2.6.5
+### pytorch-lightning 2.6.6
 
 - License: Apache-2.0
 - Copyright 2018-2021 William Falcon
@@ -1337,7 +1312,7 @@ the package's own license files.
 - https://requests.readthedocs.io
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
-### rich 15.0.0
+### rich 14.3.4
 
 - License: MIT
 - Copyright (c) 2020 Will McGugan
@@ -1350,7 +1325,7 @@ the package's own license files.
 - https://github.com/rapidsai/rmm
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
-### s3fs 2025.10.0
+### s3fs 2026.9.0
 
 - License: BSD-3-Clause
 - http://github.com/fsspec/s3fs/
@@ -1637,10 +1612,10 @@ the package's own license files.
 - https://tqdm.github.io
 - License text: [tqdm.txt](third_party_licenses/tqdm.txt)
 
-### transformer_engine 1.11.0+cafd8e50pt2.11.0cu128sm80to120ptx100.nre1
+### transformer_engine 1.12.0+pt2.11.0cu128sm80to120ptx100.nre1
 
 - License: Apache-2.0
-- Modified: patched, see deps/custom_wheels/transformer_engine/ (NVIDIA fork of release_v1.11, modified by NVIDIA CORPORATION & AFFILIATES, 2026: Blackwell archs, flash-attn 2.7.4 bounds, JAX/Paddle imports disabled, PyTorch 2.11 ONNX imports; see NUREC_CHANGES.txt in the wheel dist-info)
+- Modified: patched, see deps/custom_wheels/transformer_engine/ (upstream v1.12, modified by NVIDIA CORPORATION & AFFILIATES, 2026: PyTorch 2.11 ONNX imports; see NUREC_CHANGES.txt in the wheel dist-info)
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
 ### transformers 5.17.0
@@ -1676,12 +1651,6 @@ the package's own license files.
 - https://github.com/pypa/trove-classifiers
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
-### typeguard 4.5.2
-
-- License: MIT
-- https://github.com/agronholm/typeguard
-- License text: [typeguard.txt](third_party_licenses/typeguard.txt)
-
 ### typer 0.26.8
 
 - License: MIT
@@ -1716,13 +1685,6 @@ the package's own license files.
 - Copyright (c) 1991 - 1995, Stichting Mathematisch Centrum Amsterdam,
 - https://github.com/python/typing_extensions
 - License text: [typing-extensions.txt](third_party_licenses/typing-extensions.txt)
-
-### tyro 1.0.15
-
-- License: MIT
-- Copyright (c) 2024 Brent Yi
-- https://github.com/brentyi/tyro
-- License text: [MIT](third_party_licenses/generic/MIT.txt)
 
 ### tzdata 2024.2
 
@@ -1761,11 +1723,10 @@ the package's own license files.
 - https://openusd.org
 - License text: [usd-core.txt](third_party_licenses/usd-core.txt)
 
-### viser 0.2.23+nre5
+### viser 1.1.1
 
 - License: Apache-2.0
-- https://github.com/nerfstudio-project/viser
-- Modified: patched, see deps/custom_wheels/viser/ (NVIDIA fork of upstream main after 0.2.23: plyfile dependency removed, websocket size limit, screenshot renderer reuse; the wheel itself carries no change notice)
+- https://github.com/viser-project/viser
 - Notice: Licensed Apache-2.0 per the wheel's shipped licenses/LICENSE, which is the Apache License 2.0 text. The package METADATA says 'MIT' with an MIT classifier, an inconsistency in the package metadata; the shipped license text governs.
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
@@ -1810,19 +1771,12 @@ the package's own license files.
 - https://github.com/google/yapf
 - License text: [yapf.txt](third_party_licenses/yapf.txt)
 
-### yarl 1.23.0
+### yarl 1.25.1
 
 - License: Apache-2.0
 - Copyright 2016-2021, Andrew Svetlov and aio-libs team
 - https://github.com/aio-libs/yarl
 - License text: [yarl.txt](third_party_licenses/yarl.txt)
-
-### yourdfpy 0.0.58+nre1
-
-- License: MIT
-- Copyright (c) 2021 Clemens Eppner
-- https://github.com/clemense/yourdfpy/
-- License text: [yourdfpy.txt](third_party_licenses/yourdfpy.txt)
 
 ### zarr 2.18.2
 
@@ -1845,6 +1799,13 @@ the package's own license files.
 - Copyright Jason R. Coombs
 - https://github.com/jaraco/zipp
 - License text: [MIT](third_party_licenses/generic/MIT.txt)
+
+### zstandard 0.25.0
+
+- License: BSD-3-Clause
+- Copyright (c) 2016, Gregory Szorc
+- https://github.com/indygreg/python-zstandard
+- License text: [BSD-3-Clause](third_party_licenses/generic/BSD-3-Clause.txt)
 
 ## Vendored source
 
@@ -1901,7 +1862,7 @@ than installed as a package. Copyright lines are curated by hand.
 - https://github.com/KhronosGroup/glslang
 - License text: [glslang.txt](third_party_licenses/glslang.txt)
 
-### gsplat b0cedf8d
+### gsplat 98e9dba0
 
 - License: Apache-2.0
 - Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1923,6 +1884,22 @@ than installed as a package. Copyright lines are curated by hand.
 - Copyright (c) 2022, NVIDIA CORPORATION
 - https://github.com/NVIDIA/cuda-samples
 - License text: [helper-math.txt](third_party_licenses/helper-math.txt)
+
+### libnl3 3.7.0-0.3build1 (Ubuntu noble)
+
+- License: LGPL-2.1-only
+- Copyright (c) 2003-2006 Thomas Graf <tgraf@suug.ch>
+- Copyright (c) Baruch Even <baruch@ev-en.org>
+- Copyright (c) Petr Gotthard <petr.gotthard@siemens.com>
+- Copyright (c) Siemens AG Oesterreich
+- Copyright (c) Philip Craig <philipc@snapgear.com>
+- Copyright (c) Patrick McHardy <kaber@trash.net>
+- Copyright (c) Secure Computing Corporation
+- https://launchpad.net/ubuntu/+source/libnl3/3.7.0-0.3build1
+- Notice: libnl 3.7.0 is redistributed unmodified, as the shared libraries libnl-3.so.200 and libnl-route-3.so.200 of the Ubuntu noble packages libnl-3-200 and libnl-route-3-200 (3.7.0-0.3build1), which libibverbs loads to resolve RoCE neighbor addresses. They are only in run images built with --config=rdma. libnl is used under the GNU Lesser General Public License version 2.1 (its text is in the license file below). NuRec applies no patches to libnl.
+  Source: the complete corresponding source is the Ubuntu source package libnl3 3.7.0-0.3build1 (https://launchpad.net/ubuntu/+source/libnl3/3.7.0-0.3build1): the upstream release libnl3_3.7.0.orig.tar.gz (sha256 9fe43ccbeeea72c653bdcf8c93332583135cda46a79507bfd0a483bb57f65939) and Ubuntu's packaging and patches, libnl3_3.7.0-0.3build1.debian.tar.xz (sha256 0040031cf0d971d6d6041add9d6b5ef209e33603ad95c27407c79dc2379ded21). On request NVIDIA will also supply this source for at least three years after the last distribution of the corresponding binaries (contact: the maintainers of this project through its public issue tracker).
+  Replacing the libraries: libnl-3.so.200 and libnl-route-3.so.200 sit in /usr/lib/x86_64-linux-gnu of the image, where libibverbs loads them by those names. You may replace them with your own build of libnl 3.x that keeps these sonames, by installing it there or by putting its directory first in LD_LIBRARY_PATH.
+- License text: [libnl3.txt](third_party_licenses/libnl3.txt)
 
 ### lz4 slang 2026.4 submodule 7f71be0
 
@@ -1946,7 +1923,7 @@ than installed as a package. Copyright lines are curated by hand.
 - Copyright (c) OpenMMLab
 - Copyright (c) 2023, NVIDIA CORPORATION
 - https://github.com/open-mmlab/mmsegmentation
-- Modified: patched, see deps/mmseg_repo/mmseg_gpu_io.patch
+- Modified: patched, see deps/mmseg_repo/mmseg_gpu_io.patch, deps/mmseg_repo/mmseg_early_trt.patch and deps/mmseg_repo/mmseg_lazy_imports.patch
 - License text: [Apache-2.0](third_party_licenses/generic/Apache-2.0.txt)
 
 ### ncore_pai_converter cbd8c16f
@@ -1970,9 +1947,17 @@ than installed as a package. Copyright lines are curated by hand.
 - https://github.com/fwilliams/pybind11
 - License text: [numpyeigen-pybind11.txt](third_party_licenses/numpyeigen-pybind11.txt)
 
-### python-build-standalone CPython 3.13.15, release 20260807
+### poisson_recon 18.76 (262b0f53)
 
-- License: Python-2.0 AND CNRI-Python AND Apache-2.0 AND OpenSSL AND MIT AND X11 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Zlib AND bzip2-1.0.6 AND Sleepycat AND TCL AND blessing
+- License: MIT
+- Copyright (c) 2015 mkazhdan
+- https://github.com/mkazhdan/PoissonRecon
+- Modified: patched, see deps/poisson_recon/no_image_include.patch
+- License text: [MIT](third_party_licenses/generic/MIT.txt)
+
+### python-build-standalone CPython 3.13.18, release 20261026
+
+- License: Python-2.0 AND CNRI-Python AND Apache-2.0 AND MIT AND X11 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Zlib AND bzip2-1.0.6 AND Sleepycat AND TCL AND blessing
 - Copyright (c) 2001 Python Software Foundation; All Rights Reserved
 - Copyright of the bundled libraries: see the license texts
 - https://github.com/astral-sh/python-build-standalone
@@ -1984,6 +1969,22 @@ than installed as a package. Copyright lines are curated by hand.
 - Copyright (c) Meta Platforms, Inc. and affiliates
 - https://github.com/facebookresearch/pytorch3d
 - License text: [pytorch3d-knn.txt](third_party_licenses/pytorch3d-knn.txt)
+
+### rdma-core 50.0-2build2 (Ubuntu noble)
+
+- License: (Linux-OpenIB OR GPL-2.0-only) AND (BSD-2-Clause OR GPL-2.0-only) AND (BSD-3-Clause OR GPL-2.0-only) AND BSD-2-Clause AND MIT AND CC0-1.0
+- Copyright (c) 2004-2012 Intel Corporation
+- Copyright (c) 2004-2005 Topspin Communications
+- Copyright (c) 2005-2007 Cisco Systems, Inc.
+- Copyright (c) 2005 PathScale, Inc.
+- Copyright (c) 2005 Mellanox Technologies Ltd.
+- Copyright (c) 2005 Voltaire, Inc.
+- Copyright (c) 2008 Lawrence Livermore National Laboratory
+- Copyright (c) 2019 Mellanox Technologies, Inc.; 2020-2024 Nvidia, Inc. (mlx5 provider)
+- The other providers' copyright holders are listed per file in the license text
+- https://launchpad.net/ubuntu/+source/rdma-core/50.0-2build2
+- Notice: rdma-core 50.0 is redistributed unmodified from the Ubuntu noble packages libibverbs1 and ibverbs-providers (50.0-2build2): libibverbs.so.1 and the provider drivers under libibverbs/, with their configuration in /etc/libibverbs.d. Its libibverbs headers are compiled into the NuRec RDMA transport. Every shipped file is licensed under a BSD license (the OpenIB.org BSD license, BSD-2-Clause or BSD-3-Clause), MIT or CC0-1.0, in most files as the alternative to GPL-2.0 (see the license file below); NuRec uses these non-GPL terms throughout. These libraries are only in run images built with --config=rdma.
+- License text: [rdma-core.txt](third_party_licenses/rdma-core.txt)
 
 ### slang 2026.4 + PR 11040 + bf16 prelude fix
 

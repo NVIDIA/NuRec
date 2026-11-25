@@ -19,6 +19,7 @@ import unittest
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock
 
+import numpy as np
 import torch
 
 import nurec.models.gaussians.collect as collect
@@ -381,6 +382,35 @@ class MockSHRigidGaussianModel(MockSHGaussianModel, MockRigidGaussianModel):
 # =============================================================================
 # Tests
 # =============================================================================
+
+
+class TestLidarSHExport(unittest.TestCase):
+    def test_coefficient_major_signals_discard_higher_bands(self):
+        model = MockSHGaussianModel(
+            n_gaussians=2,
+            lidar_extra_signal_dim=3,
+            lidar_extra_signal_names={"intensity": (0, 1), "raydrop": (1, 2)},
+        )
+        model.config.particle.lidar_extra_signal_sph_degree = 1
+        coefficients = torch.tensor(
+            [
+                [[1.0, 2.0, 3.0], [100.0, 200.0, 300.0], [400.0, 500.0, 600.0], [700.0, 800.0, 900.0]],
+                [[4.0, 5.0, 6.0], [-100.0, -200.0, -300.0], [-400.0, -500.0, -600.0], [-700.0, -800.0, -900.0]],
+            ]
+        )
+        model.lidar_extra_signal = coefficients.reshape(2, -1)
+        accessor = GaussianExportAccessor(model)
+        # Use the mock collector; no CUDA kernels are needed for signal extraction.
+        accessor.collector = model.collector
+        with self.assertLogs("nurec.utils.io.export.gaussian_export_accessor", level="WARNING") as logs:
+            attributes, _, _ = accessor.get_attributes_at_timestamp(0)
+            accessor.get_attributes_at_timestamp(1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("higher-order coefficients", logs.output[0])
+        expected = coefficients[:, 0, :].numpy() * 0.28209479177387814 + 0.5
+        np.testing.assert_allclose(attributes.lidar_intensity, expected[:, :1])
+        np.testing.assert_allclose(attributes.lidar_raydrop_logits, expected[:, 1:])
+        torch.testing.assert_close(model.lidar_extra_signal, coefficients.reshape(2, -1))
 
 
 class TestAccessorBasicInfo(unittest.TestCase):

@@ -8,6 +8,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nurec.config.base_schema import BaseConfigSchema
+from nurec.config.image_resolution import LEGACY_SUBSAMPLE_OVERRIDE_PATHS, warn_legacy_resolution
 from nurec.config.nurec import NuRecConfig
 from nurec.config.resolvers import xor as xor
 from nurec.instant_nurec.config.parse import materialize_pretrained_instant_nurec_config
@@ -29,6 +30,37 @@ def dump_config(path: str, config: BaseConfigSchema) -> None:
         OmegaConf.save(config=save_config, f=fp)
 
 
+def _separate_legacy_resolution_overrides(hydra_args: list[str]) -> tuple[list[str], dict[str, int]]:
+    """Extract old CLI subsample paths before Hydra checks config keys."""
+    canonical_args: list[str] = []
+    legacy_overrides: dict[str, int] = {}
+    for override in hydra_args:
+        key, separator, value = override.partition("=")
+        legacy_key = key.lstrip("+")
+        if legacy_key not in LEGACY_SUBSAMPLE_OVERRIDE_PATHS:
+            canonical_args.append(override)
+            continue
+        if not separator or legacy_key in legacy_overrides:
+            raise ValueError(f"Expected one integer override for {legacy_key}")
+        try:
+            legacy_overrides[legacy_key] = int(value)
+        except ValueError as error:
+            raise ValueError(f"Expected an integer override for {legacy_key}, got {value!r}") from error
+
+    for legacy_key in legacy_overrides:
+        resolution_path = LEGACY_SUBSAMPLE_OVERRIDE_PATHS[legacy_key]
+        for override in canonical_args:
+            key = override.partition("=")[0].lstrip("+~")
+            if (
+                key == resolution_path
+                or key.startswith(f"{resolution_path}.")
+                or key.endswith(f"@{resolution_path}")
+                or key.endswith(f"@_global_.{resolution_path}")
+            ):
+                raise ValueError(f"{legacy_key} cannot be combined with an explicit {resolution_path} override")
+    return canonical_args, legacy_overrides
+
+
 def parse_untyped_config(
     config_name: str,
     hydra_args: list[str] | tuple[str],
@@ -45,7 +77,7 @@ def parse_untyped_config(
     Returns:
         The composed and resolved configuration.
     """
-    hydra_args_list: list[str] = list(hydra_args)  # convert to list in case we have a tuple
+    hydra_args_list, legacy_subsample_overrides = _separate_legacy_resolution_overrides(list(hydra_args))
 
     config_dir_path = __reporoot__ / "configs"
     config_name_path = Path(str(config_name))
@@ -75,6 +107,21 @@ def parse_untyped_config(
     # e.g. from multiple tests or other scripts work properly.
     with hydra.initialize_config_dir(str(compose_root), version_base=None):
         config = hydra.compose(config_name=str(config_name), overrides=hydra_args_list)
+
+    for legacy_key, subsample in legacy_subsample_overrides.items():
+        resolution_path = LEGACY_SUBSAMPLE_OVERRIDE_PATHS[legacy_key]
+        missing = object()
+        legacy_value = OmegaConf.select(config, legacy_key, default=missing)
+        resolution_value = OmegaConf.select(config, resolution_path, default=missing)
+        if OmegaConf.select(config, f"{resolution_path}.mode") == "relative":
+            OmegaConf.update(config, f"{resolution_path}.subsample", subsample)
+        elif resolution_value is not missing or legacy_value is missing:
+            raise ValueError(f"{legacy_key} requires a relative {resolution_path} selection")
+        # An old YAML scalar may still be present next to a canonical default. Keep
+        # it in sync so schema-level compatibility normalization cannot undo the CLI override.
+        if legacy_value is not missing:
+            OmegaConf.update(config, legacy_key, subsample)
+        warn_legacy_resolution(legacy_key, f"{resolution_path}.subsample")
 
     OmegaConf.resolve(config)
 

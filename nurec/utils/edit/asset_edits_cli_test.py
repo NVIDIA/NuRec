@@ -31,6 +31,7 @@ from nurec.utils.edit.asset_edits_cli import (
     _validate_asset_edit_target_layers,
     compile_asset_edits,
 )
+from nurec.utils.edit.layer_append import LAYER_PARAM_NAMES
 
 
 _LAYER = "dynamic_rigids"
@@ -78,7 +79,16 @@ class AssetEditTargetValidationTest(unittest.TestCase):
             _validate_asset_edit_target_layers(composite, ["dynamic_deformables"])
 
 
-def _synth(edit_id: str, nurec_track_id: int, global_index: int) -> SyntheticTrack:
+def _synth(
+    edit_id: str,
+    nurec_track_id: int,
+    global_index: int,
+    *,
+    n_poses: int = 2,
+    kind: str = "world",
+    flags: str = "DYNAMIC",
+    per_track_state: dict | None = None,
+) -> SyntheticTrack:
     """A minimal synthetic-track record with distinguishable pose/dims values."""
     return SyntheticTrack(
         edit_id=edit_id,
@@ -86,12 +96,15 @@ def _synth(edit_id: str, nurec_track_id: int, global_index: int) -> SyntheticTra
         track_id_str=f"prop:{edit_id}",
         nurec_track_id=nurec_track_id,
         global_index=global_index,
-        timestamps_us=(8_000_000, 22_000_000),
-        pose_tquat_nurec=[[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]] * 2,
-        pose_tquat_world=[[11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 1.0]] * 2,
+        timestamps_us=[8_000_000 + i * (14_000_000 // max(n_poses - 1, 1)) for i in range(n_poses)],
+        pose_tquat_nurec=[[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]] * n_poses,
+        pose_tquat_world=[[11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 1.0]] * n_poses,
         dims_nurec=[0.5, 2.0, 0.6],
         dims_world=[0.5, 2.0, 0.6],
         label_class="protruding_object",
+        kind=kind,
+        flags=flags,
+        per_track_state=per_track_state,
     )
 
 
@@ -168,6 +181,24 @@ class SpliceSyntheticTracksTest(unittest.TestCase):
         with self.assertRaisesRegex(click.ClickException, "unhandled track-sized"):
             _splice_synthetic_tracks(sd, _LAYER, [_synth("b", 3, 5)], old_n_tracks=3, old_n_poses=10)
 
+    def test_layer_sidecar_buffers_are_not_mistaken_for_track_tensors(self) -> None:
+        """A per-Gaussian sidecar buffer whose row count happens to equal the old track count is
+        the layer's own row tensor, not an unhandled per-track one."""
+        sd = _state_dict()
+        sd[_PREFIX + "mcmc_position_anchor"] = torch.zeros(3, 3)  # 3 rows == old_n_tracks, by coincidence
+        with self.assertRaisesRegex(click.ClickException, "unhandled track-sized"):
+            _splice_synthetic_tracks(sd, _LAYER, [_synth("b", 3, 5)], old_n_tracks=3, old_n_poses=10)
+        sd = _state_dict()
+        sd[_PREFIX + "mcmc_position_anchor"] = torch.zeros(3, 3)
+        _splice_synthetic_tracks(
+            sd,
+            _LAYER,
+            [_synth("b", 3, 5)],
+            old_n_tracks=3,
+            old_n_poses=10,
+            row_tensor_names=[*LAYER_PARAM_NAMES, "mcmc_position_anchor"],
+        )
+
     def test_leading_dim_mismatch_raises(self) -> None:
         """A handled entry whose leading dim disagrees with the expected count fails."""
         sd = _state_dict(n_poses=9)
@@ -212,6 +243,50 @@ class SpliceSyntheticTracksTest(unittest.TestCase):
         self.assertTrue(torch.equal(albedos[3], torch.eye(4)[:3]))
         self.assertEqual(sd[_PREFIX + "track_scales"].shape, (4, 3))
 
+    def test_clone_with_k_keyframes_adds_k_pose_rows(self) -> None:
+        """A clone inheriting a 5-keyframe trajectory extends the per-pose calib by 5, not 2."""
+        sd = _state_dict(n_tracks=3, n_poses=10)
+        synths = [_synth("barrier_1", 3, 5), _synth("car_clone", 4, 6, n_poses=5, kind="clone")]
+        _splice_synthetic_tracks(sd, _LAYER, synths, old_n_tracks=3, old_n_poses=10)
+        self.assertEqual(sd[_PREFIX + "tracks_calib.tracks_delta_q"].shape, (17, 4))
+        self.assertEqual(sd[_PREFIX + "tracks_calib.tracks_delta_t"].shape, (17, 3))
+        ranges = sd[_PREFIX + "time_embed.timestamps_us_ranges"]
+        self.assertEqual(ranges.shape, (5, 2))
+        self.assertEqual(ranges[4].tolist(), [8_000_000, 22_000_000])  # min/max of the 5 keyframes
+        self.assertEqual(sd[_PREFIX + "_extra_state"]["n_tracks"], 5)
+
+    def test_clone_copies_its_source_per_track_state(self) -> None:
+        """A clone's copied rows replace the identity/fresh rows for every tensor it carries."""
+        sd = _state_dict(n_tracks=3, n_poses=10)
+        sd[_PREFIX + "track_albedos"] = torch.randn(3, 3, 4)
+        sd[_PREFIX + "track_scales"] = torch.randn(3, 3)
+        copied = {
+            "time_embed.timestamps_us_ranges": torch.tensor([[1_000, 2_000]], dtype=torch.int64),
+            "time_embed.u": torch.full((1, 2, 5), 0.25),
+            "track_albedos": torch.full((1, 3, 4), 7.0),
+            "track_scales": torch.full((1, 3), -1.0),
+        }
+        synths = [_synth("car_clone", 3, 5, n_poses=3, kind="clone", per_track_state=copied), _synth("barrier_1", 4, 6)]
+        _splice_synthetic_tracks(
+            sd,
+            _LAYER,
+            synths,
+            old_n_tracks=3,
+            old_n_poses=10,
+            track_albedo_identity=torch.eye(4)[:3],
+            track_scale_identity=torch.zeros(3),
+        )
+        self.assertEqual(sd[_PREFIX + "time_embed.timestamps_us_ranges"][3].tolist(), [1_000, 2_000])
+        self.assertEqual(sd[_PREFIX + "time_embed.timestamps_us_ranges"][4].tolist(), [8_000_000, 22_000_000])
+        self.assertTrue(torch.all(sd[_PREFIX + "time_embed.u"][3] == 0.25))
+        fresh = torch.linspace(0.0, 1.0, 5 * 2 + 2)[1:-1].reshape(1, 5, 2).transpose(1, 2)[0]
+        self.assertTrue(torch.allclose(sd[_PREFIX + "time_embed.u"][4], fresh))
+        self.assertTrue(torch.all(sd[_PREFIX + "track_albedos"][3] == 7.0))
+        self.assertTrue(torch.equal(sd[_PREFIX + "track_albedos"][4], torch.eye(4)[:3]))
+        self.assertTrue(torch.all(sd[_PREFIX + "track_scales"][3] == -1.0))
+        self.assertTrue(torch.all(sd[_PREFIX + "track_scales"][4] == 0.0))
+        self.assertEqual(sd[_PREFIX + "tracks_calib.tracks_delta_q"].shape, (15, 4))
+
 
 def _serialized_tracks(n: int = 2) -> dict:
     """A serialized CuboidTracks mapping in the datasource_summary.json shape."""
@@ -245,6 +320,17 @@ class AppendSerializedTracksTest(unittest.TestCase):
         world = _serialized_tracks(2)
         _append_tracks_to_serialized_cuboid_tracks(world, [_synth("b", 2, 2)], "world")
         self.assertEqual(world["tracks_data"]["tracks_poses"][2], [[11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 1.0]] * 2)
+
+    def test_clone_keyframes_and_flags_are_written(self) -> None:
+        """A K-keyframe clone persists K poses/timestamps and its source's flags."""
+        ct = _serialized_tracks(1)
+        _append_tracks_to_serialized_cuboid_tracks(
+            ct, [_synth("c", 1, 1, n_poses=4, kind="clone", flags="NONE")], "nurec", expect_global_index=True
+        )
+        td = ct["tracks_data"]
+        self.assertEqual(len(td["tracks_poses"][1]), 4)
+        self.assertEqual(len(td["tracks_timestamps_us"][1]), 4)
+        self.assertEqual(td["tracks_flags"][1], "NONE")
 
     def test_global_index_mismatch_raises(self) -> None:
         """The reload-agreement invariant: append position must equal the recorded global index."""
@@ -360,6 +446,28 @@ class RepackArtifactTest(unittest.TestCase):
                 world = json.loads(zf.read("sequence_tracks.json"))
                 self.assertEqual(world["chunk"]["tracks_data"]["tracks_id"], ["orig_0", "prop:p1"])
                 self.assertEqual(world["chunk"]["cuboidtracks_data"]["cuboids_dims"][-1], [0.5, 2.0, 0.6])
+
+    def test_only_dynamic_synthetic_tracks_join_the_dynamic_list(self) -> None:
+        """A prop on a static layer (flags NONE) or a clone of a parked car is in the full track
+        list only; the dynamic list keeps tracks flagged DYNAMIC."""
+        from nurec.asset_edits.runtime import EditManifest
+        from nurec.utils.edit.asset_edits_cli import _repack_artifact
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._source_usdz(tmp)
+            out = Path(tmp) / "out.usdz"
+            synths = [
+                _synth("moving", 1, 1),
+                _synth("parked", 2, 2, flags="NONE"),
+                _synth("car", 3, 3, flags="CONTROLLABLE"),
+            ]
+            _repack_artifact(src, out, {"state_dict": {}}, EditManifest(clusters=[]), synths)
+            with zipfile.ZipFile(out) as zf:
+                summary = json.loads(zf.read("datasource_summary.json"))
+            all_ids = summary["sequence_tracks_all"]["seq"]["tracks_data"]["tracks_id"]
+            dynamic_ids = summary["sequence_tracks_dynamic"]["seq"]["tracks_data"]["tracks_id"]
+            self.assertEqual(all_ids, ["orig_0", "prop:moving", "prop:parked", "prop:car"])
+            self.assertEqual(dynamic_ids, ["orig_0", "prop:moving"])
 
     def test_failed_repack_leaves_no_output(self) -> None:
         from nurec.asset_edits.runtime import EditManifest

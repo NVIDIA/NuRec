@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import math
 
 from contextlib import nullcontext
-from typing import Any, ContextManager
+from typing import TYPE_CHECKING, Any, ContextManager
 
 import torch
 
-from pytorch_lightning import Trainer
-
 from nurec.config.trainer import TrainerConfig
 from nurec.utils.misc import rank_zero_only  # type: ignore
+
+
+if TYPE_CHECKING:
+    # Only used in annotations: the Trainer helpers below must stay importable without Lightning.
+    from pytorch_lightning import Trainer
 
 
 def _div_and_round_up(numerator: int, denominator: int | float) -> int:

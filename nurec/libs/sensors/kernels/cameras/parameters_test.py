@@ -13,6 +13,9 @@ Tests the camera parameter data structures including:
 
 import unittest
 
+from unittest import mock
+
+import numpy as np
 import torch
 
 from nurec.libs.sensors.kernels.cameras import (
@@ -169,6 +172,119 @@ class TestCameraProjections(unittest.TestCase):
         self.assertEqual(projection.forward_poly.shape, (4,))
         self.assertEqual(projection.newton_iterations, 5)
         self.assertAlmostEqual(projection.max_angle, 3.14159 / 2, places=5)
+
+    def test_opencv_fisheye_limits_domain_without_changing_seed(self):
+        projection = OpenCVFisheyeProjection.from_components(
+            principal_point=torch.tensor([320.0, 240.0], device=device),
+            focal_length=torch.tensor([320.0, 320.0], device=device),
+            forward_poly=torch.tensor([-1.0 / 3.0, 0.0, 0.0, 0.0], device=device),
+            resolution=torch.tensor([640, 480], device=device),
+            max_angle=2.0,
+            newton_iterations=10,
+            min_2d_norm=1e-6,
+        )
+        self.assertLess(projection.max_angle, 1.0)
+        self.assertAlmostEqual(projection.max_angle, 1.0, delta=3e-6)
+        self.assertEqual(projection.approx_backward_factor.item(), 2.0)
+
+    @staticmethod
+    def _host_fisheye() -> OpenCVFisheyeProjection:
+        return OpenCVFisheyeProjection.from_host_components(
+            principal_point=np.array([320.0, 240.0]),
+            focal_length=np.array([320.0, 320.0]),
+            forward_poly=np.array([-1.0 / 3.0, 0.0, 0.0, 0.0]),
+            resolution=np.array([640, 480]),
+            max_angle=2.0,
+            newton_iterations=20,
+            min_2d_norm=1e-6,
+            device=device,
+        )
+
+    def test_fisheye_host_factory_and_transform_do_not_read_back_tensors(self):
+        with mock.patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected readback")):
+            projection = self._host_fisheye()
+            transformed = projection.transform((0.5, 0.75), (10.0, 20.0), (300, 320))
+            transformed_again = transformed.transform(0.5)
+        self.assertEqual(transformed.configured_max_angle, 2.0)
+        self.assertEqual(transformed.max_angle, projection.max_angle)
+        self.assertEqual(transformed_again.inverse_monotonic_limit, projection.inverse_monotonic_limit)
+        torch.testing.assert_close(transformed.principal_point, torch.tensor([150.0, 160.0], device=device))
+        torch.testing.assert_close(transformed.focal_length, torch.tensor([160.0, 240.0], device=device))
+        torch.testing.assert_close(transformed.forward_poly, projection.forward_poly)
+        torch.testing.assert_close(transformed.resolution, torch.tensor([300.0, 320.0], device=device))
+
+    def test_fisheye_transform_revalidates_modified_or_replaced_intrinsics(self):
+        for replace_tensor in (False, True):
+            with self.subTest(replace_tensor=replace_tensor):
+                projection = self._host_fisheye()
+                if replace_tensor:
+                    # torch.cat returns a new tensor with the same initial version
+                    # as the old packed tensor. Identity is part of the cache key.
+                    projection.intrinsics = torch.cat(
+                        (
+                            projection.intrinsics[:4],
+                            torch.zeros(4, device=device),
+                            projection.intrinsics[8:],
+                        )
+                    )
+                else:
+                    projection.forward_poly.zero_()
+                with mock.patch.object(projection, "revalidate", wraps=projection.revalidate) as revalidate:
+                    transformed = projection.transform(0.5)
+                    self.assertEqual(revalidate.call_count, 1)
+                self.assertEqual(transformed.max_angle, 2.0)
+                self.assertEqual(transformed.configured_max_angle, 2.0)
+
+    def test_fisheye_explicit_revalidation_rejects_invalid_mutation(self):
+        projection = self._host_fisheye()
+        projection.forward_poly[0] = float("nan")
+        with self.assertRaises(ValueError):
+            projection.revalidate()
+
+    def test_fisheye_host_factory_rejects_invalid_calibration(self):
+        with self.assertRaises(ValueError):
+            OpenCVFisheyeProjection.from_host_components(
+                principal_point=np.array([320.0, 240.0]),
+                focal_length=np.array([0.0, 320.0]),
+                forward_poly=np.zeros(4),
+                resolution=np.array([640, 480]),
+                max_angle=2.0,
+                newton_iterations=20,
+                min_2d_norm=1e-6,
+                device=device,
+            )
+
+    def test_fisheye_transform_preserves_tensor_calibration_gradients(self):
+        coefficients = torch.tensor([0.01, -0.001, 0.0001, 0.0], device=device, requires_grad=True)
+        projection = OpenCVFisheyeProjection.from_components(
+            principal_point=torch.tensor([320.0, 240.0], device=device),
+            focal_length=torch.tensor([320.0, 320.0], device=device),
+            forward_poly=coefficients,
+            resolution=torch.tensor([640, 480], device=device),
+            max_angle=1.8,
+            newton_iterations=20,
+            min_2d_norm=1e-6,
+        )
+        transformed = projection.transform(0.5)
+        transformed.forward_poly.sum().backward()
+        torch.testing.assert_close(coefficients.grad, torch.ones_like(coefficients))
+
+    def test_opencv_fisheye_rejects_invalid_intrinsics(self):
+        for focal_length, coeffs in [
+            ([0.0, 320.0], [0.0] * 4),
+            ([320.0, float("inf")], [0.0] * 4),
+            ([320.0, 320.0], [float("nan"), 0.0, 0.0, 0.0]),
+        ]:
+            with self.subTest(focal_length=focal_length, coeffs=coeffs), self.assertRaises(ValueError):
+                OpenCVFisheyeProjection.from_components(
+                    principal_point=torch.tensor([320.0, 240.0], device=device),
+                    focal_length=torch.tensor(focal_length, device=device),
+                    forward_poly=torch.tensor(coeffs, device=device),
+                    resolution=torch.tensor([640, 480], device=device),
+                    max_angle=2.0,
+                    newton_iterations=10,
+                    min_2d_norm=1e-6,
+                )
 
     def test_ftheta_creation(self):
         """Test FThetaProjection creation via from_components."""

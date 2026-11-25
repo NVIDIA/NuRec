@@ -18,6 +18,7 @@ from nurec.utils.cli import config_to_cli_options
 
 
 DEFAULT_DOWNLOAD_CACHE_DIR = "~/.cache/nurec/downloaded_scenes"
+DEFAULT_BACKEND_CACHE_WAIT_TIMEOUT_S = 120.0
 
 # Default coordinates for the Harmonizer checkpoint fields below (all CLI-overridable).
 HARMONIZER_CACHE_DIR = "~/.cache/nurec/harmonizer"
@@ -174,6 +175,13 @@ class GrpcServerConfig(BaseConfigSchema):
         default=2**62,
     )
     egocar_hood_dir: Optional[str] = Field(description="Directory with egocar hood images.", default=None)
+    egocar_hood_cache_size: int = Field(
+        description=(
+            "Maximum number of egocar hood images cached on the render GPU per server process (least recently "
+            "used eviction). The bank directory itself is only listed at startup; a cached 1920x1080 hood is 33 MB."
+        ),
+        default=32,
+    )
     download_cache_dir: str = Field(
         description="Directory for downloaded scene files", default=DEFAULT_DOWNLOAD_CACHE_DIR
     )
@@ -184,6 +192,10 @@ class GrpcServerConfig(BaseConfigSchema):
     max_workers: int = Field(description="Maximum number of workers for the grpc server", default=1)
     enable_editing_actors: bool = Field(
         description="Enable editing the actors in a scene or use the original actor poses.", default=False
+    )
+    camera_only: bool = Field(
+        description="Skip lidar setup and reject lidar rendering. Single-process only.",
+        default=False,
     )
     cache_size: int = Field(
         description="Maximum number of models to cache (count-based LRU). If OOM occurs during loading, spare backends are automatically evicted and load is retried.",
@@ -204,6 +216,15 @@ class GrpcServerConfig(BaseConfigSchema):
             "~25MB, so the default allows up to ~1.6GB per session)."
         ),
         default=64,
+    )
+    backend_cache_wait_timeout_s: float = Field(
+        description=(
+            "Limit backend-capacity, CPU-preparation, and prefetch-admission waits to this many seconds. "
+            "An earlier RPC deadline takes precedence; synchronous loading and rendering are not timed out. "
+            "Unused ready CPU models expire after this many seconds."
+        ),
+        default=DEFAULT_BACKEND_CACHE_WAIT_TIMEOUT_S,
+        gt=0,
     )
     metrics_output_dir: Optional[str] = Field(
         description="Directory to save render time metrics. If not specified, metrics collection is disabled.",
@@ -242,6 +263,8 @@ class GrpcServerConfig(BaseConfigSchema):
             raise ValueError(f"cache_size must be a positive integer; got {self.cache_size}")
         if self.download_cache_size < 0:
             raise ValueError(f"download_cache_size must be a non-negative integer; got {self.download_cache_size}")
+        if self.egocar_hood_cache_size <= 0:
+            raise ValueError(f"egocar_hood_cache_size must be a positive integer; got {self.egocar_hood_cache_size}")
         return self
 
     @model_validator(mode="before")

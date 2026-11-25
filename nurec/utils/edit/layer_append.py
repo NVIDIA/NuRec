@@ -13,6 +13,7 @@ drives these; the manifest records the indices they return.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -42,6 +43,32 @@ LAYER_PARAM_NAMES = [
     "features_specular",
     "gaussian_cuboid_ids",
 ]
+
+
+# Row-aligned sidecar buffers the bake can fill for IMPORTED rows (copies take the
+# source's values). Anything else a layer declares can only be copied, never synthesized.
+_SIDECAR_FILLERS = {
+    # A layer's MCMC densifier clamps positions to their initial value; a new row's anchor is
+    # its own position.
+    "mcmc_position_anchor": lambda rows: rows["positions"].clone(),
+}
+
+
+def layer_row_tensor_names(layer_node: torch.nn.Module) -> list[str]:
+    """Every row-aligned per-Gaussian tensor of a layer.
+
+    The standard parameters plus the sidecar buffers the layer class declares through
+    ``get_additional_buffers`` (for example ``mcmc_position_anchor``). Every
+    append and every checkpoint splice must cover exactly this set, or the layer fails its own
+    field validation.
+    """
+    names = list(LAYER_PARAM_NAMES)
+    getter = getattr(layer_node, "get_additional_buffers", None)
+    if callable(getter):
+        for name, tensor in getter().items():
+            if name not in names and isinstance(tensor, torch.Tensor):
+                names.append(str(name))
+    return names
 
 
 # ----------------------------------------------------------------------------
@@ -204,29 +231,42 @@ class LayerTensorSpec:
 
 @dataclass(frozen=True)
 class CapturedSnapshot:
-    """One layer's captured (trained) track bindings, snapshotted BEFORE any rows are
-    appended: ``replace_original`` must address ORIGINAL rows only, never appended ones
-    (appended rows are tagged to the same track)."""
+    """One layer's captured (trained) state, snapshotted BEFORE any edit touches it.
 
-    cuboid_ids: np.ndarray  # (N0,)
+    ``replace`` / ``exclude`` must hide ORIGINAL rows only, never appended ones (appended
+    rows are tagged to the same track), and a captured clone must copy the TRAINED
+    density logits even when an earlier edit of the same bake has already hidden its
+    source track — so both the per-row cuboid ids and the density logits are kept.
+    """
+
+    cuboid_ids: np.ndarray  # (N0,) layer-local track index per captured row
+    densities_logit: np.ndarray  # (N0,) pre-activation density logit per captured row
 
     @classmethod
     def from_layer(cls, layer_node: RigidGaussianModel) -> "CapturedSnapshot":
-        """Snapshot the layer's per-Gaussian cuboid ids as they are RIGHT NOW."""
-        return cls(cuboid_ids=np.asarray(layer_node.gaussian_cuboid_ids.detach().cpu().numpy()).reshape(-1))
+        """Snapshot the layer's per-Gaussian cuboid ids and density logits as they are RIGHT NOW."""
+        # COPIES, not views: on a CPU layer ``.numpy()`` aliases the parameter storage, and the
+        # bake's in-place hides would rewrite the snapshot underneath later edits.
+        return cls(
+            cuboid_ids=np.array(layer_node.gaussian_cuboid_ids.detach().cpu().numpy(), copy=True).reshape(-1),
+            densities_logit=np.array(layer_node.densities.detach().cpu().numpy(), dtype=np.float32, copy=True).reshape(
+                -1
+            ),
+        )
+
+    def rows_of_track(self, track_idx: int) -> np.ndarray:
+        """The captured rows riding ``track_idx`` (ascending row indices)."""
+        return np.nonzero(self.cuboid_ids == track_idx)[0]
 
 
 class LayerAppender:
-    """Appends overlay/imported Gaussian rows to one layer node.
+    """Appends imported or copied Gaussian rows to one layer node.
 
-    Owns the row-index arithmetic: baked indices are layer-local and contiguous from
-    ``initial_n`` (the layer size before the first append), which is exactly what the
-    manifest records and the runtime replays.
+    Baked indices are layer-local and contiguous from ``initial_n`` (the layer size before the
+    first append), which is what the manifest records and the runtime replays.
 
-    Appends are STAGED, not applied: each batch is validated immediately but only
-    concatenated onto the layer by :meth:`flush` — ONE ``torch.cat`` per tensor for
-    the whole bake instead of one per part, so peak memory stays one grown copy per
-    tensor rather than a 2x-layer copy per appended part. Callers must ``flush()``
+    Appends are staged: each batch is validated immediately but concatenated onto the layer
+    only by :meth:`flush`, one ``torch.cat`` per tensor for the whole bake. Call ``flush()``
     before reading the layer's tensors.
     """
 
@@ -236,6 +276,7 @@ class LayerAppender:
         self.spec = spec
         self.initial_n = int(layer_node.get_num_gaussians())
         self.appended = 0
+        self.row_names = layer_row_tensor_names(layer_node)
         self._pending: dict[str, list[torch.Tensor]] = {}
 
     def _append_rows(self, rows: dict[str, torch.Tensor]) -> list[int]:
@@ -245,14 +286,25 @@ class LayerAppender:
         they are identical to eager per-part concatenation. Unknown / non-tensor
         targets still fail HERE, exactly as the eager path did.
         """
+        # Imported rows carry the standard tensors only; fill the layer's sidecar buffers.
+        for name in self.row_names:
+            if name in rows or name in LAYER_PARAM_NAMES:
+                continue
+            filler = _SIDECAR_FILLERS.get(name)
+            if filler is None:
+                raise ValueError(
+                    f"layer has a per-Gaussian sidecar buffer {name!r} the bake cannot synthesize for imported "
+                    "rows; only copies of captured rows can be appended to this layer"
+                )
+            rows[name] = filler(rows)
         # A batch must cover EXACTLY the layer tensor set with one row count: a
         # missing or extra key, or a mismatched leading dim, would desynchronize
         # the per-tensor row arithmetic silently at flush.
-        expected = set(LAYER_PARAM_NAMES)
+        expected = set(self.row_names)
         if set(rows) != expected:
             missing = sorted(expected - set(rows))
             extra = sorted(set(rows) - expected)
-            raise ValueError(f"row batch keys do not match LAYER_PARAM_NAMES: missing {missing}, unexpected {extra}")
+            raise ValueError(f"row batch keys do not match the layer's tensors: missing {missing}, unexpected {extra}")
         n = int(rows["positions"].shape[0])
         for name, tensor in rows.items():
             if int(tensor.shape[0]) != n:
@@ -270,6 +322,29 @@ class LayerAppender:
         for name, batches in self._pending.items():
             replace_layer_param(self.node, name, *batches)
         self._pending.clear()
+
+    def widen_frame_table(self, width: int) -> None:
+        """Pad the layer's per-track-frame appearance table (``features_albedo``, ``[G, N, 3]``) to ``width`` columns.
+
+        Every row, captured or staged, repeats its last column, as the trained table pads a track
+        with fewer frames than the longest; a row reads only its own track's frames, so nothing
+        renders differently. Needed when a clone has more keyframes than the table has columns.
+        """
+        current = self.node.features_albedo
+        if not isinstance(current, torch.Tensor) or current.ndim != 3:
+            raise ValueError(f"features_albedo is not a [G, N, 3] frame table: {getattr(current, 'shape', None)}")
+        n = int(current.shape[1])
+        if width <= n:
+            return
+
+        def _pad(table: torch.Tensor) -> torch.Tensor:
+            return torch.cat([table, table[:, -1:, :].expand(-1, width - n, -1)], dim=1).contiguous()
+
+        padded = _pad(current.data)
+        kind = torch.nn.Parameter if isinstance(current, torch.nn.Parameter) else torch.nn.Buffer
+        setattr(self.node, "features_albedo", kind(padded))
+        if "features_albedo" in self._pending:
+            self._pending["features_albedo"] = [_pad(batch) for batch in self._pending["features_albedo"]]
 
     def append_simready(
         self,
@@ -297,6 +372,65 @@ class LayerAppender:
         )
         return self._append_rows(rows)
 
+    def append_copied_rows(
+        self,
+        source_rows: np.ndarray,
+        track_idx: int,
+        *,
+        densities_logit: Optional[np.ndarray] = None,
+        frame_columns: Optional[np.ndarray] = None,
+    ) -> list[int]:
+        """Stage copies of captured rows (a cloned actor), retagged to ``track_idx``.
+
+        Every per-Gaussian tensor is copied as is (positions in the source's cuboid-local frame,
+        rotations, scales, SH including temporal coefficients, extra signals, the layer's sidecar
+        buffers) except the cuboid id
+        and, when the caller passes the trained logits, the densities (the source may already be
+        hidden by an earlier edit). ``source_rows`` must address original rows; staged appends
+        cannot be copied before ``flush``.
+
+        ``frame_columns`` re-indexes a per-track-frame appearance table (``features_albedo`` of
+        shape ``[G, N, 3]``): column ``k`` of a copied row takes the source row's column
+        ``frame_columns[k]``. One entry per column; more entries than the table has columns
+        widen it first (:meth:`widen_frame_table`).
+        """
+        src = np.asarray(source_rows, dtype=np.int64).reshape(-1)
+        if src.size and int(src.max()) >= self.initial_n:
+            raise ValueError(
+                f"copied rows must be captured rows (< {self.initial_n}); got a row index of {int(src.max())}"
+            )
+        idx = torch.as_tensor(src, device=self.spec.device)
+        n = int(idx.numel())
+        rows: dict[str, torch.Tensor] = {}
+        for name in self.row_names:
+            current = getattr(self.node, name)
+            if not isinstance(current, torch.Tensor):
+                raise TypeError(f"{name}: expected tensor-like, got {type(current).__name__}")
+            rows[name] = current.data.index_select(0, idx).clone()
+        if frame_columns is not None:
+            table = rows["features_albedo"]
+            columns = torch.as_tensor(np.asarray(frame_columns, dtype=np.int64).reshape(-1), device=table.device)
+            if table.ndim == 3:
+                self.widen_frame_table(int(columns.numel()))
+            width = int(self.node.features_albedo.shape[1]) if table.ndim == 3 else -1
+            if int(columns.numel()) != width:
+                raise ValueError(
+                    f"frame_columns has {int(columns.numel())} entries for a features_albedo table of shape "
+                    f"{tuple(table.shape)}; expected one per column of a [G, N, 3] table ({width})"
+                )
+            rows["features_albedo"] = table.index_select(1, columns)
+        rows["gaussian_cuboid_ids"] = torch.full((n,), track_idx, device=self.spec.device, dtype=torch.int32)
+        if densities_logit is not None:
+            logits = np.ascontiguousarray(np.asarray(densities_logit, dtype=np.float32).reshape(-1))
+            if logits.shape[0] != n:
+                raise ValueError(f"densities_logit has {logits.shape[0]} rows, expected {n} (one per copied row)")
+            rows["densities"] = (
+                torch.from_numpy(logits)
+                .to(device=self.spec.device, dtype=self.spec.dtype)
+                .reshape(rows["densities"].shape)
+            )
+        return self._append_rows(rows)
+
 
 def world_track_poses(ct: CuboidTracks, world_to_nurec) -> np.ndarray:
     """``(n_tracks, 4, 4)`` world-frame track poses (cuboid-local -> world)."""
@@ -316,6 +450,7 @@ __all__ = [
     "LayerAppender",
     "LayerTensorSpec",
     "euler_xyz_to_matrix",
+    "layer_row_tensor_names",
     "make_simready_rows",
     "matrix_to_quat_wxyz",
     "quat_mul_wxyz",

@@ -8,7 +8,7 @@ import os
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Optional, Tuple, Type
+from typing import Any, Optional, Self, Tuple, Type
 
 import cv2
 import numpy as np
@@ -18,6 +18,7 @@ import torch
 from gsplat.scene.components.env_map_background import (
     EnvMapBackground as GsplatEnvMapBackground,
 )
+from gsplat.scene.kernels.env_map_sample_ops import composite_env_map_cubemap
 from python.runfiles import runfiles
 from simple_lama_inpainting import SimpleLama
 from torch import nn
@@ -31,7 +32,12 @@ from nurec.config.model import (
     SkyMlpBackgroundConfig,
 )
 from nurec.config.trainer import TrainerConfig
-from nurec.models.background_sampling import cubemap_coverage_seamless, sample_cubemap_seamless
+from nurec.models.background_sampling import (
+    cubemap_coverage_seamless,
+    pad_cubemap_for_seamless_sampling,
+    sample_cubemap_seamless,
+    seamless_face_coordinate_scale,
+)
 from nurec.models.base import BaseModel
 from nurec.models.nn_extensions import module_call_type
 from nurec.models.utils import eval_tcnn_network, get_activation
@@ -40,7 +46,7 @@ from nurec.utils.geometry import cartesian_to_spherical
 from nurec.utils.misc import linear_to_srgb, srgb_to_linear, unpack_optional
 from nurec.utils.tcnn_allocator import use_torch_allocator_for_tcnn
 from nurec.utils.trainer import adjust_step_for_world_size
-from nurec.utils.types import ExtraSignal, GaussiansCompositeReturn
+from nurec.utils.types import ExtraSignal, GaussiansCompositeReturn, GaussiansRenderReturn
 
 
 RUNFILES = runfiles.Create()
@@ -71,21 +77,28 @@ class BaseBackground(BaseModel, ABC):
 
     def combine_rgb_colors(self, results: GaussiansCompositeReturn, background_rgb: torch.Tensor) -> None:
         """Compute the linear combination of RGB colors within the volume and background"""
-        assert results.rendered_cam is not None, "rendered_cam should not be None"
-        assert results.rendered_cam.rgb is not None, "rendered_cam.rgb should not be None"
-        if results.rendered_cam.extra_ray_signals is None:
-            results.rendered_cam.extra_ray_signals = ExtraSignal()
+        rendered = results.rendered_cam
+        assert rendered is not None, "rendered_cam should not be None"
+        assert rendered.rgb is not None, "rendered_cam.rgb should not be None"
 
         if self.composite_in_linear_space:
-            rgb_linear = srgb_to_linear(results.rendered_cam.rgb)
+            rgb_linear = srgb_to_linear(rendered.rgb)
             background_rgb_linear = srgb_to_linear(background_rgb)
-            background_rgb_linear_scaled = background_rgb_linear * (1.0 - results.rendered_cam.opacity[..., None])
-            results.rendered_cam.rgb = linear_to_srgb(rgb_linear + background_rgb_linear_scaled)
-            results.rendered_cam.extra_ray_signals.rgb_background = background_rgb_linear
+            background_rgb_linear_scaled = background_rgb_linear * (1.0 - rendered.opacity[..., None])
+            self._store_composite(
+                rendered, linear_to_srgb(rgb_linear + background_rgb_linear_scaled), background_rgb_linear
+            )
         else:
-            background_color = background_rgb * (1.0 - results.rendered_cam.opacity[..., None])
-            results.rendered_cam.rgb = results.rendered_cam.rgb + background_color
-            results.rendered_cam.extra_ray_signals.rgb_background = background_rgb
+            background_color = background_rgb * (1.0 - rendered.opacity[..., None])
+            self._store_composite(rendered, rendered.rgb + background_color, background_rgb)
+
+    @staticmethod
+    def _store_composite(rendered: GaussiansRenderReturn, rgb: torch.Tensor, background_rgb: torch.Tensor) -> None:
+        """Write the composited image and the background it used back to ``rendered``."""
+        rendered.rgb = rgb
+        if rendered.extra_ray_signals is None:
+            rendered.extra_ray_signals = ExtraSignal()
+        rendered.extra_ray_signals.rgb_background = background_rgb
 
     @abstractmethod
     def forward(
@@ -179,6 +192,14 @@ class SkyEnvMapBackground(BaseBackground, GsplatEnvMapBackground):  # type: igno
         # OpenGL before sampling. This is not required for volume rendering correctness
         # but makes it easier to reason about the cube-map faces and inpainting.
         self.to_opengl = nn.Buffer(torch.FloatTensor([[0, -1, 0], [0, 0, 1], [-1, 0, 0]]), persistent=False)
+        # ``to_opengl`` is a signed axis permutation: (x, y, z) -> (-y, z, -x), i.e. a cyclic
+        # shift by one component (roll) and these per-axis signs (its row sums). Applied that
+        # way it is exact in float32, whereas a matmul rounds the rays to float16 under autocast
+        # or to TF32 under ``matmul_precision=medium`` (see _rotate_rays_to_opengl).
+        self._opengl_axis_sign = nn.Buffer(self.to_opengl.sum(dim=1), persistent=False)
+        # Seamless-padded copy of ``textures`` for the fused composite in eval-mode no-grad
+        # forwards (see _padded_textures).
+        self._padded_textures_cache: Optional[tuple[tuple[int, int], torch.Tensor]] = None
 
         self.original_textures = (
             nn.Buffer(torch.zeros_like(self.textures), persistent=False) if self.config.should_inpaint else None
@@ -205,22 +226,74 @@ class SkyEnvMapBackground(BaseBackground, GsplatEnvMapBackground):  # type: igno
         texture_update_mask: Optional[torch.Tensor] = None,
     ) -> None:
         assert results.rendered_cam is not None, "rendered_cam should not be None"
+        if self._fused_composite_applicable(results.rendered_cam, rays_d):
+            self._forward_fused(rays_d, results.rendered_cam, is_training, texture_update_mask)
+            return
+
         # Rotate world rays into OpenGL before sampling (gsplat's samplers use the
         # OpenGL cube-map convention).
-        rays_d = rays_d @ self.to_opengl.T
-
-        raw_rgb = self._sample_raw(rays_d)
+        raw_rgb = self._sample_raw(self._rotate_rays_to_opengl(rays_d))
         if texture_update_mask is not None:
             texture_update_mask = texture_update_mask.reshape(-1, 1)
             assert texture_update_mask.shape[0] == raw_rgb.shape[0]
             # Preserve the sampled values for compositing, but remove the autograd
             # connection to the texture for all non-sky rays.
             raw_rgb = torch.where(texture_update_mask, raw_rgb, raw_rgb.detach())
-        background_rgb = self.activation(raw_rgb).to(rays_d.dtype)
+        background_rgb = self.activation(raw_rgb)
 
         self._track_texture_grads(raw_rgb, rays_d, results.rendered_cam.opacity, texture_update_mask, is_training)
 
         self.combine_rgb_colors(results, background_rgb)
+
+    def _fused_composite_applicable(self, rendered: GaussiansRenderReturn, rays_d: torch.Tensor) -> bool:
+        """Whether ``forward`` can run as one fused gsplat launch instead of the generic path.
+
+        The fused kernel implements exactly ``rgb + act(sample) * (1 - opacity)`` for a
+        float32 CUDA cubemap; linear-space compositing and the equirectangular layout
+        keep the generic path.
+        """
+        return (
+            self.envmap_type is EnvMapType.CUBEMAP
+            and not self.composite_in_linear_space
+            and rendered.rgb is not None
+            and rendered.rgb.is_cuda
+            and rendered.rgb.dtype == torch.float32
+            and rendered.opacity.dtype == torch.float32
+            and rays_d.is_cuda
+            and self.textures.dtype == torch.float32
+        )
+
+    def _forward_fused(
+        self,
+        rays_d: torch.Tensor,
+        rendered: GaussiansRenderReturn,
+        is_training: bool,
+        texture_update_mask: Optional[torch.Tensor],
+    ) -> None:
+        """Rotate, sample, activate and composite in one gsplat launch.
+
+        Same math and rounding as the generic path in ``forward``: the OpenGL rotation is
+        applied in registers and the ray-direction slice is read in place, so no
+        intermediate ``[N, 3]`` tensors are materialised between the rays and the
+        composited image.
+        """
+        mask = None
+        if texture_update_mask is not None:
+            mask = texture_update_mask.reshape(-1).to(torch.bool)
+            assert mask.shape[0] == rays_d.shape[0]
+        rgb, background = composite_env_map_cubemap(
+            rays_d.to(torch.float32),
+            self._padded_textures()[None],
+            unpack_optional(rendered.rgb),
+            rendered.opacity.reshape(-1),
+            rotation=self.to_opengl,
+            face_coordinate_scale=seamless_face_coordinate_scale(self.height),
+            activation="saturate" if self.saturate_radiance else "relu",
+            texture_grad_mask=mask,
+        )
+
+        self._track_texture_grads(background, rays_d, rendered.opacity, mask, is_training)
+        self._store_composite(rendered, rgb, background)
 
     def _track_texture_grads(
         self,
@@ -234,7 +307,7 @@ class SkyEnvMapBackground(BaseBackground, GsplatEnvMapBackground):  # type: igno
 
         Coverage is the texture gradient of the sampled radiance with ``1 - opacity`` as
         the cotangent: how strongly sky rays observe each texel. ``texture_grads`` keeps
-        its running max.
+        its running max. ``rays_d`` are world-frame directions.
 
         Same gate, cadence and DDP averaging as gsplat's ``_track_gradients``; only how
         per-texel magnitude is computed differs. Cubemaps call the sampler's VJP directly
@@ -256,8 +329,9 @@ class SkyEnvMapBackground(BaseBackground, GsplatEnvMapBackground):  # type: igno
                 weights = torch.where(texture_update_mask.reshape(-1), weights, 0.0)
             match self.envmap_type:
                 case EnvMapType.CUBEMAP:
-                    # Use the same ray dtype as _sample_raw so coverage lands on the sampled texels.
-                    coverage = cubemap_coverage_seamless(self.height, rays_d.to(self.textures.dtype), weights)
+                    # Rotated here, only on tracking steps, with the exact float32 rotation the
+                    # samplers use, so coverage lands on the sampled texels.
+                    coverage = cubemap_coverage_seamless(self.height, self._rotate_rays_to_opengl(rays_d), weights)
                 case EnvMapType.EQUIRECTANGULAR:
                     grad_outputs = weights[:, None].expand_as(raw_rgb)
                     texture_grad = torch.autograd.grad(raw_rgb, self.textures, grad_outputs, retain_graph=True)[0]
@@ -295,6 +369,44 @@ class SkyEnvMapBackground(BaseBackground, GsplatEnvMapBackground):  # type: igno
                 return self._sample_equirect(rays_d)
             case EnvMapType.CUBEMAP:
                 return self._sample_cubemap(rays_d)
+
+    def _rotate_rays_to_opengl(self, rays_d: torch.Tensor) -> torch.Tensor:
+        """``rays_d @ self.to_opengl.T`` evaluated exactly in float32.
+
+        The rotation is a signed axis permutation -- (x, y, z) -> (-y, z, -x), i.e. a cyclic
+        shift of the components followed by sign flips -- so ``roll`` and a multiply reproduce
+        the matmul bit-for-bit in float32. Neither op is autocast-eligible or a matmul, so the
+        rays are not rounded to float16 (autocast) or TF32 (``matmul_precision=medium``) on the
+        way, as they were by the matmul.
+        """
+        return torch.roll(rays_d.float(), shifts=-1, dims=-1) * self._opengl_axis_sign
+
+    def train(self, mode: bool = True) -> Self:
+        # The sky texture only changes in training mode (optimizer steps), so no cached pad
+        # survives a mode switch; see _padded_textures.
+        self._padded_textures_cache = None
+        super().train(mode)
+        return self
+
+    def _padded_textures(self) -> torch.Tensor:
+        """``textures`` padded for the seamless sampler, cached across eval-mode no-grad forwards.
+
+        Training-mode and grad-enabled forwards always pad afresh: apex's FusedAdam (the sky
+        texture's optimizer) writes the parameter without bumping its version counter, so no
+        in-tensor signal marks an optimizer step, and under autograd the padding has to stay in
+        the graph anyway. In eval mode the texture only changes through explicit copies
+        (``load_state_dict``, ``.to()``), which the (storage, version) key does see, and the
+        cache is dropped on every mode switch (``train``).
+        """
+        textures = self.textures.squeeze(0)
+        if self.training or torch.is_grad_enabled():
+            return pad_cubemap_for_seamless_sampling(textures)
+        key = (self.textures.data_ptr(), self.textures._version)
+        cached = self._padded_textures_cache
+        if cached is None or cached[0] != key:
+            cached = (key, pad_cubemap_for_seamless_sampling(textures))
+            self._padded_textures_cache = cached
+        return cached[1]
 
     def _sample_cubemap(self, rays_d: torch.Tensor) -> torch.Tensor:
         """Sample the cubemap with seamless cross-face filtering."""

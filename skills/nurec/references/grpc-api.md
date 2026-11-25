@@ -53,6 +53,7 @@ avoid shell expansion). Common server flags:
 | `--enable-timing`                                        | `False`                                                                        | Print per-stage rendering timings.                                                                                |
 | `--ray-chunk-size`                                       | `2^62`                                                                         | Max rays per forward pass; lower it to fit smaller GPUs.                                                          |
 | `--egocar-hood-dir`                                      | unset                                                                          | Override directory of egocar hood images.                                                                         |
+| `--egocar-hood-cache-size`                               | `32`                                                                           | Max hood images cached on the render GPU per process (LRU); the bank is only listed at startup.                   |
 | `--enable-editing-actors`                                | `False`                                                                        | Required to apply `--edit-assets` later via `render-grpc`.                                                        |
 | `--cache-size`                                           | `10`                                                                           | Max number of loaded backends (count-based LRU). On OOM, spare backends are auto-evicted and the load is retried. |
 | `--max-workers`                                          | `1`                                                                            | gRPC server thread-pool worker count.                                                                             |
@@ -65,8 +66,10 @@ Deprecated (still accepted with a warning, hidden from `--help`):
 - `--use-gsplat` → `--renderer gsplat`
 
 The server raises gRPC `max_send_message_length` /
-`max_receive_message_length` to **50 MB** (LiDAR returns can be large);
-match those limits client-side.
+`max_receive_message_length` to **50 MiB**; match those limits client-side.
+ET30X firing-pattern lookup exceeds the stock 4 MiB receive limit even for
+single-return rendering: its direction buffer alone is 5,244,480 bytes.
+Two-layer and embedded-pattern render responses also require the larger limit.
 
 ## 2. Client protobufs from source
 
@@ -94,38 +97,40 @@ import nurec.grpc.protos.sensorsim_pb2_grpc as sensorsim_pb2_grpc
 
 Defined in `nurec.grpc.protos.sensorsim_pb2_grpc`. Every RPC request /
 response message is in `sensorsim_pb2` (or `common_pb2` for the shared
-types).
+types). The server also answers on `nre.grpc.protos.sensorsim.SensorsimService`,
+the name before 26.10, so clients built from earlier protos keep working.
 
-| RPC                          | Request                                            | Response                                                                                                    | Purpose                                                                                                                                                                                              |
-| ---------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_version`                | `Empty`                                            | `VersionId` (server `version_id`, `git_hash`, `grpc_api_version`)                                           | Server / API version probe.                                                                                                                                                                          |
-| `get_server_config`          | `Empty`                                            | `ServerConfig` (`map<string,string>`)                                                                       | Read the resolved server config (renderer, difix, cache sizes, …).                                                                                                                                   |
-| `get_available_scenes`       | `Empty`                                            | `AvailableScenesReturn(scene_ids)`                                                                          | List loaded USDZ scene IDs.                                                                                                                                                                          |
-| `get_available_cameras`      | `AvailableCamerasRequest(scene_id)`                | `AvailableCamerasReturn(available_cameras)`                                                                 | Camera intrinsics + `rig_to_camera` per scene.                                                                                                                                                       |
-| `get_available_trajectories` | `AvailableTrajectoriesRequest(scene_id)`           | `AvailableTrajectoriesReturn(available_trajectories)`                                                       | Embedded trajectories (rig pose vs time).                                                                                                                                                            |
-| `get_available_ego_masks`    | `Empty`                                            | `AvailableEgoMasksReturn(ego_mask_metadata)`                                                                | List of `(camera_logical_id, rig_config_id)` ego-mask IDs (e.g. `hyperion8.0`, `hyperion8.1`).                                                                                                       |
-| `get_dynamic_objects`        | `AvailableDynamicObjectsRequest(scene_id)`         | `AvailableDynamicObjectsReturn(dynamic_objects)`                                                            | Per-track trajectory + AABB + semantic class for the scene's actors.                                                                                                                                 |
-| `get_external_asset_objects` | `ExternalAssetObjectsRequest(scene_id)`            | `ExternalAssetObjectsReturn(track_ids)`                                                                     | List the external assets (Asset-Harvester PLYs) currently bundled in the artifact.                                                                                                                   |
-| `edit_assets`                | `EditAssetsRequest(scene_id, replace[], insert[])` | `EditAssetsResponse(success, message)`                                                                      | One-shot mutate of the renderable model: replace tracks with a different asset and/or insert new dynamic-object tracks. Server saves the original training parameters first so they can be restored. |
-| `restore_model_parameters`   | `RestoreModelParametersRequest(scene_id)`          | `Empty`                                                                                                     | Undo the last `edit_assets` call and revert to the training parameters.                                                                                                                              |
-| `render_rgb`                 | `RGBRenderRequest`                                 | `RGBRenderReturn(image_bytes)`                                                                              | Render one RGB frame.                                                                                                                                                                                |
-| `batch_render_rgb`           | `BatchRGBRenderRequest(items[])`                   | `BatchRGBRenderReturn(items[])`                                                                             | Multiple cameras / frames in one call (per-item `success`, `error_message`).                                                                                                                         |
-| `render_lidar`               | `LidarRenderRequest`                               | `LidarRenderReturn(point_xyzs, point_intensities, num_points, point_xyzs_buffer, point_intensities_buffer)` | Render one LiDAR sweep.                                                                                                                                                                              |
-| `shut_down`                  | `Empty`                                            | `Empty`                                                                                                     | Graceful server shutdown.                                                                                                                                                                            |
+| RPC                          | Request                                                                             | Response                                                          | Purpose                                                                                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_version`                | `Empty`                                                                             | `VersionId` (server `version_id`, `git_hash`, `grpc_api_version`) | Server / API version probe.                                                                                                                                                                          |
+| `get_server_config`          | `Empty`                                                                             | `ServerConfig` (`map<string,string>`)                             | Read the resolved server config (renderer, difix, cache sizes, …).                                                                                                                                   |
+| `get_available_scenes`       | `Empty`                                                                             | `AvailableScenesReturn(scene_ids)`                                | List loaded USDZ scene IDs.                                                                                                                                                                          |
+| `get_available_cameras`      | `AvailableCamerasRequest(scene_id)`                                                 | `AvailableCamerasReturn(available_cameras)`                       | Camera intrinsics + `rig_to_camera` per scene.                                                                                                                                                       |
+| `get_available_trajectories` | `AvailableTrajectoriesRequest(scene_id)`                                            | `AvailableTrajectoriesReturn(available_trajectories)`             | Embedded trajectories (rig pose vs time).                                                                                                                                                            |
+| `get_available_ego_masks`    | `Empty`                                                                             | `AvailableEgoMasksReturn(ego_mask_metadata)`                      | List of `(camera_logical_id, rig_config_id)` ego-mask IDs (e.g. `hyperion8.0`, `hyperion8.1`).                                                                                                       |
+| `get_dynamic_objects`        | `AvailableDynamicObjectsRequest(scene_id)`                                          | `AvailableDynamicObjectsReturn(dynamic_objects)`                  | Per-track trajectory + AABB + semantic class for the scene's actors.                                                                                                                                 |
+| `get_external_asset_objects` | `ExternalAssetObjectsRequest(scene_id)`                                             | `ExternalAssetObjectsReturn(track_ids)`                           | List the external assets (Asset-Harvester PLYs) currently bundled in the artifact.                                                                                                                   |
+| `edit_assets`                | `EditAssetsRequest(scene_id, replace[], insert[])`                                  | `EditAssetsResponse(success, message)`                            | One-shot mutate of the renderable model: replace tracks with a different asset and/or insert new dynamic-object tracks. Server saves the original training parameters first so they can be restored. |
+| `restore_model_parameters`   | `RestoreModelParametersRequest(scene_id)`                                           | `Empty`                                                           | Undo the last `edit_assets` call and revert to the training parameters.                                                                                                                              |
+| `render_rgb`                 | `RGBRenderRequest`                                                                  | `RGBRenderReturn(image_bytes)`                                    | Render one RGB frame.                                                                                                                                                                                |
+| `batch_render_rgb`           | `BatchRGBRenderRequest(items[])`                                                    | `BatchRGBRenderReturn(items[])`                                   | Multiple cameras / frames in one call (per-item `success`, `error_message`).                                                                                                                         |
+| `render_lidar`               | `LidarRenderRequest`                                                                | `LidarRenderReturn` (per-ray buffers or point-cloud fields)       | Render one LiDAR sweep; point cloud by default, explicit per-ray output requires a stored pattern.                                                                                                   |
+| `get_lidar_firing_pattern`   | `LidarFiringPatternRequest(scene_id, lidar_id, frame_start_us?, firing_pattern_id)` | `LidarFiringPatternReturn`                                        | Retrieve cacheable ray directions, firing times, grid, optional packet layout, and frame period.                                                                                                     |
+| `shut_down`                  | `Empty`                                                                             | `Empty`                                                           | Graceful server shutdown.                                                                                                                                                                            |
 
 The server also registers the standard `grpc.health.v1.Health`
 service — on the same port unless `--health-port` is set.
 
 ### Status codes the server emits
 
-| gRPC status           | When the server raises it                                                                                       |
-| --------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `OUT_OF_RANGE`        | Render request's `[frame_start_us, frame_end_us)` is outside the scene's time range.                            |
-| `RESOURCE_EXHAUSTED`  | Backend cache full or GPU OOM during render (volumetric effects / under-converged checkpoints often trip this). |
-| `FAILED_PRECONDITION` | Cache cannot serve the scene; or model/artifact incompatibility.                                                |
-| `NOT_FOUND`           | Scene or asset key missing.                                                                                     |
-| `INVALID_ARGUMENT`    | Bad request fields (wrong type, out-of-range value).                                                            |
-| `UNKNOWN`             | Anything else (server logs the full traceback before failing).                                                  |
+| gRPC status           | When the server raises it                                                                                                           |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `OUT_OF_RANGE`        | Render request's `[frame_start_us, frame_end_us)` is outside the scene's time range.                                                |
+| `RESOURCE_EXHAUSTED`  | Backend capacity exhausted in `render_lidar` or `get_lidar_firing_pattern`; GPU OOM during rendering.                               |
+| `FAILED_PRECONDITION` | Model/artifact incompatibility or LiDAR requested in camera-only mode. Some discovery RPCs also use this for cache capacity errors. |
+| `NOT_FOUND`           | Scene or asset key missing.                                                                                                         |
+| `INVALID_ARGUMENT`    | Bad request fields (wrong type, out-of-range value).                                                                                |
+| `UNKNOWN`             | Anything else (server logs the full traceback before failing).                                                                      |
 
 `render_rgb` reports a single status; `batch_render_rgb` returns
 per-item `success` / `error_message` so a partial failure does not
@@ -216,8 +221,20 @@ sensorsim_pb2.LidarRenderRequest(
     sensor_pose:     PosePair,
     dynamic_objects: list[DynamicObject],
     render_filter:   LidarRenderFilter,         # all four fields are optional
+    lidar_id:        str,                       # required when the artifact has multiple lidars
+    output_mode:     LidarOutputMode,           # optional POINT_CLOUD or PER_RAY
+    return_types:    list[LidarReturnType],      # per-ray only; ordered, unique FIRST / STRONGEST
+    firing_pattern_id: str,                     # optional explicit pattern selection
+    include_firing_pattern: bool,               # embed geometry instead of fetching it separately
 )
 ```
+
+API `0.1.0` defaults to `LIDAR_OUTPUT_POINT_CLOUD` for every sensor. Per-ray clients
+must set `output_mode=LIDAR_OUTPUT_PER_RAY`, which requires a stored pattern.
+Point-cloud requests must leave `return_types` empty and `include_firing_pattern` false.
+In per-ray mode, empty `return_types` selects `[LIDAR_RETURN_STRONGEST]`.
+`LIDAR_RETURN_UNSPECIFIED=0` is invalid; real layers are `FIRST=1` and `STRONGEST=2`. FIRST currently repeats
+the STRONGEST samples; requesting both does not produce a distinct predicted first return.
 
 `LidarRenderFilter` exposes the four LiDAR post-processing knobs:
 
@@ -233,17 +250,39 @@ sensorsim_pb2.LidarRenderRequest(
 ```python
 sensorsim_pb2.RGBRenderReturn(image_bytes: bytes)   # encoded by image_format
 sensorsim_pb2.LidarRenderReturn(
-    # Either the typed lists or the raw bytes buffers may be populated
-    # by the server depending on the build.
+    # LIDAR_OUTPUT_POINT_CLOUD: compacted, compensated points.
     point_xyzs:               list[float],            # [x1,y1,z1, x2,y2,z2, ...]
     point_intensities:        list[float],            # in [0, 1]
     num_points:               uint32,
     point_xyzs_buffer:        bytes,                  # float32 binary, end-of-spin LiDAR space
     point_intensities_buffer: bytes,                  # float32 binary
+    # LIDAR_OUTPUT_PER_RAY: point-cloud fields above are empty.
+    num_rays:                uint32,
+    num_return_layers:       uint32,
+    return_types:            list[LidarReturnType],
+    firing_pattern_id:       str,
+    ray_distances_m_buffer:   bytes,                  # float32 [layers, rays], metres
+    ray_intensities_buffer:  bytes,                  # float32 [layers, rays]; optional
+    ray_valid_masks_packed:  bytes,                  # LSB-first; ceil(rays/8) bytes per layer
+    firing_pattern:          LidarFiringPatternReturn, # present only when requested
 )
 ```
 
-Coordinates are in **end-of-spin LiDAR space**.
+Point-cloud coordinates are in **end-of-spin LiDAR space, in metres**. Per-ray buffers
+retain every emitted ray slot, including invalid returns, and are uncompensated.
+Use the validity mask before consuming distances or intensities.
+
+On a pattern cache miss, call `get_lidar_firing_pattern` with the same `scene_id`
+and `lidar_id`, and the response's exact `firing_pattern_id`. Without an explicit
+ID, `frame_start_us` selects the repeating phase; omitting both is valid only for a
+single template, otherwise `INVALID_ARGUMENT`. The lookup returns `directions_sensor` (float32 `[num_rays, 3]`),
+`frame_period_us`, and int64 microsecond firing offsets. Offsets appear either
+per ray in `timestamp_offsets_us` or once per packet in
+`packet_layout.timestamp_offsets_us`; expand packet times using the
+`packet_layout.ray_offsets_u32_le` prefix boundaries. Packet layout is optional.
+The optional `num_columns`/`num_rows` grid is absent when both are zero.
+Reconstruct uncompensated points as `directions_sensor * distances_m[:, None]`
+for each return layer, then apply motion compensation if needed.
 
 ### Asset editing
 
@@ -347,6 +386,7 @@ the `await` keywords.
 import numpy as np
 from nurec.grpc.protos.sensorsim_pb2 import (
     LidarDeviceType,
+    LidarOutputMode,
     LidarRenderFilter,
     LidarRenderRequest,
     LidarSpec,
@@ -357,6 +397,7 @@ from nurec.grpc.protos.sensorsim_pb2 import (
 def render_one_lidar_sweep(client, scene_id, pose, timestamp_us):
     request = LidarRenderRequest(
         scene_id=scene_id,
+        output_mode=LidarOutputMode.LIDAR_OUTPUT_POINT_CLOUD,
         lidar_config=LidarSpec(lidar_type=LidarDeviceType.PANDAR128),
         frame_start_us=timestamp_us,
         frame_end_us=timestamp_us + 100_000,            # 100 ms sweep window
@@ -450,20 +491,26 @@ Required: `--artifact-path` and `--output-dir`. Common optional flags
 
 LiDAR-mode flags activate when `--lidar` is set:
 
-| Flag                                                     | Default          | Purpose                                                              |
-| -------------------------------------------------------- | ---------------- | -------------------------------------------------------------------- |
-| `--lidar`                                                | off              | Switch to `render_lidar` and write point clouds.                     |
-| `--lidar-id`                                             | first available  | LiDAR sensor ID to use for frame timestamps.                         |
-| `--lidar-format [bin\|ply]`                              | `bin`            | Raw binary (xyz then intensity) or PLY with intensity-mapped colors. |
-| `--lidar-raydrop-threshold`                              | `0.5`            | Drop rays with `raydrop > T`.                                        |
-| `--lidar-opacity-threshold`                              | `0.0`            | Drop rays with `opacity <= T`. `0.0` disables the filter.            |
-| `--lidar-distance-filter` / `--no-lidar-distance-filter` | artifact default | Toggle distance-based edge filtering.                                |
-| `--lidar-distance-filter-threshold`                      | artifact default | `[0, 1]`; higher = fewer points filtered.                            |
+| Flag                                                     | Default          | Purpose                                                                                                                    |
+| -------------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `--lidar`                                                | off              | Switch to `render_lidar`; select point-cloud or per-ray export below.                                                      |
+| `--lidar-id`                                             | first available  | LiDAR sensor ID to use for frame timestamps.                                                                               |
+| `--lidar-format [bin\|ply\|per-ray]`                     | `bin`            | `bin`/`ply` explicitly request point-cloud output; `per-ray` writes uncompensated NPZ frames and a firing-pattern catalog. |
+| `--lidar-raydrop-threshold`                              | `0.5`            | Drop rays with `raydrop > T`.                                                                                              |
+| `--lidar-opacity-threshold`                              | `0.0`            | Drop rays with `opacity <= T`. `0.0` disables the filter.                                                                  |
+| `--lidar-distance-filter` / `--no-lidar-distance-filter` | artifact default | Toggle distance-based edge filtering.                                                                                      |
+| `--lidar-distance-filter-threshold`                      | artifact default | `[0, 1]`; higher = fewer points filtered.                                                                                  |
 
 The helper writes `timestamps.json` next to the rendered frames (one
 entry per frame with `file_name`, `render_frame_idx`,
 `frame_start_timestamp_us`, `frame_end_timestamp_us`) and
 `render_grpc_cli_args.json` capturing the exact CLI invocation.
+With `--lidar-format per-ray`, `firing_patterns.json` maps pattern IDs to
+`firing_patterns/pattern_NNN.npz` sidecars even for a singleton. Paths are relative
+to `--output-dir`, not the repeat directory. Each invocation/sensor requires a fresh
+output directory. Frames also contain the actual request interval and float64
+start/end sensor-to-world matrices, including rig offsets. Later repeats explicitly
+pin first-pass pattern IDs. See `nurec/grpc/release/LIDAR_MIGRATION.md` for migration details.
 
 ## 7. Harmonizer (Fixer) post-processing inside the container
 
@@ -511,8 +558,8 @@ repository linked in [harmonizer.md](harmonizer.md).
   `render-grpc` does this automatically; replicate the convention in
   your own clients.
 - **Message-size limits:** the server raises `max_send_message_length`
-  / `max_receive_message_length` to **50 MB** so LiDAR responses fit;
-  set the same limits on the client channel.
+  / `max_receive_message_length` to **50 MiB**. Set the same limits on the client
+  channel for firing-pattern lookup, two-layer returns, and embedded geometry.
 - **Backend cache & OOM:** the server keeps up to `--cache-size` model
   backends in a count-based LRU. On GPU OOM during a checkout, spare
   backends are evicted and the load is retried. If every slot is

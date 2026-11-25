@@ -3,93 +3,56 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NuRec CUDA IPC transport (same-node frame delivery)
+# CUDA IPC frame delivery
 
-This folder implements an optional **CUDA IPC** transport for the `serve-grpc`
-render service, for the common case where the client runs on the **same node** as
-the server. It shares GPU memory across the two processes with `cudaIpcGetMemHandle`
-/ `cudaIpcOpenMemHandle`, so no NIC and no host round-trip are needed — just PCIe.
+CUDA IPC delivers GPU-resident images to a client on the same host and physical GPU.
+The server packs float RGB output directly into shared planar uint8 buffers, without
+copying image data through CPU memory or protobuf.
 
-## Motivation
+The server owns the buffers. The client maps them once per session and treats them
+as read-only.
 
-CUDA IPC lets one process hand another process a pointer to the _same_ physical GPU
-memory it already rendered into, with no copy at all. It uses the shared fused pack
-kernel (`//nurec/libs/render_pack:render_pack_cuda`) to convert the renderer's raw float
-output directly into the delivered format in the buffer the client maps.
+## Camera batches and completion
 
-## Architecture — ownership and buffer pool
+`batch_render_camera` accepts 1–8 IPC requests for one scene and session. Each item
+must set `use_cuda_ipc=true` and request only color output, using `RGB_UINT8_PLANAR`
+at the session dimensions, without bounding-box overlays.
 
-**The server owns the buffers**: at session open it pre-allocates a small pool (default 2, i.e.
-double-buffered) and exports each as a `cudaIpcMemHandle_t`. The client only ever
-reads. `render_rgb` stays a blocking RPC; buffer selection is entirely server-side —
-the client's only input is telling the server, via `released_buffer_id` on its
-_next_ request, that it is done reading a buffer from a previous response (having
-already fenced that release with its own CPU-side `cudaEventSynchronize`, so no new
-CUDA event plumbing is needed on the server side for this).
+On temporal-Harmonizer servers, IPC camera batches must leave `apply_harmonizer`
+false or unset and omit `harmonizer_session_id`. Multiprocess serving is not supported.
 
-```mermaid
-sequenceDiagram
-  participant C as NuRec client (GPU, same node)
-  participant S as NuRec server (GPU)
-  Note over C,S: control plane — gRPC (loopback or UDS)
-  C->>S: open_ipc_session (requested_width, requested_height, requested_buffer_count)
-  S-->>C: OpenIpcSessionResponse (session_id, cuda_ipc_mem_handles[], buffer_size, device_uuid)
-  C->>C: cudaIpcOpenMemHandle per handle (after checking device_uuid matches)
-  loop per frame
-    C->>S: render_rgb (use_cuda_ipc=true, ipc_session_id, released_buffer_id?)
-    Note over S: render -> fused pack kernel -> a free pooled buffer
-    S-->>C: RGBRenderReturn (buffer_id = which pooled buffer now holds the frame)
-    Note over C: read buffer_id's mapped pointer, run ISP, then event-sync + release next request
-  end
-  C->>C: cudaIpcCloseMemHandle per mapped buffer
-  C->>S: close_ipc_session
-```
+Choose the completion mode when opening the session:
 
-**Same-GPU requirement:** the client's `device_uuid` check (against
-`OpenIpcSessionResponse.device_uuid`, `cudaDeviceProp::uuid`) guards against opening
-handles exported by a different physical GPU than the one the client's CUDA context
-is bound to — `cudaIpcOpenMemHandle` only works within the same GPU.
+- `COMPLETION_ON_RETURN` is the default. Returned images are ready to read.
+- `EVENT_ORDERED` is supported only by `batch_render_camera`. The RPC may return
+  before GPU work finishes. Before reading a returned buffer, enqueue a wait on its
+  ready event in the consuming CUDA stream.
 
-**Teardown order:** the client must call `cudaIpcCloseMemHandle` on every buffer it
-mapped _before_ sending `close_ipc_session` — `close_session` (`cuda_ipc_module.cpp`)
-`cudaFree`s the underlying allocations as soon as it receives the request, and CUDA
-documents that freeing memory an importer still has open is undefined behavior. This
-is entirely a client-side ordering requirement; the server has no way to detect or
-enforce it (it doesn't know whether the client has actually closed its mappings).
+Check the accepted `completion_mode` in the session response. Older servers may
+ignore the requested mode.
 
-## gRPC additions (session protocol)
+Camera batching works with either completion mode.
 
-- **`ipc.proto`** — new package `nurec.grpc.protos.ipc`, two request/response pairs:
-  - `OpenIpcSession{Request,Response}` — client requests a frame size and buffer
-    count; server allocates the pool and returns one `cudaIpcMemHandle_t` per buffer
-    plus `buffer_size` and its `device_uuid`. No `RegisterReceiveBuffer` analog —
-    there is nothing for the client to register, since the server owns every buffer.
-  - `CloseIpcSession{Request,Response}` — best-effort teardown.
-- **`sensorsim.proto`** imports `ipc.proto`, adds the two RPCs (`open_ipc_session`,
-  `close_ipc_session`), and gives both `RGBRenderRequest` (tags 21/22/23) and
-  `CameraRenderRequest` (tags 18/19/20) the same opt-in fields: `use_cuda_ipc`,
-  `ipc_session_id`, `released_buffer_id`. `RGBRenderReturn` gets `format` (tag 2)
-  and `buffer_id` (tag 3); `CameraRenderOutput` gets the same pair at tags 7/8 —
-  in both cases the server-selected buffer that now holds the frame.
-  `CameraRenderRequest`'s IPC path only ever produces a single
-  `CAMERA_RENDER_PRODUCT_COLOR` output (no bounding-box overlay, no second product):
-  the pack kernel writes straight from the float32 raster, with no host-visible
-  image for an overlay to draw onto or a second, differently-typed buffer.
+## Buffer ownership
+
+Wait for all client reads or copies to finish before sending `released_buffer_id`
+in a subsequent request. Send each release once. After release, the server may
+reuse the buffer.
+
+A completed ready event means the server has finished writing that image. It does
+not mean the client has finished reading it.
+
+Before closing a session, finish outstanding requests and GPU work, destroy imported
+event handles, and unmap all buffers with `cudaIpcCloseMemHandle`. Then call
+`close_ipc_session`.
 
 ## Components
 
-| File                  | Role                                                                                                                                                                          |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cuda_ipc_module.cpp` | pybind11 `IpcManager` — owns the per-session buffer pool; `open_session` / `write_render_hwc_f32` / `close_session`. The entire native surface — no network handshake needed. |
-| `__init__.py`         | exposes `IpcManager` (or `None` when the native module is not built).                                                                                                         |
-
-`write_render_hwc_f32` reuses `nurec_render_pack::launch_render_pack_hwc_f32_to_chw_u8`
-from `//nurec/libs/render_pack:render_pack_cuda` directly — no kernel duplication.
-
-Server-side wiring lives in `nurec/grpc/serve.py`: `open_ipc_session` /
-`close_ipc_session` handlers, and the `use_cuda_ipc` branch in `render_rgb` and
-`render_camera` (and, for batches of `RGBRenderRequest` items, `batch_render_rgb`)
-that calls `IpcManager.write_render_hwc_f32`.
+| Component     | Role                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| `IpcManager`  | Own sessions, buffers, and ready events; reserve buffers, pack images, and reclaim unpublished buffers. |
+| `render_pack` | Convert float HWC images directly into planar uint8 IPC buffers on the supplied CUDA stream.            |
+| `serve.py`    | Validate requests, render images, and return buffer IDs through the existing RPCs.                      |
 
 ## Build
 
@@ -99,9 +62,19 @@ The transport is always built in — no opt-in flag:
 bazel build //:run
 ```
 
-`serve.py`'s import of `IpcManager` still degrades gracefully (defensive
-try/except) if it were ever to fail, so a build that somehow lacked the native
-module would start normally and report the IPC RPCs as unavailable.
+If the native IPC module cannot be imported, the server still starts but IPC RPCs
+are unavailable.
+
+### Optional CUDA 12.9 runtime
+
+The default build uses CUDA 12.8. For CUDA 12.9 IPC clients, build with:
+
+```text
+--//nurec/libs/cuda_ipc_transport:cuda_12_9=true
+```
+
+This links a private CUDA 12.9 runtime into the IPC extension without changing the
+runtime used by the rest of the server.
 
 ## Runtime requirements
 

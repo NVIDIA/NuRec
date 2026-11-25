@@ -13,7 +13,7 @@ These tests exercise that contract for the three ``torch`` RNG
 primitives the module is documented to support (``torch.rand``,
 ``torch.randn``, ``torch.randint``), plus the per-element
 ``randn * std + mean`` composition pattern used by
-``GSplatStrategy._split_gaussians`` (in lieu of the direct
+``gsplat.strategy.ops.split`` (in lieu of the direct
 ``torch.normal(mean, std, generator=...)``, which is not
 stream-capture-safe in this PyTorch version). Each test:
 

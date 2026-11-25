@@ -9,11 +9,13 @@ import multiprocessing
 import multiprocessing.synchronize
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
@@ -22,6 +24,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Iterator,
     Literal,
     Mapping,
     Optional,
@@ -45,11 +48,13 @@ import ncore.impl.data.stores as ncore_stores
 import nurec.utils.cli as nurec_utils_cli
 
 from apps.av.aux_gen.depth_estimator import DepthEstimator
+from apps.av.aux_gen.device_frame import DeviceFrameContext
 from apps.av.aux_gen.device_frame_service import (
     DeviceFrameServiceReady,
     DeviceFrameSharedArray,
     DeviceFrameSharedArrayDescriptor,
     DeviceFrameSharedBuffers,
+    DeviceFrameStopSignal,
     SharedDeviceFrameClient,
     run_device_frame_service_process,
 )
@@ -63,6 +68,9 @@ from apps.av.aux_gen.segmentation_device_pipeline import (
 )
 from apps.av.aux_gen.segmentation_presentation import is_dark_image
 from apps.av.aux_gen.shared_segmentation import (
+    AuxiliaryFrameSelection,
+    AuxiliaryOutputIdentity,
+    AuxiliarySegmentationOutputHandler,
     AuxiliarySegmentationOutputs,
     SegmentationFrameOutput,
     SharedSegmentationFrameProcessor,
@@ -107,10 +115,130 @@ if TYPE_CHECKING:
 breakpoint_env()
 
 
+def _progress_disabled() -> bool:
+    """Keep worker output and redirected benchmark logs free of progress bars."""
+    return multiprocessing.parent_process() is not None or not sys.stderr.isatty()
+
+
+class _FrameProgress:
+    """Render completed-frame counts in the parent for either execution mode.
+
+    Serial writers advance a local counter and refresh the bar. Parallel
+    workers each own a shared counter, polled by the parent. Counts are UI
+    telemetry, never used for synchronization. Redirected runs allocate none.
+    """
+
+    def __init__(self, ctx: Any, workers: int, total: int, description: str) -> None:
+        """Create a bar and counters; ``ctx=None`` selects local storage."""
+        disabled = _progress_disabled()
+        self.counts = None if disabled else ([0] * workers if ctx is None else ctx.Array("Q", workers, lock=False))
+        self.bar = tqdm.tqdm(total=total, desc=description, unit="frame", mininterval=1.0, disable=disabled)
+
+    def update(self) -> None:
+        """Poll stored-frame counts without forcing a redraw."""
+        if self.counts is not None:
+            completed = sum(self.counts)
+            if completed != self.bar.n:
+                self.bar.update(completed - self.bar.n)
+
+    def advance(self) -> None:
+        """Count a successfully stored serial frame and refresh its parent bar."""
+        if self.counts is not None:
+            self.counts[0] += 1
+            self.update()
+
+    def close(self) -> None:
+        """Collect final counts and close, preserving incomplete progress on failure."""
+        self.update()
+        self.bar.close()
+
+
+def _progress_callback(counts: Any | None, worker_id: int) -> Callable[[], None] | None:
+    """Create a stored-frame callback for one worker, or None when disabled.
+
+    Args:
+        counts: Optional shared array with one counter owned by each worker.
+        worker_id: Index of the counter this callback advances.
+
+    Returns:
+        A no-argument increment callback, or None when counts is None.
+    """
+    if counts is None:
+        return None
+
+    def advance() -> None:
+        """Count one successfully stored frame in this worker's slot."""
+        counts[worker_id] += 1
+
+    return advance
+
+
+@contextmanager
+def _frame_progress(
+    total: int, description: str, on_frame_stored: Callable[[], None] | None
+) -> Iterator[Callable[[], None] | None]:
+    """Use supplied parent counters or own a serial bar for successful writes.
+
+    Args:
+        total: Number of frames selected for processing.
+        description: Label for a serial parent-owned bar.
+        on_frame_stored: Existing parallel-stage callback, when supplied.
+
+    Yields:
+        Callback to invoke after a frame's writes, or None when disabled.
+    """
+    if on_frame_stored is not None or _progress_disabled():
+        yield on_frame_stored
+        return
+    progress = _FrameProgress(None, 1, total, description)
+    try:
+        yield progress.advance
+    finally:
+        progress.close()
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SensorRanges:
     camera_frame_ranges: dict[str, range]
     lidar_frame_ranges: dict[str, range]
+
+    def restrict_to_timestamps(
+        self, loader: ncore.data.SequenceLoaderProtocol, bounds: tuple[int, int] | None
+    ) -> SensorRanges:
+        """Intersect every selected sensor's frames with an absolute time window.
+
+        Args:
+            loader: Source of each sensor's ordered exposure-end timestamps.
+            bounds: Inclusive start/end timestamps in microseconds, or None.
+
+        Returns:
+            Restricted frame ranges, or this selection when no bounds are supplied.
+        """
+        if bounds is None:
+            return self
+
+        def restrict(ranges: dict[str, range], get_sensor: Callable) -> dict[str, range]:
+            """Intersect existing ranges with this sensor type's timestamp window.
+
+            Args:
+                ranges: Selected frame indices for each sensor.
+                get_sensor: Loader accessor returning a timestamped sensor.
+
+            Returns:
+                Frame ranges restricted to the common time window.
+            """
+            restricted = {}
+            for sensor_id, frames in ranges.items():
+                timestamps = get_sensor(sensor_id).get_frames_timestamps_us()
+                start = int(np.searchsorted(timestamps, bounds[0], side="left"))
+                stop = int(np.searchsorted(timestamps, bounds[1], side="right"))
+                restricted[sensor_id] = range(max(frames.start, start), min(frames.stop, stop))
+            return restricted
+
+        return SensorRanges(
+            camera_frame_ranges=restrict(self.camera_frame_ranges, loader.get_camera_sensor),
+            lidar_frame_ranges=restrict(self.lidar_frame_ranges, loader.get_lidar_sensor),
+        )
 
 
 SensorRangeCallback = Callable[
@@ -155,6 +283,7 @@ class CLIBaseParams:
     ego_mask_samples_per_second: float
     ego_mask_aggregation_method: Literal["majority"]
     ego_mask_camera_ids: tuple[str, ...] | None = None
+    timestamp_range_us: tuple[int, int] | None = None
     execution_mode: Literal["serial", "parallel"]
     workers_per_gpu: int
 
@@ -174,7 +303,6 @@ class CLIState:
     depth_generation: DepthGenerationRequest | None
     auxiliary_segmentation: AuxiliarySegmentationRequest | None
     extension_cli_params: dict[str, Any]
-    instance_generation: InstanceGenerationRequest | None = None
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -189,27 +317,6 @@ class DepthGenerationRequest:
 DepthGenerationConfigurator = Callable[[dict[str, Any]], DepthGenerationRequest | None]
 
 
-class InstanceGenerationRequest(Protocol):
-    """Optional instance-mask generation owned by an extending entrypoint."""
-
-    def preflight(self) -> None:
-        """Validate model inputs before opening the sequence."""
-        ...
-
-    def generate(
-        self,
-        sequence_loader: ncore.data.SequenceLoaderProtocol,
-        backend: DatasetBackend,
-        writer: AuxDataWriter,
-        camera_frame_ranges: Mapping[str, range],
-    ) -> None:
-        """Write instances for selected cameras, releasing model state before returning."""
-        ...
-
-
-InstanceGenerationConfigurator = Callable[[dict[str, Any]], InstanceGenerationRequest | None]
-
-
 class AuxiliarySegmentationRequest(Protocol):
     """Model-agnostic auxiliary segmentation configured by an entrypoint.
 
@@ -219,6 +326,11 @@ class AuxiliarySegmentationRequest(Protocol):
     counters when the run completes. This module stays independent of which
     model does that work: an extending entrypoint owns option parsing, frame
     selection, processor construction, and result finalization.
+
+    ``select_camera_frames`` returns explicit selection data. The
+    runner calls ``prepare_output`` with the output identity and selection.
+    The returned handler owns output configuration and finalization.
+    Factories carry picklable configuration and readiness inputs, never model state.
     """
 
     def preflight(self) -> None:
@@ -230,11 +342,20 @@ class AuxiliarySegmentationRequest(Protocol):
         """
         ...
 
-    def frame_outputs(self) -> AuxiliarySegmentationOutputs:
-        """Describe how the extension processor's frame outputs are consumed.
+    def prepare_output(
+        self, output_identity: AuxiliaryOutputIdentity, selection: AuxiliaryFrameSelection
+    ) -> AuxiliarySegmentationOutputHandler:
+        """Check destinations and create this source part's output handler.
+
+        Args:
+            output_identity: Named output identity for this sequence part.
+            selection: Resolved camera frame schedule.
 
         Returns:
-            A picklable description forwarded to every camera worker.
+            Parent-owned handler with a picklable worker output description.
+
+        Raises:
+            Exception: If the extension cannot safely publish its outputs.
         """
         ...
 
@@ -251,7 +372,7 @@ class AuxiliarySegmentationRequest(Protocol):
         sequence_loader: ncore.data.SequenceLoaderProtocol,
         camera_frame_ranges: Sequence[tuple[str, range]],
         /,
-    ) -> Mapping[int, tuple[int, ...]]:
+    ) -> AuxiliaryFrameSelection:
         """Select the frames each camera worker submits to the processor.
 
         Args:
@@ -260,27 +381,8 @@ class AuxiliarySegmentationRequest(Protocol):
                 positionally indexed by worker identity.
 
         Returns:
-            Worker-local frame indices keyed by worker identity. Workers absent
-            from the mapping submit no auxiliary frames.
-        """
-        ...
-
-    def finalize(
-        self,
-        *,
-        camera_ids: tuple[str, ...],
-        camera_statistics: tuple[Mapping[str, Any], ...],
-        processor_metadata: Mapping[str, Any],
-        wall_time_seconds: float,
-    ) -> None:
-        """Publish extension-owned results after every camera worker exits.
-
-        Args:
-            camera_ids: Cameras processed by this run, in worker order.
-            camera_statistics: One record per camera that produced counters.
-            processor_metadata: The device processor's storage metadata as
-                reported at service readiness.
-            wall_time_seconds: Total shared-segmentation wall time.
+            Explicit worker-local frame indices, frame records and selection metadata.
+            Workers absent from sample_indices submit no auxiliary frames.
         """
         ...
 
@@ -369,8 +471,6 @@ def _preflight_auxiliary_segmentation(
         return
     if not params.parallel_mode:
         raise ValueError("Auxiliary segmentation requires --parallel-mode")
-    if params.dataset_path is None:
-        raise ValueError("Auxiliary segmentation requires --dataset-path")
     auxiliary_segmentation.preflight()
 
 
@@ -538,8 +638,10 @@ def _run_segmentation_camera_frames(
     visualize: bool,
     process_frame: Callable[[int, int, Any, Path | None], Any],
     resolve_frame: Callable[[Any], SegmentationFrameOutput] | None = None,
+    wait_for_capacity: Callable[[], None] | None = None,
     max_in_flight: int | None = 1,
     selected_frame_indices: frozenset[int] | None = None,
+    on_frame_stored: Callable[[], None] | None = None,
 ) -> None:
     """Decode and store camera frames independently of inference topology.
 
@@ -554,9 +656,14 @@ def _run_segmentation_camera_frames(
             outputs or a token resolved by ``resolve_frame``.
         resolve_frame: Optional callback that waits for and resolves a
             submitted frame token.
+        wait_for_capacity: Block until dynamic transport capacity can progress;
+            wake and propagate shutdown.
         max_in_flight: Maximum submitted frames awaiting ordered resolution,
             or ``None`` when the frame processor owns dynamic capacity.
         selected_frame_indices: Optional worker-local subset to decode.
+        on_frame_stored: Optional callback run on the writer thread after
+            all writes for a frame succeed. Serial and parallel execution use
+            the same callback path.
 
     Returns:
         None.
@@ -565,7 +672,8 @@ def _run_segmentation_camera_frames(
         RuntimeError: If capacity becomes unavailable, resolved output is
             invalid, or asynchronous storage fails.
         TypeError: If a resolved frame has an unexpected type.
-        ValueError: If ``max_in_flight`` is not positive.
+        ValueError: If ``max_in_flight`` is not positive or dynamic capacity
+            has no corresponding progress wait.
     """
     logger = logging.getLogger(__name__)
     if semantic_metadata is not None:
@@ -575,9 +683,16 @@ def _run_segmentation_camera_frames(
     if max_in_flight is not None and max_in_flight < 1:
         raise ValueError(f"max_in_flight must be positive, got {max_in_flight}")
 
+    if max_in_flight is None and wait_for_capacity is None:
+        raise ValueError("Dynamic frame processing requires a progress wait")
+
     # AuxDataWriter initializes stores lazily without locking. Metadata
     # initialization above completes before this single consumer starts.
-    with AsyncShardWriter() as shard_writer:
+    total = len(timestamped_image_frame_handles) if selected_frame_indices is None else len(selected_frame_indices)
+    with (
+        _frame_progress(total, "Camera segmentation", on_frame_stored) as on_frame_stored,
+        AsyncShardWriter() as shard_writer,
+    ):
         pending_frames: deque[tuple[int, Any]] = deque()
 
         def store_frame(frame_timestamp_us: int, token: Any) -> None:
@@ -637,9 +752,10 @@ def _run_segmentation_camera_frames(
                     nbytes=owned_auxiliary_mask.nbytes,
                 )
 
-        for frame_index, (frame_timestamp_us, frame_image_handle) in enumerate(
-            tqdm.tqdm(timestamped_image_frame_handles)
-        ):
+            if on_frame_stored is not None:
+                shard_writer.submit(on_frame_stored, nbytes=0)
+
+        for frame_index, (frame_timestamp_us, frame_image_handle) in enumerate(timestamped_image_frame_handles):
             if selected_frame_indices is not None and frame_index not in selected_frame_indices:
                 continue
             image = frame_image_handle.get_data().get_decoded_image()
@@ -658,7 +774,8 @@ def _run_segmentation_camera_frames(
                 if pending_frames:
                     store_frame(*pending_frames.popleft())
                 else:
-                    time.sleep(0.001)
+                    assert wait_for_capacity is not None
+                    wait_for_capacity()
 
             if max_in_flight is not None and len(pending_frames) >= max_in_flight:
                 store_frame(*pending_frames.popleft())
@@ -677,8 +794,27 @@ def _run_egomask_samples(
     aggregation_method: Literal["majority"],
     visualize: bool,
     infer_mask: Callable[[int, Any], NDArray[np.uint8]],
+    on_frame_stored: Callable[[], None] | None = None,
 ) -> NDArray[np.uint8] | None:
-    """Infer, store, aggregate, and optionally visualize sampled ego masks."""
+    """Infer, store, aggregate, and optionally visualize sampled ego masks.
+
+    Args:
+        writer: Destination auxiliary-data writer.
+        camera_id: Camera used for stored mask keys.
+        resolution: Image width and height in pixels.
+        metadata: Dataset, method and pretrained checkpoint storage metadata.
+        samples: Ordered request ID, timestamp and encoded-image handle triples.
+        aggregation_method: Majority voting across sampled masks.
+        visualize: Whether to save overlays.
+        infer_mask: Callback returning a uint8[H, W] mask for one sample.
+        on_frame_stored: Optional callback after each raw mask is stored.
+
+    Returns:
+        Majority aggregate as uint8[H, W], or None for no samples.
+
+    Raises:
+        ValueError: If the aggregation method is unsupported.
+    """
     if not samples:
         return None
     if aggregation_method != "majority":
@@ -699,25 +835,28 @@ def _run_egomask_samples(
     if vis_folder is not None:
         os.makedirs(vis_folder, exist_ok=True)
 
-    for request_id, frame_timestamp_us, frame_image_handle in tqdm.tqdm(samples):
-        image = frame_image_handle.get_data().get_decoded_image()
-        ego_mask = infer_mask(request_id, image)
-        writer.store_egomask(
-            camera_id,
-            frame_timestamp_us,
-            ego_mask,
-            image_file_format="png",
-        )
-        mask_sum += ego_mask
-        if vis_folder is not None:
-            visualize_egomask_overlay(
-                ego_mask,
-                np.asarray(image),
-                vis_folder,
+    with _frame_progress(len(samples), "SAM2 samples", on_frame_stored) as on_frame_stored:
+        for request_id, frame_timestamp_us, frame_image_handle in samples:
+            image = frame_image_handle.get_data().get_decoded_image()
+            ego_mask = infer_mask(request_id, image)
+            writer.store_egomask(
+                camera_id,
                 frame_timestamp_us,
-                "raw_ego",
+                ego_mask,
+                image_file_format="png",
             )
-            sampled_frames.append((frame_timestamp_us, frame_image_handle))
+            if on_frame_stored is not None:
+                on_frame_stored()
+            mask_sum += ego_mask
+            if vis_folder is not None:
+                visualize_egomask_overlay(
+                    ego_mask,
+                    np.asarray(image),
+                    vis_folder,
+                    frame_timestamp_us,
+                    "raw_ego",
+                )
+                sampled_frames.append((frame_timestamp_us, frame_image_handle))
 
     aggregate = (mask_sum >= len(samples) / 2).astype(np.uint8)
     writer.store_egomask(
@@ -752,6 +891,7 @@ def _run_shared_sam2_prepass(
     aggregation_method: Literal["majority"],
     visualize: bool,
     client: SharedDeviceFrameClient,
+    on_frame_stored: Callable[[], None] | None = None,
 ) -> NDArray[np.uint8] | None:
     """Generate raw and aggregate SAM2 masks before semantic segmentation.
 
@@ -765,6 +905,7 @@ def _run_shared_sam2_prepass(
         aggregation_method: Aggregation applied across sampled masks.
         visualize: Whether to save raw and aggregate mask overlays.
         client: Shared device-frame client used for SAM2-only requests.
+        on_frame_stored: Optional callback after each raw mask is stored.
 
     Returns:
         Majority aggregate as ``uint8[H, W]``, or ``None`` when no samples
@@ -788,10 +929,13 @@ def _run_shared_sam2_prepass(
                 request_id=sample_index,
                 image=image,
                 enabled_processors=frozenset({SAM2_PROCESSOR}),
+                frame=DeviceFrameContext(
+                    client.worker_id, sample_index, camera_id, timestamped_image_frame_handles[sample_index][0], ()
+                ),
             )
             if pending is not None:
                 break
-            time.sleep(0.001)
+            client.wait_for_capacity()
         resolved = client.resolve(pending)
         ego_mask = resolved.outputs.get(SAM2_MASK_OUTPUT)
         if ego_mask is None:
@@ -815,12 +959,23 @@ def _run_shared_sam2_prepass(
         aggregation_method=aggregation_method,
         visualize=visualize,
         infer_mask=infer_mask,
+        on_frame_stored=on_frame_stored,
     )
+
+
+# Pipe.poll cannot wait on stop_event; poll so failed startup can cancel workers
+# even when no metadata is sent. This is a cancellation interval, not a startup deadline.
+_HOST_WORKER_CANCEL_POLL_SECONDS = 0.2
+# Before readiness handoff, host workers only import or poll for cancellation;
+# they own no frame slots or outputs, so failed startup needs a shorter join.
+_HOST_WORKER_UNRELEASED_STOP_WAIT_SECONDS = 1.0
+# Give processes that may own frame resources time to exit before terminating them.
+_PROCESS_CLEANUP_GRACE_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
 class _SegmentationHostWorkerConfig:
-    """Picklable configuration for one segmentation host worker."""
+    """Picklable camera and IPC configuration available before model startup."""
 
     worker_id: int
     loader_payload: LoaderWorkerPayload
@@ -828,12 +983,10 @@ class _SegmentationHostWorkerConfig:
     output_path: Path
     camera_id: str
     camera_frame_range: range
-    semantic_metadata: dict[str, Any] | None
     resolution: tuple[int, int]
     visualize: bool
     slot_queue: Any
     sam2_sample_indices: tuple[int, ...]
-    sam2_metadata: dict[str, Any] | None
     ego_mask_aggregation_method: Literal["majority"]
     request_queue: Any
     result_queue: Any
@@ -841,34 +994,92 @@ class _SegmentationHostWorkerConfig:
     stop_event: Any
     auxiliary_sample_indices: tuple[int, ...] = ()
     auxiliary_outputs: AuxiliarySegmentationOutputs | None = None
-    auxiliary_camera_stats: Any | None = None
+    progress_counts: Any | None = None
 
 
-def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
+@dataclass(kw_only=True, frozen=True, slots=True)
+class _SegmentationHostWorkerReady:
+    """Payload sent after model readiness and shared-buffer allocation.
+
+    Metadata is None for disabled processors; camera statistics are None when
+    auxiliary segmentation is disabled. Fields must pickle outside process
+    startup; IPC handles belong in _SegmentationHostWorkerConfig.
+    """
+
+    semantic_metadata: dict[str, Any] | None
+    sam2_metadata: dict[str, Any] | None
+    auxiliary_camera_stats: Any | None
+
+
+def _wait_for_worker_ready(ready_receiver: Any, stop_event: Any) -> _SegmentationHostWorkerReady | None:
+    """Receive one readiness payload while allowing startup cancellation.
+
+    Args:
+        ready_receiver: Pipe endpoint carrying the payload after services are ready.
+        stop_event: Cancellation signal for failed startup.
+
+    Returns:
+        The readiness payload, or None if startup was cancelled.
+
+    Raises:
+        EOFError: If the sender closes without a readiness payload.
+    """
+    while not stop_event.is_set():
+        if ready_receiver.poll(_HOST_WORKER_CANCEL_POLL_SECONDS):
+            return ready_receiver.recv()
+    return None
+
+
+def _segmentation_host_worker_when_ready(config: _SegmentationHostWorkerConfig, ready_receiver: Any) -> None:
+    """Overlap worker imports with model startup, then process one camera.
+
+    Args:
+        config: Startup configuration whose stop event cancels metadata polling.
+        ready_receiver: One-shot pipe carrying a _SegmentationHostWorkerReady
+            payload after services are ready and transport slots are allocated.
+
+    Returns:
+        None after processing, or cancellation before metadata is received.
+
+    Raises:
+        EOFError: If the sender closes without a readiness payload.
+    """
+    try:
+        ready = _wait_for_worker_ready(ready_receiver, config.stop_event)
+    finally:
+        ready_receiver.close()
+    if ready is not None:
+        _segmentation_host_worker(config, ready)
+
+
+def _segmentation_host_worker(config: _SegmentationHostWorkerConfig, ready: _SegmentationHostWorkerReady) -> None:
     """Decode and store one camera while a separate process owns CUDA.
 
     Args:
-        config: Serializable loader, output, model, and IPC configuration.
+        config: Serializable loader, output, and IPC startup configuration.
+        ready: Model metadata and optional manager-backed camera statistics,
+            received after service readiness and shared-buffer allocation.
 
     Returns:
         None. The worker raises failures to its process boundary and always
         closes its shared-memory attachments.
     """
     worker_id = config.worker_id
+    on_frame_stored = _progress_callback(config.progress_counts, worker_id)
     loader_payload = config.loader_payload
     zarr_store_type = config.zarr_store_type
     output_path = config.output_path
     camera_id = config.camera_id
     camera_frame_range = config.camera_frame_range
-    semantic_metadata = config.semantic_metadata
+    semantic_metadata = ready.semantic_metadata
     resolution = config.resolution
     visualize = config.visualize
     slot_queue = config.slot_queue
     sam2_sample_indices = config.sam2_sample_indices
-    sam2_metadata = config.sam2_metadata
+    sam2_metadata = ready.sam2_metadata
     auxiliary_sample_indices = config.auxiliary_sample_indices
     auxiliary_outputs = config.auxiliary_outputs
-    auxiliary_camera_stats = config.auxiliary_camera_stats
+    auxiliary_camera_stats = ready.auxiliary_camera_stats
     ego_mask_aggregation_method = config.ego_mask_aggregation_method
     request_queue = config.request_queue
     result_queue = config.result_queue
@@ -877,8 +1088,12 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
     client: SharedDeviceFrameClient | None = None
     frame_processor: SharedSegmentationFrameProcessor | None = None
     static_processor_input: DeviceFrameSharedArray | None = None
+    instance_processor_input: DeviceFrameSharedArray | None = None
     writer: AuxDataWriter | None = None
     writer_finalized = False
+    instance_writer: AuxDataWriter | None = None
+    instance_resolution: list[int] | None = None
+    instance_writer_finalized = False
     try:
         backend, sequence_loader = _open_worker_sequence(loader_payload)
         base_name, shard_id, shard_count = sequence_loader_shard_info(backend, sequence_loader)
@@ -917,6 +1132,7 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
             aggregation_method=ego_mask_aggregation_method,
             visualize=visualize,
             client=client,
+            on_frame_stored=on_frame_stored,
         )
 
         camera_mask = get_camera_sensor_mask(camera_sensor, backend=backend)
@@ -935,6 +1151,20 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
             )
             processor_inputs = (static_processor_input.descriptor,)
 
+        if (
+            auxiliary_outputs is not None
+            and auxiliary_outputs.instance_camera_mask_input is not None
+            and auxiliary_outputs.instance_classes.get(camera_id)
+        ):
+            instance_mask = get_camera_sensor_mask(camera_sensor, backend=backend, resample=PILImage.Resampling.NEAREST)
+            if instance_mask is None:
+                instance_mask = generated_camera_mask
+            if instance_mask is not None:
+                instance_processor_input = DeviceFrameSharedArray.create(
+                    auxiliary_outputs.instance_camera_mask_input, np.asarray(instance_mask, dtype=np.bool_)
+                )
+                processor_inputs += (instance_processor_input.descriptor,)
+
         frame_processor = SharedSegmentationFrameProcessor(
             stuff_colors=stuff_colors,
             processor_inputs=processor_inputs,
@@ -946,6 +1176,57 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
             camera_frame_range_start=camera_frame_range.start,
         )
 
+        instance_classes = () if auxiliary_outputs is None else auxiliary_outputs.instance_classes.get(camera_id, ())
+        if instance_classes:
+            assert auxiliary_outputs is not None and auxiliary_outputs.instance_output_root is not None
+            instance_root = auxiliary_outputs.instance_output_root / "cam" / camera_id
+            for suffix in ("zarr", "zarr.itar"):
+                destination = instance_root / f"{base_name}.aux.object-iseg.{suffix}"
+                if destination.exists():
+                    raise FileExistsError(destination)
+            instance_writer = AuxDataWriter(
+                instance_root,
+                base_name,
+                sequence_loader.sequence_id,
+                shard_id,
+                shard_count,
+                zarr_store_type,
+            )
+
+        def resolve_frame(pending: Any) -> SegmentationFrameOutput:
+            """Consume transport results once and persist native instances.
+
+            Args:
+                pending: Submitted frame with its transport request and identity.
+
+            Returns:
+                Host-owned semantic output and optional visualization.
+
+            Raises:
+                RuntimeError: If transport or inference fails.
+                KeyError: If an instance refers to an unscheduled class.
+                OSError: If writing native instance arrays fails.
+            """
+            nonlocal instance_resolution
+            # Consume the host-owned arrays before the transport slot is reused.
+            resolved = client.resolve(pending.device_frame, include_input=pending.vis_path is not None)
+            if "instance_masks_packed" in resolved.outputs:
+                assert instance_writer is not None
+                masks = resolved.outputs["instance_masks_packed"]
+                scores = resolved.outputs["instance_scores"]
+                label_ids = resolved.outputs["instance_classes"]
+                indices = {label_id: index for index, (label_id, _) in enumerate(instance_classes)}
+                classes = np.array([indices[int(label)] for label in label_ids], dtype=np.int32)
+                instance_writer.store_object_instance_segmentation(
+                    camera_id,
+                    pending.device_frame.request.frame.timestamp_us,
+                    masks,
+                    scores,
+                    classes,
+                )
+                instance_resolution = list(pending.device_frame.request.slot.resolution)
+            return frame_processor.resolve(pending, resolved=resolved)
+
         _run_segmentation_camera_frames(
             writer=writer,
             camera_id=camera_id,
@@ -953,15 +1234,31 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
             semantic_metadata=metadata,
             visualize=visualize and metadata is not None,
             process_frame=frame_processor,
-            resolve_frame=frame_processor.resolve,
+            resolve_frame=resolve_frame,
+            wait_for_capacity=client.wait_for_capacity,
             max_in_flight=None,
             selected_frame_indices=frozenset(auxiliary_sample_indices) if metadata is None else None,
+            on_frame_stored=on_frame_stored,
         )
         if auxiliary_camera_stats is not None:
             camera_statistics = frame_processor.auxiliary_camera_statistics()
             if camera_statistics is not None:
                 auxiliary_camera_stats.append(dict(camera_statistics))
 
+        if instance_resolution is not None:
+            assert instance_writer is not None and auxiliary_outputs is not None
+            instance_writer.store_object_instance_meta(
+                camera_id,
+                instance_resolution,
+                auxiliary_outputs.instance_dataset_name,
+                auxiliary_outputs.instance_method,
+                auxiliary_outputs.instance_checkpoint,
+                [name for _, name in instance_classes],
+                [list(auxiliary_outputs.instance_colors[label_id]) for label_id, _ in instance_classes],
+            )
+        if instance_writer is not None:
+            instance_writer.finalize()
+            instance_writer_finalized = True
         writer.finalize()
         writer_finalized = True
     except Exception:
@@ -969,10 +1266,17 @@ def _segmentation_host_worker(config: _SegmentationHostWorkerConfig) -> None:
         error_queue.put((camera_id, traceback.format_exc()))
         raise
     finally:
+        if instance_writer is not None and not instance_writer_finalized:
+            try:
+                instance_writer.finalize()
+            except Exception:
+                logging.exception("Failed to finalize partial instance outputs for camera %s", camera_id)
         if frame_processor is not None:
             frame_processor.close()
         elif client is not None:
             client.close()
+        if instance_processor_input is not None:
+            instance_processor_input.close()
         if static_processor_input is not None:
             static_processor_input.close()
         if writer is not None and not writer_finalized:
@@ -1079,7 +1383,7 @@ def _wait_for_segmentation_services(
     return reference_ready
 
 
-def _stop_processes_if_alive(processes: Iterable[Any], *, timeout_s: float = 10.0) -> None:
+def _stop_processes_if_alive(processes: Iterable[Any], *, timeout_s: float = _PROCESS_CLEANUP_GRACE_SECONDS) -> None:
     """Stop child processes that remain alive during failure cleanup.
 
     Args:
@@ -1095,7 +1399,7 @@ def _stop_processes_if_alive(processes: Iterable[Any], *, timeout_s: float = 10.
         try:
             process.join(timeout=timeout_s)
             if process.is_alive():
-                logging.warning("Terminating unresponsive process %s", process.name)
+                logging.warning("Terminating process %s after %gs cleanup wait", process.name, timeout_s)
                 process.terminate()
                 process.join(timeout=timeout_s)
             if process.is_alive():
@@ -1106,6 +1410,20 @@ def _stop_processes_if_alive(processes: Iterable[Any], *, timeout_s: float = 10.
                 logging.error("Process %s remained alive after kill", process.name)
         except Exception:
             logging.exception("Failed to stop process %s during cleanup", process.name)
+
+
+def _close_queues_without_joining(queues: Iterable[Any]) -> None:
+    """Close owned queues without waiting for abandoned feeder writes.
+
+    Args:
+        queues: Multiprocessing queues whose consumers have been stopped.
+
+    Returns:
+        None. Buffered writes may be discarded when a consumer has failed.
+    """
+    for owned_queue in queues:
+        owned_queue.cancel_join_thread()
+        owned_queue.close()
 
 
 def _run_shared_segmentation(
@@ -1186,23 +1504,37 @@ def _run_shared_segmentation(
     ctx = multiprocessing.get_context("spawn")
     auxiliary_started = time.perf_counter()
     auxiliary_outputs: AuxiliarySegmentationOutputs | None = None
+    auxiliary_output_handler: AuxiliarySegmentationOutputHandler | None = None
     auxiliary_processor: AuxiliaryProcessorFactory | None = None
     auxiliary_manager: Any | None = None
     auxiliary_camera_stats: Any | None = None
     auxiliary_camera_stats_snapshot: tuple[Mapping[str, Any], ...] = ()
     auxiliary_sample_indices_by_worker: Mapping[int, tuple[int, ...]] = {}
+    auxiliary_selection: AuxiliaryFrameSelection | None = None
     if auxiliary_segmentation is not None:
-        auxiliary_outputs = auxiliary_segmentation.frame_outputs()
-        auxiliary_processor = auxiliary_segmentation.processor_factory()
-        auxiliary_sample_indices_by_worker = auxiliary_segmentation.select_camera_frames(
-            sequence_loader,
-            camera_items,
+        auxiliary_selection = auxiliary_segmentation.select_camera_frames(sequence_loader, camera_items)
+        store_base_name, shard_id, shard_count = sequence_loader_shard_info(backend, sequence_loader)
+        auxiliary_output_handler = auxiliary_segmentation.prepare_output(
+            AuxiliaryOutputIdentity(
+                sequence_loader.sequence_id, store_base_name, shard_id, shard_count, params.zarr_store_type
+            ),
+            auxiliary_selection,
         )
+        auxiliary_sample_indices_by_worker = auxiliary_selection.sample_indices
+        auxiliary_outputs = auxiliary_output_handler.frame_outputs
+        auxiliary_processor = auxiliary_segmentation.processor_factory()
+    progress = _FrameProgress(
+        ctx,
+        len(camera_items),
+        sum(len(indices) for indices in sam2_sample_indices_by_worker.values())
+        + (total_frame_count if mask2former_enabled else sum(map(len, auxiliary_sample_indices_by_worker.values()))),
+        "Camera frames (SAM2 + segmentation)",
+    )
     request_queue = ctx.Queue(maxsize=transport_slot_count)
     result_queues = [ctx.Queue(maxsize=transport_slot_count) for _ in camera_items]
     ready_queue = ctx.Queue(maxsize=service_count)
     error_queue = ctx.Queue()
-    stop_event = ctx.Event()
+    stop_event = DeviceFrameStopSignal.create(ctx)
     pipeline_factory = SegmentationDeviceFramePipelineFactory(
         estimate_logits=params.seg_logits,
         enable_trt=params.enable_trt,
@@ -1241,16 +1573,74 @@ def _run_shared_segmentation(
     }
     owned_slots: list[DeviceFrameSharedBuffers] = []
     worker_processes: dict[int, Any] = {}
+    worker_ready_senders: dict[int, Any] = {}
+    slot_queues_by_resolution: dict[tuple[int, int], Any] = {}
     premature_service_ids: set[int] = set()
     worker_error_failures: list[str] = []
     auxiliary_processor_metadata: dict[str, Any] | None = None
+    workers_may_have_ready_payload = False
 
     try:
+        for service_process in service_processes.values():
+            service_process.start()
+        worker_ids_by_resolution: dict[tuple[int, int], list[int]] = {}
+        for worker_id, resolution in resolutions_by_worker.items():
+            worker_ids_by_resolution.setdefault(resolution, []).append(worker_id)
+        slot_counts_by_resolution = {
+            resolution: len(worker_ids) for resolution, worker_ids in worker_ids_by_resolution.items()
+        }
+        for extra_slot_index in range(transport_slot_count - len(camera_items)):
+            resolution = resolutions_by_worker[extra_slot_index % len(camera_items)]
+            slot_counts_by_resolution[resolution] += 1
+
+        slot_queues_by_resolution = {
+            resolution: ctx.Queue(maxsize=slot_count) for resolution, slot_count in slot_counts_by_resolution.items()
+        }
+
+        for worker_id, (camera_id, camera_frame_range) in enumerate(camera_items):
+            resolution = resolutions_by_worker[worker_id]
+            sam2_sample_indices = sam2_sample_indices_by_worker[worker_id]
+            auxiliary_sample_indices = auxiliary_sample_indices_by_worker.get(worker_id, ())
+            camera_output_path = output_path / "cam" / camera_id
+            ready_receiver, ready_sender = ctx.Pipe(duplex=False)
+            worker_ready_senders[worker_id] = ready_sender
+            try:
+                worker_process = ctx.Process(
+                    name=f"segmentation-host-{camera_id}",
+                    target=_segmentation_host_worker_when_ready,
+                    args=(
+                        _SegmentationHostWorkerConfig(
+                            worker_id=worker_id,
+                            loader_payload=opened_sequence.worker_payload,
+                            zarr_store_type=params.zarr_store_type,
+                            output_path=camera_output_path,
+                            camera_id=camera_id,
+                            camera_frame_range=camera_frame_range,
+                            resolution=resolution,
+                            visualize=params.visualize,
+                            slot_queue=slot_queues_by_resolution[resolution],
+                            sam2_sample_indices=sam2_sample_indices,
+                            auxiliary_sample_indices=auxiliary_sample_indices,
+                            auxiliary_outputs=auxiliary_outputs,
+                            ego_mask_aggregation_method=params.ego_mask_aggregation_method,
+                            request_queue=request_queue,
+                            result_queue=result_queues[worker_id],
+                            error_queue=error_queue,
+                            stop_event=stop_event,
+                            progress_counts=progress.counts,
+                        ),
+                        ready_receiver,
+                    ),
+                )
+                worker_process.start()
+            finally:
+                ready_receiver.close()
+            worker_processes[worker_id] = worker_process
+
+        # Manager startup imports the entrypoint too; overlap it with model initialization.
         if auxiliary_outputs is not None:
             auxiliary_manager = ctx.Manager()
             auxiliary_camera_stats = auxiliary_manager.list()
-        for service_process in service_processes.values():
-            service_process.start()
 
         reference_ready = _wait_for_segmentation_services(
             service_processes,
@@ -1270,20 +1660,8 @@ def _run_shared_segmentation(
         if auxiliary_outputs is not None:
             auxiliary_processor_metadata = reference_ready.processor_metadata[auxiliary_outputs.processor_name].storage
         num_classes = len(semantic_metadata["stuff_classes"]) if semantic_metadata is not None else 0
-        worker_ids_by_resolution: dict[tuple[int, int], list[int]] = {}
-        for worker_id, resolution in resolutions_by_worker.items():
-            worker_ids_by_resolution.setdefault(resolution, []).append(worker_id)
-        slot_counts_by_resolution = {
-            resolution: len(worker_ids) for resolution, worker_ids in worker_ids_by_resolution.items()
-        }
-        for extra_slot_index in range(transport_slot_count - len(camera_items)):
-            resolution = resolutions_by_worker[extra_slot_index % len(camera_items)]
-            slot_counts_by_resolution[resolution] += 1
-
-        slot_queues_by_resolution: dict[tuple[int, int], Any] = {}
         for resolution, slot_count in slot_counts_by_resolution.items():
-            slot_queue = ctx.Queue(maxsize=slot_count)
-            slot_queues_by_resolution[resolution] = slot_queue
+            slot_queue = slot_queues_by_resolution[resolution]
             for _ in range(slot_count):
                 output_specs = pipeline_factory.output_specs(
                     resolution,
@@ -1293,45 +1671,20 @@ def _run_shared_segmentation(
                 owned_slots.append(owned_slot)
                 slot_queue.put(owned_slot.slot)
 
-        for worker_id, (camera_id, camera_frame_range) in enumerate(camera_items):
-            resolution = resolutions_by_worker[worker_id]
-            sam2_sample_indices = sam2_sample_indices_by_worker[worker_id]
-            auxiliary_sample_indices = auxiliary_sample_indices_by_worker.get(worker_id, ())
-            camera_output_path = output_path / "cam" / camera_id
-            worker_process = ctx.Process(
-                name=f"segmentation-host-{camera_id}",
-                target=_segmentation_host_worker,
-                args=(
-                    _SegmentationHostWorkerConfig(
-                        worker_id=worker_id,
-                        loader_payload=opened_sequence.worker_payload,
-                        zarr_store_type=params.zarr_store_type,
-                        output_path=camera_output_path,
-                        camera_id=camera_id,
-                        camera_frame_range=camera_frame_range,
-                        semantic_metadata=semantic_metadata,
-                        resolution=resolution,
-                        visualize=params.visualize,
-                        slot_queue=slot_queues_by_resolution[resolution],
-                        sam2_sample_indices=sam2_sample_indices,
-                        sam2_metadata=sam2_metadata,
-                        auxiliary_sample_indices=auxiliary_sample_indices,
-                        auxiliary_outputs=auxiliary_outputs,
-                        auxiliary_camera_stats=auxiliary_camera_stats,
-                        ego_mask_aggregation_method=params.ego_mask_aggregation_method,
-                        request_queue=request_queue,
-                        result_queue=result_queues[worker_id],
-                        error_queue=error_queue,
-                        stop_event=stop_event,
-                    ),
-                ),
-            )
-            worker_process.start()
-            worker_processes[worker_id] = worker_process
+        worker_ready = _SegmentationHostWorkerReady(
+            semantic_metadata=semantic_metadata,
+            sam2_metadata=sam2_metadata,
+            auxiliary_camera_stats=auxiliary_camera_stats,
+        )
+        # A failed send may already have delivered metadata to a worker.
+        workers_may_have_ready_payload = True
+        for ready_sender in worker_ready_senders.values():
+            ready_sender.send(worker_ready)
 
         while any(worker_process.is_alive() for worker_process in worker_processes.values()):
             for worker_process in worker_processes.values():
                 worker_process.join(timeout=0.05)
+            progress.update()
             if any(worker_process.exitcode not in (None, 0) for worker_process in worker_processes.values()):
                 stop_event.set()
             for service_id, service_process in service_processes.items():
@@ -1356,8 +1709,8 @@ def _run_shared_segmentation(
 
         for worker_process in worker_processes.values():
             worker_process.join()
-        for service_process in service_processes.values():
-            service_process.join()
+        # A CUDA wait (including teardown) may never return after failure.
+        _stop_processes_if_alive(service_processes.values())
 
         failures = [
             f"{worker_process.name} exited with code {worker_process.exitcode}"
@@ -1390,16 +1743,28 @@ def _run_shared_segmentation(
                 request_queue.put_nowait(None)
             except queue.Full:
                 break
-        _stop_processes_if_alive(worker_processes.values())
+        _stop_processes_if_alive(
+            worker_processes.values(),
+            timeout_s=(
+                _PROCESS_CLEANUP_GRACE_SECONDS
+                if workers_may_have_ready_payload
+                else _HOST_WORKER_UNRELEASED_STOP_WAIT_SECONDS
+            ),
+        )
+        for ready_sender in worker_ready_senders.values():
+            ready_sender.close()
         _stop_processes_if_alive(service_processes.values())
+        _close_queues_without_joining(slot_queues_by_resolution.values())
         for owned_slot in owned_slots:
             owned_slot.close()
         if auxiliary_manager is not None:
             auxiliary_manager.shutdown()
+        progress.close()
+        stop_event.close()
 
     if auxiliary_segmentation is not None:
-        assert auxiliary_processor_metadata is not None
-        auxiliary_segmentation.finalize(
+        assert auxiliary_processor_metadata is not None and auxiliary_output_handler is not None
+        auxiliary_output_handler.finalize(
             camera_ids=tuple(camera_id for camera_id, _ in camera_items),
             camera_statistics=auxiliary_camera_stats_snapshot,
             processor_metadata=auxiliary_processor_metadata,
@@ -1428,8 +1793,29 @@ def lidar_segmentation_worker(
     output_path: Path,
     frame_timestamps_us: list[int],
     visualize: bool,
+    progress_counts: Any | None = None,
+    worker_id: int = 0,
 ):
-    """Worker: Lidar Segmentation."""
+    """Generate and finalize one LiDAR chunk on its assigned GPU.
+
+    Args:
+        device_id: Logical CUDA device for inference.
+        gpu_sem: Semaphore limiting concurrent workers on that device.
+        lidar_id: LiDAR sensor identifier.
+        camera_ids: Cameras used for projection and visibility.
+        loader_payload: Serializable source-sequence reopening information.
+        zarr_store_type: Output archive format.
+        lidar_seg_ensemble_cuda: Whether to use CUDA label ensembling.
+        cam_seg_fp: Camera semantic-segmentation archive path.
+        output_path: Destination directory for this chunk.
+        frame_timestamps_us: Ordered frame timestamps, in microseconds.
+        visualize: Whether to store visualizations.
+        progress_counts: Optional shared, single-writer counters.
+        worker_id: Index of the counter owned by this worker.
+
+    Returns:
+        None. The output writer is finalized before returning.
+    """
     from apps.av.aux_gen.estimators import LidarSegmentationByProjectEstimator
 
     with gpu_sem:
@@ -1474,6 +1860,7 @@ def lidar_segmentation_worker(
             lidar_id,
             frame_timestamps_us,
             visualize,
+            on_frame_stored=_progress_callback(progress_counts, worker_id),
         )
 
         del estimator
@@ -1509,36 +1896,45 @@ def run_lidar_segmentation_parallel(
         return [list(chunk) for chunk in np.array_split(lst, n)]
 
     frame_timestamp_chunks = split_chunks(frame_timestamps_us, num_threads)
+    progress = _FrameProgress(ctx, len(frame_timestamp_chunks), len(frame_timestamps_us), "LiDAR frames")
 
-    for idx, ts_list in enumerate(frame_timestamp_chunks):
-        device_id = idx % num_gpus
+    try:
+        for idx, ts_list in enumerate(frame_timestamp_chunks):
+            device_id = idx % num_gpus
 
-        logging.info(f"Assign chunk {idx} -> GPU {device_id}")
-        lidar_output_path = output_path / "lidar_seg" / f"chunk_{idx}"
-        output_path_list.append(lidar_output_path)
-        p = ctx.Process(
-            target=lidar_segmentation_worker,
-            args=(
-                device_id,
-                gpu_sems[device_id],
-                lidar_id,
-                camera_ids,
-                opened_sequence.worker_payload,
-                params.zarr_store_type,
-                params.lidar_seg_ensemble_cuda,
-                cam_seg_fp,
-                lidar_output_path,
-                ts_list,
-                params.visualize,
-            ),
-        )
-        p.start()
-        procs.append(p)
+            logging.info(f"Assign chunk {idx} -> GPU {device_id}")
+            lidar_output_path = output_path / "lidar_seg" / f"chunk_{idx}"
+            output_path_list.append(lidar_output_path)
+            p = ctx.Process(
+                target=lidar_segmentation_worker,
+                args=(
+                    device_id,
+                    gpu_sems[device_id],
+                    lidar_id,
+                    camera_ids,
+                    opened_sequence.worker_payload,
+                    params.zarr_store_type,
+                    params.lidar_seg_ensemble_cuda,
+                    cam_seg_fp,
+                    lidar_output_path,
+                    ts_list,
+                    params.visualize,
+                    progress.counts,
+                    idx,
+                ),
+            )
+            p.start()
+            procs.append(p)
 
-    for p in procs:
-        p.join()
-        if p.exitcode != 0:
-            raise RuntimeError(f"Worker process failed with exit code {p.exitcode}")
+        for p in procs:
+            while p.is_alive():
+                p.join(timeout=0.25)
+                progress.update()
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"Worker process failed with exit code {p.exitcode}")
+    finally:
+        progress.close()
 
     final_output_fp = merge_zarr_itar(
         root_dir=Path(output_path / "lidar_seg"),
@@ -1637,7 +2033,6 @@ class AsyncShardWriter:
         with self._space:
             pending = self._pending_bytes
         if pending:
-            # tqdm counts submissions, so the bar is already at 100% here.
             self._logger.info("Draining %.1f MB of pending shard writes", pending / 1e6)
         self._queue.put(None)
         self._thread.join()
@@ -1802,7 +2197,9 @@ def run_dinov2_feature_precomputation(
 
                 dinov2_feats_list: list[np.ndarray] = []
 
-                for _, frame_image_handle in tqdm.tqdm(timestamped_image_frame_handles_subset):
+                for _, frame_image_handle in tqdm.tqdm(
+                    timestamped_image_frame_handles_subset, disable=_progress_disabled()
+                ):
                     encoded_img_data = frame_image_handle.get_data()
                     img = encoded_img_data.get_decoded_image()
 
@@ -1854,7 +2251,9 @@ def run_dinov2_feature_extraction(
     # Ego mask is used to determine if DINOv2 feature is valid for reconstruction.
     camera_mask: Optional[np.ndarray] = get_camera_sensor_mask(camera_sensor, backend=backend)
 
-    for frame_timestamp_us, frame_image_handle in tqdm.tqdm(timestamped_image_frame_handles):
+    for frame_timestamp_us, frame_image_handle in tqdm.tqdm(
+        timestamped_image_frame_handles, disable=_progress_disabled()
+    ):
         encoded_img_data = frame_image_handle.get_data()
         img = encoded_img_data.get_decoded_image()
         dinov2_feats, dino_ego_mask = dinov2_estimator.predict(img, ego_mask=camera_mask)
@@ -1894,7 +2293,9 @@ def run_depth_estimation(
 
         cmap = matplotlib.colormaps.get_cmap("Spectral_r")  # type: ignore
 
-    for frame_idx, (frame_timestamp_us, frame_image_handle) in enumerate(tqdm.tqdm(timestamped_image_frame_handles)):
+    for frame_idx, (frame_timestamp_us, frame_image_handle) in enumerate(
+        tqdm.tqdm(timestamped_image_frame_handles, disable=_progress_disabled())
+    ):
         image = np.asarray(frame_image_handle.get_data().get_decoded_image())
         depth = depth_estimator.predict(image).squeeze(axis=0)
 
@@ -1933,7 +2334,23 @@ def run_lidar_segmentation(
     lidar_id: str,
     frame_timestamps_us: list[int],
     visualize: bool = False,
+    *,
+    on_frame_stored: Callable[[], None] | None = None,
 ) -> None:
+    """Store semantic labels and camera visibility for LiDAR frames.
+
+    Args:
+        estimator: Predictor for labels and camera visibility.
+        loader: Source sequence loader.
+        writer: Destination auxiliary-data writer.
+        lidar_id: LiDAR sensor identifier.
+        frame_timestamps_us: Ordered frame timestamps, in microseconds.
+        visualize: Whether to save per-frame visualizations.
+        on_frame_stored: Optional callback after both frame outputs are stored.
+
+    Returns:
+        None. Storage or inference failures propagate to the caller.
+    """
     logger = logging.getLogger(__name__)
 
     lidar_sensor = loader.get_lidar_sensor(lidar_id)
@@ -1957,16 +2374,19 @@ def run_lidar_segmentation(
             "Start lidar segmentation. If you find the speed is too slow (< 1it/s), please switch to cuda version, lower "
             " the number of numba threads (using CLI --num-threads), or stop other tasks with high CPU usage."
         )
-    for frame_timestamp_us in tqdm.tqdm(frame_timestamps_us):
-        lidar_seg, visibility_mask = estimator.predict(
-            lidar_sensor=lidar_sensor,
-            frame_timestamp_us=frame_timestamp_us,
-            vis_path=vis_path,
-        )
-        # writing results to shard
-        logger.debug(f"Storing semantic {(lidar_id, frame_timestamp_us, lidar_seg)}")
-        writer.store_lidar_semantic_segmentation(lidar_id, frame_timestamp_us, lidar_seg, "png")
-        writer.store_lidar_camera_visibility(lidar_id, frame_timestamp_us, visibility_mask)
+    with _frame_progress(len(frame_timestamps_us), "LiDAR frames", on_frame_stored) as on_frame_stored:
+        for frame_timestamp_us in frame_timestamps_us:
+            lidar_seg, visibility_mask = estimator.predict(
+                lidar_sensor=lidar_sensor,
+                frame_timestamp_us=frame_timestamp_us,
+                vis_path=vis_path,
+            )
+            # writing results to shard
+            logger.debug(f"Storing semantic {(lidar_id, frame_timestamp_us, lidar_seg)}")
+            writer.store_lidar_semantic_segmentation(lidar_id, frame_timestamp_us, lidar_seg, "png")
+            writer.store_lidar_camera_visibility(lidar_id, frame_timestamp_us, visibility_mask)
+            if on_frame_stored is not None:
+                on_frame_stored()
 
 
 def visualize_egomask_overlay(
@@ -2023,6 +2443,12 @@ def _with_cli_options(command: Callable[..., Any]) -> Callable[..., Any]:
         click.option("--masks-component-group", type=str, help="V4 component group for 'masks'", default="default"),
         click.option("--cuboids-component-group", type=str, help="V4 component group for 'cuboids'", default="default"),
         click.option("--output-dir", type=str, help="Path to the output folder", required=True),
+        click.option(
+            "--timestamp-range-us",
+            type=(int, int),
+            default=None,
+            help="Restrict all sensors to inclusive absolute START END timestamps in microseconds before sampling.",
+        ),
         click.option(
             "--camera-id",
             "camera_ids",
@@ -2164,7 +2590,6 @@ def _run_cli(
     ctx: click.Context,
     configure_depth_generation: DepthGenerationConfigurator | None,
     configure_auxiliary_segmentation: AuxiliarySegmentationConfigurator | None,
-    configure_instance_generation: InstanceGenerationConfigurator | None,
     **kwargs: Any,
 ) -> None:
     """Process inferred auxiliary-data signals for NCore shards.
@@ -2174,7 +2599,6 @@ def _run_cli(
         configure_depth_generation: Optional internal depth-option consumer.
         configure_auxiliary_segmentation: Optional internal consumer of
             auxiliary segmentation options.
-        configure_instance_generation: Optional internal consumer of instance-generation options.
         **kwargs: Parsed top-level command options.
 
     Returns:
@@ -2202,6 +2626,9 @@ def _run_cli(
         raise click.UsageError("--workers-per-gpu requires --parallel-mode")
     if kwargs["execution_mode"] == "parallel" and kwargs["zarr_store_type"] != "itar":
         raise click.UsageError("--parallel-mode requires --zarr-store-type=itar")
+    bounds = kwargs["timestamp_range_us"]
+    if bounds is not None and bounds[0] > bounds[1]:
+        raise click.BadParameter("START must not exceed END", param_hint="--timestamp-range-us")
     kwargs.setdefault("explicit_path_pattern", None)
     # Preserve extension-owned options after the configurators consume them.
     unconfigured_kwargs = kwargs.copy()
@@ -2215,7 +2642,6 @@ def _run_cli(
         and auxiliary_segmentation is None
     ):
         raise click.UsageError("--parallel-mode requires --segmentation-backend=mask2former or auxiliary segmentation")
-    instance_generation = None if configure_instance_generation is None else configure_instance_generation(kwargs)
     extension_cli_params = {name: value for name, value in unconfigured_kwargs.items() if name not in kwargs}
     params = CLIBaseParams(**kwargs)
 
@@ -2229,7 +2655,6 @@ def _run_cli(
         depth_generation=depth_generation,
         auxiliary_segmentation=auxiliary_segmentation,
         extension_cli_params=extension_cli_params,
-        instance_generation=instance_generation,
     )
     ctx.obj = state
 
@@ -2257,7 +2682,6 @@ def _run_cli(
                 state.depth_generation,
                 state.extension_cli_params,
                 state.auxiliary_segmentation,
-                state.instance_generation,
             )
         finally:
             ScopedTimer.print_summary()
@@ -2307,7 +2731,6 @@ def _run_offset(
         state.depth_generation,
         state.extension_cli_params,
         state.auxiliary_segmentation,
-        state.instance_generation,
     )
     ScopedTimer.print_summary()
 
@@ -2379,7 +2802,6 @@ def _run_sensor_frames(
         state.depth_generation,
         state.extension_cli_params,
         state.auxiliary_segmentation,
-        state.instance_generation,
     )
     ScopedTimer.print_summary()
 
@@ -2387,7 +2809,6 @@ def _run_sensor_frames(
 def build_ncore_aux_data_cli(
     configure_depth_generation: DepthGenerationConfigurator | None = None,
     configure_auxiliary_segmentation: AuxiliarySegmentationConfigurator | None = None,
-    configure_instance_generation: InstanceGenerationConfigurator | None = None,
 ) -> click.Group:
     """Build an independent aux-data CLI with optional extension configuration.
 
@@ -2402,8 +2823,6 @@ def build_ncore_aux_data_cli(
             remove its extension-owned keys, including disabled options, before
             the remaining values are passed to ``CLIBaseParams``. Consumed
             values are retained separately as invocation metadata.
-        configure_instance_generation: Optional instance-generation configurator,
-            following the same option-consumption contract.
 
     Returns:
         An independent Click group with the public options and range
@@ -2417,9 +2836,7 @@ def build_ncore_aux_data_cli(
     @click.pass_context
     def command(ctx: click.Context, **kwargs: Any) -> None:
         """Process inferred auxiliary-data signals for NCore shards."""
-        _run_cli(
-            ctx, configure_depth_generation, configure_auxiliary_segmentation, configure_instance_generation, **kwargs
-        )
+        _run_cli(ctx, configure_depth_generation, configure_auxiliary_segmentation, **kwargs)
 
     @command.command(name="offset")
     @click.option(
@@ -2486,7 +2903,6 @@ def ncore_aux_data(
     depth_generation: DepthGenerationRequest | None,
     extension_cli_params: dict[str, Any],
     auxiliary_segmentation: AuxiliarySegmentationRequest | None = None,
-    instance_generation: InstanceGenerationRequest | None = None,
 ) -> None:
     """Generate requested auxiliary data for every selected sequence.
 
@@ -2500,7 +2916,6 @@ def ncore_aux_data(
             entrypoint and retained for invocation metadata.
         auxiliary_segmentation: Optional model-agnostic auxiliary segmentation
             request run beside shared Mask2Former segmentation.
-        instance_generation: Optional instance-mask pass run before the other models.
 
     Returns:
         None.
@@ -2518,8 +2933,6 @@ def ncore_aux_data(
     num_threads_str = str(num_threads)
     logging.info(f"Setting number of threads to {num_threads_str}")
     _preflight_auxiliary_segmentation(params, auxiliary_segmentation)
-    if instance_generation is not None:
-        instance_generation.preflight()
 
     ## Initialize the sequence data loaders
     opened_sequences: list[OpenedSequence] = []
@@ -2567,7 +2980,7 @@ def ncore_aux_data(
             )
         ]
 
-    if auxiliary_segmentation is not None and len(opened_sequences) != 1:
+    if auxiliary_segmentation is not None and params.dataset_path is not None and len(opened_sequences) != 1:
         raise ValueError("Auxiliary segmentation requires exactly one NCore sequence")
 
     # Set up output path
@@ -2587,7 +3000,9 @@ def ncore_aux_data(
     for opened_sequence in opened_sequences:
         backend = opened_sequence.backend
         sequence_loader = opened_sequence.loader
-        sensor_ranges = range_callback(sequence_loader)
+        sensor_ranges = range_callback(sequence_loader).restrict_to_timestamps(
+            sequence_loader, params.timestamp_range_us
+        )
 
         base_name, shard_id, shard_count = sequence_loader_shard_info(backend, sequence_loader)
 
@@ -2604,10 +3019,6 @@ def ncore_aux_data(
         logging.info(
             f"Processing aux data for sequence {sequence_loader.sequence_id} ({sequence_loader.sequence_paths}) on cameras {sensor_ranges.camera_frame_ranges.keys()}"
         )
-
-        if instance_generation is not None:
-            with ScopedTimer("aux_gen/instance_segmentation", tag=TimingTag.DEFAULT):
-                instance_generation.generate(sequence_loader, backend, writer, sensor_ranges.camera_frame_ranges)
 
         # If PCA is needed for DINOv2 feature extraction, pre-compute the transformation with **all cameras** jointly.
         #   TODO [JH]: In the future, we might want to perform PCA on all shards provided.

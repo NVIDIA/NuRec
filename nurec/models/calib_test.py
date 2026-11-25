@@ -122,7 +122,7 @@ def test_v2_free_pose_calib(small_clipgt_dataset: tuple[NCORETrainDataset, NuRec
     # Create a DataBatch from the dataset.
     camera_id = "camera_front_wide_120fov"
     camera_frame_idx = 2
-    sampled_pixels = RectSubsampled(
+    sampled_pixels = RectSubsampled.from_subsample(
         width=240, height=135, subsample_factor=2.0, original_width=480, original_height=270
     )
     camera_data_batch: DataBatch.Camera = train_dataset.get_camera_data_batch(
@@ -176,7 +176,7 @@ def test_active_tile_prewarm_plan_matches_label_loaded_free_pose_calibration(
     camera_id = "camera_front_wide_120fov"
     lidar_id = "lidar_gt_top_p128"
 
-    sampled_pixels = RectSubsampled(
+    sampled_pixels = RectSubsampled.from_subsample(
         width=240,
         height=135,
         subsample_factor=2.0,
@@ -405,7 +405,7 @@ def test_rig_calib_forward_skip_gradients_and_checkpoint(
     camera_data_batch = train_dataset.get_camera_data_batch(
         sensor_id="camera_front_wide_120fov",
         sensor_frame_idx=2,
-        sampled_pixels=RectSubsampled(
+        sampled_pixels=RectSubsampled.from_subsample(
             width=200,
             height=100,
             subsample_factor=2.0,

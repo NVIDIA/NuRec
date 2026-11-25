@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import queue
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from typing import Any, Callable, List, Literal, Optional, Self, Sequence, Tuple, TypeAlias, TypeVar, Union, cast
 
-import cv2
 import numpy as np
 import numpy.typing as npt
-import PIL.Image as PILImage
 import torch
 import torch.nn.functional as F
 
@@ -36,7 +34,8 @@ from ncore.sensors import (
 from nurec.libs.geometry.kernels.pose import se3pose_from_matrix
 from nurec.libs.sensors.kernels.cameras import ShutterType, image_points_to_world_rays_shutter_pose
 from nurec.libs.sensors.kernels.lidars import generate_spinning_lidar_rays
-from nurec.utils.geometry import tquat_to_se3_matrix
+from nurec.utils.geometry import interpolate_se3_poses, se3_matrix_inverse, tquat_to_se3_matrix
+from nurec.utils.image_resolution import ImageResolutionTransform
 from nurec.utils.misc import assert_same_type, collate_fn, to_torch, unpack_optional
 from nurec.utils.prober import get_global_prober
 from nurec.utils.profiling import ScopedTimer
@@ -73,36 +72,30 @@ ConcreteSensorModelParametersUnion: TypeAlias = ConcreteCameraModelParametersUni
 
 @dataclass(kw_only=True, slots=True)
 class RectSubsampled(RectSubsampledSensor):
-    """
-    Subsampled rectangular pixel region with offset i/j and dimension height/width.
+    """A resolved sensor rectangle with image and camera application helpers."""
 
-    Note that the offset i/j and dimension height/width are relative to the scaled pixel domain. I.e., subsampling is applied first, then cropping.
-
-    The fields are:
-    - original_width: The original width of the sensor. [int]
-    - original_height: The original height of the sensor. [int]
-    - width: The width of the pixel region. [int]
-    - height: The height of the pixel region. [int]
-    - i: Optional. The offset in the x-direction. Default is 0. [int]
-    - j: Optional. The offset in the y-direction. Default is 0. [int]
-    - subsample_factor: Optional. The amount of isotropic subsampling. The larger the value is, the smaller the sampled region will be. 1 means no subsampling. Default is 1. [float]
-    """
+    @classmethod
+    def from_image_resolution_transform(
+        cls,
+        image_transform: ImageResolutionTransform,
+        *,
+        output_resolution: tuple[int, int] | None = None,
+        image_domain_offset: tuple[int, int] | None = None,
+    ) -> Self:
+        """Retain resolved geometry, optionally selecting a crop within it."""
+        return cls(
+            image_transform=replace(
+                image_transform,
+                output_resolution=output_resolution or image_transform.output_resolution,
+                image_domain_offset=image_domain_offset or image_transform.image_domain_offset,
+            )
+        )
 
     def to_json(self) -> dict:
-        return {
-            "original_width": self.original_width,
-            "original_height": self.original_height,
-            "width": self.width,
-            "height": self.height,
-            "i": self.i,
-            "j": self.j,
-            "subsample_factor": self.subsample_factor,
-        }
+        return asdict(self.image_transform)
 
     def __hash__(self) -> int:
-        return hash(
-            (self.original_width, self.original_height, self.width, self.height, self.i, self.j, self.subsample_factor)
-        )
+        return hash(self.image_transform)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, RectSubsampled):
@@ -133,35 +126,18 @@ class RectSubsampled(RectSubsampledSensor):
 
         This is the resolution that matches the coordinates from `pixel_coordinates`.
         """
-        w = round(self.original_width / self.subsample_factor)
-        h = round(self.original_height / self.subsample_factor)
-        return (w, h)
+        return self.image_transform.resized_pre_crop_resolution
 
     def crop_array(self, arr: np.ndarray) -> np.ndarray:
         """Crop an array to the pixel region.
 
         Args:
-            arr: The sensor array to crop. Should be a 3D array with shape (H-scaled, W-scaled, C) that is already subsampled.
+            arr: The sensor array to crop. Should be a 3D array whose shape matches resized_pre_crop_resolution.
 
         Returns:
             The cropped sensor array.
         """
-        assert arr.ndim == 3, f"Array must be 3D shape, but got {arr.ndim}D of shape {arr.shape}"
-        height, width, _ = arr.shape
-        assert height * self.subsample_factor == self.original_height, (
-            f"Unscaled height ({height}) does not match the original height ({self.original_height})"
-        )
-        assert width * self.subsample_factor == self.original_width, (
-            f"Unscaled width ({width}) does not match the original width ({self.original_width})"
-        )
-
-        # crop
-        box = (self.i, self.j, self.i + self.width, self.j + self.height)  # (left, top, right, bottom)
-        if width < box[2]:
-            raise ValueError(f"Image width {width} is smaller than the width of the pixel region {box[2]}")
-        if height < box[3]:
-            raise ValueError(f"Image height {height} is smaller than the height of the pixel region {box[3]}")
-        return arr[box[1] : box[3], box[0] : box[2], :]
+        return self.image_transform.crop_array(arr)
 
     def apply_to_array(self, arr: np.ndarray, interpolation: int | None, use_pil_lanczos: bool = False) -> np.ndarray:
         """Apply the subsampling (resizing and cropping) to a sensor array.
@@ -175,32 +151,11 @@ class RectSubsampled(RectSubsampledSensor):
         Returns:
             The subsampled sensor array.
         """
-        assert arr.ndim == 3, f"Array must be 3D shape, but got {arr.ndim}D of shape {arr.shape}"
-        height, width, dim = arr.shape
-        assert height == self.original_height, (
-            f"Image height ({height}) does not match the original height ({self.original_height})"
+        return self.image_transform.apply_to_array(
+            arr,
+            interpolation,
+            use_pil_lanczos=use_pil_lanczos,
         )
-        assert width == self.original_width, (
-            f"Image width ({width}) does not match the original width ({self.original_width})"
-        )
-
-        # resize
-        if self.subsample_factor != 1.0:
-            height = round(height / self.subsample_factor)
-            width = round(width / self.subsample_factor)
-            if use_pil_lanczos:
-                pil_image = PILImage.fromarray(arr)
-                pil_image = pil_image.resize((width, height), PILImage.Resampling.LANCZOS)
-                arr = np.asarray(pil_image)
-            else:
-                assert interpolation is not None, "interpolation is required when use_pil_lanczos is False"
-                arr = cv2.resize(arr, (width, height), interpolation=interpolation)
-            # In the case of arr is (height, width, 1), cv2.resize will return (height, width),
-            # so we need to reshape it back to (height, width, 1)
-            arr = arr.reshape(height, width, dim)
-
-        # crop
-        return self.crop_array(arr)
 
     def apply_to_camera_model(self, sensor_model: CameraModel) -> CameraModel:
         """Apply the subsampling to the camera sensor model.
@@ -237,13 +192,22 @@ class RectSubsampled(RectSubsampledSensor):
         else:
             raise Exception(f"Unsupported camera model type: {ncore_camera_model_parameter_type}")
 
-        transformed_parameters = ncore_camera_model_parameters.transform(
-            image_domain_scale=1.0 / self.subsample_factor,
-            image_domain_offset=(self.i, self.j),
-            new_resolution=(self.width, self.height),
-        )
+        transformed_parameters = self.image_transform.apply_to_camera_parameters(ncore_camera_model_parameters)
 
         return camera_model_from_parameters(transformed_parameters, device=sensor_model.device, dtype=torch.float32)
+
+
+def _pixel_ray_angle(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # For normalized rays, the chord lengths give tan(angle / 2). Unlike acos(dot),
+    # this retains small angles when the float32 dot product would round to one.
+    difference = torch.linalg.vector_norm(a - b, dim=-1)
+    total = torch.linalg.vector_norm(a + b, dim=-1)
+    # Preserve the former pi/2 result for two zero rays and avoid atan2(0, 0)
+    # in backward. One zero ray already has equal, nonzero chord lengths.
+    both_zero = (difference == 0) & (total == 0)
+    difference = torch.where(both_zero, 1.0, difference)
+    total = torch.where(both_zero, 1.0, total)
+    return 2 * torch.atan2(difference, total)
 
 
 @torch.autocast(device_type="cuda", enabled=False)
@@ -252,7 +216,7 @@ def compute_pixel_footprint(camera_rays: torch.Tensor | np.ndarray, pixel_offset
     Since the computation is usually precision sensitive, we disable autocast to avoid mis-using 16-bit precision.
     Input:
         camera_rays - normalized rays in the camera coordinate system [h,w,3] (torch.Tensor | np.ndarray)
-        pixel_offset - offset used to compute the solid angle. When the fov is small and the image resolution is high, small pixel offset can lead to problems with numerical precision
+        pixel_offset - offset used to compute the angle between neighboring rays
         mode - pixel footprint definition (cone - diameter of a cone carved by the pixel, plane_intersect - diameter of the intersection of the pixel cone with the plane parallel to the image )
     """
 
@@ -272,33 +236,18 @@ def compute_pixel_footprint(camera_rays: torch.Tensor | np.ndarray, pixel_offset
 
     if mode == "cone":
         # Bottom right corner
-        dot_product = torch.einsum(
-            "ijk, ijk -> ij", camera_rays[pixel_offset:, pixel_offset:], camera_rays[:-pixel_offset, :-pixel_offset]
-        )
-        # Clamp between [-1, 1] to avoid NaN in arccos.
-        # These are due to numerical precision issues in F.normalize and torch.einsum
-        dot_product = torch.clamp(dot_product, -1.0, 1.0)
-        solid_angle_bottom_right = torch.arccos(
-            F.pad(
-                dot_product.unsqueeze(0),
-                (0, pixel_offset, 0, pixel_offset),
-                mode="replicate",
-            ).squeeze(0)
-        )
+        angle = _pixel_ray_angle(camera_rays[pixel_offset:, pixel_offset:], camera_rays[:-pixel_offset, :-pixel_offset])
+        solid_angle_bottom_right = F.pad(
+            angle.unsqueeze(0), (0, pixel_offset, 0, pixel_offset), mode="replicate"
+        ).squeeze(0)
 
         # Top right corner
-        dot_product = torch.einsum(
-            "ijk, ijk -> ij",
+        angle = _pixel_ray_angle(
             camera_rays[pixel_offset:, :-pixel_offset],
             camera_rays[:-pixel_offset, pixel_offset:],
         )
-        dot_product = torch.clamp(dot_product, -1.0, 1.0)
-        solid_angle_top_right = torch.arccos(
-            F.pad(
-                dot_product.unsqueeze(0),
-                (0, pixel_offset, pixel_offset, 0),
-                mode="replicate",
-            ).squeeze(0)
+        solid_angle_top_right = F.pad(angle.unsqueeze(0), (0, pixel_offset, pixel_offset, 0), mode="replicate").squeeze(
+            0
         )
 
         solid_angle = torch.mean(
@@ -483,7 +432,7 @@ class RenderingData:
     sensor_model_parameters: list[ConcreteSensorModelParametersUnion | None]
     poses_tquat_startend: torch.Tensor  # (B, 2, 7)
     timestamps_startend_us: torch.Tensor  # (B, 2) - kept on GPU for GPU operations
-    rays_timestamps_us: torch.Tensor | None = None  # (B, height, width, 1)
+    rays_timestamps_us: torch.Tensor | None = None  # (B, height, width, 1), possibly broadcast
     # Producer guarantee for the row-major image grid; None means unknown/random.
     # Arbitrary spatial reordering must clear this metadata. Batch slicing is safe.
     rays_timestamp_layout: Literal["rows", "columns", "global"] | None = None
@@ -1879,7 +1828,9 @@ class CameraFreePoseViewGeometry(torch.nn.Module):
                 # it to be aligned with the old batch format.
                 footprints = compute_pixel_footprint(sensor_rays)[..., None]  # (height, width, 1)
                 sensor_model_parameters = sensor_model.get_parameters()
-                sensorlib_parameters = CameraModelConverter.convert(sensor_model, device=T_sensor_world_startend.device)
+                sensorlib_parameters = CameraModelConverter.convert(
+                    sensor_model, device=T_sensor_world_startend.device, host_parameters=sensor_model_parameters
+                )
             else:
                 subsample = meta.subsample
                 unique_sensor_idx = meta.unique_sensor_idx if meta.unique_sensor_idx >= 0 else 0
@@ -1900,7 +1851,7 @@ class CameraFreePoseViewGeometry(torch.nn.Module):
                     footprints = compute_pixel_footprint(sensor_rays)[..., None]  # (height, width, 1)
                     sensor_model_parameters = sensor_model.get_parameters()
                     sensorlib_parameters = CameraModelConverter.convert(
-                        sensor_model, device=T_sensor_world_startend.device
+                        sensor_model, device=T_sensor_world_startend.device, host_parameters=sensor_model_parameters
                     )
                     self.cached_sensor_params[str(unique_sensor_idx)] = {
                         "rect_subsampled": subsample,
@@ -2216,33 +2167,55 @@ class LidarFreePoseViewGeometry(torch.nn.Module):
         # Anything that moves the poses -- free-pose `embeds`, or a rig-calib `pose_correction`
         # (supplied with skip_calib=True, so `enable_calib` is False there) -- cannot move the
         # measured rays, which were precomputed in world space; leaving the two inconsistent is
-        # what this guards. A' compensates below; B still asserts.
+        # what this guards. Both measured paths (A' structured and B unstructured)
+        # compensate below.
         poses_moved = enable_calib or (pose_correction is not None and pose_correction.modifies_poses)
 
-        def recalibrate_measured_rays(measured: torch.Tensor) -> torch.Tensor:
+        def recalibrate_measured_rays(measured: torch.Tensor, ray_timestamps_us: torch.Tensor) -> torch.Tensor:
             """Re-express precomputed world rays (N, 6) under the moved pose.
 
             datasets/ncore.py builds them from the stored pose, so anything that moved it --
             free-pose `embeds` or a rig-calib `pose_correction` -- must be re-applied here or
             it is silently discarded. `enable_calib=False` below is the stored pose under both,
             since `pose_correction` is applied after it.
+
+            The correction is PER RAY. A calibration that moves the start and end poses by
+            different amounts induces a correction that varies across the sweep, and both
+            renderers interpolate the sensor pose per ray from its own timestamp. Applying
+            the end-of-frame correction to every ray would disagree with that: with an
+            identity original pose and a calibration translating only the start pose by
+            +1 m on X, a frame-start ray would keep batch origin (0, 0, 0) while its
+            RENDERED origin is (1, 0, 0), so reconstructing a point from the rendered
+            distance would place it on the wrong ray.
             """
             if not poses_moved:
                 return measured
-            # A single rigid transform covers the sweep: motion_compensation=True puts every
-            # point in the END-timepoint sensor frame. float64 throughout, cast once -- `m` is
-            # near identity, so its translation is a difference of two large world translations.
+            # float64 throughout, cast once -- the correction is near identity, so its
+            # translation is a difference of two large world translations.
             T_orig_startend = self.get_poses_and_timestamps_startend(
                 meta, enable_calib=False, enable_torch_compile=enable_torch_compile
             ).T_sensor_world_startend
-            m = torch.matmul(
-                T_sensor_world_startend[1].double(),
-                torch.linalg.inv(T_orig_startend[1].double()),
-            ).to(T_sensor_world_startend.dtype)
+            T_new = T_sensor_world_startend.double()
+            # Relative sweep time over the frame window, clamped to [0, 1].
+            # - Structured render: same window and interpolation, so the correction is exact.
+            # - Unstructured gsplat render: normalizes over the rays' own min/max timestamps
+            #   and lerps the world->sensor translation; exact only when the rays span the
+            #   frame and the sweep rotation is constant (mm-scale residual otherwise).
+            ts = timestamps_startend_us.to(torch.float64)
+            duration = torch.clamp(ts[1] - ts[0], min=1.0)
+            rel = torch.clamp((ray_timestamps_us.reshape(-1).to(torch.float64) - ts[0]) / duration, 0.0, 1.0)
+            # Interpolate BOTH poses at each ray's own time, then form that ray's correction.
+            # Interpolating the correction itself would be wrong: it is not a rotation-free
+            # quantity, so lerping two rigid transforms is not the transform between the
+            # interpolated poses.
+            T_new_t = interpolate_se3_poses(T_new[0], T_new[1], rel)  # (N, 4, 4)
+            T_orig_t = interpolate_se3_poses(T_orig_startend[0].double(), T_orig_startend[1].double(), rel)
+            m = torch.matmul(T_new_t, se3_matrix_inverse(T_orig_t, unbatch=False)).to(T_sensor_world_startend.dtype)
+            R = m[:, :3, :3]
             return torch.cat(
                 [
-                    torch.addmm(m[:3, 3], measured[:, :3], m[:3, :3].transpose(0, 1)),
-                    torch.matmul(measured[:, 3:], m[:3, :3].transpose(0, 1)),
+                    torch.baddbmm(m[:, :3, 3:4], R, measured[:, :3, None]).squeeze(-1),
+                    torch.bmm(R, measured[:, 3:, None]).squeeze(-1),
                 ],
                 dim=-1,
             )
@@ -2332,16 +2305,24 @@ class LidarFreePoseViewGeometry(torch.nn.Module):
             # Model-free (N, 1, *) grid: dims come from the return list, NOT the
             # sensor model. sensor_model_parameters is None -> no model dependency.
             if measured_rays:
-                # (B) measured world rays. Re-expressing them would not unblock calibration
-                # here: the unstructured renderer takes its geometry from the dataloader-built
-                # tiling and reads `rays` only for its shape, and gsplat backprops into neither
-                # that tiling nor `viewmats`, so nothing would reach the pose deltas. Unblocking
-                # it needs a world-ray input on UnstructuredLidarFrameContext.
-                assert not poses_moved, (
-                    "use_real_lidar_rays=True with lidar_ray_mode='unstructured' does not support "
-                    "pose calibration: the unstructured render path cannot propagate pose gradients."
-                )
-                rays = unpack_optional(sparse_rays).squeeze(0).reshape(-1, 1, 6)
+                # (B) measured world rays. These are NOT what gets rendered: the
+                # unstructured renderer reads this tensor for its shape only
+                # (models/gaussians/renderers.py takes H, W from it), and gsplat
+                # regenerates the world rays it actually traces from the pose, in
+                # _generate_world_rays. The pose delta therefore reaches the render
+                # through the viewmats, and the gradient returns the same way, which
+                # is what the paired gsplat change unblocks -- ray generation there
+                # used to run under no_grad with a CPU-round-tripping pose
+                # conversion, so nothing reached the deltas.
+                #
+                # They are still re-expressed rather than passed through, because
+                # they remain the ray geometry for anything that reads the batch
+                # outside the render, and leaving them on the stored pose while the
+                # rendered rays move would make the two silently disagree.
+                rays = recalibrate_measured_rays(
+                    unpack_optional(sparse_rays).squeeze(0),
+                    unpack_optional(sparse_timestamps).squeeze(0),
+                ).reshape(-1, 1, 6)
             else:
                 # (C) modeled world rays generated at the return elements.
                 gen = unpack_optional(world_rays)  # (N, 6) in nurec space
@@ -2372,7 +2353,10 @@ class LidarFreePoseViewGeometry(torch.nn.Module):
         # (A') structured + measured: override the returning cells with the measured
         # world rays / timestamps (the modeled grid otherwise fills every cell).
         if measured_rays:
-            measured = recalibrate_measured_rays(unpack_optional(sparse_rays).squeeze(0))
+            measured = recalibrate_measured_rays(
+                unpack_optional(sparse_rays).squeeze(0),
+                unpack_optional(sparse_timestamps).squeeze(0),
+            )
             # Override into copies: the generated rays are saved for
             # GenerateSpinningLidarRaysFunction's backward, so an in-place write bumps their
             # version counter and autograd rejects the graph. Unconditional on purpose -- with

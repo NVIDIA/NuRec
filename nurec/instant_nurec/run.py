@@ -11,7 +11,6 @@ import click_default_group
 import pytorch_lightning as pl
 import yaml
 
-from lightning_utilities.core.rank_zero import rank_zero_info
 from omegaconf import OmegaConf
 
 import nurec.instant_nurec.systems
@@ -24,7 +23,7 @@ from nurec.instant_nurec.config.parse import parse_typed_instant_nurec_config
 from nurec.instant_nurec.systems.base import BaseInstantNuRecSystem
 from nurec.instant_nurec.utils.run_helpers import resolve_has_full_init, resolve_strategy, setup_environment_and_logger
 from nurec.utils.callbacks import TimingLogger, TQDMProgressBar, make_logger
-from nurec.utils.misc import rank_zero_only, unpack_optional
+from nurec.utils.misc import rank_zero_info, rank_zero_only, unpack_optional
 
 
 def launch_predict(config: InstantNuRecConfig, system: BaseInstantNuRecSystem, logger: logging.Logger) -> None:
@@ -60,7 +59,10 @@ def launch_predict(config: InstantNuRecConfig, system: BaseInstantNuRecSystem, l
         system.model.on_train_from_scratch_start(system)
 
     # Set return_predictions to False since we return primitives which is memory-consuming.
-    trainer.predict(system, datamodule=system.datamodule, ckpt_path=ckpt_path, return_predictions=False)
+    # NuRec checkpoints carry enums and RNG/loop state, which torch's weights-only default rejects.
+    trainer.predict(
+        system, datamodule=system.datamodule, ckpt_path=ckpt_path, return_predictions=False, weights_only=False
+    )
 
 
 @click.command("main")

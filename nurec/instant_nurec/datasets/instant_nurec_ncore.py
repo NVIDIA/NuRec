@@ -12,6 +12,7 @@ from typing import Optional, cast
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 import torch
 
 from scipy import ndimage
@@ -326,6 +327,10 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
         # Cache for _get_loaders_and_sensors: at most one entry, keyed by ncore_json_path (only used when not in a worker)
         self.cache_loaders_and_sensors = config.cache_loaders_and_sensors
         self._loaders_sensors_cache: dict[str, NCoreInstantNuRecDataset.LoadersAndSensorsResult] = {}
+        self.cache_full_clip_cuboid_observations = config.cache_full_clip_cuboid_observations
+        self._full_clip_cuboid_observations_cache: dict[str, pd.DataFrame] = {}
+        self.cache_full_clip_cuboid_consolidation = config.cache_full_clip_cuboid_consolidation
+        self._full_clip_cuboid_consolidation_cache: dict[str, dict[str, dict]] = {}
 
         # Camera and lidar id mappings
         self.camera_id_mapping = config.camera_id_mapping
@@ -337,6 +342,69 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
     def __len__(self) -> int:
         return len(self.ncore_json_paths) * self.num_samples_per_sequence
 
+    def _get_cuboid_observations(
+        self,
+        sequence_loader: ncore.data.SequenceLoaderProtocol,
+        time_range_us: HalfClosedInterval,
+        *,
+        cache_key: str,
+    ) -> pd.DataFrame:
+        use_cache = (
+            self.cache_full_clip_cuboid_observations and self.cuboid_tracks_params.track_extrapolate_timestamps_us < 0
+        )
+        if use_cache and cache_key in self._full_clip_cuboid_observations_cache:
+            return self._full_clip_cuboid_observations_cache[cache_key]
+
+        cuboids_df = compute_cuboid_df(sequence_loader, time_range_us, serialize_observation=False)
+        if use_cache:
+            # Prediction proceeds clip by clip. Keep only the active clip so a
+            # long-lived dataset cannot retain stale observation tables.
+            self._full_clip_cuboid_observations_cache = {cache_key: cuboids_df}
+        return cuboids_df
+
+    def _get_canonical_cuboid_tracks(
+        self,
+        cuboids_df: pd.DataFrame,
+        sequence_loader: ncore.data.SequenceLoaderProtocol,
+        *,
+        cache_key: str,
+    ) -> dict[str, dict] | None:
+        use_cache = (
+            self.cache_full_clip_cuboid_consolidation and self.cuboid_tracks_params.track_extrapolate_timestamps_us < 0
+        )
+        if not use_cache:
+            return None
+
+        if cache_key not in self._full_clip_cuboid_consolidation_cache:
+            canonical_tracks = consolidate_cuboid_tracks(
+                cuboids_df=cuboids_df,
+                sequence_loader=sequence_loader,
+                track_label_sources=[self.cuboid_tracks_params.track_label_source],
+                track_min_centroid_rig_dist_m=self.cuboid_tracks_params.track_min_centroid_rig_dist_m,
+                T_world_world_base=None,
+                tqdm_disabled=True,
+                association_device=torch.device("cpu"),
+            )
+            self._full_clip_cuboid_consolidation_cache = {cache_key: canonical_tracks}
+
+        return self._full_clip_cuboid_consolidation_cache[cache_key]
+
+    @staticmethod
+    def _copy_cuboid_tracks_with_world_base(
+        canonical_tracks: dict[str, dict],
+        T_world_world_base: np.ndarray,
+    ) -> dict[str, dict]:
+        """Create per-chunk tracks without exposing cached lists to mutation."""
+        return {
+            track_id: {
+                "dimension": np.array(track["dimension"], copy=True),
+                "label_class": track["label_class"],
+                "poses": [T_world_world_base @ pose for pose in track["poses"]],
+                "timestamps_us": list(track["timestamps_us"]),
+            }
+            for track_id, track in canonical_tracks.items()
+        }
+
     def _compute_cuboid_tracks(
         self,
         context_frame_batch: FrameBatchSamplerReturn,
@@ -345,6 +413,8 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
         camera_sensors: dict[ExtendedCameraId, ncore.data.CameraSensorProtocol],
         lidar_sensors: dict[str, ncore.data.LidarSensorProtocol],
         T_world_ref: np.ndarray,
+        *,
+        cache_key: str,
     ) -> CuboidTracksDataPack:
         if self.cuboid_tracks_params.lidar_id is None:
             cuboid_tracks = CuboidTracks.Factory.empty(device=torch.device("cpu"))
@@ -377,18 +447,22 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
                 frame_batch_min_timestamps_us - self.cuboid_tracks_params.track_extrapolate_timestamps_us,
                 frame_batch_max_timestamps_us + self.cuboid_tracks_params.track_extrapolate_timestamps_us,
             )
-        cuboids_df = compute_cuboid_df(sequence_loader, time_range_us, serialize_observation=False)
+        cuboids_df = self._get_cuboid_observations(sequence_loader, time_range_us, cache_key=cache_key)
 
         # First associate all tracks within the batch
-        all_batch_tracks = consolidate_cuboid_tracks(
-            cuboids_df=cuboids_df,
-            sequence_loader=sequence_loader,
-            track_label_sources=[self.cuboid_tracks_params.track_label_source],
-            track_min_centroid_rig_dist_m=self.cuboid_tracks_params.track_min_centroid_rig_dist_m,
-            T_world_world_base=T_world_ref,
-            tqdm_disabled=True,
-            association_device=torch.device("cpu"),
-        )
+        canonical_tracks = self._get_canonical_cuboid_tracks(cuboids_df, sequence_loader, cache_key=cache_key)
+        if canonical_tracks is None:
+            all_batch_tracks = consolidate_cuboid_tracks(
+                cuboids_df=cuboids_df,
+                sequence_loader=sequence_loader,
+                track_label_sources=[self.cuboid_tracks_params.track_label_source],
+                track_min_centroid_rig_dist_m=self.cuboid_tracks_params.track_min_centroid_rig_dist_m,
+                T_world_world_base=T_world_ref,
+                tqdm_disabled=True,
+                association_device=torch.device("cpu"),
+            )
+        else:
+            all_batch_tracks = self._copy_cuboid_tracks_with_world_base(canonical_tracks, T_world_ref)
 
         all_track_ids = []
         all_tracks_poses = []
@@ -1217,6 +1291,8 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
 
         # Load cuboid tracks for the model to compute inputs or supervision.
         # (Both context and supervision frame batches are needed to determine best time ranges to extract)
+        # Like the loader cache, key cuboids by manifest: different annotation
+        # exports can share a sequence ID without sharing observations or tracks.
         cuboid_tracks = self._compute_cuboid_tracks(
             context_frame_batch,
             supervision_frame_batch,
@@ -1224,6 +1300,7 @@ class NCoreInstantNuRecDataset(BaseInstantNuRecIndexableDataset):
             camera_sensors,
             lidar_sensors,
             T_world_ref,
+            cache_key=str(ncore_json_path),
         )
 
         # Compute meta data

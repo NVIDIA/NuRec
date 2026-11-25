@@ -74,7 +74,7 @@ class Tracks(dataclasses_json.DataClassJsonMixin):
         return Tracks.Unpacked.from_data(input).to_dict()
 
     @staticmethod
-    def decoder_tracks(input: dict) -> TracksData:
+    def decoder_tracks(input: dict, device: torch.device = torch.device("cuda")) -> TracksData:
         unpacked = Tracks.Unpacked.from_dict(input)
         return Tracks.Factory.from_numpy(
             unpacked.tracks_id,
@@ -82,7 +82,8 @@ class Tracks(dataclasses_json.DataClassJsonMixin):
             [np.array(track_timestamps_us, dtype=np.int64) for track_timestamps_us in unpacked.tracks_timestamps_us],
             unpacked.tracks_label_class,
             unpacked.tracks_flags,
-            "tquat",
+            pose_format="tquat",
+            device=device,
         ).tracks_data
 
     tracks_data: TracksData = field(metadata=dataclasses_json.config(encoder=encoder_tracks, decoder=decoder_tracks))
@@ -268,12 +269,12 @@ class CuboidTracks(Tracks):
         return CuboidTracks.Unpacked(input.cuboids_dims.tolist()).to_dict()
 
     @staticmethod
-    def decoder_cuboidtracks(input: dict) -> CuboidTracksData:
+    def decoder_cuboidtracks(input: dict, device: torch.device = torch.device("cuda")) -> CuboidTracksData:
         return CuboidTracksData(
             cuboids_dims=torch.tensor(
                 CuboidTracks.Unpacked.from_dict(input).cuboids_dims,
                 dtype=torch.float32,
-                device=torch.device("cuda"),
+                device=device,
             ).reshape(-1, 3)
         )
 
@@ -286,6 +287,14 @@ class CuboidTracks(Tracks):
         return self.cuboidtracks_data.cuboids_dims
 
     class Factory:
+        @staticmethod
+        def from_serialized(input: dict, device: torch.device = torch.device("cuda")) -> CuboidTracks:
+            """Decode serialized cuboid tracks on ``device``."""
+            return CuboidTracks(
+                tracks_data=Tracks.decoder_tracks(input["tracks_data"], device),
+                cuboidtracks_data=CuboidTracks.decoder_cuboidtracks(input["cuboidtracks_data"], device),
+            )
+
         @staticmethod
         def empty(device: torch.device = torch.device("cuda")) -> CuboidTracks:
             """
@@ -757,11 +766,14 @@ class CuboidTracks(Tracks):
 
             track_starts_counts = cuboid_tracks.tracks_packinfo[indices_tensor]
             track_starts, track_counts = track_starts_counts[:, 0], track_starts_counts[:, 1]
-            packed_attr_ind = (
-                linstep_interleave(track_starts, track_counts, 1).values
-                if len(track_starts)
-                else torch.empty(0, dtype=torch.long, device=cuboid_tracks.device)
-            )
+            if not len(track_starts):
+                packed_attr_ind = torch.empty(0, dtype=torch.long, device=cuboid_tracks.device)
+            elif track_starts.device.type == "cpu":
+                packed_attr_ind = torch.cat(
+                    [torch.arange(start, start + count) for start, count in track_starts_counts.tolist()]
+                )
+            else:
+                packed_attr_ind = linstep_interleave(track_starts, track_counts, 1).values
 
             return CuboidTracks(
                 # base tracks part

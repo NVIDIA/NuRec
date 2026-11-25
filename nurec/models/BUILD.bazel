@@ -57,7 +57,6 @@ py_library(
     deps = [
         pip_requirement("torch"),
         pip_requirement("omegaconf"),
-        pip_requirement("pytorch-lightning"),
         "//nurec/models/base:pylib",
         "//nurec/utils:pylib",
         "//nurec/utils:pylib_misc",
@@ -153,6 +152,7 @@ py_library(
         "//nurec/datasets:pylib",
         "//nurec/models/base:pylib",
         "//nurec/utils:pylib",
+        "//nurec/utils:pylib_initialization",
         "//nurec/utils:pylib_optim",
         "//nurec/utils:pylib_prober",
         "//nurec/utils:pylib_tcnn_allocator",
@@ -252,6 +252,7 @@ pytest_test(
         ":pylib_tracks_calib",
         "//nurec/config:pylib",
         "//nurec/datasets:pylib_tracks",
+        pip_requirement("matplotlib"),
         pip_requirement("numpy"),
         pip_requirement("omegaconf"),
         pip_requirement("torch"),

@@ -13,7 +13,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -38,7 +38,8 @@ class TemporalDeformationStorage(nn.Module, ABC):
     A backend only understands integer rows and columns. ``row_start_columns``
     and ``row_end_columns`` describe each row's inclusive stored interval;
     ``row_group_ids`` lets a backend group rows and prevents MCMC from copying
-    trajectories between actors.
+    trajectories between actors. Row lifetimes are immutable after construction
+    or checkpoint loading.
     """
 
     row_start_columns: torch.Tensor
@@ -197,6 +198,23 @@ class FrameMajorRaggedStorage(TemporalDeformationStorage):
         """Build one learnable value block for every non-empty time column."""
 
         super().__init__(**kwargs)
+        self.columns = nn.ModuleDict()
+        self._frozen_gradient_handles: dict[str, torch.utils.hooks.RemovableHandle] = {}
+        dtype = self._empty_values.dtype
+        device = self._empty_values.device
+        for column_index, active_count in enumerate(self._active_column_counts()):
+            if active_count:
+                self.columns[str(column_index)] = _ColumnValues(
+                    (active_count, self.value_dim),
+                    dtype=dtype,
+                    device=device,
+                    allocate_values=allocate_values,
+                )
+        self.register_load_state_dict_post_hook(FrameMajorRaggedStorage._validate_column_sizes_after_load)
+
+    def _active_column_counts(self) -> list[int]:
+        """Count stored rows once during construction or checkpoint loading."""
+
         count_deltas = torch.zeros(
             self.num_columns + 1,
             device=self.row_start_columns.device,
@@ -205,18 +223,36 @@ class FrameMajorRaggedStorage(TemporalDeformationStorage):
         ones = torch.ones_like(self.row_start_columns)
         count_deltas.index_add_(0, self.row_start_columns, ones)
         count_deltas.index_add_(0, self.row_end_columns + 1, -ones)
+        return count_deltas[:-1].cumsum(0).cpu().tolist()
 
-        self.columns = nn.ModuleDict()
-        self._frozen_gradient_handles: dict[str, torch.utils.hooks.RemovableHandle] = {}
-        dtype = self._empty_values.dtype
-        device = self._empty_values.device
-        for column_index, active_count in enumerate(count_deltas[:-1].cumsum(0).cpu().tolist()):
-            if active_count:
-                self.columns[str(column_index)] = _ColumnValues(
-                    (int(active_count), self.value_dim),
-                    dtype=dtype,
-                    device=device,
-                    allocate_values=allocate_values,
+    @staticmethod
+    def _validate_column_sizes_after_load(module: nn.Module, _incompatible_keys: Any) -> None:
+        """Reject inconsistent checkpoints before fixed-size selection can pad or truncate."""
+
+        storage = cast(FrameMajorRaggedStorage, module)
+        starts, ends = storage.row_start_columns, storage.row_end_columns
+        if (
+            starts.dtype != torch.int64
+            or ends.dtype != torch.int64
+            or starts.shape != (storage.num_rows,)
+            or ends.shape != (storage.num_rows,)
+            or bool(((starts < 0) | (ends >= storage.num_columns) | (starts > ends)).any().item())
+        ):
+            raise RuntimeError("checkpoint deformation row lifetimes are invalid")
+        for column_index, active_count in enumerate(storage._active_column_counts()):
+            key = str(column_index)
+            if key not in storage.columns:
+                if active_count:
+                    raise RuntimeError(f"checkpoint deformation column {column_index} is missing active rows")
+                continue
+            values = storage._column(key).values
+            if isinstance(values, nn.UninitializedParameter):
+                raise RuntimeError(
+                    f"checkpoint deformation column {column_index} was not loaded (missing columns.{key}.values)"
+                )
+            if values.shape != (active_count, storage.value_dim):
+                raise RuntimeError(
+                    f"checkpoint deformation column {column_index} does not match its {active_count} active rows"
                 )
 
     def _column(self, key: str) -> _ColumnValues:
@@ -230,7 +266,12 @@ class FrameMajorRaggedStorage(TemporalDeformationStorage):
         key = str(column_index)
         if key not in self.columns:
             return self.empty_column()
-        return CompressedDeformationColumn(self.active_rows(column_index), self._column(key).values)
+        values = self._column(key).values
+        # Membership is fixed; column shape gives its exact size without a
+        # device-to-host count synchronization or a persistent row-index cache.
+        active = (self.row_start_columns <= column_index) & (column_index <= self.row_end_columns)
+        rows = torch.nonzero_static(active, size=values.shape[0]).flatten()
+        return CompressedDeformationColumn(rows, values)
 
     @torch.no_grad()
     def _copy_rows(

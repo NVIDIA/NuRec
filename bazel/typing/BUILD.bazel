@@ -27,6 +27,7 @@ py_library(
         pip_requirement("pytorch_lightning"),
         pip_requirement("imageio"),
         pip_requirement("pillow"),
+        pip_requirement("scikit-image"),
         pip_requirement("kornia"),
         pip_requirement("viser"),
         pip_requirement("pydantic"),

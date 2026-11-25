@@ -942,7 +942,7 @@ class CollectorFunction(torch.autograd.Function):
     3. Return input gradients
 
     Thread configuration:
-    - Forward: 256 threads/block (conservative for wide per-Gaussian signals)
+    - Forward: 256 threads/block (wide signals; segmented launches require a multiple of 32)
     - Backward: 128 threads/block (uses more registers, needs lower occupancy)
 
     Memory layout:
@@ -1125,6 +1125,13 @@ class CollectorFunction(torch.autograd.Function):
                     offset += count
                     continue
 
+                segmented = layer_segments.n_segments > 0
+                if segmented:
+                    # SparseRows.component exchanges rows across complete CUDA warp tiles.
+                    assert threads_per_block % 32 == 0, (
+                        "segmented collect requires a block size that is a multiple of 32"
+                    )
+
                 params = layer_handler.get_kernel_parameters(
                     layers_data, layer_data, output_params, CollectorFunction.forward_tensor_func
                 )
@@ -1133,7 +1140,6 @@ class CollectorFunction(torch.autograd.Function):
                 assert blocks_per_grid > 0
 
                 with profile("slangtorch_call_direct"):
-                    segmented = layer_segments.n_segments > 0
                     kernel = params.kernel.kernels[int(segmented)]
                     segment_params: tuple[Any, ...] = ()
                     if segmented:

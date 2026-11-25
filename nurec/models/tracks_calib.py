@@ -12,12 +12,10 @@ from dataclasses import dataclass
 from typing import Any, Optional, Type, cast
 
 import lietorch as lt
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 from lietorch.group_ops import lietorch_backends
-from matplotlib import collections as mc
 from omegaconf import DictConfig
 from torch import nn
 
@@ -827,6 +825,11 @@ class ElevationAwareUnicycleTracksCalib(BaseTracksCalib):
         return {}
 
     def visualize_unicycle(self):
+        # Debug-only plotting; matplotlib is imported on first use so model imports stay light.
+        import matplotlib.pyplot as plt
+
+        from matplotlib import collections as mc
+
         num_tracks = min(self.ground_q.size(0), 16)
 
         if not hasattr(self, "figure"):

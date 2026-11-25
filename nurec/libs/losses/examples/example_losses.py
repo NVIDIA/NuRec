@@ -12,9 +12,9 @@ This script provides simple, runnable examples of different loss function implem
    that work on CPU or CUDA without requiring specialized kernels. gsplat provides them;
    this repository registers them under the names used in loss configs.
 
-2. CUDA fused example: Demonstrates ModuleLosses, a fused CUDA kernel implementation that computes
+2. CUDA fused example: Demonstrates AccumulatorModuleLosses, a fused CUDA kernel implementation that computes
    multiple losses simultaneously for improved performance. This example shows how to:
-   - Create a ModuleLosses instance
+   - Create an AccumulatorModuleLosses instance
    - Configure individual losses (RGB L1, background MSE)
    - Call the forward pass with model results and target data
 
@@ -36,9 +36,11 @@ import torch
 from gsplat.losses.functional import bce_clipped, relu_sum
 
 from nurec.config.trainer import TrainerConfig
-from nurec.libs.losses.models import ModuleLosses, SlangBaseLoss
+from nurec.libs.losses.functional.cuda_losses_accumulator import LOSS_SLOT_BY_NAME
+from nurec.libs.losses.models import SlangBaseLoss
+from nurec.libs.losses.models.accumulator_module import AccumulatorModuleLosses
 from nurec.libs.losses.models.render_losses import RoadGaussiansLoss
-from nurec.libs.losses.orchestration.config import LossItemConfig
+from nurec.libs.losses.orchestration.config import LossAccumulatorReturn, LossItemConfig
 from nurec.models.gaussians.gaussians_composite import GaussiansComposite
 from nurec.models.gaussians.gaussians_model import BaseGaussianModel
 from nurec.models.nn_extensions import TypedModuleDict, TypedModuleList
@@ -81,23 +83,23 @@ def python_example():
     print(f"  Time to run: {elapsed_time:.3f} seconds")
 
 
-def slang_example():
-    """Demonstrate Slang-based losses example."""
+def accumulator_example():
+    """Demonstrate CUDA accumulator losses."""
     start_time = time.time()
-    print("\nSlang example:")
+    print("\nAccumulator example:")
 
-    # ModuleLosses requires CUDA
+    # The accumulator requires CUDA
     if device.type != "cuda":
-        print("WARNING: Slang requires CUDA. Skipping this example.")
+        print("WARNING: Accumulator losses require CUDA. Skipping this example.")
         return
 
-    # Create ModuleLosses instance
-    module_losses = ModuleLosses()
+    # Create the family input module
+    module_losses = AccumulatorModuleLosses()
 
     # Configure RGB L1 Mean loss
     loss_config = LossItemConfig.model_validate({"fn": "l1", "lambda_": 1.0, "reduce": {"name": "mean"}})
 
-    # Append SlangBaseLoss to module_losses.losses (like LossAggregator does)
+    # Configure the fused RGB member
     module_losses.losses.append(SlangBaseLoss("rgb", loss_config, trainer_config))
 
     # Add background loss configuration
@@ -108,6 +110,7 @@ def slang_example():
     # Intentionally skip super().__init__() to avoid needing config
     model = GaussiansComposite.__new__(GaussiansComposite)
     torch.nn.Module.__init__(model)
+    model.register_buffer("_device_indicator", torch.zeros((), device=device), persistent=False)
     model.gaussians_nodes = TypedModuleDict[BaseGaussianModel]({})
     model.post_processings = TypedModuleList[BasePostProcessing]([])
     model.background = None
@@ -144,12 +147,11 @@ def slang_example():
     data_batch = DataBatch(idx=0, worker_id=None, sequence_id=["example"], camera=camera, lidar=None)
     target = DataAndRenderingBatch(data=data_batch)
 
-    # Call ModuleLosses forward via call operator (as LossAggregator does)
-    loss_returns = module_losses(step=0, model=model, results=results, target=target)
-
-    print(f"  Computed {len(loss_returns)} loss(es):")
-    for loss_name, loss_ret in loss_returns.items():
-        print(f"    {loss_name}: {loss_ret.reduced_value.item():.6f}")
+    vector, weights = module_losses.accumulate(step=0, model=model, results=results, target=target)
+    result = LossAccumulatorReturn(vector, LOSS_SLOT_BY_NAME, weights)
+    print(f"  Computed {len(result.names)} loss(es):")
+    for loss_name in result.names:
+        print(f"    {loss_name}: {result.weighted_value(loss_name).item():.6f}")
 
     elapsed_time = time.time() - start_time
     print(f"  Time to run: {elapsed_time:.3f} seconds")
@@ -207,7 +209,7 @@ def cuda_example():
 def main():
     print(f"Using device: {device}")
     python_example()
-    slang_example()
+    accumulator_example()
     cuda_example()
 
 

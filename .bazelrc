@@ -55,6 +55,13 @@ build --remote_instance_name nre
 # for their local builds. CI overrides this via .bazelrc.user
 build --remote_upload_local_results=false
 
+# Reduce build overhead by not building the *.runfiles symlink trees. 'bazel run' still transparently
+# creates runfiles for its target.
+# If you need to execute bazel-bin/<target> directly after build or inspect its runfiles, either run
+# first with 'bazel run' or override the setting below by passing --build_runfile_links to the build
+# command.
+build --nobuild_runfile_links
+
 # Pass GITHUB_TOKEN for update-license-overrides target
 run:license-update --action_env=GITHUB_TOKEN
 
@@ -108,16 +115,22 @@ build:cuda_100 --@rules_cuda//cuda:archs=compute_100:sm_100
 #? --config=cuda_120           Build kernels for compute-capability 120 only
 build:cuda_120 --@rules_cuda//cuda:archs=compute_120:sm_120;compute_120:compute_120
 
-#? --config=ci_test_timeout    Increased the CI test timeouts [default 60,300,900,3600 for short, moderate, long, eternal]
-build:ci_test_timeout --test_timeout=60,300,1300,3600
+#? --config=ci_test_timeout    Increased the CI test timeouts [default 60,300,900,14400 for short, moderate, long, eternal]
+build:ci_test_timeout --test_timeout=60,300,1300,14400
 
 #? --config=local_gsplat      Use the local gsplat checkout instead of the pinned remote module
 build:local_gsplat --override_module=gsplat=%workspace%/deps/gsplat
+
+#? --config=rdma              Link the RDMA (RoCEv2) transport into serve-grpc and its libraries into the run images (x86_64)
+build:rdma --//bazel/flags:rdma=True
 # Forward $CCACHE_DIR into the cmake() sandbox (no-op when CCACHE_DIR is unset).
 build --action_env=CCACHE_DIR
 
 # Show outputs of failing tests by default
 test --test_output=errors
+
+# Bazel's default test timeouts, with "eternal" raised to fit the full-mode SQA tests
+test --test_timeout=60,300,900,14400
 
 # Only build test targets when executing tests
 test --build_tests_only
@@ -131,7 +144,7 @@ build --@mypy_integration//:mypy_config=//bazel/typing:mypy.ini
 build --incompatible_default_to_explicit_init_py
 
 # Code coverage measurement (Python/C++ only)
-coverage --test_timeout=180,900,3900,10800 # Triple of CI test timeouts to account for coverage collection overhead
+coverage --test_timeout=180,900,3900,43200 # Triple of CI test timeouts to account for coverage collection overhead
 coverage --instrument_test_targets
 coverage --instrumentation_filter="^//"
 

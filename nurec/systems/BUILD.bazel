@@ -34,6 +34,9 @@ py_library(
         "//nurec/instant_nurec/config:pylib",
         "//nurec/libs/losses:pylib",
         "//nurec/libs/losses/orchestration:pylib_component_only_normalization",
+        "//nurec/libs/losses/orchestration:pylib_config",
+        "//nurec/libs/losses/orchestration:pylib_loss_orchestrator",
+        "//nurec/lidar/firing_patterns:io",
         "//nurec/metrics:pylib",
         "//nurec/models:pylib",
         "//nurec/models/base:pylib",
@@ -69,6 +72,7 @@ py_library(
         # List any dependencies of utils.py here
         "//nurec/datamodules:pylib",
         "//nurec/libs/losses:pylib",
+        "//nurec/libs/losses/orchestration:pylib_loss_orchestrator",
         "//nurec/models/base:pylib",
         pip_requirement("numpy"),
         pip_requirement("torch"),
@@ -81,6 +85,8 @@ pytest_test(
     srcs = ["base_test.py"],
     deps = [
         ":pylib",
+        "//nurec/ncore_backends:pylib",
+        pip_requirement("universal-pathlib"),
     ],
 )
 
@@ -125,6 +131,7 @@ pytest_test(
     srcs = ["gaussians_component_only_test.py"],
     deps = [
         ":pylib",
+        "//nurec/libs/losses/orchestration:pylib_config",
     ],
 )
 

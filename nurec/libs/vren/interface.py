@@ -18,6 +18,7 @@ from ncore.data import (
     ShutterType,
 )
 from ncore.sensors import CameraModel
+from nurec.libs.fisheye import opencv_fisheye_max_angle
 
 
 # MyPy likes the vren module variable to be of Any type so it treats all its attributes as dynamic, avoiding
@@ -68,7 +69,8 @@ def to_vren(
     """Provides vren camera model parameter (generic over camera model type) by either
 
         - initializing from corresponding NCore camera model parameter type
-        - forwarding argument directly if of 'vren.<CameraModelType>Parameters' type
+        - forwarding native VREN parameters, except fisheye parameters are copied
+          and restricted to their optical-axis increasing polynomial branch
 
     Errors out if non-supported camera model parameter structure is provided"""
 
@@ -81,13 +83,26 @@ def to_vren(
     }
 
     match ncore_or_vren_camera_model_parameters:
-        case (
-            vren.OpenCVPinholeCameraModelParameters()
-            | vren.OpenCVFisheyeCameraModelParameters()
-            | vren.FThetaCameraModelParameters()
-        ):
+        case vren.OpenCVPinholeCameraModelParameters() | vren.FThetaCameraModelParameters():
             # identity transformation
             return ncore_or_vren_camera_model_parameters
+
+        case vren.OpenCVFisheyeCameraModelParameters():
+            # Validate native parameter objects too, without mutating the caller's
+            # calibration. The NCore domain calculation is cached on the host.
+            source = ncore_or_vren_camera_model_parameters
+            vren_params = vren.OpenCVFisheyeCameraModelParameters()
+            for field in (
+                "resolution",
+                "shutter_type",
+                "external_distortion_parameters",
+                "principal_point",
+                "focal_length",
+                "radial_coeffs",
+            ):
+                setattr(vren_params, field, getattr(source, field))
+            vren_params.max_angle = opencv_fisheye_max_angle(source.radial_coeffs, source.max_angle)
+            return vren_params
 
         case OpenCVPinholeCameraModelParameters(
             resolution=resolution,
@@ -131,7 +146,7 @@ def to_vren(
             vren_params.principal_point = principal_point.tolist()
             vren_params.focal_length = focal_length.tolist()
             vren_params.radial_coeffs = radial_coeffs.tolist()
-            vren_params.max_angle = max_angle
+            vren_params.max_angle = opencv_fisheye_max_angle(radial_coeffs, max_angle)
 
             return vren_params
 

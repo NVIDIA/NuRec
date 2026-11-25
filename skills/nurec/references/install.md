@@ -23,7 +23,7 @@ build. A missing release image is a publication problem: report the
 exact image and pull error rather than substituting another registry or runtime.
 
 Docker's Buildx plugin is required (`docker buildx version`). The selected
-checkout must include the Dockerfile's `BASE_IMAGE` argument. If it does not,
+checkout must include the Dockerfile's `NUREC_DEV_DEPS_IMAGE` argument. If it does not,
 use a matching source release that supports this setup before proceeding.
 
 From the host's Bash shell, replace `<release>` with your release branch or tag
@@ -36,13 +36,13 @@ export NUREC_SRC="$PWD"
 export NUREC_DEV_DEPS_IMAGE=ghcr.io/nvidia/nurec/nurec_dev_deps:<tag>
 export NUREC_IMAGE=nurec_dev:local
 docker buildx version
-grep -q '^ARG BASE_IMAGE' "$NUREC_SRC/deps/docker/Dockerfile-dev.build" || {
-  echo 'This checkout needs the BASE_IMAGE development Dockerfile.' >&2
+grep -q 'ARG NUREC_DEV_DEPS_IMAGE' "$NUREC_SRC/deps/docker/Dockerfile-dev.build" || {
+  echo 'This checkout needs the NUREC_DEV_DEPS_IMAGE development Dockerfile.' >&2
   exit 1
 }
 docker pull "$NUREC_DEV_DEPS_IMAGE"
 docker buildx build --network=host \
-  --build-arg BASE_IMAGE="$NUREC_DEV_DEPS_IMAGE" \
+  --build-arg NUREC_DEV_DEPS_IMAGE="$NUREC_DEV_DEPS_IMAGE" \
   -t "$NUREC_IMAGE" -f "$NUREC_SRC/deps/docker/Dockerfile-dev.build" \
   --load "$NUREC_SRC/deps/docker"
 python3 "$NUREC_SRC/skills/nurec/scripts/validate_setup.py" --source "$NUREC_SRC"

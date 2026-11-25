@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - override /image_resolution/camera@_global_.dataset.samplers.batch_sampler.camera_pixel_sampler.resolution: relative_4
+
+
 dataset:
   samplers:
     batch_sampler:
       camera_pixel_sampler:
         crop_type: full_image
-        subsample: 4

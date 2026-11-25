@@ -59,23 +59,23 @@ When implementing your converter, use these as working references for the expect
 **1. NCore format documentation (structure of a V4 shard)**  
 The canonical description of the V4 component-store layout is in the NCore docs:
 
-- **[Data formats](https://nvidia.github.io/ncore/data/formats.html)** (including [formats.rst](https://github.com/NVIDIA/ncore/blob/v19.8.0/docs/data/formats.rst) in the NCore repo): component group hierarchy, root-level `sequence_meta_data` and `sequence_timestamp_interval_us`, and the layout of each component type (Poses, Intrinsics, Camera, Lidar, Radar, Cuboids, Masks). It also describes the **itar** (single-file) vs **directory** store options.
+- **[Data formats](https://nvidia.github.io/ncore/data/formats.html)** (including [formats.rst](https://github.com/NVIDIA/ncore/blob/v19.8.5/docs/data/formats.rst) in the NCore repo): component group hierarchy, root-level `sequence_meta_data` and `sequence_timestamp_interval_us`, and the layout of each component type (Poses, Intrinsics, Camera, Lidar, Radar, Cuboids, Masks). It also describes the **itar** (single-file) vs **directory** store options.
 
 Use this to confirm directory structure, attribute names, and array shapes (e.g. poses as 4×4, timestamps in microseconds).
 
 **2. Example V4 data**
 
 - **Template output:** Running the skeleton converter produces minimal but valid V4 under your `--output-dir`. Inspect the resulting directory (or `.zarr.itar` file) and the `{sequence_id}.json` sequence meta to see a concrete example.
-- **NCore test-data-v4:** The NCore repo uses a **test-data-v4** archive (fetched from GitHub Packages in `MODULE.bazel`) as real V4 data in its tests. If you have access to the NCore repo and GitHub Packages (see [NCore CONTRIBUTING](https://github.com/NVIDIA/ncore/blob/v19.8.0/CONTRIBUTING.md)), you can use that archive as another reference.
-- **Reference converters:** The [Waymo](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/waymo/converter.py), [PAI](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/pai/converter.py), and [Colmap](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/colmap/converter.py) converters in the NCore repo produce full V4 output (poses, cameras, lidar, etc.). Running one of them (when you have the source data) gives you a complete example shard to compare against.
+- **NCore test-data-v4:** The NCore repo uses a **test-data-v4** archive (fetched from GitHub Packages in `MODULE.bazel`) as real V4 data in its tests. If you have access to the NCore repo and GitHub Packages (see [NCore CONTRIBUTING](https://github.com/NVIDIA/ncore/blob/v19.8.5/CONTRIBUTING.md)), you can use that archive as another reference.
+- **Reference converters:** The [Waymo](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/waymo/converter.py), [PAI](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/pai/converter.py), and [Colmap](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/colmap/converter.py) converters in the NCore repo produce full V4 output (poses, cameras, lidar, etc.). Running one of them (when you have the source data) gives you a complete example shard to compare against.
 
 **3. Code examples**
 
-- **[components_test.py](https://github.com/NVIDIA/ncore/blob/v19.8.0/ncore/impl/data/v4/components_test.py):** Full example of writing V4 data and extending it with a custom component (`TestDataNewComponent`). Useful for seeing the exact writer calls and store layout in code.
+- **[components_test.py](https://github.com/NVIDIA/ncore/blob/v19.8.5/ncore/impl/data/v4/components_test.py):** Full example of writing V4 data and extending it with a custom component (`TestDataNewComponent`). Useful for seeing the exact writer calls and store layout in code.
 
 ### Step 1: Add a Config subclass
 
-Copy and adapt from `ExampleConverterConfig` in [converter.py](ncore_example/converter.py). Extend `FileBasedDataConverterConfig` and add the same NCore-style options used by the existing NCore converters ([Waymo](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/waymo/converter.py), [Colmap](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/colmap/converter.py), [PAI](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/pai/converter.py)):
+Copy and adapt from `ExampleConverterConfig` in [converter.py](ncore_example/converter.py). Extend `FileBasedDataConverterConfig` and add the same NCore-style options used by the existing NCore converters ([Waymo](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/waymo/converter.py), [Colmap](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/colmap/converter.py), [PAI](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/pai/converter.py)):
 
 - `store_type`: `"itar"` | `"directory"` (default `"itar"`).
 - `component_group_profile`: `"default"` | `"separate-sensors"` | `"separate-all"` (default `"separate-sensors"`).
@@ -99,7 +99,7 @@ Follow the structure of `ExampleConverter.convert_sequence` in [converter.py](nc
    `SequenceComponentGroupsWriter(output_dir_path, store_base_name, sequence_id, sequence_timestamp_interval_us, store_type, generic_meta_data)`. (See the example's `store_writer` setup.)
 
 2. **Component group layout**  
-   Use `ComponentGroupAssignments.create(camera_ids, lidar_ids, radar_ids, point_clouds_ids, camera_labels_ids, profile=...)` so the layout matches what NuRec expects (same pattern as the [Waymo V4 converter](https://github.com/NVIDIA/ncore/blob/v19.8.0/tools/data_converter/waymo/converter.py) and the [skeleton converter](ncore_example/converter.py)).
+   Use `ComponentGroupAssignments.create(camera_ids, lidar_ids, radar_ids, point_clouds_ids, camera_labels_ids, profile=...)` so the layout matches what NuRec expects (same pattern as the [Waymo V4 converter](https://github.com/NVIDIA/ncore/blob/v19.8.5/tools/data_converter/waymo/converter.py) and the [skeleton converter](ncore_example/converter.py)).
 
 3. **Register and use V4 component writers** from `ncore.data.v4` — each in its own `_write_*` method (see the skeleton for the full pattern):
 
@@ -521,4 +521,4 @@ For consistency with NCore:
 - Ruff, 120-char line length (configured in [pyproject.toml](pyproject.toml)).
 - Format: `bazel run //:format`.
 
-See [NCore CONTRIBUTING](https://github.com/NVIDIA/ncore/blob/v19.8.0/CONTRIBUTING.md).
+See [NCore CONTRIBUTING](https://github.com/NVIDIA/ncore/blob/v19.8.5/CONTRIBUTING.md).

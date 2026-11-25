@@ -45,7 +45,7 @@ class LayerTrackIds:
         # Edited cuboid tracks
         cuboid_tracks: CuboidTracks
 
-        # Maps each edited track index to its original model/owner track index.
+        # mapping[i] is the owner track index for edited track i; values are unique.
         mapping: torch.Tensor
 
     tracks_edit: Edit | None = None
